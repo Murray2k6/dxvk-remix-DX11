@@ -2,7 +2,7 @@
 
 A Direct3D 11 fork of [NVIDIA's dxvk-remix](https://github.com/NVIDIAGameWorks/dxvk-remix) that swaps the upstream D3D9 frontend for a D3D11 frontend while keeping the RTX Remix runtime, USD export, material editing, and path-traced rendering pipeline.
 
-Release `0.4` is packaged to match the local `_output` deployment layout exactly.
+Release is packaged to match the local `_output` deployment layout exactly.
 
 ## Overview
 
@@ -117,7 +117,7 @@ These are example defaults, not a mandatory full config. Start small and only ke
 
 ## Release Layout
 
-The `0.4` release archive mirrors `_output` directly instead of inventing a second packaging structure.
+The release archive mirrors `_output` directly instead of inventing a second packaging structure.
 
 Top-level release contents include:
 
@@ -200,7 +200,7 @@ The normal runtime build does not need a separate test build to produce `d3d11.d
 After a successful build that populates `_output`, create a release-staged folder and zip:
 
 ```powershell
-.\package_release.ps1 -Version 0.4
+.\package_release.ps1 -Version 0.5
 ```
 
 That command stages the package under `_release/` and creates a zip that matches the deploy layout.
