@@ -117,6 +117,7 @@ namespace dxvk {
 
     void switchMenu(UIType type, bool force = false, bool allowCrossModuleFallback = true);
     void markRemixMenuHotkeyHandled();
+    bool isRemixMenuHotkeyLatched() const { return m_remixMenuHotkeyLatched; }
     
     enum Tabs {
       kTab_Rendering = 0,

@@ -751,6 +751,18 @@ namespace dxvk {
     const bool useOverlayInput = m_overlayWin.ptr() != nullptr && RtxOptions::useNewGuiInputMethod();
     const bool overlayOwnsInputMsg = useOverlayInput && (isKeyMsg || isMouseMsg || msg == WM_INPUT);
 
+    // Debug: log key messages to track input delivery
+    if (isKeyMsg) {
+      static uint32_t keyMsgCount = 0;
+      if (keyMsgCount < 20 || (keyMsgCount % 100 == 0)) {
+        Logger::info(str::format("[ImGUI] wndProcHandler: keyMsg #", keyMsgCount,
+          " msg=0x", std::hex, msg, std::dec,
+          " wParam=", (int)wParam,
+          " overlayOwns=", overlayOwnsInputMsg ? 1 : 0));
+      }
+      ++keyMsgCount;
+    }
+
     if (!overlayOwnsInputMsg) {
       ImGui_ImplWin32_WndProcHandler(hWnd, msg, wParam, lParam);
     }
@@ -1080,10 +1092,36 @@ namespace dxvk {
       }
     }
 
+    // GetAsyncKeyState-based hotkey check (fallback when WndProc doesn't deliver keys)
+    // Static tracker for rising edge detection - prevents multiple toggles per key press
+    static bool s_asyncKeyStatePrevDown = false;
+    auto checkHotkeyWithGetAsyncKeyState = [](const VirtualKeys& virtKeys) -> bool {
+      if (virtKeys.empty()) return false;
+      for (const auto& vk : virtKeys) {
+        if ((::GetAsyncKeyState(vk.val) & 0x8000) == 0)
+          return false;
+      }
+      return true;
+    };
+
     const VirtualKeys& remixMenuKeyBinds = RtxOptions::remixMenuKeyBinds();
-    const bool remixMenuHotkeyDown = checkHotkeyState(remixMenuKeyBinds, true);
-    const bool remixMenuHotkeyPressed = isHotkeyPressedThisFrame(remixMenuKeyBinds);
-    const bool menuHotkeyHandledInWndProc = m_gameHwnd != nullptr;
+    const bool imguiHotkeyDown = checkHotkeyState(remixMenuKeyBinds, true);
+    const bool asyncKeyDown = checkHotkeyWithGetAsyncKeyState(remixMenuKeyBinds);
+    const bool asyncKeyPressed = asyncKeyDown && !s_asyncKeyStatePrevDown; // Rising edge only
+    
+    // Log when async key state changes
+    if (asyncKeyDown != s_asyncKeyStatePrevDown) {
+      Logger::info(str::format("[ImGUI] processHotkeys: asyncKeyDown changed to ", asyncKeyDown ? 1 : 0,
+        " (risingEdge=", asyncKeyPressed ? 1 : 0,
+        " imguiHotkeyDown=", imguiHotkeyDown ? 1 : 0,
+        " latch=", m_remixMenuHotkeyLatched ? 1 : 0, ")"));
+    }
+    s_asyncKeyStatePrevDown = asyncKeyDown;
+
+    const bool remixMenuHotkeyDown = imguiHotkeyDown || asyncKeyDown;
+    // For "pressed this frame" with GetAsyncKeyState, use rising edge detection
+    const bool remixMenuHotkeyPressed = isHotkeyPressedThisFrame(remixMenuKeyBinds) || asyncKeyPressed;
+    // Always handle hotkey here - m_remixMenuHotkeyLatched prevents double-toggle if WndProc also handled it
     if (!remixMenuHotkeyDown) {
       m_remixMenuHotkeyLatched = false;
     } else {
@@ -1092,7 +1130,7 @@ namespace dxvk {
       const bool debounceExpired = m_lastRemixMenuToggleTime.time_since_epoch().count() == 0
         || now - m_lastRemixMenuToggleTime >= kRemixMenuHotkeyDebounce;
 
-      if (!menuHotkeyHandledInWndProc && remixMenuHotkeyPressed && !m_remixMenuHotkeyLatched && debounceExpired) {
+      if (remixMenuHotkeyPressed && !m_remixMenuHotkeyLatched && debounceExpired) {
         Logger::info("[ImGUI] Alt+X hotkey detected — toggling Remix menu");
         const bool uiOpen = getEffectiveUIType() != UIType::None;
         if(RtxOptions::defaultToAdvancedUI()) {
@@ -1120,6 +1158,17 @@ namespace dxvk {
   }
 
   void ImGUI::update(const Rc<DxvkContext>& ctx) {
+    static uint64_t updateCallCount = 0;
+    ++updateCallCount;
+    if (updateCallCount <= 5 || (updateCallCount % 500 == 0)) {
+      const auto& io = ImGui::GetIO();
+      Logger::info(str::format("[ImGUI] update #", updateCallCount,
+        ": KeyAlt=", io.KeyAlt ? 1 : 0,
+        " KeyCtrl=", io.KeyCtrl ? 1 : 0,
+        " WantCaptureKeyboard=", io.WantCaptureKeyboard ? 1 : 0,
+        " effectiveUI=", (int)getEffectiveUIType()));
+    }
+
     ImGui_ImplDxvk::NewFrame();
     ImGui_ImplWin32_NewFrame();
 
@@ -1175,6 +1224,24 @@ namespace dxvk {
     } else {
       ImGui::GetIO().MouseDrawCursor = drawImGuiCursor;
       forceOsCursorVisible(!drawImGuiCursor);
+      // Periodically unclip cursor while UI is open (throttled to avoid fighting with game).
+      // Games like Skyrim re-clip the cursor every frame; we counteract at ~10Hz.
+      if (RtxOptions::blockInputToGameInUI()) {
+        static auto lastUnclipTime = std::chrono::steady_clock::now();
+        auto now = std::chrono::steady_clock::now();
+        if (std::chrono::duration_cast<std::chrono::milliseconds>(now - lastUnclipTime).count() > 100) {
+          lastUnclipTime = now;
+          RECT clipRect;
+          if (::GetClipCursor(&clipRect)) {
+            // Only unclip if it's actually clipped (not full screen rect)
+            RECT fullScreen = { 0, 0, ::GetSystemMetrics(SM_CXVIRTUALSCREEN), ::GetSystemMetrics(SM_CYVIRTUALSCREEN) };
+            if (clipRect.left != fullScreen.left || clipRect.top != fullScreen.top ||
+                clipRect.right != fullScreen.right || clipRect.bottom != fullScreen.bottom) {
+              ::ClipCursor(nullptr);
+            }
+          }
+        }
+      }
     }
 
     showHudMessages(ctx);
@@ -1273,16 +1340,19 @@ namespace dxvk {
 
       const static ImGuiTabBarFlags tab_bar_flags = ImGuiTabBarFlags_Reorderable | ImGuiTabBarFlags_NoCloseWithMiddleMouseButton;
       const static ImGuiTabItemFlags tab_item_flags = ImGuiTabItemFlags_NoCloseWithMiddleMouseButton;
-      const int selectedTab = m_triggerTab != kTab_Count
-        ? static_cast<int>(m_triggerTab)
-        : (m_curTab != kTab_Count ? static_cast<int>(m_curTab) : -1);
+      // Only force-select a tab when there's an explicit programmatic trigger.
+      // Using SetSelected every frame based on m_curTab conflicts with ImGui's
+      // internal tab bar state, causing tabs to bounce when the user clicks.
+      const bool hasProgrammaticTrigger = m_triggerTab != kTab_Count;
+      const int triggerTabIndex = hasProgrammaticTrigger ? static_cast<int>(m_triggerTab) : -1;
       m_triggerTab = kTab_Count;
 
       // Tab Bar
       if (ImGui::BeginTabBar("Developer Tabs", tab_bar_flags)) {
         for (int n = 0; n < kTab_Count; n++) {
           auto tabItemFlags = tab_item_flags;
-          if (n == selectedTab) {
+          // Only use SetSelected for one-time programmatic switches
+          if (hasProgrammaticTrigger && n == triggerTabIndex) {
             tabItemFlags |= ImGuiTabItemFlags_SetSelected;
           }
           if (ImGui::BeginTabItem(tabNames[n], nullptr, tabItemFlags)) {
@@ -2943,8 +3013,7 @@ namespace dxvk {
     const float thumbnailPadding = ImGui::GetStyle().CellPadding.x;
     const uint32_t numThumbnailsPerRow = uint32_t(std::max(1.f, (m_windowWidth - 18.f) / (thumbnailSize + thumbnailSpacing + thumbnailPadding * 2.f)));
 
-    if (IMGUI_ADD_TOOLTIP(ImGui::BeginTabItem("Step 1: Categorize Textures", nullptr,
-        tab_item_flags | (m_curSetupTab == kSetupTab_CategorizeTextures ? ImGuiTabItemFlags_SetSelected : 0)),
+    if (IMGUI_ADD_TOOLTIP(ImGui::BeginTabItem("Step 1: Categorize Textures", nullptr, tab_item_flags),
         "Select texture definitions for Remix")) {
       m_curSetupTab = kSetupTab_CategorizeTextures;
       spacing();
@@ -3087,8 +3156,7 @@ namespace dxvk {
       ImGui::EndTabItem();
     }
 
-    if (ImGui::BeginTabItem("Step 2: Parameter Tuning", nullptr,
-        tab_item_flags | (m_curSetupTab == kSetupTab_ParameterTuning ? ImGuiTabItemFlags_SetSelected : 0))) {
+    if (ImGui::BeginTabItem("Step 2: Parameter Tuning", nullptr, tab_item_flags)) {
       m_curSetupTab = kSetupTab_ParameterTuning;
       spacing();
       RemixGui::DragFloat("Scene Unit Scale", &RtxOptions::sceneScaleObject(), 0.00001f, 0.00001f, FLT_MAX, "%.5f", sliderFlags);

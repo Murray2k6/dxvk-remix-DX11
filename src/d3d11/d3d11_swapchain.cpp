@@ -4,6 +4,7 @@
 
 #include "../dxvk/imgui/dxvk_imgui.h"
 #include "../dxvk/rtx_render/rtx_option_manager.h"
+#include "../util/log/log.h"
 
 #include <mutex>
 #include <unordered_map>
@@ -118,6 +119,13 @@ namespace dxvk {
 
     if (sc != nullptr && matchesMenuHotkeyMessage(msg, wParam, lParam)) {
       auto& gui = sc->m_device->getCommon()->getImgui();
+      // Skip if the hotkey was already processed by processHotkeys() this frame
+      if (gui.isRemixMenuHotkeyLatched()) {
+        Logger::info("[D3D11SwapChain] WndProc hotkey skipped - already handled by processHotkeys");
+        --recursionDepth;
+        return 0;
+      }
+      Logger::info("[D3D11SwapChain] WndProc hotkey toggling menu");
       const bool uiOpen = gui.isMenuOpen();
       const UIType nextType = uiOpen
         ? UIType::None
@@ -148,6 +156,20 @@ namespace dxvk {
     if (sc != nullptr) {
       auto& gui = sc->m_device->getCommon()->getImgui();
       if (gui.isInit()) {
+        // Debug: log mouse button events (clicks) to diagnose flickering
+        const bool isMouseButtonMsg = (msg == WM_LBUTTONDOWN || msg == WM_LBUTTONUP ||
+                                       msg == WM_RBUTTONDOWN || msg == WM_RBUTTONUP ||
+                                       msg == WM_MBUTTONDOWN || msg == WM_MBUTTONUP ||
+                                       msg == WM_LBUTTONDBLCLK || msg == WM_RBUTTONDBLCLK);
+        if (isMouseButtonMsg) {
+          static uint32_t clickCount = 0;
+          Logger::info(str::format("[D3D11SwapChain] Mouse CLICK #", clickCount++,
+            ": msg=0x", std::hex, msg, std::dec,
+            " (", msg == WM_LBUTTONDOWN ? "LDOWN" : msg == WM_LBUTTONUP ? "LUP" :
+                  msg == WM_RBUTTONDOWN ? "RDOWN" : msg == WM_RBUTTONUP ? "RUP" :
+                  msg == WM_LBUTTONDBLCLK ? "LDBL" : "other", ")"));
+        }
+
         // ImGui sees the message first — updates key state and UI input
         const bool consumedByGui = gui.wndProcHandler(hWnd, msg, wParam, lParam);
 
@@ -170,22 +192,24 @@ namespace dxvk {
             return 0;
           }
         }
-      }
-    }
 
-    // Block system key messages from the game to prevent key state corruption.
-    // Bare Alt (VK_MENU) passes through so games can detect Alt held/released.
-    // Alt+F4 and Alt+Enter pass through for close and fullscreen toggle.
-    switch (msg) {
-    case WM_SYSKEYDOWN:
-    case WM_SYSKEYUP:
-      if (wParam == VK_MENU || wParam == VK_F4 || wParam == VK_RETURN)
-        break;  // allow these through to the game
-      --recursionDepth;
-      return 0;
-    case WM_SYSCHAR:
-      --recursionDepth;
-      return 0;
+        // Block system key messages from the game ONLY when UI is open to prevent key state corruption.
+        // Bare Alt (VK_MENU) passes through so games can detect Alt held/released.
+        // Alt+F4 and Alt+Enter pass through for close and fullscreen toggle.
+        if (uiOpen) {
+          switch (msg) {
+          case WM_SYSKEYDOWN:
+          case WM_SYSKEYUP:
+            if (wParam == VK_MENU || wParam == VK_F4 || wParam == VK_RETURN)
+              break;  // allow these through to the game
+            --recursionDepth;
+            return 0;
+          case WM_SYSCHAR:
+            --recursionDepth;
+            return 0;
+          }
+        }
+      }
     }
 
     // Decrement AFTER CallWindowProcW returns — the previous WndProc

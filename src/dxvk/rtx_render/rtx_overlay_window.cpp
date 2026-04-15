@@ -4,6 +4,7 @@
 #include "rtx_overlay_window.h"
 #include "../imgui/dxvk_imgui.h"
 #include "imgui/imgui_impl_win32.h"
+#include "rtx_options.h"
 
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
 
@@ -302,6 +303,12 @@ LRESULT GameOverlay::overlayWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
 
   case WM_NCHITTEST:
   {
+    // In legacy input mode, the overlay should always be click-through.
+    // All input goes through the game window's WndProc which forwards to ImGui.
+    if (!RtxOptions::useNewGuiInputMethod()) {
+      return HTTRANSPARENT;
+    }
+
     // Default hit-test
     LRESULT hit = DefWindowProcW(hWnd, msg, wParam, lParam);
 
@@ -316,6 +323,12 @@ LRESULT GameOverlay::overlayWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
 
   case WM_INPUT:
   {
+    // In legacy input mode, the game window's WndProc handles all input forwarding to ImGui.
+    // Only process raw input here when using the new overlay input method.
+    if (!RtxOptions::useNewGuiInputMethod()) {
+      return DefWindowProcW(m_hwnd, msg, wParam, lParam);
+    }
+
     UINT size = 0;
     if (GetRawInputData((HRAWINPUT) lParam, RID_INPUT, nullptr, &size, sizeof(RAWINPUTHEADER)) != 0 || size == 0)
       return DefWindowProcW(m_hwnd, msg, wParam, lParam);
@@ -371,21 +384,25 @@ LRESULT GameOverlay::overlayWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
   }
   }
 
-  const bool isKeyMsg = (msg >= WM_KEYFIRST && msg <= WM_KEYLAST)
-                     || (msg >= WM_SYSKEYDOWN && msg <= WM_SYSDEADCHAR);
-  const bool isMouseMsg = (msg >= WM_MOUSEFIRST && msg <= WM_MOUSELAST);
+  // Only process legacy key/mouse messages when using the new overlay input method.
+  // In legacy mode, the game window's WndProc handles all input forwarding to ImGui.
+  if (RtxOptions::useNewGuiInputMethod()) {
+    const bool isKeyMsg = (msg >= WM_KEYFIRST && msg <= WM_KEYLAST)
+                       || (msg >= WM_SYSKEYDOWN && msg <= WM_SYSDEADCHAR);
+    const bool isMouseMsg = (msg >= WM_MOUSEFIRST && msg <= WM_MOUSELAST);
 
-  // When using the new overlay input method, we need to forward legacy mouse messages
-  // to ImGui for proper UI interaction (checkboxes, buttons, sliders, etc.).
-  // WM_INPUT is the authoritative source for raw input, but legacy messages are still
-  // needed for ImGui's hover and click detection.
-  if (isKeyMsg || isMouseMsg) {
-    // Forward to ImGui for proper UI interaction
-    if (ImGui_ImplWin32_WndProcHandler(imguiHwnd, msg, wParam, lParam)) {
-      return 0;
+    // When using the new overlay input method, we need to forward legacy mouse messages
+    // to ImGui for proper UI interaction (checkboxes, buttons, sliders, etc.).
+    // WM_INPUT is the authoritative source for raw input, but legacy messages are still
+    // needed for ImGui's hover and click detection.
+    if (isKeyMsg || isMouseMsg) {
+      // Forward to ImGui for proper UI interaction
+      if (ImGui_ImplWin32_WndProcHandler(imguiHwnd, msg, wParam, lParam)) {
+        return 0;
+      }
+      // If ImGui didn't handle it, pass through to the underlying window
+      return DefWindowProcW(m_hwnd, msg, wParam, lParam);
     }
-    // If ImGui didn't handle it, pass through to the underlying window
-    return DefWindowProcW(m_hwnd, msg, wParam, lParam);
   }
 
   return DefWindowProcW(m_hwnd, msg, wParam, lParam);
@@ -433,21 +450,26 @@ void GameOverlay::windowThreadMain() {
 
   show();
 
-  RAWINPUTDEVICE rid[2] {};
-  // Mouse
-  rid[0].usUsagePage = 0x01;
-  rid[0].usUsage = 0x02;
-  rid[0].dwFlags = RIDEV_INPUTSINK;
-  rid[0].hwndTarget = m_hwnd;
-  // Keyboard
-  rid[1].usUsagePage = 0x01;
-  rid[1].usUsage = 0x06;
-  rid[1].dwFlags = RIDEV_INPUTSINK;  // no RIDEV_NOLEGACY: that flag suppresses WM_KEYDOWN for the whole process, breaking game input
-  rid[1].hwndTarget = m_hwnd;
+  // Only register for raw input when using the new overlay input method.
+  // In legacy mode, the game window's WndProc handles all input forwarding to ImGui,
+  // so we should NOT receive duplicate raw input here.
+  if (RtxOptions::useNewGuiInputMethod()) {
+    RAWINPUTDEVICE rid[2] {};
+    // Mouse
+    rid[0].usUsagePage = 0x01;
+    rid[0].usUsage = 0x02;
+    rid[0].dwFlags = RIDEV_INPUTSINK;
+    rid[0].hwndTarget = m_hwnd;
+    // Keyboard
+    rid[1].usUsagePage = 0x01;
+    rid[1].usUsage = 0x06;
+    rid[1].dwFlags = RIDEV_INPUTSINK;  // no RIDEV_NOLEGACY: that flag suppresses WM_KEYDOWN for the whole process, breaking game input
+    rid[1].hwndTarget = m_hwnd;
 
-  if (!RegisterRawInputDevices(rid, 2, sizeof(RAWINPUTDEVICE))) {
-    Logger::err(str::format("Failed to register raw input for overlay window: ", m_className));
-    return;
+    if (!RegisterRawInputDevices(rid, 2, sizeof(RAWINPUTDEVICE))) {
+      Logger::err(str::format("Failed to register raw input for overlay window: ", m_className));
+      return;
+    }
   }
 
   MSG msg {};

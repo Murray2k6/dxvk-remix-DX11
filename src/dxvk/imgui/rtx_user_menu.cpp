@@ -168,7 +168,7 @@ namespace dxvk {
     ImGui::PushStyleColor(ImGuiCol_PopupBg, ImGui::GetStyleColorVec4(ImGuiCol_WindowBg));
     bool pushedPopupBg = true;
 
-    bool basicMenuOpen = RtxOptions::showUI() == UIType::Basic;
+    bool basicMenuOpen = getEffectiveUIType() == UIType::Basic;
     if (ImGui::BeginPopupModal(m_userGraphicsWindowTitle, &basicMenuOpen, ImGuiWindowFlags_AlwaysAutoResize)) {
       // Restore PopupBg
       ImGui::PopStyleColor();

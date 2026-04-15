@@ -129,6 +129,12 @@ static ImGui_ImplWin32_Data* ImGui_ImplWin32_GetBackendData()
     return ImGui::GetCurrentContext() ? (ImGui_ImplWin32_Data*)ImGui::GetIO().BackendPlatformUserData : NULL;
 }
 
+// Track which input sources we've already processed this frame to avoid duplicates.
+// Games like Skyrim register for raw input, so both WM_INPUT and legacy messages
+// may arrive. We prioritize raw input when available, skip legacy duplicates.
+static bool s_rawInputDeliveredThisFrame = false;
+static DWORD s_lastRawInputTime = 0;
+
 // Functions
 bool    ImGui_ImplWin32_Init(void* hwnd)
 {
@@ -357,6 +363,9 @@ static void ImGui_ImplWin32_UpdateGamepads()
 
 void    ImGui_ImplWin32_NewFrame()
 {
+    // Reset raw input deduplication flag each frame
+    s_rawInputDeliveredThisFrame = false;
+
     ImGuiIO& io = ImGui::GetIO();
     ImGui_ImplWin32_Data* bd = ImGui_ImplWin32_GetBackendData();
     IM_ASSERT(bd != NULL && "Did you call ImGui_ImplWin32_Init()?");
@@ -526,6 +535,7 @@ ImGuiKey ImGui_ImplWin32_VirtualKeyToImGuiKey(WPARAM wParam)
 // Copy this line into your .cpp file to forward declare the function.
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
 #endif
+
 IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
     if (ImGui::GetCurrentContext() == NULL)
@@ -542,7 +552,6 @@ IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hwnd, UINT msg, WPARA
       if (GetRawInputData((HRAWINPUT) lParam, RID_INPUT, nullptr, &size, sizeof(RAWINPUTHEADER)) != 0 || size == 0)
         break;
 
-      // Small stack buffer for common cases; heap fallback for large HID packets.
       BYTE stack_buf[256];
       std::unique_ptr<BYTE[]> heap_buf;
       BYTE* buf = size <= sizeof(stack_buf) ? stack_buf : (heap_buf.reset(new BYTE[size]), heap_buf.get());
@@ -550,111 +559,76 @@ IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hwnd, UINT msg, WPARA
         break;
 
       RAWINPUT* ri = reinterpret_cast<RAWINPUT*>(buf);
+      s_rawInputDeliveredThisFrame = true;
+      s_lastRawInputTime = GetTickCount();
 
       if (ri->header.dwType == RIM_TYPEMOUSE) {
         const RAWMOUSE& m = ri->data.mouse;
 
-        // Position: prefer absolute cursor (screen->client) if available, else use deltas.
-        if (m.usFlags & MOUSE_MOVE_ABSOLUTE) {
-          POINT p; GetCursorPos(&p);
-          // Convert to this window's client space (overlay/input window)
-          ScreenToClient(hwnd, &p);
-          io.AddMousePosEvent((float) p.x, (float) p.y);
-        } else if (m.lLastX || m.lLastY) {
-          // Relative movement: accumulate to last known position
-          // ImGui expects absolute (client) positions, so query current and add deltas.
-          POINT p; GetCursorPos(&p);
-          ScreenToClient(hwnd, &p);
-          p.x += (int) m.lLastX;
-          p.y += (int) m.lLastY;
-          io.AddMousePosEvent((float) p.x, (float) p.y);
-        }
+        // Mouse position from raw input
+        POINT p; GetCursorPos(&p);
+        ScreenToClient(hwnd, &p);
+        io.AddMousePosEvent((float) p.x, (float) p.y);
 
-        auto push_button = [&](int imgui_button, bool down) {
-          io.AddMouseButtonEvent(imgui_button, down);
-        };
-        if (m.usButtonFlags & RI_MOUSE_LEFT_BUTTON_DOWN)  push_button(0, true);
-        if (m.usButtonFlags & RI_MOUSE_LEFT_BUTTON_UP)    push_button(0, false);
-        if (m.usButtonFlags & RI_MOUSE_RIGHT_BUTTON_DOWN) push_button(1, true);
-        if (m.usButtonFlags & RI_MOUSE_RIGHT_BUTTON_UP)   push_button(1, false);
-        if (m.usButtonFlags & RI_MOUSE_MIDDLE_BUTTON_DOWN)push_button(2, true);
-        if (m.usButtonFlags & RI_MOUSE_MIDDLE_BUTTON_UP)  push_button(2, false);
-        if (m.usButtonFlags & RI_MOUSE_BUTTON_4_DOWN)     push_button(3, true);
-        if (m.usButtonFlags & RI_MOUSE_BUTTON_4_UP)       push_button(3, false);
-        if (m.usButtonFlags & RI_MOUSE_BUTTON_5_DOWN)     push_button(4, true);
-        if (m.usButtonFlags & RI_MOUSE_BUTTON_5_UP)       push_button(4, false);
+        // Mouse buttons from raw input
+        if (m.usButtonFlags & RI_MOUSE_LEFT_BUTTON_DOWN)   io.AddMouseButtonEvent(0, true);
+        if (m.usButtonFlags & RI_MOUSE_LEFT_BUTTON_UP)     io.AddMouseButtonEvent(0, false);
+        if (m.usButtonFlags & RI_MOUSE_RIGHT_BUTTON_DOWN)  io.AddMouseButtonEvent(1, true);
+        if (m.usButtonFlags & RI_MOUSE_RIGHT_BUTTON_UP)    io.AddMouseButtonEvent(1, false);
+        if (m.usButtonFlags & RI_MOUSE_MIDDLE_BUTTON_DOWN) io.AddMouseButtonEvent(2, true);
+        if (m.usButtonFlags & RI_MOUSE_MIDDLE_BUTTON_UP)   io.AddMouseButtonEvent(2, false);
+        if (m.usButtonFlags & RI_MOUSE_BUTTON_4_DOWN)      io.AddMouseButtonEvent(3, true);
+        if (m.usButtonFlags & RI_MOUSE_BUTTON_4_UP)        io.AddMouseButtonEvent(3, false);
+        if (m.usButtonFlags & RI_MOUSE_BUTTON_5_DOWN)      io.AddMouseButtonEvent(4, true);
+        if (m.usButtonFlags & RI_MOUSE_BUTTON_5_UP)        io.AddMouseButtonEvent(4, false);
 
-        if (m.usButtonFlags & RI_MOUSE_WHEEL) {
-          const float dy = (short) m.usButtonData / (float) WHEEL_DELTA;
-          io.AddMouseWheelEvent(0.0f, dy);
-        }
-        if (m.usButtonFlags & RI_MOUSE_HWHEEL) {
-          const float dx = (short) m.usButtonData / (float) WHEEL_DELTA;
-          io.AddMouseWheelEvent(dx, 0.0f);
-        }
+        // Mouse wheel
+        if (m.usButtonFlags & RI_MOUSE_WHEEL)
+          io.AddMouseWheelEvent(0.0f, (short) m.usButtonData / (float) WHEEL_DELTA);
+        if (m.usButtonFlags & RI_MOUSE_HWHEEL)
+          io.AddMouseWheelEvent((short) m.usButtonData / (float) WHEEL_DELTA, 0.0f);
 
         return 0;
       }
 
       if (ri->header.dwType == RIM_TYPEKEYBOARD) {
         const RAWKEYBOARD& k = ri->data.keyboard;
-
-        // Filter fake events
         if (k.VKey == 255)
           return 0;
 
-        const bool is_down =
-          (k.Message == WM_KEYDOWN) || (k.Message == WM_SYSKEYDOWN);
-
-        // Virtual-key --> ImGui key
+        const bool is_down = (k.Message == WM_KEYDOWN) || (k.Message == WM_SYSKEYDOWN);
         int vk = (int) k.VKey;
-        if (vk == VK_RETURN && (k.Flags & RI_KEY_E0)) // keypad enter remap (same as legacy path)
+        if (vk == VK_RETURN && (k.Flags & RI_KEY_E0))
           vk = IM_VK_KEYPAD_ENTER;
 
         const ImGuiKey key = ImGui_ImplWin32_VirtualKeyToImGuiKey(vk);
-        const int scancode = (int) k.MakeCode; // Win32 scancode; backend uses scancode for workarounds
+        const int scancode = (int) k.MakeCode;
         if (key != ImGuiKey_None)
           ImGui_ImplWin32_AddKeyEvent(key, is_down, vk, scancode);
 
-        // Submit individual left/right modifier events
-        if (vk == VK_SHIFT)
-        {
-          // Important: Shift keys tend to get stuck when pressed together, missing key-up events are corrected in ImGui_ImplWin32_ProcessKeyEventsWorkarounds()
-          if (IsVkDown(VK_LSHIFT) == is_down) { ImGui_ImplWin32_AddKeyEvent(ImGuiKey_LeftShift, is_down, VK_LSHIFT, scancode); }
-          if (IsVkDown(VK_RSHIFT) == is_down) { ImGui_ImplWin32_AddKeyEvent(ImGuiKey_RightShift, is_down, VK_RSHIFT, scancode); }
-        }
-        else if (vk == VK_CONTROL)
-        {
-          if (IsVkDown(VK_LCONTROL) == is_down) {
-            ImGui_ImplWin32_AddKeyEvent(ImGuiKey_LeftCtrl, is_down, VK_LCONTROL, scancode);
-          }
-          if (IsVkDown(VK_RCONTROL) == is_down) {
-            ImGui_ImplWin32_AddKeyEvent(ImGuiKey_RightCtrl, is_down, VK_RCONTROL, scancode);
-          }
-        }
-        else if (vk == VK_MENU)
-        {
-          if (IsVkDown(VK_LMENU) == is_down) { ImGui_ImplWin32_AddKeyEvent(ImGuiKey_LeftAlt, is_down, VK_LMENU, scancode); }
-          if (IsVkDown(VK_RMENU) == is_down) { ImGui_ImplWin32_AddKeyEvent(ImGuiKey_RightAlt, is_down, VK_RMENU, scancode); }
+        // Modifiers
+        if (vk == VK_SHIFT) {
+          if (IsVkDown(VK_LSHIFT) == is_down) ImGui_ImplWin32_AddKeyEvent(ImGuiKey_LeftShift, is_down, VK_LSHIFT, scancode);
+          if (IsVkDown(VK_RSHIFT) == is_down) ImGui_ImplWin32_AddKeyEvent(ImGuiKey_RightShift, is_down, VK_RSHIFT, scancode);
+        } else if (vk == VK_CONTROL) {
+          if (IsVkDown(VK_LCONTROL) == is_down) ImGui_ImplWin32_AddKeyEvent(ImGuiKey_LeftCtrl, is_down, VK_LCONTROL, scancode);
+          if (IsVkDown(VK_RCONTROL) == is_down) ImGui_ImplWin32_AddKeyEvent(ImGuiKey_RightCtrl, is_down, VK_RCONTROL, scancode);
+        } else if (vk == VK_MENU) {
+          if (IsVkDown(VK_LMENU) == is_down) ImGui_ImplWin32_AddKeyEvent(ImGuiKey_LeftAlt, is_down, VK_LMENU, scancode);
+          if (IsVkDown(VK_RMENU) == is_down) ImGui_ImplWin32_AddKeyEvent(ImGuiKey_RightAlt, is_down, VK_RMENU, scancode);
         }
 
-        // Modifiers (explicit L/R)
-        // Important: modifiers can miss key-up events; backend has a workaround but keep these in sync.
         ImGui_ImplWin32_UpdateKeyModifiers();
 
-        // generate text input
+        // Text input
         if (is_down) {
           BYTE keyboard_state[256] = {};
           GetKeyboardState(keyboard_state);
-
-          // Map VK scan to Unicode for this layout
           WCHAR wbuf[8];
           HKL layout = GetKeyboardLayout(0);
           int n = ToUnicodeEx((UINT) vk, (UINT) k.MakeCode, keyboard_state, wbuf, IM_ARRAYSIZE(wbuf), 0, layout);
-          if (n > 0) {
-            for (int i = 0; i < n; ++i)
-              io.AddInputCharacterUTF16((ImWchar) wbuf[i]);
-          }
+          for (int i = 0; i < n; ++i)
+            io.AddInputCharacterUTF16((ImWchar) wbuf[i]);
         }
 
         return 0;
@@ -662,8 +636,14 @@ IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hwnd, UINT msg, WPARA
 
       break;
     }
+
     case WM_MOUSEMOVE:
-        // We need to call TrackMouseEvent in order to receive WM_MOUSELEAVE events
+    {
+        // Skip if raw input is active (avoid duplicate position updates)
+        DWORD now = GetTickCount();
+        if (s_rawInputDeliveredThisFrame && (now - s_lastRawInputTime) < 100)
+          break;
+
         bd->MouseHwnd = hwnd;
         if (!bd->MouseTracked)
         {
@@ -673,6 +653,7 @@ IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hwnd, UINT msg, WPARA
         }
         io.AddMousePosEvent((float)GET_X_LPARAM(lParam), (float)GET_Y_LPARAM(lParam));
         break;
+    }
     case WM_MOUSELEAVE:
         if (bd->MouseHwnd == hwnd)
             bd->MouseHwnd = NULL;
@@ -684,6 +665,11 @@ IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hwnd, UINT msg, WPARA
     case WM_MBUTTONDOWN: case WM_MBUTTONDBLCLK:
     case WM_XBUTTONDOWN: case WM_XBUTTONDBLCLK:
     {
+        // Skip if raw input is handling buttons
+        DWORD now = GetTickCount();
+        if (s_rawInputDeliveredThisFrame && (now - s_lastRawInputTime) < 100)
+          return 0;
+
         int button = 0;
         if (msg == WM_LBUTTONDOWN || msg == WM_LBUTTONDBLCLK) { button = 0; }
         if (msg == WM_RBUTTONDOWN || msg == WM_RBUTTONDBLCLK) { button = 1; }
@@ -700,6 +686,11 @@ IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hwnd, UINT msg, WPARA
     case WM_MBUTTONUP:
     case WM_XBUTTONUP:
     {
+        // Skip if raw input is handling buttons
+        DWORD now = GetTickCount();
+        if (s_rawInputDeliveredThisFrame && (now - s_lastRawInputTime) < 100)
+          return 0;
+
         int button = 0;
         if (msg == WM_LBUTTONUP) { button = 0; }
         if (msg == WM_RBUTTONUP) { button = 1; }
@@ -722,6 +713,11 @@ IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hwnd, UINT msg, WPARA
     case WM_SYSKEYDOWN:
     case WM_SYSKEYUP:
     {
+        // Skip if raw input is handling keyboard
+        DWORD now = GetTickCount();
+        if (s_rawInputDeliveredThisFrame && (now - s_lastRawInputTime) < 100)
+          return 0;
+
         const bool is_key_down = (msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN);
         if (wParam < 256)
         {
@@ -762,6 +758,8 @@ IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hwnd, UINT msg, WPARA
     }
     case WM_SETFOCUS:
     case WM_KILLFOCUS:
+        // Reset raw input tracking on focus change to prevent input lockup after alt-tab
+        s_rawInputDeliveredThisFrame = false;
         io.AddFocusEvent(msg == WM_SETFOCUS);
         return 0;
     case WM_CHAR:

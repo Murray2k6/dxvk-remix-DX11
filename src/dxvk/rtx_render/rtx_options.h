@@ -534,7 +534,7 @@ namespace dxvk {
                     "Can be toggled with Alt + Delete.", args.onChangeCallback = &showUICursorOnChange);
     
     public: static void blockInputToGameInUIOnChange(DxvkDevice* device);
-    RTX_OPTION_ARGS("rtx", bool, blockInputToGameInUI, false,
+    RTX_OPTION_ARGS("rtx", bool, blockInputToGameInUI, true,
                     "If true, input will not be passed to the game when the UI is active.\n"
                     "Can be toggled with Alt + Backspace", args.onChangeCallback = &blockInputToGameInUIOnChange, args.flags = RtxOptionFlags::NoSave);
 
