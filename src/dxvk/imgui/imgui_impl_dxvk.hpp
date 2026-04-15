@@ -222,7 +222,7 @@ namespace ImGui_ImplDxvk {
 
     ctx->setInputLayout(/*attrCount*/3, attrs, /*bindingCount*/1, bindings);
 
-    // Rasterizer state
+    // Fixed function state
     DxvkInputAssemblyState ia = {};
     ia.primitiveTopology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
     ia.primitiveRestart = VK_FALSE;

@@ -554,26 +554,23 @@ IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hwnd, UINT msg, WPARA
       if (ri->header.dwType == RIM_TYPEMOUSE) {
         const RAWMOUSE& m = ri->data.mouse;
 
-                // WM_INPUT arrives after the OS cursor has already been updated, so the
-                // current cursor position is the authoritative client-space position for
-                // both absolute and relative devices.
-                if ((m.usFlags & MOUSE_MOVE_ABSOLUTE) || m.lLastX || m.lLastY) {
-                    POINT p; GetCursorPos(&p);
-                    ScreenToClient(hwnd, &p);
-                    bd->MouseHwnd = hwnd;
-                    io.AddMousePosEvent((float) p.x, (float) p.y);
+        // Position: prefer absolute cursor (screen->client) if available, else use deltas.
+        if (m.usFlags & MOUSE_MOVE_ABSOLUTE) {
+          POINT p; GetCursorPos(&p);
+          // Convert to this window's client space (overlay/input window)
+          ScreenToClient(hwnd, &p);
+          io.AddMousePosEvent((float) p.x, (float) p.y);
+        } else if (m.lLastX || m.lLastY) {
+          // Relative movement: accumulate to last known position
+          // ImGui expects absolute (client) positions, so query current and add deltas.
+          POINT p; GetCursorPos(&p);
+          ScreenToClient(hwnd, &p);
+          p.x += (int) m.lLastX;
+          p.y += (int) m.lLastY;
+          io.AddMousePosEvent((float) p.x, (float) p.y);
         }
 
-                auto push_button = [&](int imgui_button, bool down) {
-                    if (down) {
-                        if (bd->MouseButtonsDown == 0 && ::GetCapture() == NULL)
-                            ::SetCapture(hwnd);
-                        bd->MouseButtonsDown |= 1 << imgui_button;
-                    } else {
-                        bd->MouseButtonsDown &= ~(1 << imgui_button);
-                        if (bd->MouseButtonsDown == 0 && ::GetCapture() == hwnd)
-                            ::ReleaseCapture();
-                    }
+        auto push_button = [&](int imgui_button, bool down) {
           io.AddMouseButtonEvent(imgui_button, down);
         };
         if (m.usButtonFlags & RI_MOUSE_LEFT_BUTTON_DOWN)  push_button(0, true);

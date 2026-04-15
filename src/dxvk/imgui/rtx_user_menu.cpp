@@ -163,11 +163,14 @@ namespace dxvk {
     constexpr float windowPaddingX = 74.0f;
     constexpr float windowPaddingHalfX = windowPaddingX * 0.5f;
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(windowPaddingX, 10));
+
+    // Use the same background color and alpha as other menus, PopupBg has alpha 1 because it's used for combobox popups etc. 
     ImGui::PushStyleColor(ImGuiCol_PopupBg, ImGui::GetStyleColorVec4(ImGuiCol_WindowBg));
     bool pushedPopupBg = true;
 
-    bool basicMenuOpen = getEffectiveUIType() == UIType::Basic;
+    bool basicMenuOpen = RtxOptions::showUI() == UIType::Basic;
     if (ImGui::BeginPopupModal(m_userGraphicsWindowTitle, &basicMenuOpen, ImGuiWindowFlags_AlwaysAutoResize)) {
+      // Restore PopupBg
       ImGui::PopStyleColor();
       pushedPopupBg = false;
 
@@ -299,7 +302,7 @@ namespace dxvk {
     }
 
     // Close via titlebar close button
-    if (!basicMenuOpen && getEffectiveUIType() == UIType::Basic) {
+    if (!basicMenuOpen) {
       switchMenu(UIType::None);
     }
 
@@ -388,11 +391,6 @@ namespace dxvk {
       } else {
         getUpscalerCombo(dlss, rayReconstruction).getKey(&RtxOptions::upscalerTypeObject());
       }
-
-      // Keep the user-menu preset state in sync with explicit upscaler edits.
-      // Without this, selecting NIS/XeSS/TAAU while the DLSS preset is Off can be
-      // overwritten back to None on the next frame by updateUpscalerFromDlssPreset().
-      RtxOptions::updatePresetFromUpscaler();
 
       // Upscaler Preset
 
