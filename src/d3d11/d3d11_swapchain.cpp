@@ -121,11 +121,9 @@ namespace dxvk {
       auto& gui = sc->m_device->getCommon()->getImgui();
       // Skip if the hotkey was already processed by processHotkeys() this frame
       if (gui.isRemixMenuHotkeyLatched()) {
-        Logger::info("[D3D11SwapChain] WndProc hotkey skipped - already handled by processHotkeys");
         --recursionDepth;
         return 0;
       }
-      Logger::info("[D3D11SwapChain] WndProc hotkey toggling menu");
       const bool uiOpen = gui.isMenuOpen();
       const UIType nextType = uiOpen
         ? UIType::None
@@ -156,20 +154,6 @@ namespace dxvk {
     if (sc != nullptr) {
       auto& gui = sc->m_device->getCommon()->getImgui();
       if (gui.isInit()) {
-        // Debug: log mouse button events (clicks) to diagnose flickering
-        const bool isMouseButtonMsg = (msg == WM_LBUTTONDOWN || msg == WM_LBUTTONUP ||
-                                       msg == WM_RBUTTONDOWN || msg == WM_RBUTTONUP ||
-                                       msg == WM_MBUTTONDOWN || msg == WM_MBUTTONUP ||
-                                       msg == WM_LBUTTONDBLCLK || msg == WM_RBUTTONDBLCLK);
-        if (isMouseButtonMsg) {
-          static uint32_t clickCount = 0;
-          Logger::info(str::format("[D3D11SwapChain] Mouse CLICK #", clickCount++,
-            ": msg=0x", std::hex, msg, std::dec,
-            " (", msg == WM_LBUTTONDOWN ? "LDOWN" : msg == WM_LBUTTONUP ? "LUP" :
-                  msg == WM_RBUTTONDOWN ? "RDOWN" : msg == WM_RBUTTONUP ? "RUP" :
-                  msg == WM_LBUTTONDBLCLK ? "LDBL" : "other", ")"));
-        }
-
         // ImGui sees the message first — updates key state and UI input
         const bool consumedByGui = gui.wndProcHandler(hWnd, msg, wParam, lParam);
 
@@ -183,8 +167,17 @@ namespace dxvk {
           return 0;
         }
 
-        // When explicitly enabled, block all game input while the Remix UI is open.
-        // Otherwise, only messages actively captured by ImGui are consumed.
+        // When the Remix UI is open, block game input unconditionally.
+        // Games like Skyrim SE read mouse/keyboard via WM_INPUT (raw input)
+        // and direct WM_MOUSE* / WM_KEY* messages in their own WndProc —
+        // if we let those through, the player's camera keeps spinning, the
+        // weapon swings, and the game reacts to every click on a Remix
+        // widget, which feels like "the game is stealing control".
+        //
+        // blockInputToGameInUI was previously opt-in, but the correct default
+        // for any modded game is to freeze input while the overlay is up.
+        // The setting is kept as a debug escape hatch: set it to False only
+        // if you explicitly want the game to react while you're in the menu.
         const bool uiOpen = gui.isMenuOpen();
         if (uiOpen && RtxOptions::blockInputToGameInUI()) {
           if (isKeyMsg || isMouseMsg || isRawInputMsg) {
@@ -837,6 +830,15 @@ namespace dxvk {
 
 
   void D3D11SwapChain::RecreateSwapChain(BOOL Vsync) {
+    // Logged so we can correlate "game refreshes / black flash" events in
+    // the log with actual swapchain recreations. Very useful when the UI
+    // triggers a settings change that forces a recreate.
+    Logger::info(str::format("[D3D11SwapChain] RecreateSwapChain: ",
+      m_desc.Width, "x", m_desc.Height,
+      " bufCount=", m_desc.BufferCount,
+      " vsync=", Vsync ? 1 : 0,
+      " fmt=", (uint32_t) m_desc.Format));
+
     // Ensure that we can safely destroy the swap chain
     m_device->waitForSubmission(&m_presentStatus);
     m_device->waitForIdle();

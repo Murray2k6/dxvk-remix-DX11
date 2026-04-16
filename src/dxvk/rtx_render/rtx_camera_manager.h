@@ -82,6 +82,18 @@ namespace dxvk {
     std::array<RtCamera, CameraType::Count> m_cameras;
     CameraType::Enum m_lastSetCameraType = CameraType::Unknown;
     uint32_t m_lastCameraCutFrameId = -1;
+    // Frame id of the most recent Main-camera update that came from a real
+    // cbuffer projection (not the viewport-fallback synthesis).  Used to
+    // suppress fallback-projection candidates for a short grace period once
+    // a real projection has been seen, so a single failed extraction frame
+    // does not snap Main to a synthetic projection and cause flicker.
+    uint32_t m_lastMainCbufferProjFrameId = UINT32_MAX;
+    // Whether the last successful Main update used the viewport fallback.
+    // When this flips between frames we force a camera cut so the denoiser
+    // discards temporal history accumulated under the wrong projection
+    // (kills the transition flicker from Remix-boot splash into gameplay).
+    bool m_lastMainUsedFallbackProj = false;
+    bool m_hasLastMainUpdate = false;
     float m_mainCameraCandidateScore = -1.0e30f;
     fast_unordered_cache<DecomposeProjectionParams> m_decompositionCache;
 

@@ -311,7 +311,14 @@ namespace dxvk {
       case AccessType::ReadWrite:
       case AccessType::Read:
         if (!ownsResource()) {
-          std::string errorMessage = str::format("AliasedResource WAR hazard detected:",
+          // Note: this ownership tracker only records Writes / ReadWrites, so any
+          // legitimate multi-reader pattern (a later pass reading the output of
+          // an earlier writer that didn't explicitly hand off ownership) trips
+          // this path.  It is a development aid, not a GPU-side hazard — the
+          // real memory dependency is expressed by DXVK barriers.  Log it as a
+          // warning (once) so it is still visible when someone is actively
+          // hunting aliasing bugs, but don't emit it as an error.
+          std::string errorMessage = str::format("AliasedResource WAR hazard tracker tripped:",
                  "\nNew access type: ", accessType == AccessType::Read ? "Read" : "ReadWrite",
                  "\nNew owner: \"", name() ? name() : "name unknown", "\""
                  "\nPrevious owner: \"", m_sharedResource->owner.expired()
@@ -319,7 +326,7 @@ namespace dxvk {
                                        : (*m_sharedResource->owner.lock().get())->name()
                                           ? (*m_sharedResource->owner.lock().get())->name()
                                           : "name unknown", "\"");
-          ONCE(Logger::err(errorMessage));
+          ONCE(Logger::warn(errorMessage));
         }
         break;
       default:

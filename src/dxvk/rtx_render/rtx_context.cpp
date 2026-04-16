@@ -693,7 +693,9 @@ namespace dxvk {
       // If we really don't have any RT to do, or the scene collapsed to a tiny
       // helper/post-process subset, bail early and let the previous scene stay alive.
       if (hasValidRtScene) {
-        const bool traceRtStartupStages = m_device->getCurrentFrameId() <= 40;
+        // Trace only the first few frames so a one-time startup issue is
+        // visible in the log without drowning it on longer runs.
+        const bool traceRtStartupStages = m_device->getCurrentFrameId() <= 3;
         auto logRtStartupStage = [&](const char* stage) {
           if (traceRtStartupStages) {
             Logger::info(str::format("[RTX-Startup] frame=", m_device->getCurrentFrameId(), " stage=", stage));
@@ -1655,7 +1657,7 @@ namespace dxvk {
   void RtxContext::dispatchIntegrate(const Resources::RaytracingOutput& rtOutput) {
     ScopedGpuProfileZone(this, "Integrate Raytracing");
 
-    const bool traceRtStartupStages = m_device->getCurrentFrameId() <= 40;
+    const bool traceRtStartupStages = m_device->getCurrentFrameId() <= 3;
     auto logRtStartupStage = [&](const char* stage) {
       if (traceRtStartupStages) {
         Logger::info(str::format("[RTX-Startup] frame=", m_device->getCurrentFrameId(), " stage=", stage));
@@ -1690,7 +1692,7 @@ namespace dxvk {
 
   void RtxContext::dispatchPathTracing(const Resources::RaytracingOutput& rtOutput) {
 
-    const bool traceRtStartupStages = m_device->getCurrentFrameId() <= 40;
+    const bool traceRtStartupStages = m_device->getCurrentFrameId() <= 3;
     auto logRtStartupStage = [&](const char* stage) {
       if (traceRtStartupStages) {
         Logger::info(str::format("[RTX-Startup] frame=", m_device->getCurrentFrameId(), " stage=", stage));

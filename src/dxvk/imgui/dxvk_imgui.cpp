@@ -178,6 +178,573 @@ namespace dxvk {
 
   constexpr size_t kMaxRetainedReleasedTexturePreviews = 65536;
 
+  // ---------------------------------------------------------------------------
+  // DirectInput defeater: steal foreground with a tiny invisible helper
+  // window when the UI is open.
+  //
+  // Bethesda's engine (Skyrim SE / Fallout 4 / Starfield-era) reads mouse
+  // and keyboard state via IDirectInputDevice8::GetDeviceState.  That call
+  // runs on the game's own input thread; it never touches WndProc, never
+  // calls SetCursorPos, and completely bypasses the IAT hook / WndProc
+  // blocking mitigations above.
+  //
+  // The only external, non-invasive way to stop DirectInput is to break
+  // the acquired device's foreground cooperative level: when the game
+  // window loses foreground status, DIERR_INPUTLOST is raised and the
+  // game stops reading input until it regains focus.
+  //
+  // We implement that by creating an off-screen, WS_POPUP, NON-NOACTIVATE
+  // helper window on a dedicated thread and calling SetForegroundWindow
+  // on it when the UI opens.  When the UI closes we hand foreground back
+  // to the game window.  The game pausing during this (e.g. Skyrim's
+  // "game paused" text) is the intended effect — that is exactly what a
+  // modal overlay should look like to the user.
+  // ---------------------------------------------------------------------------
+  namespace {
+    static std::atomic<bool>   g_focusStealRun      { false };
+    static std::atomic<bool>   g_focusStealWanted   { false };
+    static std::atomic<HWND>   g_focusStealHwnd     { nullptr };
+    static std::atomic<HWND>   g_focusStealGameHwnd { nullptr };
+    static std::thread         g_focusStealThread;
+
+    static LRESULT CALLBACK focusStealWndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
+      return DefWindowProcW(h, m, w, l);
+    }
+
+    static void focusStealThreadMain() {
+      Logger::info("[FocusSteal] thread starting");
+      WNDCLASSW wc {};
+      wc.lpfnWndProc   = &focusStealWndProc;
+      wc.hInstance     = GetModuleHandleW(nullptr);
+      wc.lpszClassName = L"RemixFocusSink";
+      RegisterClassW(&wc);
+
+      HWND sink = CreateWindowExW(
+        WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+        wc.lpszClassName, L"RemixFocusSink",
+        WS_POPUP,
+        -32000, -32000, 1, 1, // off-screen
+        nullptr, nullptr, wc.hInstance, nullptr);
+      if (!sink) {
+        Logger::warn("[FocusSteal] failed to create helper window");
+        return;
+      }
+      g_focusStealHwnd.store(sink);
+
+      bool stolen = false;
+      while (g_focusStealRun.load(std::memory_order_relaxed)) {
+        MSG msg;
+        while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+          TranslateMessage(&msg);
+          DispatchMessageW(&msg);
+        }
+
+        const bool want = g_focusStealWanted.load(std::memory_order_relaxed);
+        HWND gameHwnd = g_focusStealGameHwnd.load(std::memory_order_relaxed);
+
+        if (want && !stolen) {
+          // Show briefly so SetForegroundWindow is allowed to take focus
+          // (Windows foreground lock requires an active window).
+          ShowWindow(sink, SW_SHOWNOACTIVATE);
+          // AttachThreadInput lets us bypass the foreground lock.
+          const DWORD myTid   = GetCurrentThreadId();
+          const DWORD gameTid = gameHwnd ? GetWindowThreadProcessId(gameHwnd, nullptr) : 0;
+          if (gameTid && gameTid != myTid) {
+            AttachThreadInput(gameTid, myTid, TRUE);
+          }
+          SetForegroundWindow(sink);
+          SetFocus(sink);
+          if (gameTid && gameTid != myTid) {
+            AttachThreadInput(gameTid, myTid, FALSE);
+          }
+          Logger::info("[FocusSteal] stole foreground for UI");
+          stolen = true;
+        } else if (!want && stolen) {
+          // Hand foreground back to the game window.
+          if (gameHwnd) {
+            const DWORD myTid   = GetCurrentThreadId();
+            const DWORD gameTid = GetWindowThreadProcessId(gameHwnd, nullptr);
+            if (gameTid && gameTid != myTid) {
+              AttachThreadInput(gameTid, myTid, TRUE);
+            }
+            SetForegroundWindow(gameHwnd);
+            SetFocus(gameHwnd);
+            if (gameTid && gameTid != myTid) {
+              AttachThreadInput(gameTid, myTid, FALSE);
+            }
+          }
+          ShowWindow(sink, SW_HIDE);
+          Logger::info("[FocusSteal] returned foreground to game");
+          stolen = false;
+        }
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(16));
+      }
+
+      DestroyWindow(sink);
+      g_focusStealHwnd.store(nullptr);
+    }
+
+    static void startFocusStealThread() {
+      bool expected = false;
+      if (!g_focusStealRun.compare_exchange_strong(expected, true)) {
+        return;
+      }
+      g_focusStealThread = std::thread(&focusStealThreadMain);
+    }
+
+    static void stopFocusStealThread() {
+      if (!g_focusStealRun.exchange(false)) {
+        return;
+      }
+      // Wake the thread's message loop.
+      if (HWND h = g_focusStealHwnd.load()) {
+        PostMessageW(h, WM_NULL, 0, 0);
+      }
+      if (g_focusStealThread.joinable()) {
+        g_focusStealThread.join();
+      }
+    }
+  } // namespace
+
+  // ---------------------------------------------------------------------------
+  // IAT hook for user32!SetCursorPos.
+  //
+  // Skyrim (and other Bethesda / engine-specific mouselook implementations)
+  // read mouse input via DirectInput8, which runs on its own thread and
+  // never reaches our WndProc. Every game tick the engine then calls
+  // user32!SetCursorPos(center_x, center_y) to re-center the cursor for
+  // its relative-motion mouselook.  The result is that while the Remix UI
+  // is open the cursor visibly "locks" to screen centre a few ms after
+  // every attempt to move it, because we can see the movement via WM_*
+  // but the game instantly warps it back.
+  //
+  // None of the normal WndProc-level mitigations (blockInputToGameInUI,
+  // ClipCursor(nullptr) watchdog, ReleaseCapture, etc.) can stop this
+  // because SetCursorPos bypasses both the message pump and the clip
+  // rectangle.  The only reliable fix is to intercept SetCursorPos itself.
+  //
+  // We do this with an IAT (import address table) patch of every loaded
+  // module except our own.  When g_uiBlocksSetCursorPos is true the thunk
+  // silently no-ops; otherwise it forwards to the real function.  The
+  // atomic flag is raised in render() while the UI is visible and
+  // blockInputToGameInUI is set.
+  // ---------------------------------------------------------------------------
+  namespace {
+    using SetCursorPos_t = BOOL (WINAPI*)(int, int);
+    using mouse_event_t  = VOID (WINAPI*)(DWORD, DWORD, DWORD, DWORD, ULONG_PTR);
+    using SendInput_t    = UINT (WINAPI*)(UINT, LPINPUT, int);
+    static SetCursorPos_t g_realSetCursorPos = &::SetCursorPos;
+    static mouse_event_t  g_realMouseEvent   = &::mouse_event;
+    static SendInput_t    g_realSendInput    = &::SendInput;
+    static std::atomic<bool> g_uiBlocksSetCursorPos { false };
+    static std::atomic<bool> g_setCursorPosHooked { false };
+
+    static BOOL WINAPI SetCursorPos_Thunk(int X, int Y) {
+      const bool blocking = g_uiBlocksSetCursorPos.load(std::memory_order_relaxed);
+      // Log the first few calls after the UI opens so we can tell whether
+      // the game is actually trying to warp the cursor.  Reset on close.
+      static std::atomic<uint32_t> sLoggedThisSession { 0 };
+      if (blocking) {
+        const uint32_t n = sLoggedThisSession.fetch_add(1, std::memory_order_relaxed);
+        if (n < 5) {
+          Logger::info(str::format("[CursorLock] SetCursorPos(", X, ",", Y,
+                                   ") blocked (hit #", n + 1, ")"));
+        }
+      } else {
+        sLoggedThisSession.store(0, std::memory_order_relaxed);
+      }
+      if (blocking) {
+        return TRUE;
+      }
+      return g_realSetCursorPos(X, Y);
+    }
+
+    static VOID WINAPI mouse_event_Thunk(DWORD dwFlags, DWORD dx, DWORD dy,
+                                         DWORD dwData, ULONG_PTR dwExtraInfo) {
+      if (g_uiBlocksSetCursorPos.load(std::memory_order_relaxed)) {
+        static std::atomic<uint32_t> sLogged { 0 };
+        const uint32_t n = sLogged.fetch_add(1, std::memory_order_relaxed);
+        if (n < 5) {
+          Logger::info(str::format("[CursorLock] mouse_event(flags=0x",
+                                   std::hex, dwFlags, std::dec,
+                                   ",dx=", (int) dx, ",dy=", (int) dy,
+                                   ") blocked (hit #", n + 1, ")"));
+        }
+        return;
+      }
+      g_realMouseEvent(dwFlags, dx, dy, dwData, dwExtraInfo);
+    }
+
+    static UINT WINAPI SendInput_Thunk(UINT cInputs, LPINPUT pInputs, int cbSize) {
+      if (g_uiBlocksSetCursorPos.load(std::memory_order_relaxed) && pInputs) {
+        // Only swallow mouse inputs; keep keyboard/hardware passthrough
+        // for other normal consumers (ImGui uses WM_*, not SendInput).
+        bool anyMouse = false;
+        for (UINT i = 0; i < cInputs; ++i) {
+          if (pInputs[i].type == INPUT_MOUSE) { anyMouse = true; break; }
+        }
+        if (anyMouse) {
+          static std::atomic<uint32_t> sLogged { 0 };
+          const uint32_t n = sLogged.fetch_add(1, std::memory_order_relaxed);
+          if (n < 5) {
+            Logger::info(str::format("[CursorLock] SendInput(n=", cInputs,
+                                     ") mouse blocked (hit #", n + 1, ")"));
+          }
+          // Pretend we processed them all.
+          return cInputs;
+        }
+      }
+      return g_realSendInput(cInputs, pInputs, cbSize);
+    }
+
+    // ---------------- DirectInput8 vtable hooks ----------------
+    // Bethesda's Creation Engine (Skyrim/FO4) reads mouse deltas via
+    // DirectInput8 (IDirectInputDevice8::GetDeviceState / GetDeviceData)
+    // on an exclusively-cooperative mouse device.  That path does not
+    // generate WM_* messages, does not call SetCursorPos / mouse_event /
+    // SendInput, and cannot be killed by ClipCursor or focus theft alone.
+    //
+    // Strategy: IAT-hook dinput8!DirectInput8Create.  When the game
+    // creates the IDirectInput8 interface we patch its vtable slot for
+    // CreateDevice.  Every device it hands back then gets its vtable
+    // patched for GetDeviceState / GetDeviceData / Poll.  While the UI
+    // is open those thunks return zeroed state / zero events, so the
+    // game reads "no mouse motion, no buttons".
+    using DirectInput8Create_t = HRESULT (WINAPI*)(HINSTANCE, DWORD, REFIID, LPVOID*, LPUNKNOWN);
+    using DI8_GetDeviceState_t = HRESULT (STDMETHODCALLTYPE*)(IUnknown*, DWORD, LPVOID);
+    using DI8_GetDeviceData_t  = HRESULT (STDMETHODCALLTYPE*)(IUnknown*, DWORD, LPVOID, LPDWORD, DWORD);
+    using DI8_Acquire_t        = HRESULT (STDMETHODCALLTYPE*)(IUnknown*);
+    using DI8_Unacquire_t      = HRESULT (STDMETHODCALLTYPE*)(IUnknown*);
+    using DI8_CreateDevice_t   = HRESULT (STDMETHODCALLTYPE*)(IUnknown*, REFGUID, IUnknown**, LPUNKNOWN);
+
+    // DirectInput HRESULTs we return from thunks.
+    static constexpr HRESULT kDI_OK                    = 0;
+    static constexpr HRESULT kDIERR_OTHERAPPHASPRIO    = 0x80070005L; // E_ACCESSDENIED reinterpretation per DX docs
+
+    static DirectInput8Create_t                g_realDI8Create      { nullptr };
+    static std::atomic<DI8_GetDeviceState_t>   g_realGetDeviceState { nullptr };
+    static std::atomic<DI8_GetDeviceData_t>    g_realGetDeviceData  { nullptr };
+    static std::atomic<DI8_Acquire_t>          g_realAcquire        { nullptr };
+    static std::atomic<DI8_Unacquire_t>        g_realUnacquire      { nullptr };
+    static std::atomic<DI8_CreateDevice_t>     g_realCreateDevice   { nullptr };
+
+    // Devices we've seen come out of CreateDevice.  When the UI opens we
+    // walk this list and force-Unacquire each one so Skyrim's exclusive
+    // mouse drops and WM_MOUSEMOVE starts flowing again.
+    static std::mutex g_di8DevicesMtx;
+    static std::vector<IUnknown*> g_di8Devices;
+
+    static HRESULT STDMETHODCALLTYPE DI8_GetDeviceState_Thunk(IUnknown* self, DWORD cbData, LPVOID lpvData) {
+      auto real = g_realGetDeviceState.load(std::memory_order_relaxed);
+      if (!real) return E_FAIL;
+      HRESULT hr = real(self, cbData, lpvData);
+      if (SUCCEEDED(hr) && g_uiBlocksSetCursorPos.load(std::memory_order_relaxed) && lpvData && cbData) {
+        memset(lpvData, 0, cbData);
+        static std::atomic<uint32_t> sLog { 0 };
+        const uint32_t n = sLog.fetch_add(1, std::memory_order_relaxed);
+        if (n < 3) {
+          Logger::info(str::format("[CursorLock] DI8 GetDeviceState zeroed (hit #",
+                                   n + 1, " cb=", cbData, ")"));
+        }
+      }
+      return hr;
+    }
+
+    static HRESULT STDMETHODCALLTYPE DI8_GetDeviceData_Thunk(IUnknown* self, DWORD cbOD,
+                                                             LPVOID rgdod, LPDWORD pdwInOut, DWORD dwFlags) {
+      if (g_uiBlocksSetCursorPos.load(std::memory_order_relaxed)) {
+        if (pdwInOut) *pdwInOut = 0;
+        static std::atomic<uint32_t> sLog { 0 };
+        const uint32_t n = sLog.fetch_add(1, std::memory_order_relaxed);
+        if (n < 3) {
+          Logger::info(str::format("[CursorLock] DI8 GetDeviceData suppressed (hit #", n + 1, ")"));
+        }
+        return kDI_OK;
+      }
+      auto real = g_realGetDeviceData.load(std::memory_order_relaxed);
+      if (!real) return E_FAIL;
+      return real(self, cbOD, rgdod, pdwInOut, dwFlags);
+    }
+
+    // Block Acquire while UI is open.  This is critical: Skyrim's mouse
+    // device is created with DISCL_EXCLUSIVE, and when the device is in
+    // the Acquired state the OS suppresses WM_MOUSEMOVE for that
+    // application.  If we let Acquire succeed, ImGui stops seeing mouse
+    // motion on the second UI open (after an Alt-Tab round-trip).
+    static HRESULT STDMETHODCALLTYPE DI8_Acquire_Thunk(IUnknown* self) {
+      if (g_uiBlocksSetCursorPos.load(std::memory_order_relaxed)) {
+        static std::atomic<uint32_t> sLog { 0 };
+        const uint32_t n = sLog.fetch_add(1, std::memory_order_relaxed);
+        if (n < 5) {
+          Logger::info(str::format("[CursorLock] DI8 Acquire blocked (hit #", n + 1, ")"));
+        }
+        return kDIERR_OTHERAPPHASPRIO;
+      }
+      auto real = g_realAcquire.load(std::memory_order_relaxed);
+      if (!real) return kDI_OK;
+      return real(self);
+    }
+
+    static std::mutex g_di8VtableMtx;
+    static constexpr size_t kMaxDI8Vtables = 32;
+    static void* g_di8DevVtablesPatched[kMaxDI8Vtables]   { };
+    static void* g_di8IfaceVtablesPatched[kMaxDI8Vtables] { };
+    static size_t g_di8DevVtCount   = 0;
+    static size_t g_di8IfaceVtCount = 0;
+
+    static bool alreadyPatchedVt(void** list, size_t& count, void* vt) {
+      for (size_t i = 0; i < count; ++i) {
+        if (list[i] == vt) return true;
+      }
+      if (count < kMaxDI8Vtables) { list[count++] = vt; return false; }
+      return true; // full — refuse to patch any more to stay safe
+    }
+
+    static void patchVtableSlot(void** vtbl, int slot, void* newFn, void** outOld) {
+      void** entry = vtbl + slot;
+      DWORD oldProt = 0;
+      if (VirtualProtect(entry, sizeof(void*), PAGE_READWRITE, &oldProt)) {
+        if (outOld) *outOld = *entry;
+        *entry = newFn;
+        VirtualProtect(entry, sizeof(void*), oldProt, &oldProt);
+      }
+    }
+
+    // IDirectInputDevice8 vtable layout (W/A are identical in layout):
+    //   3 GetCapabilities  7  Acquire     9  GetDeviceState
+    //   4 EnumObjects      8  Unacquire   10 GetDeviceData
+    //   ...                                 23 Poll
+    static void hookDI8Device(IUnknown* dev) {
+      if (!dev) return;
+      void** vtbl = *reinterpret_cast<void***>(dev);
+      {
+        std::lock_guard<std::mutex> lk(g_di8VtableMtx);
+        if (!alreadyPatchedVt(g_di8DevVtablesPatched, g_di8DevVtCount, vtbl)) {
+          void* oldGS = nullptr; patchVtableSlot(vtbl,  9, reinterpret_cast<void*>(&DI8_GetDeviceState_Thunk), &oldGS);
+          void* oldGD = nullptr; patchVtableSlot(vtbl, 10, reinterpret_cast<void*>(&DI8_GetDeviceData_Thunk),  &oldGD);
+          void* oldAc = nullptr; patchVtableSlot(vtbl,  7, reinterpret_cast<void*>(&DI8_Acquire_Thunk),        &oldAc);
+          if (oldGS && !g_realGetDeviceState.load()) g_realGetDeviceState.store(reinterpret_cast<DI8_GetDeviceState_t>(oldGS));
+          if (oldGD && !g_realGetDeviceData.load())  g_realGetDeviceData.store (reinterpret_cast<DI8_GetDeviceData_t>(oldGD));
+          if (oldAc && !g_realAcquire.load())        g_realAcquire.store       (reinterpret_cast<DI8_Acquire_t>(oldAc));
+          // Unacquire is slot 8 — we don't patch it, just grab the real
+          // pointer so we can call it to force-drop exclusive mode.
+          if (!g_realUnacquire.load()) {
+            g_realUnacquire.store(reinterpret_cast<DI8_Unacquire_t>(vtbl[8]));
+          }
+          Logger::info(str::format("[DI8] device vtable hooked vt=", vtbl));
+        }
+      }
+      // Track device instance so we can force-Unacquire it on UI open.
+      {
+        std::lock_guard<std::mutex> lk(g_di8DevicesMtx);
+        bool found = false;
+        for (auto* d : g_di8Devices) { if (d == dev) { found = true; break; } }
+        if (!found) g_di8Devices.push_back(dev);
+      }
+    }
+
+    // Force-unacquire every DI8 device we know about.  Called on UI-open
+    // rising edge so that any device Skyrim re-Acquired while we were
+    // idle (e.g. across an Alt-Tab) drops its exclusive hold.
+    static void forceUnacquireAllDI8Devices() {
+      auto real = g_realUnacquire.load(std::memory_order_relaxed);
+      if (!real) return;
+      std::lock_guard<std::mutex> lk(g_di8DevicesMtx);
+      for (IUnknown* dev : g_di8Devices) {
+        if (dev) real(dev);
+      }
+      if (!g_di8Devices.empty()) {
+        Logger::info(str::format("[DI8] force-unacquired ", g_di8Devices.size(), " device(s) on UI open"));
+      }
+    }
+
+    static HRESULT STDMETHODCALLTYPE DI8_CreateDevice_Thunk(IUnknown* self, REFGUID rguid,
+                                                            IUnknown** ppDevice, LPUNKNOWN pOuter) {
+      auto real = g_realCreateDevice.load(std::memory_order_relaxed);
+      if (!real) return E_FAIL;
+      HRESULT hr = real(self, rguid, ppDevice, pOuter);
+      if (SUCCEEDED(hr) && ppDevice && *ppDevice) {
+        hookDI8Device(*ppDevice);
+      }
+      return hr;
+    }
+
+    static void hookDI8Interface(IUnknown* iface) {
+      if (!iface) return;
+      void** vtbl = *reinterpret_cast<void***>(iface);
+      std::lock_guard<std::mutex> lk(g_di8VtableMtx);
+      if (alreadyPatchedVt(g_di8IfaceVtablesPatched, g_di8IfaceVtCount, vtbl)) return;
+      void* old = nullptr;
+      patchVtableSlot(vtbl, 3, reinterpret_cast<void*>(&DI8_CreateDevice_Thunk), &old);
+      if (old && !g_realCreateDevice.load()) {
+        g_realCreateDevice.store(reinterpret_cast<DI8_CreateDevice_t>(old));
+      }
+      Logger::info(str::format("[DI8] IDirectInput8 vtable hooked vt=", vtbl));
+    }
+
+    static HRESULT WINAPI DirectInput8Create_Thunk(HINSTANCE hinst, DWORD dwVersion,
+                                                   REFIID riid, LPVOID* ppvOut, LPUNKNOWN pUnk) {
+      if (!g_realDI8Create) return E_FAIL;
+      HRESULT hr = g_realDI8Create(hinst, dwVersion, riid, ppvOut, pUnk);
+      if (SUCCEEDED(hr) && ppvOut && *ppvOut) {
+        hookDI8Interface(reinterpret_cast<IUnknown*>(*ppvOut));
+      }
+      return hr;
+    }
+
+    // Patch a single module's IAT entries for user32 + dinput8 imports we care about.
+    static void patchModuleIAT(HMODULE hMod, HMODULE hSelf) {
+      if (!hMod || hMod == hSelf) {
+        return;
+      }
+      struct HookEntry { const char* name; void* thunk; };
+      const HookEntry user32Hooks[] = {
+        { "SetCursorPos", reinterpret_cast<void*>(&SetCursorPos_Thunk) },
+        { "mouse_event",  reinterpret_cast<void*>(&mouse_event_Thunk)  },
+        { "SendInput",    reinterpret_cast<void*>(&SendInput_Thunk)    },
+      };
+      const HookEntry dinput8Hooks[] = {
+        { "DirectInput8Create", reinterpret_cast<void*>(&DirectInput8Create_Thunk) },
+      };
+
+      auto base = reinterpret_cast<BYTE*>(hMod);
+      auto dos = reinterpret_cast<IMAGE_DOS_HEADER*>(base);
+      if (dos->e_magic != IMAGE_DOS_SIGNATURE) return;
+      auto nt = reinterpret_cast<IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
+      if (nt->Signature != IMAGE_NT_SIGNATURE) return;
+
+      auto& impDir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+      if (impDir.VirtualAddress == 0 || impDir.Size == 0) return;
+
+      auto desc = reinterpret_cast<IMAGE_IMPORT_DESCRIPTOR*>(base + impDir.VirtualAddress);
+      for (; desc->Name; ++desc) {
+        const char* modName = reinterpret_cast<const char*>(base + desc->Name);
+        const HookEntry* hooks = nullptr;
+        size_t hookCount = 0;
+        if (_stricmp(modName, "user32.dll") == 0) {
+          hooks = user32Hooks;
+          hookCount = sizeof(user32Hooks) / sizeof(user32Hooks[0]);
+        } else if (_stricmp(modName, "dinput8.dll") == 0) {
+          hooks = dinput8Hooks;
+          hookCount = sizeof(dinput8Hooks) / sizeof(dinput8Hooks[0]);
+        } else {
+          continue;
+        }
+
+        auto origThunk = reinterpret_cast<IMAGE_THUNK_DATA*>(
+          base + (desc->OriginalFirstThunk ? desc->OriginalFirstThunk : desc->FirstThunk));
+        auto iat = reinterpret_cast<IMAGE_THUNK_DATA*>(base + desc->FirstThunk);
+
+        for (; origThunk->u1.AddressOfData; ++origThunk, ++iat) {
+          if (IMAGE_SNAP_BY_ORDINAL(origThunk->u1.Ordinal)) continue;
+          auto importByName = reinterpret_cast<IMAGE_IMPORT_BY_NAME*>(
+            base + origThunk->u1.AddressOfData);
+
+          void* newFn = nullptr;
+          for (size_t i = 0; i < hookCount; ++i) {
+            if (strcmp(importByName->Name, hooks[i].name) == 0) {
+              newFn = hooks[i].thunk;
+              break;
+            }
+          }
+          if (!newFn) continue;
+
+          void** slot = reinterpret_cast<void**>(&iat->u1.Function);
+          if (*slot == newFn) continue; // already patched
+
+          DWORD oldProt = 0;
+          if (VirtualProtect(slot, sizeof(void*), PAGE_READWRITE, &oldProt)) {
+            *slot = newFn;
+            VirtualProtect(slot, sizeof(void*), oldProt, &oldProt);
+          }
+        }
+      }
+    }
+
+    // SEH wrapper — kept in its own function so the caller can use C++
+    // objects with destructors (MSVC disallows __try in functions that
+    // require object unwinding).
+    static void patchModuleIAT_Safe(HMODULE hMod, HMODULE hSelf) {
+      __try {
+        patchModuleIAT(hMod, hSelf);
+      } __except (EXCEPTION_EXECUTE_HANDLER) {
+        // A module with a malformed header; skip.
+      }
+    }
+
+    static void installSetCursorPosHook() {
+      const bool firstTime = !g_setCursorPosHooked.exchange(true);
+      if (firstTime) {
+        // Resolve the real addresses from user32 directly so we don't chain
+        // through another hooker's thunk.
+        if (HMODULE u32 = GetModuleHandleW(L"user32.dll")) {
+          if (auto real = reinterpret_cast<SetCursorPos_t>(GetProcAddress(u32, "SetCursorPos"))) {
+            g_realSetCursorPos = real;
+          }
+          if (auto real = reinterpret_cast<mouse_event_t>(GetProcAddress(u32, "mouse_event"))) {
+            g_realMouseEvent = real;
+          }
+          if (auto real = reinterpret_cast<SendInput_t>(GetProcAddress(u32, "SendInput"))) {
+            g_realSendInput = real;
+          }
+        }
+        // Resolve real dinput8!DirectInput8Create.  Force-load dinput8 if
+        // the game hasn't imported it yet so the IAT fixup below finds it
+        // in modules that bind it lazily via LoadLibrary + GetProcAddress.
+        HMODULE dinput8 = GetModuleHandleW(L"dinput8.dll");
+        if (!dinput8) {
+          dinput8 = LoadLibraryW(L"dinput8.dll");
+        }
+        if (dinput8) {
+          if (auto real = reinterpret_cast<DirectInput8Create_t>(
+                GetProcAddress(dinput8, "DirectInput8Create"))) {
+            g_realDI8Create = real;
+          }
+        }
+      }
+
+      HMODULE hSelf = nullptr;
+      GetModuleHandleExW(
+        GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+        reinterpret_cast<LPCWSTR>(&installSetCursorPosHook), &hSelf);
+
+      HMODULE mods[1024];
+      DWORD needed = 0;
+      HANDLE hProc = GetCurrentProcess();
+      // EnumProcessModules is in psapi; load dynamically to avoid a new
+      // link-time dep.
+      using EnumProcModules_t = BOOL (WINAPI*)(HANDLE, HMODULE*, DWORD, LPDWORD);
+      EnumProcModules_t pEnum = nullptr;
+      if (HMODULE k32 = GetModuleHandleW(L"kernel32.dll")) {
+        pEnum = reinterpret_cast<EnumProcModules_t>(GetProcAddress(k32, "K32EnumProcessModules"));
+      }
+      if (!pEnum) {
+        if (HMODULE psapi = LoadLibraryW(L"psapi.dll")) {
+          pEnum = reinterpret_cast<EnumProcModules_t>(GetProcAddress(psapi, "EnumProcessModules"));
+        }
+      }
+      if (!pEnum) {
+        Logger::warn("[ImGUI] SetCursorPos IAT hook: EnumProcessModules unavailable");
+        return;
+      }
+      if (!pEnum(hProc, mods, sizeof(mods), &needed)) {
+        return;
+      }
+      const DWORD count = std::min<DWORD>(needed / sizeof(HMODULE), 1024);
+      uint32_t patched = 0;
+      for (DWORD i = 0; i < count; ++i) {
+        if (!mods[i] || mods[i] == hSelf) continue;
+        patchModuleIAT_Safe(mods[i], hSelf);
+        ++patched;
+      }
+      if (firstTime) {
+        Logger::info(str::format("[ImGUI] user32 + dinput8 IAT hooks installed across ",
+                               patched, " modules"));
+      }
+    }
+  } // namespace
+
   void forceOsCursorVisible(bool visible) {
     CURSORINFO cursorInfo {};
     cursorInfo.cbSize = sizeof(cursorInfo);
@@ -668,9 +1235,122 @@ namespace dxvk {
     if (RtxOptions::useNewGuiInputMethod()) {
       m_overlayWin = new GameOverlay("RemixGuiInputSink", this);
     }
+
+    // Install the user32!SetCursorPos IAT hook exactly once. Required to
+    // defeat Skyrim-style DirectInput mouselook (see thunk comment above).
+    installSetCursorPosHook();
+
+    // Spawn the focus-steal helper thread.  When the Remix UI opens we
+    // need to drop the game window out of the foreground so DirectInput
+    // acquired devices lose DISCL_FOREGROUND and stop feeding input to
+    // the game's game-thread ticks.  See the FocusSteal namespace.
+    startFocusStealThread();
+
+    // Launch the cursor-unclip watchdog. It spins at ~200Hz only while the
+    // UI is actually open; otherwise it sleeps on a long interval. This is
+    // how we defeat Skyrim's per-frame ClipCursor/SetCapture: we win the
+    // race by polling faster than the game can re-apply its clip.
+    m_cursorWatchdogRun.store(true);
+    m_cursorWatchdogThread = std::thread([this]() {
+      // Cursor-lock detector state. We sample the OS cursor once per
+      // iteration and count how many consecutive samples are identical
+      // while the UI is open. If the cursor has not moved by even a
+      // single pixel for roughly 250 ms while a Remix menu is up, the
+      // game is almost certainly pinning it via SetCursorPos / raw
+      // input / a mouse hook that bypassed our IAT patch.  We log
+      // that so you can correlate it with the observed mouse lock.
+      POINT lastPt = {INT_MIN, INT_MIN};
+      uint32_t stuckSamples = 0;
+      bool stuckLogged = false;
+      RECT lastClip = {};
+      bool lastClipValid = false;
+      HWND lastForeground = nullptr;
+      while (m_cursorWatchdogRun.load(std::memory_order_relaxed)) {
+        if (!m_cursorWatchdogUiOpen.load(std::memory_order_relaxed)) {
+          std::this_thread::sleep_for(std::chrono::milliseconds(50));
+          lastPt = {INT_MIN, INT_MIN};
+          stuckSamples = 0;
+          stuckLogged = false;
+          lastClipValid = false;
+          lastForeground = nullptr;
+          continue;
+        }
+        // Foreground-window tracker: reveals "game alt-tabbing itself".
+        HWND fgNow = ::GetForegroundWindow();
+        if (fgNow != lastForeground) {
+          Logger::info(str::format(
+            "[CursorLock] foreground changed: ", (void*) lastForeground,
+            " -> ", (void*) fgNow,
+            " (gameHwnd=", (void*) m_gameHwnd, ")"));
+          lastForeground = fgNow;
+        }
+        RECT clip;
+        if (::GetClipCursor(&clip)) {
+          const int vx = ::GetSystemMetrics(SM_XVIRTUALSCREEN);
+          const int vy = ::GetSystemMetrics(SM_YVIRTUALSCREEN);
+          const int vr = vx + ::GetSystemMetrics(SM_CXVIRTUALSCREEN);
+          const int vb = vy + ::GetSystemMetrics(SM_CYVIRTUALSCREEN);
+          if (clip.left != vx || clip.top != vy || clip.right != vr || clip.bottom != vb) {
+            // Log the first time someone re-clips while UI is open
+            // (but only once per "session", to avoid spam).
+            if (!lastClipValid ||
+                clip.left   != lastClip.left   || clip.top    != lastClip.top ||
+                clip.right  != lastClip.right  || clip.bottom != lastClip.bottom) {
+              Logger::info(str::format(
+                "[CursorLock] ClipCursor re-applied by game while UI open: rect=(",
+                clip.left, ",", clip.top, "-", clip.right, ",", clip.bottom,
+                ") -> unclipping"));
+              lastClip = clip;
+              lastClipValid = true;
+            }
+            ::ClipCursor(nullptr);
+          }
+        }
+
+        POINT pt;
+        if (::GetCursorPos(&pt)) {
+          if (pt.x == lastPt.x && pt.y == lastPt.y) {
+            ++stuckSamples;
+            // 400 samples @ 5ms = ~2000 ms of zero movement, which is
+            // well past anything a user would perceive as "lag"; a
+            // genuine mouselock will trivially trip this, a user just
+            // looking at a menu will not.
+            if (stuckSamples == 400 && !stuckLogged) {
+              stuckLogged = true;
+              HWND fg = ::GetForegroundWindow();
+              HWND cap = ::GetCapture();
+              Logger::info(str::format(
+                "[CursorLock] cursor pinned at (", pt.x, ",", pt.y,
+                ") for ~2s while UI open;",
+                " foreground=", (void*) fg,
+                " capture=", (void*) cap,
+                " gameHwnd=", (void*) m_gameHwnd,
+                " hookActive=", g_uiBlocksSetCursorPos.load() ? 1 : 0));
+            }
+          } else {
+            stuckSamples = 0;
+            stuckLogged = false;
+            lastPt = pt;
+          }
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+      }
+    });
   }
 
   ImGUI::~ImGUI() {
+    // Stop the watchdog first so it can't touch state during teardown.
+    m_cursorWatchdogRun.store(false);
+    m_cursorWatchdogUiOpen.store(false);
+    g_uiBlocksSetCursorPos.store(false);
+    if (m_cursorWatchdogThread.joinable()) {
+      m_cursorWatchdogThread.join();
+    }
+    // Stop focus-steal thread and hand foreground back to the game on
+    // the way out.
+    g_focusStealWanted.store(false);
+    stopFocusStealThread();
+
     g_imguiTextureMap.clear();
 
     ImGui::SetCurrentContext(m_context);
@@ -751,18 +1431,6 @@ namespace dxvk {
     const bool useOverlayInput = m_overlayWin.ptr() != nullptr && RtxOptions::useNewGuiInputMethod();
     const bool overlayOwnsInputMsg = useOverlayInput && (isKeyMsg || isMouseMsg || msg == WM_INPUT);
 
-    // Debug: log key messages to track input delivery
-    if (isKeyMsg) {
-      static uint32_t keyMsgCount = 0;
-      if (keyMsgCount < 20 || (keyMsgCount % 100 == 0)) {
-        Logger::info(str::format("[ImGUI] wndProcHandler: keyMsg #", keyMsgCount,
-          " msg=0x", std::hex, msg, std::dec,
-          " wParam=", (int)wParam,
-          " overlayOwns=", overlayOwnsInputMsg ? 1 : 0));
-      }
-      ++keyMsgCount;
-    }
-
     if (!overlayOwnsInputMsg) {
       ImGui_ImplWin32_WndProcHandler(hWnd, msg, wParam, lParam);
     }
@@ -771,55 +1439,102 @@ namespace dxvk {
       m_overlayWin->gameWndProcHandler(hWnd, msg, wParam, lParam);
     }
 
-    // When the Remix UI is visible, consume keyboard and mouse messages so
-    // they don't reach the game (prevents WASD movement while typing in UI,
-    // camera spin while dragging sliders, etc.).
-    // 
-    // IMPORTANT: When using the new overlay input method, we should NOT consume
-    // mouse messages here because the overlay window handles them in its own thread.
-    // Consuming them here would prevent ImGui from receiving checkbox clicks and
-    // other UI interactions.
+    // When the Remix UI is visible, route input correctly:
+    //
+    //   1. If ImGui is capturing the mouse or keyboard (cursor over a window,
+    //      widget focused, slider dragging, etc.), ALWAYS consume the message.
+    //      Otherwise the game sees the click too and reacts — in Skyrim every
+    //      checkbox click becomes a weapon swing / camera re-target, which
+    //      flickers the scene and makes the UI feel unresponsive because the
+    //      click "passes through" the menu. This must happen regardless of
+    //      the blockInputToGameInUI preference: that setting controls the
+    //      broader "freeze the game while the menu is up" behaviour, not
+    //      whether clicks on UI widgets reach the game.
+    //
+    //   2. When blockInputToGameInUI is enabled, also eat UI navigation keys
+    //      and all mouse button messages while the UI is open, even if ImGui
+    //      does not claim them for the current hover position. This is the
+    //      "game paused while menu open" behaviour.
+    //
+    //   3. When the new overlay input method is active the overlay window
+    //      owns the cursor, so we must not swallow messages here.
     const auto& io = ImGui::GetIO();
     const bool uiOpen = getEffectiveUIType() != UIType::None;
-    if (uiOpen && RtxOptions::blockInputToGameInUI() && !useOverlayInput) {
-      const bool isMouseInteractionMsg = msg == WM_MOUSEMOVE
-                                      || msg == WM_MOUSEWHEEL
-                                      || msg == WM_MOUSEHWHEEL
-                                      || msg == WM_LBUTTONDOWN
-                                      || msg == WM_LBUTTONUP
-                                      || msg == WM_LBUTTONDBLCLK
-                                      || msg == WM_RBUTTONDOWN
-                                      || msg == WM_RBUTTONUP
-                                      || msg == WM_RBUTTONDBLCLK
-                                      || msg == WM_MBUTTONDOWN
-                                      || msg == WM_MBUTTONUP
-                                      || msg == WM_MBUTTONDBLCLK
-                                      || msg == WM_XBUTTONDOWN
-                                      || msg == WM_XBUTTONUP
-                                      || msg == WM_XBUTTONDBLCLK;
-      const bool isUiNavigationKey = isKeyMsg && ([](WPARAM key) {
-        switch (key) {
-        case VK_TAB:
-        case VK_LEFT:
-        case VK_RIGHT:
-        case VK_UP:
-        case VK_DOWN:
-        case VK_PRIOR:
-        case VK_NEXT:
-        case VK_HOME:
-        case VK_END:
-        case VK_RETURN:
-        case VK_SPACE:
-        case VK_ESCAPE:
-          return true;
-        default:
-          return false;
-        }
-      })(wParam);
-      const bool shouldCaptureMouse = isMouseMsg && (io.WantCaptureMouse || isMouseInteractionMsg);
 
-      if ((isKeyMsg && (io.WantCaptureKeyboard || isUiNavigationKey)) || shouldCaptureMouse)
-        return true;  // consumed — caller should NOT forward to game
+    // One-shot diagnostic: log the FIRST mouse button down + the first
+    // mouse move seen while the UI is open, plus ImGui's capture flags
+    // and the OS cursor state. This pinpoints whether the symptom is
+    // "ImGui doesn't see the click" vs. "ImGui sees it but the cursor
+    // is being warped by the game".
+    if (uiOpen && (msg == WM_LBUTTONDOWN || msg == WM_MOUSEMOVE)) {
+      static uint32_t sFirstClickLog = 0;
+      static uint32_t sFirstMoveLog = 0;
+      const bool isClick = (msg == WM_LBUTTONDOWN);
+      uint32_t& counter = isClick ? sFirstClickLog : sFirstMoveLog;
+      if (counter < 3) {
+        ++counter;
+        POINT os = {};
+        ::GetCursorPos(&os);
+        RECT clip = {};
+        ::GetClipCursor(&clip);
+        HWND cap = ::GetCapture();
+        Logger::info(str::format(
+          "[ImGUI-Diag] ", isClick ? "LBUTTONDOWN" : "MOUSEMOVE",
+          " uiOpen=1 wantCapMouse=", io.WantCaptureMouse ? 1 : 0,
+          " wantCapKb=", io.WantCaptureKeyboard ? 1 : 0,
+          " imguiMouse=(", (int)io.MousePos.x, ",", (int)io.MousePos.y, ")",
+          " osCursor=(", os.x, ",", os.y, ")",
+          " clipRect=(", clip.left, ",", clip.top, "-", clip.right, ",", clip.bottom, ")",
+          " capture=", (void*)cap,
+          " gameHwnd=", (void*)m_gameHwnd));
+      }
+    }
+    if (uiOpen && !useOverlayInput) {
+      const bool imguiOwnsMouse = isMouseMsg && io.WantCaptureMouse;
+      const bool imguiOwnsKeyboard = isKeyMsg && io.WantCaptureKeyboard;
+      if (imguiOwnsMouse || imguiOwnsKeyboard) {
+        return true;  // widget interaction — never let it reach the game
+      }
+
+      if (RtxOptions::blockInputToGameInUI()) {
+        const bool isMouseInteractionMsg = msg == WM_MOUSEMOVE
+                                        || msg == WM_MOUSEWHEEL
+                                        || msg == WM_MOUSEHWHEEL
+                                        || msg == WM_LBUTTONDOWN
+                                        || msg == WM_LBUTTONUP
+                                        || msg == WM_LBUTTONDBLCLK
+                                        || msg == WM_RBUTTONDOWN
+                                        || msg == WM_RBUTTONUP
+                                        || msg == WM_RBUTTONDBLCLK
+                                        || msg == WM_MBUTTONDOWN
+                                        || msg == WM_MBUTTONUP
+                                        || msg == WM_MBUTTONDBLCLK
+                                        || msg == WM_XBUTTONDOWN
+                                        || msg == WM_XBUTTONUP
+                                        || msg == WM_XBUTTONDBLCLK;
+        const bool isUiNavigationKey = isKeyMsg && ([](WPARAM key) {
+          switch (key) {
+          case VK_TAB:
+          case VK_LEFT:
+          case VK_RIGHT:
+          case VK_UP:
+          case VK_DOWN:
+          case VK_PRIOR:
+          case VK_NEXT:
+          case VK_HOME:
+          case VK_END:
+          case VK_RETURN:
+          case VK_SPACE:
+          case VK_ESCAPE:
+            return true;
+          default:
+            return false;
+          }
+        })(wParam);
+        if ((isKeyMsg && isUiNavigationKey) || (isMouseMsg && isMouseInteractionMsg)) {
+          return true;
+        }
+      }
     }
     return false;
   }
@@ -1158,17 +1873,6 @@ namespace dxvk {
   }
 
   void ImGUI::update(const Rc<DxvkContext>& ctx) {
-    static uint64_t updateCallCount = 0;
-    ++updateCallCount;
-    if (updateCallCount <= 5 || (updateCallCount % 500 == 0)) {
-      const auto& io = ImGui::GetIO();
-      Logger::info(str::format("[ImGUI] update #", updateCallCount,
-        ": KeyAlt=", io.KeyAlt ? 1 : 0,
-        " KeyCtrl=", io.KeyCtrl ? 1 : 0,
-        " WantCaptureKeyboard=", io.WantCaptureKeyboard ? 1 : 0,
-        " effectiveUI=", (int)getEffectiveUIType()));
-    }
-
     ImGui_ImplDxvk::NewFrame();
     ImGui_ImplWin32_NewFrame();
 
@@ -1221,26 +1925,50 @@ namespace dxvk {
     if (!uiOpen) {
       ImGui::CloseCurrentPopup();
       ImGui::GetIO().MouseDrawCursor = false;
+      m_cursorWatchdogUiOpen.store(false, std::memory_order_relaxed);
+      g_uiBlocksSetCursorPos.store(false, std::memory_order_relaxed);
+      g_focusStealWanted.store(false, std::memory_order_relaxed);
+      m_uiWasOpenLastFrame = false;
     } else {
       ImGui::GetIO().MouseDrawCursor = drawImGuiCursor;
       forceOsCursorVisible(!drawImGuiCursor);
-      // Periodically unclip cursor while UI is open (throttled to avoid fighting with game).
-      // Games like Skyrim re-clip the cursor every frame; we counteract at ~10Hz.
+      // Arm the high-frequency cursor-unclip watchdog (runs on its own
+      // thread at ~200Hz; see ctor). This guarantees we beat Skyrim's
+      // game-thread ClipCursor loop even when the render thread drops
+      // to ~10fps while the UI is up.
+      m_cursorWatchdogUiOpen.store(RtxOptions::blockInputToGameInUI(),
+                                   std::memory_order_relaxed);
+      // Neuter user32!SetCursorPos calls coming from the game so its
+      // DirectInput mouselook can't warp the cursor back to centre.
+      g_uiBlocksSetCursorPos.store(RtxOptions::blockInputToGameInUI(),
+                                   std::memory_order_relaxed);
+      // Tell the focus-steal helper thread to pull the game out of the
+      // foreground so any DirectInput devices acquired with
+      // DISCL_FOREGROUND lose acquisition and stop feeding input to the
+      // game's logic.  This is the only reliable, non-invasive way to
+      // stop DirectInput-based mouselook (Skyrim SE, FO4, etc.).
       if (RtxOptions::blockInputToGameInUI()) {
-        static auto lastUnclipTime = std::chrono::steady_clock::now();
-        auto now = std::chrono::steady_clock::now();
-        if (std::chrono::duration_cast<std::chrono::milliseconds>(now - lastUnclipTime).count() > 100) {
-          lastUnclipTime = now;
-          RECT clipRect;
-          if (::GetClipCursor(&clipRect)) {
-            // Only unclip if it's actually clipped (not full screen rect)
-            RECT fullScreen = { 0, 0, ::GetSystemMetrics(SM_CXVIRTUALSCREEN), ::GetSystemMetrics(SM_CYVIRTUALSCREEN) };
-            if (clipRect.left != fullScreen.left || clipRect.top != fullScreen.top ||
-                clipRect.right != fullScreen.right || clipRect.bottom != fullScreen.bottom) {
-              ::ClipCursor(nullptr);
-            }
-          }
-        }
+        g_focusStealGameHwnd.store(m_gameHwnd, std::memory_order_relaxed);
+        g_focusStealWanted.store(true, std::memory_order_relaxed);
+      }
+      // Re-run the IAT patch on every UI-open transition to catch any
+      // modules that were loaded after the initial hook installation
+      // (DLSS, streamline, upscalers, reshade-style shims, etc.).
+      // Without this, a settings change that pulls in a new DLL can
+      // reintroduce the SetCursorPos mouselock because that DLL's
+      // thunk was never redirected.
+      if (!m_uiWasOpenLastFrame) {
+        installSetCursorPosHook();
+        // Force-drop any exclusive-mode DI8 devices Skyrim re-acquired
+        // while the UI was closed.  This restores WM_MOUSEMOVE delivery
+        // so ImGui can see the cursor on the second UI open.
+        forceUnacquireAllDI8Devices();
+        m_uiWasOpenLastFrame = true;
+      }
+      // Also release any capture the game took on the last mouse-down so
+      // subsequent mouse moves route to our WndProc and ImGui sees them.
+      if (RtxOptions::blockInputToGameInUI() && ::GetCapture() == m_gameHwnd) {
+        ::ReleaseCapture();
       }
     }
 

@@ -168,7 +168,22 @@ namespace dxvk {
     } else if (isViewModel(decomposeProjectionParams.fov, input.maxZ, frameId)) {
       cameraType = CameraType::ViewModel;
     }
-    
+
+    // Suppress viewport-fallback candidates for Main when a real cbuffer
+    // projection has been seen recently.  Without this, a single frame that
+    // fails cbuffer extraction would overwrite Main with a synthetic camera
+    // and cause visible flicker / wrong-aspect renders.  30 frames (~0.5s at
+    // 60Hz) is long enough to ride out transient extraction failures but
+    // short enough to recover if the game genuinely stops exposing a
+    // projection cbuffer (e.g. a true 2D menu pass).
+    if (cameraType == CameraType::Main
+        && input.getTransformData().usedViewportFallbackProjection
+        && m_lastMainCbufferProjFrameId != UINT32_MAX
+        && frameId - m_lastMainCbufferProjFrameId <= 30u) {
+      m_lastSetCameraType = CameraType::Unknown;
+      return CameraType::Unknown;
+    }
+
     // Check fov consistency across frames
     if (frameId > 0) {
       if (getCamera(cameraType).isValid(frameId - 1) && !areFovsClose(decomposeProjectionParams.fov, getCamera(cameraType))) {
@@ -242,6 +257,20 @@ namespace dxvk {
 
     if (cameraType == CameraType::Main && camera.getLastUpdateFrame() == frameId) {
       m_mainCameraCandidateScore = candidateScore;
+      const bool usedFallback = input.getTransformData().usedViewportFallbackProjection;
+      if (!usedFallback) {
+        m_lastMainCbufferProjFrameId = frameId;
+      }
+      // Force a camera cut when the projection source flips between
+      // fallback and real cbuffer. Without this the denoiser keeps
+      // temporal history from the wrong projection for ~10 frames,
+      // which is exactly the "flicker after Remix loads" the user sees
+      // when the splash/fallback phase ends and gameplay begins.
+      if (m_hasLastMainUpdate && usedFallback != m_lastMainUsedFallbackProj) {
+        isCameraCut = true;
+      }
+      m_lastMainUsedFallbackProj = usedFallback;
+      m_hasLastMainUpdate = true;
     }
 
     // Register camera cut when there are significant interruptions to the view (like changing level, or opening a menu)

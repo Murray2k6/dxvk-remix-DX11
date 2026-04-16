@@ -26,6 +26,8 @@
 
 #include <chrono>
 #include <optional>
+#include <atomic>
+#include <thread>
 #define WIN32_LEAN_AND_MEAN 
 #include <windows.h>
 
@@ -182,6 +184,20 @@ namespace dxvk {
     bool                  m_menuOpenClientRectValid = false;
     UIType                m_activeUiType = UIType::None;
     UIType                m_lastObservedRequestedUiType = UIType::None;
+
+    // Cursor-unclip watchdog: Skyrim (and similar Gamebryo/Creation engines)
+    // call ClipCursor and SetCapture from their game thread every frame,
+    // independent of any WndProc message. The render thread's throttled
+    // unclip cannot keep up, so the cursor snaps back to a 1x1 rect the
+    // moment you move off a widget. A dedicated high-frequency thread wins
+    // the race: it polls at ~200Hz while the menu is open and does nothing
+    // while it is closed.
+    std::atomic<bool>     m_cursorWatchdogRun { false };
+    std::atomic<bool>     m_cursorWatchdogUiOpen { false };
+    std::thread           m_cursorWatchdogThread;
+    // Rising-edge detector for UI-open transitions (used to re-run the
+    // user32!SetCursorPos IAT patch so newly-loaded DLLs are covered).
+    bool                  m_uiWasOpenLastFrame = false;
 
     RECT                  m_prevCursorClipRect = {};
     RECT                  m_menuOpenClientRect = {};

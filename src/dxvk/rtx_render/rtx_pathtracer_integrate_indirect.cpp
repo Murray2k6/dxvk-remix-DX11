@@ -399,7 +399,7 @@ namespace dxvk {
     const Resources::RaytracingOutput& rtOutput) {
 
     const uint32_t frameIdx = ctx->getDevice()->getCurrentFrameId();
-    const bool traceRtStartupStages = frameIdx <= 40;
+    const bool traceRtStartupStages = frameIdx <= 3;
     auto logRtStartupStage = [&](const char* stage) {
       if (traceRtStartupStages) {
         Logger::info(str::format("[RTX-Startup] frame=", frameIdx, " stage=", stage));
@@ -513,11 +513,12 @@ namespace dxvk {
       const NeeCachePass& neeCache = ctx->getCommonObjects()->metaNeeCache();
       logRtStartupStage("before indirect ray dispatch");
       switch (RtxOptions::renderPassIntegrateIndirectRaytraceMode()) {
-      case RaytraceMode::RayQuery:
+      case RaytraceMode::RayQuery: {
         VkExtent3D workgroups = util::computeBlockCount(rayDims, VkExtent3D { 16, 8, 1 });
         ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, getComputeShader(neeCacheEnabled, nrcEnabled, wboitEnabled));
         ctx->dispatch(workgroups.width, workgroups.height, workgroups.depth);
         break;
+      }
       case RaytraceMode::RayQueryRayGen:
         ctx->bindRaytracingPipelineShaders(getPipelineShaders(true, serEnabled, ommEnabled, neeCacheEnabled, includePortals, pomEnabled, nrcEnabled, wboitEnabled));
         ctx->traceRays(rayDims.width, rayDims.height, rayDims.depth);

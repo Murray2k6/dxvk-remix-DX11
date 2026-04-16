@@ -140,6 +140,20 @@ namespace dxvk {
     // and makes per-game config files useless.
     const RtxOptionLayer* defaults = RtxOptionLayer::getDefaultLayer();
 
+    // --- Graphics preset: Custom by default ---
+    // The Auto/High/Medium/Low presets populate the Quality Presets layer
+    // (priority 0xFFFFFFFF) with values for every UserSetting-flagged option.
+    // That layer is stronger than the User Settings layer (0xFFFFFFFE) and the
+    // RtxConf layer (3), so any toggle the user makes in the menu lands in a
+    // weaker layer and is immediately shadowed by the preset.  Observed
+    // symptom: every checkbox and dropdown reverts as soon as it is changed.
+    //
+    // Forcing Custom keeps the Quality layer empty, letting User and RtxConf
+    // writes win the resolve.  Games that want a preset can still set
+    // rtx.graphicsPreset explicitly in their rtx.conf; that value lives in a
+    // stronger layer (3) and overrides this Default-layer value.
+    RtxOptions::graphicsPresetObject().setDeferred(GraphicsPreset::Custom, defaults);
+
     // Do not force a fused world-view convention globally.
     // The D3D11 path already scans cbuffers for separate projection, view,
     // and world matrices on a per-draw basis, which is the only engine-
@@ -1088,10 +1102,19 @@ namespace dxvk {
     // for emulators and dynamic-resolution games. The host window can change
     // independently from the actual scene resolution, so client/output extents
     // should only be fallback hints instead of the primary aspect source.
+    //
+    // If the game has bound zero viewports (some engines leave the RS viewport
+    // state dirty across a no-RT clear pass) or more than one viewport (shadow
+    // cascade or split-screen passes), treat viewport[0] as a fallback hint
+    // only and do not let it drive camera detection — otherwise a 256x256
+    // cascade viewport would stamp its aspect onto the primary camera and
+    // cause path tracing to render the wrong frustum for the main scene.
     float viewportAspect = 0.0f;
-    {
+    const uint32_t boundViewports = m_context->m_state.rs.numViewports;
+    const bool singleSceneViewport = boundViewports == 1;
+    if (singleSceneViewport) {
       const auto& vp = m_context->m_state.rs.viewports[0];
-      if (vp.Height > 0.0f)
+      if (vp.Height > 0.0f && std::isfinite(vp.Width) && std::isfinite(vp.Height))
         viewportAspect = vp.Width / vp.Height;
     }
     float renderTargetWidth = 0.0f;
@@ -1266,16 +1289,32 @@ namespace dxvk {
       }
 
       if (!valid && projSlot == m_projSlot && projStage == m_projStage) {
-        // Cached location is stale (different pass). Re-scan all stages.
+        // Cached location is stale (different pass). Re-scan all stages and
+        // persist the winner back to the member cache — otherwise we would
+        // redo this full multi-stage scan for every subsequent draw.
         projSlot = UINT32_MAX;
         float bestScore = 0.0f;
+        bool bestCol = false;
         for (int si = 0; si < kNumStages; ++si) {
           uint32_t ts = UINT32_MAX; size_t to = SIZE_MAX;
           float tsc = bestScore; Matrix4 tm; bool tc = false;
           if (scanStageForProj(si, ts, to, tsc, tm, tc)) {
             projSlot = ts; projOffset = to; projStage = si;
-            proj = tm; bestScore = tsc;
+            proj = tm; bestScore = tsc; bestCol = tc;
           }
+        }
+
+        if (projSlot != UINT32_MAX) {
+          m_projSlot    = projSlot;
+          m_projOffset  = projOffset;
+          m_projStage   = projStage;
+          m_columnMajor = bestCol;
+        } else {
+          // Nothing found — drop the stale cache so the next frame's
+          // first-draw scan path runs instead of this re-scan path.
+          m_projSlot   = UINT32_MAX;
+          m_projOffset = SIZE_MAX;
+          m_projStage  = -1;
         }
       }
 
@@ -1315,7 +1354,11 @@ namespace dxvk {
     // engines that never expose a clean projection cbuffer. Large scene
     // viewports are accepted even when letterboxed or offset; only tiny helper
     // and HUD-style viewports are rejected here.
-    if (projSlot == UINT32_MAX) {
+    //
+    // Only synthesise a fallback projection when exactly one viewport is
+    // bound.  Shadow cascade / cube face / split-screen passes bind multiple
+    // viewports and must never drive the main camera.
+    if (projSlot == UINT32_MAX && singleSceneViewport) {
       const auto& vp = m_context->m_state.rs.viewports[0];
       if (vp.Width > 0.0f && vp.Height > 0.0f) {
         float targetWidth = vp.Width;
@@ -2570,7 +2613,13 @@ namespace dxvk {
 
     // Skip 2D UI/HUD draws: if position is R32G32_SFLOAT it is in screen/clip space,
     // not world space, and cannot be raytraced.
-    if (posSem->format == VK_FORMAT_R32G32_SFLOAT) {
+    //
+    // Caveat: some engines emit billboard/sprite geometry as R32G32_SFLOAT quads
+    // and expand them into 3D inside the vertex shader using the camera basis.
+    // Those draws are valid 3D content and participate in world-space lighting,
+    // so they depth-test against the scene. Only reject 2D-position draws that
+    // ALSO have depth testing off — which is the unambiguous HUD / overlay case.
+    if (posSem->format == VK_FORMAT_R32G32_SFLOAT && !zEnable) {
       ++m_submitRejectStats.position2D;
       return;
     }
