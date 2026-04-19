@@ -843,10 +843,44 @@ namespace dxvk {
         option.setImmediately(preferredValue, RtxOptionLayer::getQualityLayer());
 
         if (option() != preferredValue) {
+          // Fallback: Quality layer write failed even after retry.
+          // Write to the Default layer instead, which is always present and has the lowest
+          // priority — but since no stronger layer holds a conflicting value (we just cleared
+          // them), the Default layer value will become the resolved value.
           Logger::warn(str::format(
             "[RtxOptions] ", optionName,
-            " is still not using the auto-selected value after retry. Current value=",
-            static_cast<int>(option())));
+            " Quality layer write failed after retry (current value=",
+            static_cast<int>(option()),
+            "). Falling back to Default layer write."));
+
+          option.setImmediately(preferredValue, RtxOptionLayer::getDefaultLayer());
+
+          if (option() == preferredValue) {
+            Logger::info(str::format(
+              "[RtxOptions] ", optionName,
+              " successfully set via Default layer fallback. Resolved value=",
+              static_cast<int>(option())));
+          } else {
+            // Last resort: try the Derived layer
+            Logger::warn(str::format(
+              "[RtxOptions] ", optionName,
+              " Default layer fallback also failed. Trying Derived layer."));
+
+            option.setImmediately(preferredValue, RtxOptionLayer::getDerivedLayer());
+
+            if (option() == preferredValue) {
+              Logger::info(str::format(
+                "[RtxOptions] ", optionName,
+                " successfully set via Derived layer fallback. Resolved value=",
+                static_cast<int>(option())));
+            } else {
+              Logger::err(str::format(
+                "[RtxOptions] ", optionName,
+                " all fallback attempts failed. Auto-detected raytrace mode could not be applied."
+                " Current resolved value=", static_cast<int>(option()),
+                ", expected=", static_cast<int>(preferredValue)));
+            }
+          }
         }
       };
 

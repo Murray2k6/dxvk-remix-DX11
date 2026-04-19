@@ -166,12 +166,10 @@ namespace dxvk {
   void CompositePass::showDepthBasedFogImguiSettings() {
     RemixGui::Checkbox("Enable Depth-Based Fog", &enableFogObject());
 
-    ImGui::BeginDisabled(!enableFog());
     ImGui::Indent();
     RemixGui::DragFloat("Fog Color Scale", &fogColorScaleObject(), 0.01f, 0.0f, 10.f, "%.3f", ImGuiSliderFlags_AlwaysClamp);
     RemixGui::DragFloat("Max Fog Distance", &maxFogDistanceObject(), 1.f, 0.0f, 0.f, "%.0f", ImGuiSliderFlags_AlwaysClamp);
     ImGui::Unindent();
-    ImGui::EndDisabled();
   }
 
   void CompositePass::showImguiSettings() {

@@ -105,9 +105,7 @@ namespace dxvk {
       RemixGui::DragFloat("Max (EV100)", &evMaxValueObject(), 0.01f, -24.f, 24.f);
 
       RemixGui::Checkbox("Center Weighted Metering", &exposureCenterMeteringEnabledObject());
-      ImGui::BeginDisabled(!exposureCenterMeteringEnabled());
       RemixGui::DragFloat("Center Metering Size", &centerMeteringSizeObject(), 0.01f, 0.01f, 1.0f);
-      ImGui::EndDisabled();
 
       RemixGui::Checkbox("Exposure Compensation", &useExposureCompensationObject());
 

@@ -3421,8 +3421,15 @@ namespace dxvk {
       trackedExtent = newExtent;
     };
 
+    // Track the client extent for viewport fallback, but do NOT use it for
+    // resize detection.  The client rect can differ from the backbuffer extent
+    // (e.g., a 640×480 game in a 1920×1080 window) and comparing it via
+    // noteResizeTransition would misinterpret a stable low-resolution game as
+    // continuously resizing, keeping the camera carry-over grace period
+    // permanently active.  Only the backbuffer extent comparison (below) should
+    // trigger resize transitions.
     if (clientExtent.width > 0u && clientExtent.height > 0u) {
-      noteResizeTransition(clientExtent, m_lastClientExtent);
+      m_lastClientExtent = clientExtent;
     }
 
     if (backbuffer != nullptr) {
@@ -3528,8 +3535,15 @@ namespace dxvk {
       trackedExtent = newExtent;
     };
 
+    // Track the client extent for viewport fallback, but do NOT use it for
+    // resize detection.  The client rect can differ from the backbuffer extent
+    // (e.g., a 640×480 game in a 1920×1080 window) and comparing it via
+    // noteResizeTransition would misinterpret a stable low-resolution game as
+    // continuously resizing, keeping the camera carry-over grace period
+    // permanently active.  Only the backbuffer extent comparison (below) should
+    // trigger resize transitions.
     if (clientExtent.width > 0u && clientExtent.height > 0u) {
-      noteResizeTransition(clientExtent, m_lastClientExtent);
+      m_lastClientExtent = clientExtent;
     }
 
     if (swapchainImage != nullptr) {

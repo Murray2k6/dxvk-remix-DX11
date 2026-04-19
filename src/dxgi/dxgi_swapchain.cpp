@@ -696,7 +696,32 @@ namespace dxvk {
 
     if (preferredMode.Format == DXGI_FORMAT_UNKNOWN)
       preferredMode.Format = m_desc.Format;
-    
+
+    // Override the game-requested refresh rate with the monitor's
+    // current (desktop) refresh rate so 60Hz-locked titles like
+    // Skyrim SE actually run at the user's display rate.  Only
+    // upgrade: if the game asked for something higher than the
+    // desktop rate we leave it alone and let FindClosestMatchingMode
+    // clamp to whatever the monitor advertises.
+    {
+      DEVMODEW curMode = { };
+      curMode.dmSize = sizeof(curMode);
+      if (GetMonitorDisplayMode(outputDesc.Monitor, ENUM_CURRENT_SETTINGS, &curMode)
+          && (curMode.dmFields & DM_DISPLAYFREQUENCY)
+          && curMode.dmDisplayFrequency > 1) {
+        const UINT requested = preferredMode.RefreshRate.Denominator
+          ? (preferredMode.RefreshRate.Numerator / preferredMode.RefreshRate.Denominator)
+          : 0;
+        if (curMode.dmDisplayFrequency > requested) {
+          Logger::info(str::format(
+            "[DXGI] Refresh-rate override: game asked for ", requested,
+            "Hz, using monitor native ", curMode.dmDisplayFrequency, "Hz"));
+          preferredMode.RefreshRate.Numerator   = curMode.dmDisplayFrequency;
+          preferredMode.RefreshRate.Denominator = 1;
+        }
+      }
+    }
+
     HRESULT hr = pOutput->FindClosestMatchingMode(
       &preferredMode, &selectedMode, nullptr);
     

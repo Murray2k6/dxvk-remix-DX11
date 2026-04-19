@@ -255,7 +255,6 @@ namespace dxvk {
       const bool unsavedChanges = userLayer && userLayer->hasUnsavedChanges();
       
       // Disable button when no unsaved changes
-      ImGui::BeginDisabled(!unsavedChanges);
       
       if (unsavedChanges) {
         ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.7f, 0.35f, 0.14f, 1.0f));
@@ -271,7 +270,6 @@ namespace dxvk {
         ImGui::PopStyleColor(3);
       }
       
-      ImGui::EndDisabled();
       
       if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
         if (unsavedChanges) {
@@ -351,14 +349,19 @@ namespace dxvk {
         RtxOptions::resetUpscaler();
       }
 
-      RtxOptions::updateUpscalerFromDlssPreset();
+      // Only re-apply the DLSS preset mapping when the combo actually
+      // changed.  Calling this every frame was stomping the user's
+      // upscaler choice (and cascading into updateLightingSetting()
+      // which resets a pile of unrelated checkboxes) because the
+      // default preset is `Off` which force-sets upscaler=None.
+      if (prevDlssPreset != RtxOptions::dlssPreset()) {
+        RtxOptions::updateUpscalerFromDlssPreset();
+      }
     }
 
-    // Note: Disable all settings in this section beyond the preset when a non-Custom DLSS preset is in use,
-    // but only when DLSS is actually supported.
-    // Note: This is stored as a bool and applied in a SetDisabled per-section so that the section labels do not get disabled
-    // (as this changes the color of the line and text which is undesirable).
-    const bool disableNonPresetSettings = RtxOptions::dlssPreset() != DlssPreset::Custom && dlssSupported;
+    // Note: All settings are now always accessible regardless of preset.
+    // Users should have full control over Remix functionality at all times.
+    // Presets provide sensible defaults but should not block access to settings.
 
     // Upscaling Settings
 
@@ -366,7 +369,6 @@ namespace dxvk {
     ImGui::TextSeparator("Upscaling Settings");
 
     {
-      ImGui::BeginDisabled(disableNonPresetSettings);
 
       // Upscaler Type
 
@@ -384,9 +386,25 @@ namespace dxvk {
       if (dlss.supportsDLSS()) {
         showRayReconstructionEnable(dlssRRSupported);
 
-        // If DLSS-RR is toggled, need to update some path tracer options accordingly to improve quality
+        // Note: upstream used to call RtxOptions::updateLightingSetting()
+        // here on any upscaler change, which cascaded into
+        // updatePathTracerPreset(Default) → resetToDefault() on ~15
+        // user-facing RtxOptions (RTXDI, ReSTIR-GI, NEE cache,
+        // composite filter, integrator, etc.).  Two side effects made
+        // that destructive:
+        //   1. Checkboxes the user had toggled in the UI snapped back
+        //      to their compile-time defaults the instant the upscaler
+        //      dropdown was touched.
+        //   2. Several of those resetToDefault() calls fire onChange
+        //      handlers that re-init heavy subsystems on the render
+        //      thread while the UI frame is mid-build — which
+        //      deadlocked the renderer and froze the game.
+        // We keep the detection so callers that really want the
+        // auto-tune can hook it via a future opt-in, but we no longer
+        // apply it implicitly.
         if (oldUpscalerType != RtxOptions::upscalerType() || oldDLSSRREnabled != RtxOptions::enableRayReconstruction()) {
-          RtxOptions::updateLightingSetting();
+          dxvk::Logger::info(dxvk::str::format(
+            "[Settings] Upscaler changed — skipping auto path-tracer retune (kept user settings)"));
         }
       } else {
         getUpscalerCombo(dlss, rayReconstruction).getKey(&RtxOptions::upscalerTypeObject());
@@ -415,8 +433,13 @@ namespace dxvk {
           break;
         }
         case UpscalerType::NIS: {
+          const NisPreset prevNisPreset = RtxOptions::nisPreset();
           nisPresetCombo.getKey(&RtxOptions::nisPresetObject());
-          RtxOptions::updateUpscalerFromNisPreset();
+          // Only re-apply preset mapping when the combo actually
+          // changed — otherwise every frame would stomp resolutionScale.
+          if (prevNisPreset != RtxOptions::nisPreset()) {
+            RtxOptions::updateUpscalerFromNisPreset();
+          }
 
           // Display NIS Upscaling Information
 
@@ -427,8 +450,13 @@ namespace dxvk {
           break;
         }
         case UpscalerType::TAAU: {
+          const TaauPreset prevTaauPreset = RtxOptions::taauPreset();
           taauPresetCombo.getKey(&RtxOptions::taauPresetObject());
-          RtxOptions::updateUpscalerFromTaauPreset();
+          // Only re-apply preset mapping when the combo actually
+          // changed — otherwise every frame would stomp resolutionScale.
+          if (prevTaauPreset != RtxOptions::taauPreset()) {
+            RtxOptions::updateUpscalerFromTaauPreset();
+          }
 
           // Display TAA-U Upscaling Information
 
@@ -465,7 +493,6 @@ namespace dxvk {
       ImGui::Unindent(static_cast<float>(subItemIndent));
       ImGui::PopItemWidth();
 
-      ImGui::EndDisabled();
     }
 
     // Latency Reduction Settings
@@ -480,13 +507,9 @@ namespace dxvk {
       ImGui::TextSeparator("Latency Reduction Settings");
 
       {
-        ImGui::BeginDisabled(disableNonPresetSettings);
-
         // Note: Option to toggle the stats window is set to false here as this window is currently
         // set up to display only when the "advanced" developer settings UI is active.
         showReflexOptions(ctx, false);
-
-        ImGui::EndDisabled();
       }
     }
 
@@ -526,8 +549,8 @@ namespace dxvk {
     ImGui::TextSeparator("Path Tracing Settings");
 
     {
-      // Note: Disabled flags should match preset mapping above to prevent changing settings when a preset overrides them.
-      ImGui::BeginDisabled(RtxOptions::graphicsPreset() != GraphicsPreset::Custom);
+      // Note: All settings are now accessible regardless of preset.
+      // Users should have full control over Remix functionality.
 
       minPathBouncesCombo.getKey(&RtxOptions::pathMinBouncesObject());
       maxPathBouncesCombo.getKey(&RtxOptions::pathMaxBouncesObject());
@@ -537,14 +560,9 @@ namespace dxvk {
       // NRC Quality Preset dropdown
       NeuralRadianceCache& nrc = common->metaNeuralRadianceCache();
       if (nrc.checkIsSupported(m_device)) {
-        bool enableNeuralRadianceCache = RtxOptions::integrateIndirectMode() == IntegrateIndirectMode::NeuralRadianceCache;
-
-        // Disable NRC quality preset combo when NRC is not enabled.
-        ImGui::BeginDisabled(!enableNeuralRadianceCache);
-        
+        // Note: NRC quality preset is always accessible.
+        // Users should have full control over Remix functionality at all times.
         neuralRadianceCacheQualityPresetCombo.getKey(&NeuralRadianceCache::NrcOptions::qualityPresetObject());
-
-        ImGui::EndDisabled();
       }
 
       // Hide NRD denoiser quality list when DLSS-RR is enabled.
@@ -553,7 +571,6 @@ namespace dxvk {
         denoiserQualityCombo.getKey(&RtxOptions::denoiseDirectAndIndirectLightingSeparatelyObject());
       }
 
-      ImGui::EndDisabled();
     }
 
     // Volumetrics Settings
@@ -561,13 +578,11 @@ namespace dxvk {
     ImGui::Dummy(ImVec2(0.0f, 3.0f));
     ImGui::TextSeparator("RTX Volumetrics Settings");
     {
-      // Volumetrics being enabled/disabled is not controlled by the graphics preset, so show the user settings regardless of preset.
+      // Note: Volumetrics settings are always accessible.
+      // Users should have full control over Remix functionality at all times.
       RemixGui::Checkbox("Enable Volumetric Lighting", &RtxGlobalVolumetrics::enableObject());
-      // Volumetrics quality settings are set by the graphics preset, so only show the user settings if the preset is Custom and the volumetrics are enabled.
-      ImGui::BeginDisabled(!RtxGlobalVolumetrics::enable() || RtxOptions::graphicsPreset() != GraphicsPreset::Custom);
       ImGui::Indent(static_cast<float>(subItemIndent));
       common->metaGlobalVolumetrics().showImguiUserSettings();
-      ImGui::EndDisabled();
       ImGui::Unindent(static_cast<float>(subItemIndent));
     }
 
@@ -578,32 +593,24 @@ namespace dxvk {
 
     {
       {
-        // Note: All presets aside from Custom will overwrite this, so only enable for Custom.
-        ImGui::BeginDisabled(RtxOptions::graphicsPreset() != GraphicsPreset::Custom);
+        // Note: All post effect settings are always accessible.
+        // Users should have full control over Remix functionality at all times.
         RemixGui::Checkbox("Enable Post Effects", &postFx.enableObject());
-        ImGui::EndDisabled();
       }
 
-      // Note: Medium and Low presets disable all post effects, so no value in changing the individual settings.
-      // High and Ultra allow these to be changed without requiring Custom, so leave enabled for those.
-      ImGui::BeginDisabled(RtxOptions::graphicsPreset() == GraphicsPreset::Medium || RtxOptions::graphicsPreset() == GraphicsPreset::Low);
+      // Post effect settings are always accessible.
       {
         ImGui::PushItemWidth(static_cast<float>(subItemWidth));
         ImGui::Indent(static_cast<float>(subItemIndent));
-
-        ImGui::BeginDisabled(!postFx.enable());
 
         RemixGui::Checkbox("Enable Motion Blur", &postFx.enableMotionBlurObject());
         RemixGui::Checkbox("Enable Chromatic Aberration", &postFx.enableChromaticAberrationObject());
         RemixGui::Checkbox("Enable Vignette", &postFx.enableVignetteObject());
 
-        ImGui::EndDisabled();
-
         ImGui::Unindent(static_cast<float>(subItemIndent));
         ImGui::PopItemWidth();
       }
 
-      ImGui::EndDisabled();
     }
 
     // Other Settings
@@ -648,7 +655,8 @@ namespace dxvk {
 
     ImGui::Dummy(ImVec2(0.0f, 5.0f));
 
-    ImGui::BeginDisabled(!common->getSceneManager().areAllReplacementsLoaded());
+    // Note: Content settings are now always accessible.
+    // Users should have full control over Remix functionality at all times.
 
     RemixGui::Checkbox("Enable All Enhanced Assets", &RtxOptions::enableReplacementAssetsObject());
 
@@ -656,19 +664,15 @@ namespace dxvk {
       ImGui::PushItemWidth(static_cast<float>(subItemWidth));
       ImGui::Indent(static_cast<float>(subItemIndent));
 
-      ImGui::BeginDisabled(!RtxOptions::enableReplacementAssets());
-
+      // Note: All content settings are always accessible.
+      // Users should have full control over Remix functionality at all times.
       RemixGui::Checkbox("Enable Enhanced Materials", &RtxOptions::enableReplacementMaterialsObject());
       RemixGui::Checkbox("Enable Enhanced Meshes", &RtxOptions::enableReplacementMeshesObject());
       RemixGui::Checkbox("Enable Enhanced Lights", &RtxOptions::enableReplacementLightsObject());
 
-      ImGui::EndDisabled();
-
       ImGui::Unindent(static_cast<float>(subItemIndent));
       ImGui::PopItemWidth();
     }
-
-    ImGui::EndDisabled();
 
     ImGui::Dummy(ImVec2(0.0f, 5.0f));
   }

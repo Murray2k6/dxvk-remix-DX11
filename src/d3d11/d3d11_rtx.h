@@ -68,14 +68,14 @@ namespace dxvk {
     Vector3                              m_smoothedCamPos = Vector3(0.0f);
     bool                                 m_hasPrevCamPos  = false;
 
-    // Most recent real output size seen at EndFrame or OnPresent. Use this to
-    // keep viewport fallback aligned with the actual swapchain instead of
-    // transient intermediate render targets.
+    // Sole source of truth for resize transition detection. Only changes to
+    // this extent trigger `m_resizeTransitionFramesRemaining` and
+    // `resetScreenResolution`.
     VkExtent2D                           m_lastOutputExtent = { 0u, 0u };
 
-    // Most recent HWND client size. Prefer this over the internal present image
-    // extent for viewport fallback so emulators and dynamic-resolution games
-    // follow the user-visible window size.
+    // Used only for viewport fallback — NOT for resize detection. The client
+    // rect may differ from the backbuffer extent (e.g., 640×480 game in a
+    // 1920×1080 window) and must not trigger resize transitions.
     VkExtent2D                           m_lastClientExtent = { 0u, 0u };
 
     // Axis convention auto-detection — voting system accumulates evidence

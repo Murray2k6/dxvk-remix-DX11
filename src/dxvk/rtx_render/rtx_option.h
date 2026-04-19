@@ -229,6 +229,11 @@ namespace dxvk {
     bool isDirty() const;
     void invokeOnChangeCallback(DxvkDevice* device) const;
 
+    // User-override tracking for UI persistence
+    void markUserOverridden() { m_userOverridden = true; }
+    void clearUserOverridden() { m_userOverridden = false; }
+    bool isUserOverridden() const { return m_userOverridden; }
+
     // Migrate all layer values from this option to another option.
     // The lambda does all type conversion (read from src, write to dest).
     // bool isDestValueNew will be supplied to the transform indicating that the dest already has a value in its layer
@@ -262,6 +267,11 @@ namespace dxvk {
     std::function<void(DxvkDevice* device)> m_onChangeCallback;
     
     std::map<RtxOptionLayerKey, PrioritizedValue> m_optionLayerValueQueue;
+
+    // Tracks whether the user has explicitly overridden this option via the UI.
+    // When true, stronger layers (preset, quality, config-file, game-target) will
+    // skip re-populating their values for this option, so the user's UI change persists.
+    bool m_userOverridden = false;
 
     // Returns pointer to value in layer, creating a new entry if not found
     std::pair<GenericValue*, bool> getOrCreateGenericValue(const RtxOptionLayer* layer);
@@ -638,6 +648,16 @@ namespace dxvk {
       const RtxOptionLayer* targetLayer = getTargetLayer(layer);
       if (!targetLayer) {
         return;
+      }
+
+      // If the user has explicitly overridden this option via the UI, skip writes
+      // from layers stronger than the User layer. This prevents config re-reads
+      // and preset re-population from overwriting the user's explicit UI change.
+      if (m_userOverridden) {
+        const RtxOptionLayer* userLayer = RtxOptionLayer::getUserLayer();
+        if (userLayer && targetLayer->getLayerKey() < userLayer->getLayerKey()) {
+          return;
+        }
       }
       
       T* valuePtr = getOrCreateValuePtr<T>(targetLayer);

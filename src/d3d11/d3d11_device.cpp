@@ -3460,16 +3460,26 @@ namespace dxvk {
 
   Rc<DxvkDevice> D3D11DXGIDevice::CreateDevice(D3D_FEATURE_LEVEL FeatureLevel) {
     std::lock_guard lock(g_sharedDeviceMutex);
-    g_sharedDeviceRefCount++;
 
     if (g_sharedDevice != nullptr) {
+      g_sharedDeviceRefCount++;
       Logger::info("D3D11DXGIDevice::CreateDevice: Reusing shared DxvkDevice");
       return g_sharedDevice;
     }
 
     Logger::info("D3D11DXGIDevice::CreateDevice: Creating new shared DxvkDevice");
     DxvkDeviceFeatures deviceFeatures = D3D11Device::GetDeviceFeatures(m_dxvkAdapter, FeatureLevel);
-    g_sharedDevice = m_dxvkAdapter->createDevice(m_dxvkInstance, deviceFeatures);
+    
+    // Create device first, then increment ref count only on success
+    Rc<DxvkDevice> newDevice = m_dxvkAdapter->createDevice(m_dxvkInstance, deviceFeatures);
+    
+    if (newDevice == nullptr) {
+      Logger::err("D3D11DXGIDevice::CreateDevice: Failed to create DxvkDevice");
+      return nullptr;
+    }
+    
+    g_sharedDevice = newDevice;
+    g_sharedDeviceRefCount++;
     return g_sharedDevice;
   }
 

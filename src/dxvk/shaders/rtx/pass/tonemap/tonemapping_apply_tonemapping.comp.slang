@@ -21,6 +21,7 @@
 */
 #include "rtx/pass/tonemap/tonemapping.slangh"
 #include "rtx/pass/tonemap/tonemapping_noise.slangh"
+#include "rtx/pass/tonemap/fork_tonemap_operators.slangh"
 #include "rtx/utility/math.slangh"
 #include "rtx/utility/color.slangh"
 
@@ -129,10 +130,22 @@ float3 applyToneMapping(float3 color, uint2 pixelPosition)
     if (cb.debugMode == 0) 
     {
       // Normal tone mapping
-      color = dynamicToneMapper(color);
-      
-      if (cb.finalizeWithACES)
+      if (cb.directOperatorMode == 0)
       {
+        color = dynamicToneMapper(color);
+      }
+      
+      // Apply the selected tonemap operator (replaces the old finalizeWithACES path).
+      if (cb.tonemapOperator != tonemapOperatorNone)
+      {
+        color = applyTonemapOperator(cb.tonemapOperator, color, false,
+                                     cb.operatorSlot0, cb.operatorSlot1, cb.operatorSlot2, cb.operatorSlot3,
+                                     cb.operatorSlot4, cb.operatorSlot5, cb.operatorSlot6, cb.operatorSlot7);
+      }
+      else if (cb.finalizeWithACES)
+      {
+        // Legacy path: if no new operator is selected but finalizeWithACES is on,
+        // preserve the old behavior.
         color = ACESFilm(color, cb.useLegacyACES);
       }
     } 

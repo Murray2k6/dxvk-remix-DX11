@@ -994,6 +994,31 @@ namespace dxvk {
     }
 
     m_textureCache.clear();
+
+    // Periodically shrink the texture cache's underlying containers to reclaim
+    // memory after eviction. This prevents monotonic memory growth during long
+    // play sessions where textures are loaded and demoted repeatedly.
+    const auto now = std::chrono::steady_clock::now();
+    if (now - m_lastShrinkToFitTime >= kShrinkToFitInterval) {
+      m_textureCache.shrink_to_fit();
+      m_lastShrinkToFitTime = now;
+    }
+
+    // Periodically evict stale entries from the asset hash map to prevent
+    // unbounded growth. Entries not accessed within the TTL are removed.
+    if (now - m_lastAssetHashEvictionTime >= kAssetHashEvictionInterval) {
+      auto l = std::unique_lock{ m_assetHashToTextures_mutex };
+      for (auto it = m_assetHashToTextures.begin(); it != m_assetHashToTextures.end();) {
+        auto accessIt = m_assetHashAccessTimes.find(it->first);
+        if (accessIt != m_assetHashAccessTimes.end() && (now - accessIt->second) >= kAssetHashEvictionTTL) {
+          m_assetHashAccessTimes.erase(accessIt);
+          it = m_assetHashToTextures.erase(it);
+        } else {
+          ++it;
+        }
+      }
+      m_lastAssetHashEvictionTime = now;
+    }
   }
 
   void RtxTextureManager::requestHotReload(const Rc<ManagedTexture>& tex) {
@@ -1452,11 +1477,14 @@ namespace dxvk {
       if (it != m_assetHashToTextures.end()) {
         // Is this truly the same asset?
         if (it->second->m_assetData->info().matches(assetData->info())) {
+          // Update access time for eviction tracking
+          m_assetHashAccessTimes[hash] = std::chrono::steady_clock::now();
           return it->second;
         }
 
         // Else, clear out the old
         m_assetHashToTextures.erase(it);
+        m_assetHashAccessTimes.erase(hash);
       }
     }
 
@@ -1498,8 +1526,7 @@ namespace dxvk {
         texture->m_samplerFeedbackStamp = m_sf.m_idToTexture_count.fetch_add(1);
         m_sf.m_idToTexture.push_back(texture);
       } else {
-        assert(0);
-        Logger::err("Sampler feedback stamp overflow!");
+        ONCE(Logger::warn("Sampler feedback stamp overflow: exceeded SAMPLER_FEEDBACK_MAX_TEXTURE_COUNT. New entry rejected gracefully."));
         texture->m_samplerFeedbackStamp = SAMPLER_FEEDBACK_INVALID;
       }
     }
@@ -1508,6 +1535,8 @@ namespace dxvk {
       FileWatch::get().watchTexture(texture);
 
       auto l = std::unique_lock{ m_assetHashToTextures_mutex };
+      // Record initial access time for eviction tracking
+      m_assetHashAccessTimes[hash] = std::chrono::steady_clock::now();
       return m_assetHashToTextures.emplace(hash, texture).first->second;
     }
   }

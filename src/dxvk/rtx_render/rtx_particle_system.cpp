@@ -184,7 +184,6 @@ namespace dxvk {
       ImGui::Indent();
 
       RemixGui::Checkbox("Enable", &enableObject());
-      ImGui::BeginDisabled(!enable());
       RemixGui::Checkbox("Enable Spawning", &enableSpawningObject());
       RemixGui::DragFloat("Time Scale", &timeScaleObject(), 0.01f, 0.f, 1.f, "%.2f");
 
@@ -240,9 +239,7 @@ namespace dxvk {
         if (ImGui::CollapsingHeader("Simulation", ImGuiTreeNodeFlags_CollapsingHeader | ImGuiTreeNodeFlags_DefaultOpen)) {
           ImGui::Indent();
           RemixGui::DragFloat("Gravity Force", &gravityForceObject(), 0.01f, -1000.f, 1000.f, "%.2f");
-          ImGui::BeginDisabled();
           RemixGui::DragFloat("Max Speed", &maxSpeedObject(), 0.01f, 0.f, 100000.f, "%.2f");
-          ImGui::EndDisabled();
           RemixGui::DragFloat("Drag Coefficient", &dragCoefficientObject(), 0.01f, 0.f, 100.f, "%.2f");
 
           if (ImGui::CollapsingHeader("Attractor", ImGuiTreeNodeFlags_CollapsingHeader | ImGuiTreeNodeFlags_DefaultOpen)) {
@@ -260,7 +257,6 @@ namespace dxvk {
           }
 
           RemixGui::Checkbox("Enable Particle World Collisions", &enableCollisionDetectionObject());
-          ImGui::BeginDisabled(!enableCollisionDetection());
           RemixGui::DragFloat("Collision Restitution", &collisionRestitutionObject(), 0.01f, 0.f, 1.f, "%.2f");
           RemixGui::DragFloat("Collision Thickness", &collisionThicknessObject(), 0.01f, 0.f, 10000.f, "%.2f");
           {
@@ -274,22 +270,16 @@ namespace dxvk {
             collisionModeCombo.getKey(&collisionModeObject());
           }
 
-          ImGui::EndDisabled();
-
           RemixGui::Checkbox("Simulate Turbulence", &useTurbulenceObject());
-          ImGui::BeginDisabled(!useTurbulence());
           RemixGui::DragFloat("Turbulence Force", &turbulenceForceObject(), 0.01f, 0.f, 1000.f, "%.2f");
           RemixGui::DragFloat("Turbulence Frequency", &turbulenceFrequencyObject(), 0.01f, 0.f, 10.f, "%.2f");
-          ImGui::EndDisabled();
           ImGui::Unindent();
         }
 
         if (RemixGui::CollapsingHeader("Visual", ImGuiTreeNodeFlags_DefaultOpen)) {
           RemixGui::Checkbox("Align Particles with Velocity", &alignParticlesToVelocityObject());
           RemixGui::Checkbox("Enable Motion Trail", &enableMotionTrailObject());
-          ImGui::BeginDisabled(!enableMotionTrail());
           RemixGui::DragFloat("Motion Trail Length Multiplier", &motionTrailMultiplierObject(), 0.01f, 0.001f, 10000.f, "%.2f");
-          ImGui::EndDisabled();
           {
             static auto billboardTypeCombo = RemixGui::ComboWithKey<ParticleBillboardType>(
               "Billboard Type",
@@ -330,7 +320,6 @@ namespace dxvk {
         ImGui::Unindent();
       }
       ImGui::Unindent();
-      ImGui::EndDisabled();
       ImGui::PopID();
     }
   }

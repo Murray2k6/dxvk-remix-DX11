@@ -98,18 +98,32 @@ struct ToneMappingCurveArgs {
   uint pad2;
 };
 
+// Tonemap operator constants — must match TonemapOperator enum in rtx_fork_tonemap.h.
+static const uint32_t tonemapOperatorNone        = 0;
+static const uint32_t tonemapOperatorACES        = 1;
+static const uint32_t tonemapOperatorACESLegacy  = 2;
+static const uint32_t tonemapOperatorHableFilmic = 3;
+static const uint32_t tonemapOperatorAgX         = 4;
+static const uint32_t tonemapOperatorLottes      = 5;
+
+// Operator parameter slots — shared between mutually exclusive operators.
+// Hable Filmic uses all 8 slots (A-F + exposureBias + whitePoint).
+// AgX maps: slot0=gamma, slot1=saturation, slot2=exposureOffset, slot3=look(as float),
+//           slot4=contrast, slot5=slope, slot6=power, slot7=unused.
+// Lottes maps: slot0=hdrMax, slot1=contrast, slot2=shoulder, slot3=midIn, slot4=midOut,
+//              slot5-7=unused.
+
 struct ToneMappingApplyToneMappingArgs {
   uint toneMappingEnabled;
-  uint debugMode; // If true shows from left to right: Reinhard (0-0.25), Heji Burgess-Dawson (0.25-0.5), and dynamic tone mappers (0.5-1) along with a tone curve on the same screen.
+  uint debugMode;
   uint performSRGBConversion;
   uint enableAutoExposure;
 
-  float shadowContrast;       // See ToneMappingCurveArgs
-  float shadowContrastEnd;    // See ToneMappingCurveArgs
+  float shadowContrast;
+  float shadowContrastEnd;
   float exposureFactor;
   float contrast;
 
-  // Color grading
   vec3 colorBalance;
   uint colorGradingEnabled;
 
@@ -121,7 +135,19 @@ struct ToneMappingApplyToneMappingArgs {
   uint ditherMode;
   uint frameIndex;
   uint useLegacyACES;
-  uint pad1;
+  uint tonemapOperator;
+
+  uint directOperatorMode;
+  float operatorSlot0;        // Hable: exposureBias | AgX: gamma      | Lottes: hdrMax
+  float operatorSlot1;        // Hable: A            | AgX: saturation | Lottes: contrast
+  float operatorSlot2;        // Hable: B            | AgX: expOffset  | Lottes: shoulder
+
+  float operatorSlot3;        // Hable: C            | AgX: look(float)| Lottes: midIn
+  float operatorSlot4;        // Hable: D            | AgX: contrast   | Lottes: midOut
+  float operatorSlot5;        // Hable: E            | AgX: slope      | unused
+  float operatorSlot6;        // Hable: F            | AgX: power      | unused
+  float operatorSlot7;        // Hable: W (white pt) | unused          | unused
+  uint  pad1;
 };
 
 

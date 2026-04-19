@@ -84,7 +84,6 @@ namespace dxvk {
       ImGui::Indent();
 
       RemixGui::Checkbox("Enable", &enableObject());
-      ImGui::BeginDisabled(!enable());
 
       RemixGui::DragInt("Number of Particles", &numberOfParticlesObject(), 0.1f, 1, 100000000, "%d", ImGuiSliderFlags_AlwaysClamp);
 
@@ -109,24 +108,16 @@ namespace dxvk {
         RemixGui::DragFloat("Max Speed", &maxSpeedObject(), 0.01f, 0.f, 100.f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
 
         RemixGui::Checkbox("Simulate Turbulence", &useTurbulenceObject());
-        ImGui::BeginDisabled(!useTurbulence());
         RemixGui::DragFloat("Turbulence Amplitude", &turbulenceAmplitudeObject(), 0.01f, 0.f, 10.f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
         RemixGui::DragFloat("Turbulence Frequency", &turbulenceFrequencyObject(), 0.01f, 0.f, 10.f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
-        ImGui::EndDisabled();
       }
       ImGui::Unindent();
-      ImGui::EndDisabled();
       ImGui::PopID();
     }
   }
 
 
   void setupRasterizerState(RtxContext* ctx, const Resources::Resource& output) {
-    // Save current viewport and render target state
-    const uint32_t prevViewportCount = ctx->getCurrentViewportCount();
-    const DxvkViewportState prevViewportState = ctx->getCurrentViewportState();
-    const DxvkRenderTargets prevRenderTargets = ctx->getCurrentRenderTargets();
-
     DxvkInputAssemblyState iaState;
     iaState.primitiveTopology = VK_PRIMITIVE_TOPOLOGY_POINT_LIST;
     iaState.primitiveRestart = VK_FALSE;

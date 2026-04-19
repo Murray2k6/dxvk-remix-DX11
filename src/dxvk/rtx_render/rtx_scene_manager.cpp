@@ -1061,6 +1061,30 @@ namespace dxvk {
         auto& infoTable = m_drawCallMeta.infos[m_drawCallMeta.ticker];
         auto& mergedMeta = infoTable[instance->surface.objectPickingValue];
         mergedMeta.mergeFrom(meta);
+        mergedMeta.drawCallCount++;
+        if (mergedMeta.drawCallCount > 1) {
+          // Note: This is informational, not an error. Multiple draw calls sharing the same
+          // objectPickingValue is common in games. The merged MetaInfo is used for object picking.
+          // Users can assign unique picking values via remixapi_InstanceInfoObjectPickingEXT if
+          // they need to distinguish between individual draw calls.
+          ONCE(Logger::info(str::format(
+            "Found ", mergedMeta.drawCallCount,
+            " draw calls with objectPickingValue=", instance->surface.objectPickingValue,
+            ". Using merged MetaInfo for object picking.")));
+          // NOTE: Automatic sub-ID disambiguation (e.g. pickingValue * 1000 + collisionIndex) was
+          // evaluated and intentionally NOT implemented. Reasons:
+          //  1. GPU-side mismatch: The GPU picking buffer (PrimaryObjectPicking) is written per-pixel
+          //     in geometry_resolver.slangh using surface.objectPickingValue from RtSurface, which is
+          //     set in rtx_instance_manager.cpp. Changing the value only in this CPU-side metadata
+          //     table would desync the GPU readback from the CPU lookup.
+          //  2. Reverse lookup breakage: findLegacyTextureHashByObjectPickingValue() does exact-match
+          //     lookups — sub-IDs in the table wouldn't match the original value from the GPU buffer.
+          //  3. API contract: Users set objectPickingValue via remixapi_InstanceInfoObjectPickingEXT
+          //     and expect those exact values back from pick_RequestObjectPicking callbacks.
+          //  4. Non-deterministic ordering: Draw call order can vary per frame, making sub-ID
+          //     assignment unstable and unsuitable for consistent object selection.
+          // The improved warning above is the correct fix — users should assign unique picking values.
+        }
       }
     }
 

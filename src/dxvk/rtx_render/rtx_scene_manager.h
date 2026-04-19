@@ -337,6 +337,7 @@ private:
     std::vector<XXH64_hash_t> legacyTextureHashes {};
     std::vector<XXH64_hash_t> geometryHashes {};
     std::vector<XXH64_hash_t> materialHashes {};
+    uint32_t drawCallCount { 0 };
 
     static void addUniqueHash(std::vector<XXH64_hash_t>& hashes, XXH64_hash_t hash) {
       if (hash == kEmptyHash) {

@@ -31,6 +31,7 @@
 #include "rtx_io.h"
 #include "dxvk_raytracing.h"
 #include "rtx_debug_view.h"
+#include <chrono>
 
 namespace dxvk {
   RtxInitializer::RtxInitializer(DxvkDevice* device)
@@ -178,9 +179,31 @@ namespace dxvk {
       return;
     }
 
-    // Wait for all shader prewarming to complete
-    while (m_device->getCommon()->pipelineManager().isCompilingShaders()) {
+    // Wait for all shader prewarming to complete.  Log progress every
+    // second so we can diagnose hangs in the "Compiling shaders..."
+    // state, and bail out with a clear log after 120s instead of
+    // deadlocking the caller (which, with asyncShaderFinalizing=false,
+    // is the device-init thread invoked from the game's splash-screen
+    // present path).
+    auto& pm = m_device->getCommon()->pipelineManager();
+    const auto start = std::chrono::steady_clock::now();
+    uint32_t lastLogSec = 0;
+    while (pm.isCompilingShaders()) {
       Sleep(1);
+      const auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::steady_clock::now() - start).count();
+      if (elapsed >= 120) {
+        Logger::err(str::format(
+          "[ShaderPrewarm] timed out after 120s; remix shaders still in flight=",
+          pm.remixShaderCompilationCount(), " — giving up to avoid splash deadlock"));
+        break;
+      }
+      if (static_cast<uint32_t>(elapsed) != lastLogSec) {
+        lastLogSec = static_cast<uint32_t>(elapsed);
+        Logger::info(str::format(
+          "[ShaderPrewarm] still compiling... t=", lastLogSec,
+          "s remixInFlight=", pm.remixShaderCompilationCount()));
+      }
     }
 
     DxvkRaytracingPipeline::releaseFinalizer();

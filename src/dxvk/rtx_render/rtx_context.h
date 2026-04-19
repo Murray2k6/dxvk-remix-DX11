@@ -75,10 +75,9 @@ namespace dxvk {
           return m_state.om.renderTargets;
         }
 
-        // Getter for viewport count (returns max viewports, or adjust as needed)
+        // Getter for viewport count (returns active viewport count from rasterizer state)
         uint32_t getCurrentViewportCount() const {
-          // If you want the number of active viewports, adjust as needed
-          return static_cast<uint32_t>(m_state.vp.viewports.size());
+          return m_state.gp.state.rs.viewportCount();
         }
     
     RtxContext(const Rc<DxvkDevice>& device);

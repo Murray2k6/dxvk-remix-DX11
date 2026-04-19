@@ -298,7 +298,6 @@ namespace dxvk {
     }
     
     // Save button (disabled if no unsaved changes)
-    ImGui::BeginDisabled(!hasUnsaved);
     const std::string saveId = std::string("Save##") + idSuffix;
     if (ImGui::Button(saveId.c_str(), ImVec2(buttonWidth, 0))) {
       layer->save();
@@ -307,7 +306,6 @@ namespace dxvk {
     if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
       ImGui::SetTooltip("Save unsaved changes to %s.", layer->getFilePath().c_str());
     }
-    ImGui::EndDisabled();
     
     ImGui::SameLine();
     

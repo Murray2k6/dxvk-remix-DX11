@@ -56,12 +56,10 @@ namespace dxvk {
       ImGui::Indent();
 
       RemixGui::Checkbox("Enable Culling", &enableObject());
-      ImGui::BeginDisabled(!enable());
 
       RemixGui::DragFloat("Culling Radius", &cullingRadiusObject(), 10.f, fadeStartRadius(), 100000.f, "%.0f");
       RemixGui::DragFloat("Fade Start Radius", &fadeStartRadiusObject(), 10.f, 0.f, cullingRadius(), "%.0f");
 
-      ImGui::EndDisabled();
       ImGui::Unindent();
       ImGui::PopID();
     }

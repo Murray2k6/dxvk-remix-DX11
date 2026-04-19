@@ -598,8 +598,8 @@ namespace dxvk {
         sPrevUnsupportedRequestedUpscaler = requestedUpscaler;
         sPrevUnsupportedResolvedUpscaler = resolvedUpscaler;
       }
-
-      RtxOptions::upscalerType.setImmediately(resolvedUpscaler, RtxOptionLayer::getQualityLayer());
+      // Write fallback to Derived layer (weaker than User) so user can still override.
+      RtxOptions::upscalerType.setImmediately(resolvedUpscaler, RtxOptionLayer::getDerivedLayer());
     } else {
       sPrevUnsupportedRequestedUpscaler = UpscalerType::None;
       sPrevUnsupportedResolvedUpscaler = UpscalerType::None;
@@ -1953,7 +1953,7 @@ namespace dxvk {
     // but the reset of denoised buffers causes wide tone curve differences
     // until it converges and thus making comparison of raytracing mode outputs more difficult
     setFramePassStage(RtxFramePassStage::ToneMapping);
-    if (RtxOptions::tonemappingMode() == TonemappingMode::Global) {
+    if (RtxOptions::tonemappingMode() == TonemappingMode::Global || RtxOptions::tonemappingMode() == TonemappingMode::Direct) {
       DxvkToneMapping& toneMapper = m_common->metaToneMapping();
       toneMapper.dispatch(this, 
         getResourceManager().getSampler(VK_FILTER_LINEAR, VK_SAMPLER_MIPMAP_MODE_NEAREST, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER),

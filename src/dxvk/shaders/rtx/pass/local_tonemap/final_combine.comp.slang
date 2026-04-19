@@ -22,6 +22,7 @@
 #include "rtx/pass/local_tonemap/local_tonemapping.slangh"
 #include "rtx/pass/tonemap/tonemapping.slangh"
 #include "rtx/pass/tonemap/tonemapping_noise.slangh"
+#include "rtx/pass/tonemap/fork_tonemap_operators.slangh"
 
 [[vk::binding(FINAL_COMBINE_BLUE_NOISE_TEXTURE_INPUT)]]
 Texture2DArray BlueNoise;
@@ -105,8 +106,16 @@ void main(uint2 threadId : SV_DispatchThreadID)
     mix(1.0, finalMultiplier, (luminance / lerpToUnityThreshold) * (luminance / lerpToUnityThreshold));
 
   vec3 texelFinal = originalColor.xyz * finalMultiplier;
-  if (cb.finalizeWithACES)
+  // Apply the selected tonemap operator (replaces the old finalizeWithACES path).
+  if (cb.tonemapOperator != tonemapOperatorNone)
   {
+    texelFinal = applyTonemapOperator(cb.tonemapOperator, texelFinal, false,
+                                      cb.operatorSlot0, cb.operatorSlot1, cb.operatorSlot2, cb.operatorSlot3,
+                                      cb.operatorSlot4, cb.operatorSlot5, cb.operatorSlot6, cb.operatorSlot7);
+  }
+  else if (cb.finalizeWithACES)
+  {
+    // Legacy path: preserve old behavior when no new operator is selected.
     texelFinal = ACESFilm(texelFinal, cb.useLegacyACES);
   }
   if (cb.performSRGBConversion)

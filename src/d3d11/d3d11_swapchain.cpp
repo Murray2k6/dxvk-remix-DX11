@@ -6,6 +6,8 @@
 #include "../dxvk/rtx_render/rtx_option_manager.h"
 #include "../util/log/log.h"
 
+#include <chrono>
+#include <future>
 #include <mutex>
 #include <unordered_map>
 
@@ -28,6 +30,16 @@ namespace dxvk {
   // takes over.
   static std::mutex          g_primaryMutex;
   static D3D11SwapChain*     g_primarySwapChain = nullptr;
+
+  // Hysteresis state for primary election: a candidate must be "clearly better"
+  // for kPrimaryHysteresisFrames consecutive frames before it can steal primary.
+  // Prevents single-frame thrashing between similar swapchains in Unity.
+  // Raised from 3 to 5: at 60fps this requires ~83ms of sustained advantage
+  // (up from ~50ms), which prevents typical UI bursts (4–6 frames) from
+  // causing election thrashing between the main game and overlay swapchains.
+  static constexpr uint32_t  kPrimaryHysteresisFrames = 5;
+  static D3D11SwapChain*     g_primaryChallenger = nullptr;
+  static uint32_t            g_primaryChallengerFrames = 0;
 
   static bool isVirtualKeyPressedNow(UINT vk) {
     return (::GetAsyncKeyState(static_cast<int>(vk)) & 0x8000) != 0;
@@ -272,14 +284,33 @@ namespace dxvk {
       m_prevWndProc = nullptr;
     }
 
-    m_device->waitForSubmission(&m_presentStatus);
-    m_device->waitForIdle();
+    // Use a bounded wait so the destructor cannot block the message queue
+    // indefinitely when the GPU is stalled or a submission is stuck.
+    constexpr auto kDestructorTimeout = std::chrono::seconds(5);
+
+    auto waitFuture = std::async(std::launch::async, [this]() {
+      m_device->waitForSubmission(&m_presentStatus);
+      m_device->waitForIdle();
+    });
+
+    if (waitFuture.wait_for(kDestructorTimeout) == std::future_status::timeout) {
+      Logger::warn("D3D11SwapChain::~D3D11SwapChain: "
+        "waitForIdle timed out after 5 seconds — proceeding with destruction");
+    }
 
     // Release primary swap chain ownership so the next one can take over.
     {
       std::lock_guard<std::mutex> lk(g_primaryMutex);
-      if (g_primarySwapChain == this)
+      if (g_primarySwapChain == this) {
         g_primarySwapChain = nullptr;
+        g_primaryChallenger = nullptr;
+        g_primaryChallengerFrames = 0;
+      }
+      // If this swapchain was the pending challenger, clear that too.
+      if (g_primaryChallenger == this) {
+        g_primaryChallenger = nullptr;
+        g_primaryChallengerFrames = 0;
+      }
     }
     
     if (m_backBuffer)
@@ -526,8 +557,44 @@ namespace dxvk {
     const uint32_t thisDraws = immediateContext->m_rtx.getDrawCallID();
     m_lastPresentDrawCount = thisDraws;
 
+    // Device-independent Alt+X poll: if the user pressed the Remix hotkey,
+    // force this visible swapchain to claim primary so the UI can render
+    // even when primary election is stuck on another (idle/dummy) chain.
+    // Uses GetAsyncKeyState rising-edge so it works regardless of WndProc state.
+    {
+      static bool s_altXPrevDown = false;
+      const bool altDown = (::GetAsyncKeyState(VK_MENU) & 0x8000) != 0;
+      const bool xDown   = (::GetAsyncKeyState('X') & 0x8000) != 0;
+      const bool bothDown = altDown && xDown;
+      const bool rising = bothDown && !s_altXPrevDown;
+      s_altXPrevDown = bothDown;
+
+      if (rising && IsWindow(m_window) && IsWindowVisible(m_window) && !IsIconic(m_window)) {
+        // Re-install WndProc hook on this window so subsequent key events reach ImGui.
+        std::lock_guard<std::mutex> lk(g_d3d11WndProcMutex);
+        WNDPROC current = reinterpret_cast<WNDPROC>(GetWindowLongPtrW(m_window, GWLP_WNDPROC));
+        if (current != D3D11SwapChainWndProc) {
+          m_prevWndProc = current;
+          SetWindowLongPtrW(m_window, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(D3D11SwapChainWndProc));
+        }
+        g_d3d11WndProcMap[m_window] = this;
+
+        // Force primary to this chain so the very next frame renders UI.
+        std::lock_guard<std::mutex> pk(g_primaryMutex);
+        if (g_primarySwapChain != this) {
+          Logger::info(str::format("[D3D11SwapChain] Alt+X pressed — forcing primary from ",
+            (uintptr_t)g_primarySwapChain, " to ", (uintptr_t)this, " (HWND=", (uintptr_t)m_window, ")"));
+          g_primarySwapChain = this;
+          // Reset hysteresis so the forced primary is not immediately challenged.
+          g_primaryChallenger = nullptr;
+          g_primaryChallengerFrames = 0;
+        }
+      }
+    }
+
     struct PrimaryCandidateInfo {
       bool visible = false;
+      bool isForeground = false;
       bool exactClientMatch = false;
       bool nearClientMatch = false;
       bool hasDraws = false;
@@ -554,6 +621,7 @@ namespace dxvk {
         return info;
 
       info.visible = IsWindow(sc->m_window) && IsWindowVisible(sc->m_window) && !IsIconic(sc->m_window);
+      info.isForeground = (sc->m_window == GetForegroundWindow());
 
       RECT clientRect = {};
       if (IsWindow(sc->m_window) && GetClientRect(sc->m_window, &clientRect)) {
@@ -584,25 +652,41 @@ namespace dxvk {
     };
 
     auto isClearlyBetterCandidate = [](const PrimaryCandidateInfo& candidate, const PrimaryCandidateInfo& current) {
+      // Priority 1: Visibility — invisible windows never win.
       if (candidate.visible != current.visible)
         return candidate.visible;
 
-      if (candidate.exactClientMatch != current.exactClientMatch)
-        return candidate.exactClientMatch;
+      // NOTE: exactClientMatch and nearClientMatch are intentionally NOT checked here.
+      // These fields are retained in PrimaryCandidateInfo for logging/diagnostics only.
+      // Client-rect matching penalizes games rendering at non-native resolution (e.g., 720p
+      // in a 1080p window) and allows smaller secondary swapchains to steal primary when their
+      // backbuffer happens to match their window size. Backbuffer area and draw count are more
+      // reliable signals for identifying the main game swapchain. (See requirement 2.2)
 
-      if (candidate.nearClientMatch != current.nearClientMatch)
-        return candidate.nearClientMatch;
+      // Priority 2: Foreground window — strongest signal for the main game window in
+      // multi-window games. The foreground window is the one the user is interacting with.
+      // (See requirements 2.1, 2.6)
+      if (candidate.isForeground != current.isForeground)
+        return candidate.isForeground;
 
+      // Priority 3: Has draws — a swapchain actively drawing is more likely the game.
       if (candidate.hasDraws != current.hasDraws)
         return candidate.hasDraws;
 
       if (current.area == 0)
         return candidate.area > 0;
 
-      if (candidate.area > current.area + current.area / 8)
+      // Priority 4: Area with incumbency advantage — require the candidate to have more than
+      // double the current primary's area (100% margin). This prevents marginal candidates
+      // (e.g., a UI burst on a slightly larger surface) from stealing primary while the
+      // current primary is still healthy. (See requirement 2.5)
+      if (candidate.area > current.area * 2)
         return true;
 
-      if (candidate.draws > current.draws + 32)
+      // Priority 5: Draw count with higher threshold — require 64 extra draws to differentiate.
+      // A higher threshold prevents transient draw-count spikes (UI updates, loading screens)
+      // from causing election thrashing. (See requirement 2.5)
+      if (candidate.draws > current.draws + 64)
         return true;
 
       return false;
@@ -614,14 +698,35 @@ namespace dxvk {
       std::lock_guard<std::mutex> lk(g_primaryMutex);
       previousPrimary = g_primarySwapChain;
       if (g_primarySwapChain == nullptr || !IsWindow(g_primarySwapChain->m_window)) {
+        // No current primary or its window is gone — elect immediately (no hysteresis).
         g_primarySwapChain = this;
+        g_primaryChallenger = nullptr;
+        g_primaryChallengerFrames = 0;
         stole = true;
       } else if (g_primarySwapChain != this && thisDraws > 0) {
         const PrimaryCandidateInfo candidate = describeCandidate(this);
         const PrimaryCandidateInfo current = describeCandidate(g_primarySwapChain);
         if (isClearlyBetterCandidate(candidate, current)) {
-          g_primarySwapChain = this;
-          stole = true;
+          // Candidate is better — apply hysteresis before allowing the steal.
+          if (g_primaryChallenger == this) {
+            ++g_primaryChallengerFrames;
+          } else {
+            // Different challenger or first challenge — start counting.
+            g_primaryChallenger = this;
+            g_primaryChallengerFrames = 1;
+          }
+          if (g_primaryChallengerFrames >= kPrimaryHysteresisFrames) {
+            g_primarySwapChain = this;
+            g_primaryChallenger = nullptr;
+            g_primaryChallengerFrames = 0;
+            stole = true;
+          }
+        } else {
+          // Current primary is still at least as good — reset challenger state.
+          if (g_primaryChallenger == this) {
+            g_primaryChallenger = nullptr;
+            g_primaryChallengerFrames = 0;
+          }
         }
       }
       isPrimary = (g_primarySwapChain == this);

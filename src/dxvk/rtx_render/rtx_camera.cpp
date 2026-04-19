@@ -1186,7 +1186,6 @@ namespace dxvk
 
     // Record Button
     {
-      ImGui::BeginDisabled(isPlaying);
 
       if (isRecording) {
         ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.5, 0, 0, 1));
@@ -1200,14 +1199,12 @@ namespace dxvk
       if (isRecording) {
         ImGui::PopStyleColor(2);
       }
-      ImGui::EndDisabled();
     }
 
     ImGui::SameLine();
 
     // Play Button
     {
-      ImGui::BeginDisabled(isRecording);
 
       if (isPlaying) {
         ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0, 0.5, 0, 1));
@@ -1222,7 +1219,6 @@ namespace dxvk
         ImGui::PopStyleColor(2);
       }
 
-      ImGui::EndDisabled();
     }
 
     ImGui::SameLine();
@@ -1239,7 +1235,6 @@ namespace dxvk
 
     // Browse Button
     {
-      ImGui::BeginDisabled(isRecording || isPlaying);
 
       if (isBrowsing) {
         ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.5, 0.5, 0, 1));
@@ -1255,7 +1250,6 @@ namespace dxvk
         ImGui::PopStyleColor(2);
       }
 
-      ImGui::EndDisabled();
     }
 
     ImGui::Text("Total Frames: %d", m_settings.size());

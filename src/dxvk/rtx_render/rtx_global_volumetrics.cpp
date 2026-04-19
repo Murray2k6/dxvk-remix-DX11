@@ -240,7 +240,6 @@ namespace dxvk {
         RemixGui::Checkbox("Enable Reference Mode", &enableReferenceModeObject());
         RemixGui::Separator();
 
-        ImGui::BeginDisabled(enableReferenceMode());
 
         m_rebuildFroxels |= RemixGui::DragInt("Restir Grid Downsample Factor", &restirGridScaleObject(), 0.1f, 1);
         m_rebuildFroxels |= RemixGui::DragInt("Restir Froxel Depth Slices", &restirFroxelDepthSlicesObject(), 0.1f, 1, UINT16_MAX);
@@ -248,24 +247,17 @@ namespace dxvk {
 
         RemixGui::DragInt("Initial RIS Sample Count", &initialRISSampleCountObject(), 0.05f, 1, UINT8_MAX);
         RemixGui::Checkbox("Enable Initial Visibility", &enableInitialVisibilityObject());
-        ImGui::BeginDisabled(!enableInitialVisibility());
         RemixGui::Checkbox("Enable Visibility Reuse", &visibilityReuseObject());
-        ImGui::EndDisabled();
 
         RemixGui::Checkbox("Enable Temporal Resampling", &enableTemporalResamplingObject());
-        ImGui::BeginDisabled(!enableTemporalResampling());
         RemixGui::DragInt("Temporal Resampling Max Sample Count", &temporalReuseMaxSampleCountObject(), 1.0f, 1, UINT16_MAX);
-        ImGui::EndDisabled();
 
         RemixGui::Separator();
 
         RemixGui::Checkbox("Enable Spatial Resampling", &enableSpatialResamplingObject());
-        ImGui::BeginDisabled(!enableSpatialResampling());
         RemixGui::DragInt("Spatial Resampling Max Sample Count", &spatialReuseMaxSampleCountObject(), 1.0f, 1, UINT16_MAX);
         RemixGui::DragFloat("Clamped Spatial Resampling Search Radius", &spatialReuseSamplingRadiusObject(), 0.01f, 0.0f, 10.0f, "%.3f", ImGuiSliderFlags_AlwaysClamp);
-        ImGui::EndDisabled();
 
-        ImGui::EndDisabled();
       }
 
       ImGui::Unindent();
@@ -277,7 +269,6 @@ namespace dxvk {
       RemixGui::Checkbox("Enable Volumetric Lighting", &enableObject());
       {
         ImGui::Indent();
-        ImGui::BeginDisabled(!enable());
 
         const char* volumericPresetName[] = {
           "-Select Preset and Hit Apply-",
@@ -322,7 +313,6 @@ namespace dxvk {
 
           RemixGui::Checkbox("Enable Heterogeneous Fog", &enableHeterogeneousFogObject());
 
-          ImGui::BeginDisabled(!enableHeterogeneousFog());
           RemixGui::DragFloat("Noise Field Substep Size", &noiseFieldSubStepSizeMetersObject(), 0.01f, 0.0f, FLT_MAX, "%.2f", ImGuiSliderFlags_AlwaysClamp);
           RemixGui::DragInt("Noise Field Number of Octaves", &noiseFieldOctavesObject(), 0.05f, 1, 8);
           RemixGui::DragFloat("Noise Field Time Scale", &noiseFieldTimeScaleObject(), 0.01f, 0.0f, FLT_MAX, "%.2f", ImGuiSliderFlags_AlwaysClamp);
@@ -331,19 +321,16 @@ namespace dxvk {
           RemixGui::DragFloat("Noise Field Initial Frequency", &noiseFieldInitialFrequencyPerMeterObject(), 0.01f, 0.0f, FLT_MAX, "%.3f", ImGuiSliderFlags_AlwaysClamp);
           RemixGui::DragFloat("Noise Field Lacunarity", &noiseFieldLacunarityObject(), 0.01f, 0.0f, FLT_MAX, "%.2f", ImGuiSliderFlags_AlwaysClamp);
           RemixGui::DragFloat("Noise Field Gain", &noiseFieldGainObject(), 0.01f, 0.0f, FLT_MAX, "%.2f", ImGuiSliderFlags_AlwaysClamp);
-          ImGui::EndDisabled();
         }
 
         RemixGui::Separator();
 
         RemixGui::Checkbox("Atmosphere Enabled", &enableAtmosphereObject());
         ImGui::Indent();
-        ImGui::BeginDisabled(!enableAtmosphere());
         {
           RemixGui::DragFloat("Planet Radius", &atmospherePlanetRadiusMetersObject(), 0.1f, -FLT_MAX, FLT_MAX, "%.2f", ImGuiSliderFlags_AlwaysClamp);
           RemixGui::DragFloat("Height", &atmosphereHeightMetersObject(), 0.1f, -FLT_MAX, FLT_MAX, "%.2f", ImGuiSliderFlags_AlwaysClamp);
           RemixGui::Checkbox("Inverted", &atmosphereInvertedObject());
-          ImGui::EndDisabled();
         }
         ImGui::Unindent();
 
@@ -351,7 +338,6 @@ namespace dxvk {
         RemixGui::Checkbox("Enable Legacy Fog Remapping", &enableFogRemapObject());
         RemixGui::Separator();
 
-        ImGui::BeginDisabled(!enableFogRemap());
         {
           ImGui::Indent();
 
@@ -359,7 +345,6 @@ namespace dxvk {
 
           RemixGui::Checkbox("Enable Fog Max Distance Remapping", &enableFogMaxDistanceRemapObject());
 
-          ImGui::BeginDisabled(!enableFogMaxDistanceRemap());
           {
             // Use dynamic bounds to prevent min > max configurations
             RemixGui::DragFloat("Legacy Max Distance Min", &fogRemapMaxDistanceMinMetersObject(), 0.25f, 0.0f, fogRemapMaxDistanceMaxMeters(), "%.2f", ImGuiSliderFlags_AlwaysClamp);
@@ -367,15 +352,12 @@ namespace dxvk {
             RemixGui::DragFloat("Remapped Transmittance Measurement Distance Min", &fogRemapTransmittanceMeasurementDistanceMinMetersObject(), 0.25f, 0.0f, fogRemapTransmittanceMeasurementDistanceMaxMeters(), "%.2f", ImGuiSliderFlags_AlwaysClamp);
             RemixGui::DragFloat("Remapped Transmittance Measurement Distance Max", &fogRemapTransmittanceMeasurementDistanceMaxMetersObject(), 0.25f, fogRemapTransmittanceMeasurementDistanceMinMeters(), FLT_MAX, "%.2f", ImGuiSliderFlags_AlwaysClamp);
           }
-          ImGui::EndDisabled();
 
           RemixGui::DragFloat("Color Multiscattering Scale", &fogRemapColorMultiscatteringScaleObject(), 0.01f, 0.0f, FLT_MAX, "%.2f", ImGuiSliderFlags_AlwaysClamp);
 
           ImGui::Unindent();
         }
-        ImGui::EndDisabled();
 
-        ImGui::EndDisabled();
         ImGui::Unindent();
       }
 

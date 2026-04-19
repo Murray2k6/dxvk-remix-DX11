@@ -160,7 +160,7 @@ namespace dxvk {
   static constexpr RtxOptionLayerKey kRtxOptionLayerEnvironmentKey = { 5,          "Environment Variable Overrides" };  // Env vars set initial value, can be overridden by code
   static constexpr RtxOptionLayerKey kRtxOptionLayerDerivedKey     = { 6,          "Derived Settings" };  // OnChange callbacks when no menu is open
   static constexpr RtxOptionLayerKey kRtxOptionLayerUserKey        = { 0xFFFFFFFE, "User Settings" };
-  static constexpr RtxOptionLayerKey kRtxOptionLayerQualityKey     = { 0xFFFFFFFF, "Quality Presets" };  // Highest priority when preset is not Custom
+  static constexpr RtxOptionLayerKey kRtxOptionLayerQualityKey     = { 0xFFFFFFFF, "Quality Presets" };
 
 }  // namespace dxvk
 

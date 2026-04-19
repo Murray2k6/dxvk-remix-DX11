@@ -311,14 +311,39 @@ namespace RemixGui {
   bool Checkbox(const char* label, bool* v, float boxScale /*=1.f*/) {
     if (shouldSkip()) {
       return false;
-    } 
+    }
+
+    // Record the row start BEFORE beginFieldRow advances the cursor so
+    // we can extend the hit area to cover the entire row (label + box).
+    ImGuiWindow* window = GetCurrentWindow();
+    const ImVec2 rowStart = window->DC.CursorPos;
 
     FieldRow fr = beginFieldRow(label);
     PushID(label);
     BeginGroup();
-    const bool changed = checkboxCore("##v", v, boxScale);
+    bool changed = checkboxCore("##v", v, boxScale);
     EndGroup();
     PopID();
+
+    // Full-row click-through: if the checkbox square itself wasn't
+    // clicked, accept clicks anywhere on the same row (over the label
+    // text) as a toggle.  This matches what users expect from most
+    // settings dialogs and is what the log showed was failing — clicks
+    // were landing on the label text and being ignored.
+    if (!changed) {
+      const float rowBottom = ImMax(window->DC.CursorPos.y, rowStart.y + GetFrameHeight());
+      const float rowRight  = window->WorkRect.Max.x;
+      const ImRect rowBb(rowStart, ImVec2(rowRight, rowBottom));
+
+      if (ImGui::IsMouseHoveringRect(rowBb.Min, rowBb.Max) &&
+          ImGui::IsMouseClicked(ImGuiMouseButton_Left) &&
+          !ImGui::IsAnyItemActive() &&
+          GImGui->HoveredWindow == window) {
+        *v = !*v;
+        changed = true;
+      }
+    }
+
     endFieldRowFromLastItem(fr);
     return changed;
   }

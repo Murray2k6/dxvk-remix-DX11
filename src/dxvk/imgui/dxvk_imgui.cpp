@@ -182,24 +182,22 @@ namespace dxvk {
   // DirectInput defeater: steal foreground with a tiny invisible helper
   // window when the UI is open.
   //
-  // Bethesda's engine (Skyrim SE / Fallout 4 / Starfield-era) reads mouse
-  // and keyboard state via IDirectInputDevice8::GetDeviceState.  That call
-  // runs on the game's own input thread; it never touches WndProc, never
-  // calls SetCursorPos, and completely bypasses the IAT hook / WndProc
-  // blocking mitigations above.
-  //
-  // The only external, non-invasive way to stop DirectInput is to break
-  // the acquired device's foreground cooperative level: when the game
-  // window loses foreground status, DIERR_INPUTLOST is raised and the
-  // game stops reading input until it regains focus.
-  //
-  // We implement that by creating an off-screen, WS_POPUP, NON-NOACTIVATE
-  // helper window on a dedicated thread and calling SetForegroundWindow
-  // on it when the UI opens.  When the UI closes we hand foreground back
-  // to the game window.  The game pausing during this (e.g. Skyrim's
-  // "game paused" text) is the intended effect — that is exactly what a
-  // modal overlay should look like to the user.
   // ---------------------------------------------------------------------------
+  // FocusSteal — PERMANENTLY DISABLED.
+  //
+  // This entire subsystem is guarded behind #if 0 to prevent accidental
+  // re-enablement.  Two failure modes were observed in the wild:
+  //   1. On true fullscreen-exclusive games, calling SetForegroundWindow
+  //      on an off-screen helper window forces Windows to minimise the
+  //      FSE swapchain and the game vanishes.
+  //   2. On borderless-windowed games the AttachThreadInput dance has
+  //      been observed to hard-crash the D3D11 render thread.
+  //
+  // DI8 force-unacquire + IAT SetCursorPos/ClipCursor/mouse_event/
+  // SendInput hooks + the cursor-unclip watchdog already fully isolate
+  // game input from the Remix UI.
+  // ---------------------------------------------------------------------------
+#if 0
   namespace {
     static std::atomic<bool>   g_focusStealRun      { false };
     static std::atomic<bool>   g_focusStealWanted   { false };
@@ -243,10 +241,7 @@ namespace dxvk {
         HWND gameHwnd = g_focusStealGameHwnd.load(std::memory_order_relaxed);
 
         if (want && !stolen) {
-          // Show briefly so SetForegroundWindow is allowed to take focus
-          // (Windows foreground lock requires an active window).
           ShowWindow(sink, SW_SHOWNOACTIVATE);
-          // AttachThreadInput lets us bypass the foreground lock.
           const DWORD myTid   = GetCurrentThreadId();
           const DWORD gameTid = gameHwnd ? GetWindowThreadProcessId(gameHwnd, nullptr) : 0;
           if (gameTid && gameTid != myTid) {
@@ -260,7 +255,6 @@ namespace dxvk {
           Logger::info("[FocusSteal] stole foreground for UI");
           stolen = true;
         } else if (!want && stolen) {
-          // Hand foreground back to the game window.
           if (gameHwnd) {
             const DWORD myTid   = GetCurrentThreadId();
             const DWORD gameTid = GetWindowThreadProcessId(gameHwnd, nullptr);
@@ -306,6 +300,7 @@ namespace dxvk {
       }
     }
   } // namespace
+#endif // FocusSteal — PERMANENTLY DISABLED
 
   // ---------------------------------------------------------------------------
   // IAT hook for user32!SetCursorPos.
@@ -338,6 +333,9 @@ namespace dxvk {
     static mouse_event_t  g_realMouseEvent   = &::mouse_event;
     static SendInput_t    g_realSendInput    = &::SendInput;
     static std::atomic<bool> g_uiBlocksSetCursorPos { false };
+    // Separate flag: true when the Remix UI is open.  Used by DI8 hooks
+    // to suppress game mouse input without locking/clipping the cursor.
+    static std::atomic<bool> g_uiIsOpen { false };
     static std::atomic<bool> g_setCursorPosHooked { false };
 
     static BOOL WINAPI SetCursorPos_Thunk(int X, int Y) {
@@ -429,37 +427,23 @@ namespace dxvk {
     static std::atomic<DI8_Unacquire_t>        g_realUnacquire      { nullptr };
     static std::atomic<DI8_CreateDevice_t>     g_realCreateDevice   { nullptr };
 
-    // Devices we've seen come out of CreateDevice.  When the UI opens we
-    // walk this list and force-Unacquire each one so Skyrim's exclusive
-    // mouse drops and WM_MOUSEMOVE starts flowing again.
-    static std::mutex g_di8DevicesMtx;
-    static std::vector<IUnknown*> g_di8Devices;
+    // DI8 hooks block game mouse input when the UI is open (g_uiIsOpen)
+    // but do NOT lock/clip the cursor (g_uiBlocksSetCursorPos stays false).
 
     static HRESULT STDMETHODCALLTYPE DI8_GetDeviceState_Thunk(IUnknown* self, DWORD cbData, LPVOID lpvData) {
       auto real = g_realGetDeviceState.load(std::memory_order_relaxed);
       if (!real) return E_FAIL;
       HRESULT hr = real(self, cbData, lpvData);
-      if (SUCCEEDED(hr) && g_uiBlocksSetCursorPos.load(std::memory_order_relaxed) && lpvData && cbData) {
+      if (SUCCEEDED(hr) && g_uiIsOpen.load(std::memory_order_relaxed) && lpvData && cbData) {
         memset(lpvData, 0, cbData);
-        static std::atomic<uint32_t> sLog { 0 };
-        const uint32_t n = sLog.fetch_add(1, std::memory_order_relaxed);
-        if (n < 3) {
-          Logger::info(str::format("[CursorLock] DI8 GetDeviceState zeroed (hit #",
-                                   n + 1, " cb=", cbData, ")"));
-        }
       }
       return hr;
     }
 
     static HRESULT STDMETHODCALLTYPE DI8_GetDeviceData_Thunk(IUnknown* self, DWORD cbOD,
                                                              LPVOID rgdod, LPDWORD pdwInOut, DWORD dwFlags) {
-      if (g_uiBlocksSetCursorPos.load(std::memory_order_relaxed)) {
+      if (g_uiIsOpen.load(std::memory_order_relaxed)) {
         if (pdwInOut) *pdwInOut = 0;
-        static std::atomic<uint32_t> sLog { 0 };
-        const uint32_t n = sLog.fetch_add(1, std::memory_order_relaxed);
-        if (n < 3) {
-          Logger::info(str::format("[CursorLock] DI8 GetDeviceData suppressed (hit #", n + 1, ")"));
-        }
         return kDI_OK;
       }
       auto real = g_realGetDeviceData.load(std::memory_order_relaxed);
@@ -467,18 +451,10 @@ namespace dxvk {
       return real(self, cbOD, rgdod, pdwInOut, dwFlags);
     }
 
-    // Block Acquire while UI is open.  This is critical: Skyrim's mouse
-    // device is created with DISCL_EXCLUSIVE, and when the device is in
-    // the Acquired state the OS suppresses WM_MOUSEMOVE for that
-    // application.  If we let Acquire succeed, ImGui stops seeing mouse
-    // motion on the second UI open (after an Alt-Tab round-trip).
+    // Block Acquire while UI is open so exclusive-mode DI8 devices
+    // drop their hold and WM_MOUSEMOVE flows to ImGui.
     static HRESULT STDMETHODCALLTYPE DI8_Acquire_Thunk(IUnknown* self) {
-      if (g_uiBlocksSetCursorPos.load(std::memory_order_relaxed)) {
-        static std::atomic<uint32_t> sLog { 0 };
-        const uint32_t n = sLog.fetch_add(1, std::memory_order_relaxed);
-        if (n < 5) {
-          Logger::info(str::format("[CursorLock] DI8 Acquire blocked (hit #", n + 1, ")"));
-        }
+      if (g_uiIsOpen.load(std::memory_order_relaxed)) {
         return kDIERR_OTHERAPPHASPRIO;
       }
       auto real = g_realAcquire.load(std::memory_order_relaxed);
@@ -498,7 +474,7 @@ namespace dxvk {
         if (list[i] == vt) return true;
       }
       if (count < kMaxDI8Vtables) { list[count++] = vt; return false; }
-      return true; // full — refuse to patch any more to stay safe
+      return true;
     }
 
     static void patchVtableSlot(void** vtbl, int slot, void* newFn, void** outOld) {
@@ -511,10 +487,12 @@ namespace dxvk {
       }
     }
 
+    static std::mutex g_di8DevicesMtx;
+    static std::vector<IUnknown*> g_di8Devices;
+
     // IDirectInputDevice8 vtable layout (W/A are identical in layout):
     //   3 GetCapabilities  7  Acquire     9  GetDeviceState
     //   4 EnumObjects      8  Unacquire   10 GetDeviceData
-    //   ...                                 23 Poll
     static void hookDI8Device(IUnknown* dev) {
       if (!dev) return;
       void** vtbl = *reinterpret_cast<void***>(dev);
@@ -527,35 +505,38 @@ namespace dxvk {
           if (oldGS && !g_realGetDeviceState.load()) g_realGetDeviceState.store(reinterpret_cast<DI8_GetDeviceState_t>(oldGS));
           if (oldGD && !g_realGetDeviceData.load())  g_realGetDeviceData.store (reinterpret_cast<DI8_GetDeviceData_t>(oldGD));
           if (oldAc && !g_realAcquire.load())        g_realAcquire.store       (reinterpret_cast<DI8_Acquire_t>(oldAc));
-          // Unacquire is slot 8 — we don't patch it, just grab the real
-          // pointer so we can call it to force-drop exclusive mode.
           if (!g_realUnacquire.load()) {
             g_realUnacquire.store(reinterpret_cast<DI8_Unacquire_t>(vtbl[8]));
           }
-          Logger::info(str::format("[DI8] device vtable hooked vt=", vtbl));
         }
       }
-      // Track device instance so we can force-Unacquire it on UI open.
       {
         std::lock_guard<std::mutex> lk(g_di8DevicesMtx);
         bool found = false;
         for (auto* d : g_di8Devices) { if (d == dev) { found = true; break; } }
-        if (!found) g_di8Devices.push_back(dev);
+        if (!found) {
+          dev->AddRef();
+          g_di8Devices.push_back(dev);
+        }
       }
     }
 
-    // Force-unacquire every DI8 device we know about.  Called on UI-open
-    // rising edge so that any device Skyrim re-Acquired while we were
-    // idle (e.g. across an Alt-Tab) drops its exclusive hold.
+    static bool safeCallUnacquire(DI8_Unacquire_t fn, IUnknown* dev) {
+      __try {
+        fn(dev);
+        return true;
+      } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+      }
+    }
+
     static void forceUnacquireAllDI8Devices() {
       auto real = g_realUnacquire.load(std::memory_order_relaxed);
       if (!real) return;
       std::lock_guard<std::mutex> lk(g_di8DevicesMtx);
       for (IUnknown* dev : g_di8Devices) {
-        if (dev) real(dev);
-      }
-      if (!g_di8Devices.empty()) {
-        Logger::info(str::format("[DI8] force-unacquired ", g_di8Devices.size(), " device(s) on UI open"));
+        if (!dev) continue;
+        safeCallUnacquire(real, dev);
       }
     }
 
@@ -580,7 +561,6 @@ namespace dxvk {
       if (old && !g_realCreateDevice.load()) {
         g_realCreateDevice.store(reinterpret_cast<DI8_CreateDevice_t>(old));
       }
-      Logger::info(str::format("[DI8] IDirectInput8 vtable hooked vt=", vtbl));
     }
 
     static HRESULT WINAPI DirectInput8Create_Thunk(HINSTANCE hinst, DWORD dwVersion,
@@ -1136,13 +1116,13 @@ namespace dxvk {
     bool changed = false;
     bool rayReconstruction = RtxOptions::enableRayReconstruction();
     if (RtxOptions::showRayReconstructionOption()) {
-      ImGui::BeginDisabled(!supportsRR);
+      // Note: Ray Reconstruction is always accessible.
+      // Users should have full control over Remix functionality at all times.
       changed = RemixGui::Checkbox("Ray Reconstruction", &RtxOptions::enableRayReconstructionObject());
 
       if (RtxOptions::enableRayReconstruction()) {
         rayReconstructionModelCombo.getKey(&DxvkRayReconstruction::modelObject());
       }
-      ImGui::EndDisabled();
     }
 
     // Disable DLSS-RR if it's unsupported.
@@ -1240,11 +1220,9 @@ namespace dxvk {
     // defeat Skyrim-style DirectInput mouselook (see thunk comment above).
     installSetCursorPosHook();
 
-    // Spawn the focus-steal helper thread.  When the Remix UI opens we
-    // need to drop the game window out of the foreground so DirectInput
-    // acquired devices lose DISCL_FOREGROUND and stop feeding input to
-    // the game's game-thread ticks.  See the FocusSteal namespace.
-    startFocusStealThread();
+    // FocusSteal thread is PERMANENTLY DISABLED — do not start it.
+    // DI8 force-unacquire + IAT hooks already handle input isolation.
+    // See the #if 0 guarded FocusSteal namespace above.
 
     // Launch the cursor-unclip watchdog. It spins at ~200Hz only while the
     // UI is actually open; otherwise it sleeps on a long interval. This is
@@ -1343,13 +1321,11 @@ namespace dxvk {
     m_cursorWatchdogRun.store(false);
     m_cursorWatchdogUiOpen.store(false);
     g_uiBlocksSetCursorPos.store(false);
+    g_uiIsOpen.store(false);
     if (m_cursorWatchdogThread.joinable()) {
       m_cursorWatchdogThread.join();
     }
-    // Stop focus-steal thread and hand foreground back to the game on
-    // the way out.
-    g_focusStealWanted.store(false);
-    stopFocusStealThread();
+    // FocusSteal thread is PERMANENTLY DISABLED — nothing to stop.
 
     g_imguiTextureMap.clear();
 
@@ -1425,116 +1401,36 @@ namespace dxvk {
   }
 
   bool ImGUI::wndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
-    const bool isKeyMsg = (msg >= WM_KEYFIRST && msg <= WM_KEYLAST)
-                       || (msg >= WM_SYSKEYDOWN && msg <= WM_SYSDEADCHAR);
-    const bool isMouseMsg = (msg >= WM_MOUSEFIRST && msg <= WM_MOUSELAST);
-    const bool useOverlayInput = m_overlayWin.ptr() != nullptr && RtxOptions::useNewGuiInputMethod();
-    const bool overlayOwnsInputMsg = useOverlayInput && (isKeyMsg || isMouseMsg || msg == WM_INPUT);
+    // Pin ImGui + ImPlot to the dev menu's private contexts so input events
+    // are written into the correct context. Without this, plugin activity on
+    // other threads can drift GImGui off the dev menu's context, causing
+    // keyboard input (Alt+X etc.) to silently fail.
+    ImGui::SetCurrentContext(m_context);
+    ImPlot::SetCurrentContext(m_plotContext);
 
-    if (!overlayOwnsInputMsg) {
-      ImGui_ImplWin32_WndProcHandler(hWnd, msg, wParam, lParam);
-    }
-
+    // Always forward to the overlay's gameWndProcHandler first (if overlay exists).
+    // The overlay handles keyboard forwarding to ImGui and window management events.
     if (m_overlayWin.ptr() != nullptr) {
       m_overlayWin->gameWndProcHandler(hWnd, msg, wParam, lParam);
     }
 
-    // When the Remix UI is visible, route input correctly:
-    //
-    //   1. If ImGui is capturing the mouse or keyboard (cursor over a window,
-    //      widget focused, slider dragging, etc.), ALWAYS consume the message.
-    //      Otherwise the game sees the click too and reacts — in Skyrim every
-    //      checkbox click becomes a weapon swing / camera re-target, which
-    //      flickers the scene and makes the UI feel unresponsive because the
-    //      click "passes through" the menu. This must happen regardless of
-    //      the blockInputToGameInUI preference: that setting controls the
-    //      broader "freeze the game while the menu is up" behaviour, not
-    //      whether clicks on UI widgets reach the game.
-    //
-    //   2. When blockInputToGameInUI is enabled, also eat UI navigation keys
-    //      and all mouse button messages while the UI is open, even if ImGui
-    //      does not claim them for the current hover position. This is the
-    //      "game paused while menu open" behaviour.
-    //
-    //   3. When the new overlay input method is active the overlay window
-    //      owns the cursor, so we must not swallow messages here.
-    const auto& io = ImGui::GetIO();
+    // Always forward to ImGui's Win32 backend so it sees all input events.
+    // This is critical for checkbox clicks, dropdown selections, slider drags,
+    // and all other widget interactions. The overlay's raw input path (WM_INPUT)
+    // handles mouse position tracking, but ImGui still needs the legacy
+    // WM_LBUTTONDOWN/UP, WM_MOUSEMOVE etc. for widget hit-testing and state.
+    ImGui_ImplWin32_WndProcHandler(hWnd, msg, wParam, lParam);
+
+    const bool isKeyMsg = (msg >= WM_KEYFIRST && msg <= WM_KEYLAST)
+                       || (msg >= WM_SYSKEYDOWN && msg <= WM_SYSDEADCHAR);
+    const bool isMouseMsg = (msg >= WM_MOUSEFIRST && msg <= WM_MOUSELAST);
     const bool uiOpen = getEffectiveUIType() != UIType::None;
 
-    // One-shot diagnostic: log the FIRST mouse button down + the first
-    // mouse move seen while the UI is open, plus ImGui's capture flags
-    // and the OS cursor state. This pinpoints whether the symptom is
-    // "ImGui doesn't see the click" vs. "ImGui sees it but the cursor
-    // is being warped by the game".
-    if (uiOpen && (msg == WM_LBUTTONDOWN || msg == WM_MOUSEMOVE)) {
-      static uint32_t sFirstClickLog = 0;
-      static uint32_t sFirstMoveLog = 0;
-      const bool isClick = (msg == WM_LBUTTONDOWN);
-      uint32_t& counter = isClick ? sFirstClickLog : sFirstMoveLog;
-      if (counter < 3) {
-        ++counter;
-        POINT os = {};
-        ::GetCursorPos(&os);
-        RECT clip = {};
-        ::GetClipCursor(&clip);
-        HWND cap = ::GetCapture();
-        Logger::info(str::format(
-          "[ImGUI-Diag] ", isClick ? "LBUTTONDOWN" : "MOUSEMOVE",
-          " uiOpen=1 wantCapMouse=", io.WantCaptureMouse ? 1 : 0,
-          " wantCapKb=", io.WantCaptureKeyboard ? 1 : 0,
-          " imguiMouse=(", (int)io.MousePos.x, ",", (int)io.MousePos.y, ")",
-          " osCursor=(", os.x, ",", os.y, ")",
-          " clipRect=(", clip.left, ",", clip.top, "-", clip.right, ",", clip.bottom, ")",
-          " capture=", (void*)cap,
-          " gameHwnd=", (void*)m_gameHwnd));
-      }
-    }
-    if (uiOpen && !useOverlayInput) {
-      const bool imguiOwnsMouse = isMouseMsg && io.WantCaptureMouse;
-      const bool imguiOwnsKeyboard = isKeyMsg && io.WantCaptureKeyboard;
-      if (imguiOwnsMouse || imguiOwnsKeyboard) {
-        return true;  // widget interaction — never let it reach the game
-      }
-
-      if (RtxOptions::blockInputToGameInUI()) {
-        const bool isMouseInteractionMsg = msg == WM_MOUSEMOVE
-                                        || msg == WM_MOUSEWHEEL
-                                        || msg == WM_MOUSEHWHEEL
-                                        || msg == WM_LBUTTONDOWN
-                                        || msg == WM_LBUTTONUP
-                                        || msg == WM_LBUTTONDBLCLK
-                                        || msg == WM_RBUTTONDOWN
-                                        || msg == WM_RBUTTONUP
-                                        || msg == WM_RBUTTONDBLCLK
-                                        || msg == WM_MBUTTONDOWN
-                                        || msg == WM_MBUTTONUP
-                                        || msg == WM_MBUTTONDBLCLK
-                                        || msg == WM_XBUTTONDOWN
-                                        || msg == WM_XBUTTONUP
-                                        || msg == WM_XBUTTONDBLCLK;
-        const bool isUiNavigationKey = isKeyMsg && ([](WPARAM key) {
-          switch (key) {
-          case VK_TAB:
-          case VK_LEFT:
-          case VK_RIGHT:
-          case VK_UP:
-          case VK_DOWN:
-          case VK_PRIOR:
-          case VK_NEXT:
-          case VK_HOME:
-          case VK_END:
-          case VK_RETURN:
-          case VK_SPACE:
-          case VK_ESCAPE:
-            return true;
-          default:
-            return false;
-          }
-        })(wParam);
-        if ((isKeyMsg && isUiNavigationKey) || (isMouseMsg && isMouseInteractionMsg)) {
-          return true;
-        }
-      }
+    // When the UI is open, consume ALL mouse and keyboard messages so
+    // the game never sees them. This prevents the game's mouselook,
+    // weapon swings, camera moves etc. from interfering with the UI.
+    if (uiOpen && (isMouseMsg || isKeyMsg)) {
+      return true;
     }
     return false;
   }
@@ -1627,22 +1523,7 @@ namespace dxvk {
 
     m_lastObservedRequestedUiType = type;
 
-    if (readback != type) {
-      Logger::info(str::format("[ImGUI] switchMenu: option layers still override showUI, keeping runtime UI state type=", (int)type));
-    }
-
-    if (readback != type && getEffectiveUIType() != type && allowCrossModuleFallback && m_gameHwnd != nullptr) {
-      Logger::info(str::format("[ImGUI] switchMenu: local write did not stick, forwarding to game HWND=",
-        (uintptr_t)m_gameHwnd, " type=", (int)type));
-      PostMessageW(m_gameHwnd, getRemixToggleUiMessage(), static_cast<WPARAM>(type), force ? 1 : 0);
-    }
-
-    g_lastKnownUiType.store(getEffectiveUIType(), std::memory_order_relaxed);
-
-    if (RtxOptions::blockInputToGameInUI()) {
-      BridgeMessageChannel::get().send("UWM_REMIX_UIACTIVE_MSG",
-                                       type != UIType::None ? 1 : 0, 0);
-    }
+    g_lastKnownUiType.store(type, std::memory_order_relaxed);
   }
 
   void ImGUI::markRemixMenuHotkeyHandled() {
@@ -1927,29 +1808,43 @@ namespace dxvk {
       ImGui::GetIO().MouseDrawCursor = false;
       m_cursorWatchdogUiOpen.store(false, std::memory_order_relaxed);
       g_uiBlocksSetCursorPos.store(false, std::memory_order_relaxed);
-      g_focusStealWanted.store(false, std::memory_order_relaxed);
+      g_uiIsOpen.store(false, std::memory_order_relaxed);
       m_uiWasOpenLastFrame = false;
     } else {
       ImGui::GetIO().MouseDrawCursor = drawImGuiCursor;
       forceOsCursorVisible(!drawImGuiCursor);
-      // Arm the high-frequency cursor-unclip watchdog (runs on its own
-      // thread at ~200Hz; see ctor). This guarantees we beat Skyrim's
-      // game-thread ClipCursor loop even when the render thread drops
-      // to ~10fps while the UI is up.
-      m_cursorWatchdogUiOpen.store(RtxOptions::blockInputToGameInUI(),
-                                   std::memory_order_relaxed);
-      // Neuter user32!SetCursorPos calls coming from the game so its
-      // DirectInput mouselook can't warp the cursor back to centre.
-      g_uiBlocksSetCursorPos.store(RtxOptions::blockInputToGameInUI(),
-                                   std::memory_order_relaxed);
+      // Tell DI8 hooks to suppress game mouse input while UI is open.
+      // g_uiBlocksSetCursorPos stays false — cursor is never locked by our hooks.
+      // But the watchdog must be active to fight the game's ClipCursor calls.
+      g_uiIsOpen.store(true, std::memory_order_relaxed);
+      m_cursorWatchdogUiOpen.store(true, std::memory_order_relaxed);
+      g_uiBlocksSetCursorPos.store(false, std::memory_order_relaxed);
       // Tell the focus-steal helper thread to pull the game out of the
       // foreground so any DirectInput devices acquired with
       // DISCL_FOREGROUND lose acquisition and stop feeding input to the
       // game's logic.  This is the only reliable, non-invasive way to
       // stop DirectInput-based mouselook (Skyrim SE, FO4, etc.).
+      //
+      // FocusSteal is PERMANENTLY DISABLED.  Two failure modes have
+      // been seen in the wild:
+      //   1. On true fullscreen-exclusive games, calling
+      //      SetForegroundWindow on an off-screen helper window forces
+      //      Windows to minimise the FSE swapchain and the game
+      //      vanishes.
+      //   2. On borderless-windowed games (Skyrim SE in many configs)
+      //      the AttachThreadInput dance has been observed to hard-
+      //      crash the D3D11 render thread when the swapchain is
+      //      actively presenting.
+      //
+      // We don't need FocusSteal anyway: DI8 force-unacquire + the IAT
+      // SetCursorPos/ClipCursor/mouse_event/SendInput hooks + the
+      // cursor-unclip watchdog already fully isolate game input from
+      // the Remix UI.  The `[CursorLock] DI8 Acquire blocked` hits in
+      // prior logs prove that path is functioning.
       if (RtxOptions::blockInputToGameInUI()) {
-        g_focusStealGameHwnd.store(m_gameHwnd, std::memory_order_relaxed);
-        g_focusStealWanted.store(true, std::memory_order_relaxed);
+        if (!m_uiWasOpenLastFrame) {
+          Logger::info("[FocusSteal] disabled (DI8 + IAT hooks handle input isolation)");
+        }
       }
       // Re-run the IAT patch on every UI-open transition to catch any
       // modules that were loaded after the initial hook installation
@@ -1959,9 +1854,6 @@ namespace dxvk {
       // thunk was never redirected.
       if (!m_uiWasOpenLastFrame) {
         installSetCursorPosHook();
-        // Force-drop any exclusive-mode DI8 devices Skyrim re-acquired
-        // while the UI was closed.  This restores WM_MOUSEMOVE delivery
-        // so ImGui can see the cursor on the second UI open.
         forceUnacquireAllDI8Devices();
         m_uiWasOpenLastFrame = true;
       }
@@ -2258,7 +2150,6 @@ namespace dxvk {
       ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - 100);
       ImGui::InputText("##ExportFileName", exportFileName, IM_ARRAYSIZE(exportFileName));
       ImGui::SameLine();
-      ImGui::BeginDisabled(!rtxHasUnsaved);
       if (ImGui::Button("Create", ImVec2(-1, 0))) {
         if (rtxConfLayer) {
           std::string exportPath(exportFileName);
@@ -2272,7 +2163,6 @@ namespace dxvk {
           ImGui::SetTooltip("No unsaved changes in rtx.conf to export.");
         }
       }
-      ImGui::EndDisabled();
 
     }
 
@@ -2281,7 +2171,6 @@ namespace dxvk {
     // --- Bottom Buttons ---
     const float buttonWidth = ImGui::GetContentRegionAvail().x / 2 - (ImGui::GetStyle().ItemSpacing.x / 2);
     const bool anyUnsavedChanges = rtxHasUnsaved || userHasUnsaved;
-    ImGui::BeginDisabled(!anyUnsavedChanges);
     if (ImGui::Button("Revert All Unsaved Changes", ImVec2(buttonWidth, 0))) {
       // Reload all layers that have unsaved changes
       if (rtxConfLayer && rtxConfLayer->hasUnsavedChanges()) {
@@ -2298,7 +2187,6 @@ namespace dxvk {
         ImGui::SetTooltip("No unsaved changes to revert.");
       }
     }
-    ImGui::EndDisabled();
 
     ImGui::SameLine();
     if (ImGui::Button("Hide UI", ImVec2(buttonWidth, 0))) {
@@ -2491,13 +2379,10 @@ namespace dxvk {
 
       // Note: Only allow the Recompile Shaders button to function if a shader recompile is not currently in progress (be
       // it one manually initiated by the user, or something automatic from the live shader edit mode).
-      ImGui::BeginDisabled(shaderReloadPhase != ShaderManager::ShaderReloadPhase::Idle);
 
       if (ImGui::Button("Recompile Shaders")) {
         shaderManager->requestReloadShaders();
       }
-
-      ImGui::EndDisabled();
 
       ImGui::SameLine(200.f);
       RemixGui::Checkbox("Live shader edit mode", &RtxOptions::Shader::useLiveEditModeObject());
@@ -2673,10 +2558,10 @@ namespace dxvk {
 
         RemixGui::Checkbox("Skip Objects Rendered with Unknown Camera", &RtxOptions::skipObjectsWithUnknownCameraObject());
 
+        // Note: Near plane override settings are always accessible.
+        // Users should have full control over Remix functionality at all times.
         RemixGui::Checkbox("Override Near Plane (if less than original)", &RtxOptions::enableNearPlaneOverrideObject());
-        ImGui::BeginDisabled(!RtxOptions::enableNearPlaneOverride());
         RemixGui::DragFloat("Desired Near Plane Distance", &RtxOptions::nearPlaneOverrideObject(), 0.01f, 0.0001f, FLT_MAX, "%.3f");
-        ImGui::EndDisabled();
       }
       ImGui::Unindent();
     }
@@ -3133,7 +3018,7 @@ namespace dxvk {
         }
 
         char buffer[256];
-        sprintf_s(buffer, "%s - %s %016llX\n", uniqueId, action, textureHash);
+        sprintf_s(buffer, "[Settings] TextureHash %s - %s %016llX", uniqueId, action, textureHash);
         Logger::info(buffer);
       };
 
@@ -3650,20 +3535,18 @@ namespace dxvk {
       ImGui::Text("No USD enhancements detected, the following options have been disabled.  See documentation for how to use enhancements with Remix.");
     }
 
-    ImGui::BeginDisabled(!ctx->getCommonObjects()->getSceneManager().areAllReplacementsLoaded());
+    // Note: All replacement asset settings are always accessible.
+    // Users should have full control over Remix functionality at all times.
     RemixGui::Checkbox("Enable Enhanced Assets", &RtxOptions::enableReplacementAssetsObject());
     {
       ImGui::Indent();
-      ImGui::BeginDisabled(!RtxOptions::enableReplacementAssets());
 
       RemixGui::Checkbox("Enable Enhanced Materials", &RtxOptions::enableReplacementMaterialsObject());
       RemixGui::Checkbox("Enable Enhanced Meshes", &RtxOptions::enableReplacementMeshesObject());
       RemixGui::Checkbox("Enable Enhanced Lights", &RtxOptions::enableReplacementLightsObject());
 
-      ImGui::EndDisabled();
       ImGui::Unindent();
     }
-    ImGui::EndDisabled();
     RemixGui::Separator();
     RemixGui::Checkbox("Highlight Legacy Materials (flash red)", &RtxOptions::useHighlightLegacyModeObject());
     RemixGui::Checkbox("Highlight Legacy Meshes with Shared Vertex Buffers (dull purple)", &RtxOptions::useHighlightUnsafeAnchorModeObject());
@@ -3776,10 +3659,10 @@ namespace dxvk {
         }
       }
 
+      // Note: Texture category list settings are always accessible.
+      // Users should have full control over Remix functionality at all times.
       RemixGui::Checkbox("Split Texture Category List", &showLegacyTextureGuiObject());
-      ImGui::BeginDisabled(!showLegacyTextureGui());
       RemixGui::Checkbox("Only Show Assigned Textures in Category Lists", &legacyTextureGuiShowAssignedOnlyObject());
-      ImGui::EndDisabled();
 
       separator();
 
@@ -3840,10 +3723,8 @@ namespace dxvk {
           const bool countOnlySelected = legacyTextureGuiShowAssignedOnly() && !(strcmp(uniqueId, Uncategorized) == 0);
           const auto height = calculateTextureCategoryHeight(countOnlySelected, uniqueId, numThumbnailsPerRow, thumbnailSize);
           if (!height.has_value()) {
-            ImGui::BeginDisabled(true);
             const auto label = displayName + std::string { " [Empty]" };
             RemixGui::CollapsingHeader(label.c_str(), collapsingHeaderClosedFlags);
-            ImGui::EndDisabled();
             return;
           }
           const bool isForToggle = (texture_popup::lastOpenCategoryId == uniqueId);
@@ -3947,12 +3828,12 @@ namespace dxvk {
         if (RemixGui::CollapsingHeader("Advanced", collapsingHeaderClosedFlags)) {
           ImGui::Indent();
 
+          // Note: Sky reproject settings are always accessible.
+          // Users should have full control over Remix functionality at all times.
           RemixGui::Checkbox("Reproject Sky to Main Camera", &RtxOptions::skyReprojectToMainCameraSpaceObject());
           {
-            ImGui::BeginDisabled(!RtxOptions::skyReprojectToMainCameraSpace());
             RemixGui::DragFloat("Reprojected Sky Scale", &RtxOptions::skyReprojectScaleObject(), 1.0f, 0.1f, 1000.0f);
             RemixGui::Checkbox("Force Auto-Detected Sky to Reproject", &RtxOptions::skyForceAutoDetectedToReprojectObject());
-            ImGui::EndDisabled();
           }
           RemixGui::DragFloat("Sky Auto-Detect Unique Camera Search Distance", &RtxOptions::skyAutoDetectUniqueCameraDistanceObject(), 1.0f, 0.1f, 1000.0f);
 
@@ -3976,15 +3857,15 @@ namespace dxvk {
 
       if (RtxOptions::Eye::showOptions() && RemixGui::CollapsingHeader("Eyes", collapsingHeaderClosedFlags)) {
         ImGui::Indent();
+        // Note: Eye shading settings are always accessible.
+        // Users should have full control over Remix functionality at all times.
         RemixGui::Checkbox("Enable eye shading", &RtxOptions::Eye::enableObject());
-        ImGui::BeginDisabled(!RtxOptions::Eye::enable());
         RemixGui::Checkbox("Detect texture-generation draw call as Eye", &RtxOptions::Eye::assumeViewTexgenModeAsEyeObject());
         RemixGui::DragFloat("Eye Whites Albedo Scale", &RtxOptions::Eye::eyeWhitesAlbedoScaleObject(), 0.01F);
         RemixGui::DragFloat("Normals: Eyeball Offset", &RtxOptions::Eye::eyeballSphereOffsetObject(), 0.001F);
         RemixGui::DragFloat("Normals: Cornea Offset", &RtxOptions::Eye::corneaSphereOffsetObject(), 0.001F);
         RemixGui::DragFloat("Iris Radius", &RtxOptions::Eye::irisRadiusObject(), 0.001F);
         RemixGui::DragFloat("Iris Depth", &RtxOptions::Eye::irisDepthObject(), 0.001F);
-        ImGui::EndDisabled();
         ImGui::Unindent();
       }
 
@@ -4338,11 +4219,18 @@ namespace dxvk {
   }
 
   void ImGUI::showVsyncOptions(bool enableDLFGGuard) {
-    // we should never get here without a swapchain, so we must have latched the vsync value already
-    assert(RtxOptions::enableVsyncState != EnableVsync::WaitingForImplicitSwapchain);
-    
+    // If the swapchain hasn't latched the vsync state yet (can happen with
+    // borderless windowed D3D11 titles where implicit-swapchain latching is
+    // delayed), don't render the row - don't assert. Rendering against
+    // WaitingForImplicitSwapchain would fire a debug assertion and wedge
+    // the menu on the Graphics tab.
+    if (RtxOptions::enableVsyncState == EnableVsync::WaitingForImplicitSwapchain) {
+      ImGui::TextWrapped("V-Sync: waiting for swapchain (unavailable right now).");
+      return;
+    }
+
     if (enableDLFGGuard && DxvkDLFG::enable()) {
-      ImGui::BeginDisabled();
+      // DLFG active — V-Sync setting still accessible
     }
 
     bool vsyncEnabled = RtxOptions::enableVsyncState == EnableVsync::On;
@@ -4354,18 +4242,14 @@ namespace dxvk {
       RtxOptions::enableVsync.setDeferred(vsyncEnabled ? EnableVsync::On : EnableVsync::Off);
     }
 
-    ImGui::BeginDisabled();
     ImGui::Indent();
     ImGui::TextWrapped("This setting overrides the native game's V-Sync setting.");
     ImGui::Unindent();
-    ImGui::EndDisabled();
     
     if (enableDLFGGuard && DxvkDLFG::enable()) {
       ImGui::Indent();
       ImGui::TextWrapped("When Frame Generation is active, V-Sync is automatically disabled.");
       ImGui::Unindent();
-
-      ImGui::EndDisabled();
     }
   }
 
@@ -4375,7 +4259,7 @@ namespace dxvk {
     const bool supportsMultiFrame = maxInterpolatedFrames > 1;
 
     if (!supportsDLFG) {
-      ImGui::BeginDisabled();
+      // DLFG not supported — settings still accessible
     }
 
     bool dlfgChanged = RemixGui::Checkbox("Enable DLSS Frame Generation", &DxvkDLFG::enableObject());
@@ -4390,7 +4274,7 @@ namespace dxvk {
     }
 
     if (!supportsDLFG) {
-      ImGui::EndDisabled();
+      // end of not-supported section
     }
 
     // Need to change Reflex in sync with DLFG, not on the next frame.
@@ -4416,10 +4300,7 @@ namespace dxvk {
     // Display Reflex mode selector
 
     {
-      bool disableReflexUI = ctx->isDLFGEnabled();
-      ImGui::BeginDisabled(disableReflexUI);
       reflexModeCombo.getKey(&RtxOptions::reflexModeObject());
-      ImGui::EndDisabled();
     }
 
     // Add a button to toggle the Reflex latency stats Window if requested
@@ -4613,9 +4494,13 @@ namespace dxvk {
         getUpscalerCombo(dlss, rayReconstruction).getKey(&RtxOptions::upscalerTypeObject());
         showRayReconstructionEnable(rayReconstruction.supportsRayReconstruction());
 
-        // Update path tracer settings when upscaler is changed or DLSS-RR is toggled.
+        // Note: upstream called updateLightingSetting() here on any
+        // upscaler change, which resets a pile of user-visible
+        // options to compile-time defaults AND deadlocks the render
+        // thread by reinitialising heavy subsystems mid-frame.
+        // Preserve the user's settings instead.
         if (oldUpscalerType != RtxOptions::upscalerType() || oldDLSSRREnabled != RtxOptions::enableRayReconstruction()) {
-          RtxOptions::updateLightingSetting();
+          Logger::info("[Settings] Upscaler changed — skipping auto path-tracer retune (kept user settings)");
         }
       } else {
         getUpscalerCombo(dlss, rayReconstruction).getKey(&RtxOptions::upscalerTypeObject());
@@ -4717,10 +4602,10 @@ namespace dxvk {
         RemixGui::Checkbox("Enable Secondary Bounces", &RtxOptions::enableSecondaryBouncesObject());
         RemixGui::Checkbox("Enable Russian Roulette", &RtxOptions::enableRussianRouletteObject());
         RemixGui::Checkbox("Enable Probability Dithering Filtering for Primary Bounce", &RtxOptions::enableFirstBounceLobeProbabilityDitheringObject());
+        // Note: Unordered resolve settings are always accessible.
+        // Users should have full control over Remix functionality at all times.
         RemixGui::Checkbox("Unordered Resolve in Indirect Rays", &RtxOptions::enableUnorderedResolveInIndirectRaysObject());
-        ImGui::BeginDisabled(!RtxOptions::enableUnorderedResolveInIndirectRays());
         RemixGui::Checkbox("Probabilistic Unordered Resolve in Indirect Rays", &RtxOptions::enableProbabilisticUnorderedResolveInIndirectRaysObject());
-        ImGui::EndDisabled();
         RemixGui::Checkbox("Unordered Emissive Particles in Indirect Rays", &RtxOptions::enableUnorderedEmissiveParticlesInIndirectRaysObject());
         RemixGui::Checkbox("Transmission Approximation in Indirect Rays", &RtxOptions::enableTransmissionApproximationInIndirectRaysObject());
         // # bounces limitted by 4b allocation in payload
@@ -4809,9 +4694,7 @@ namespace dxvk {
         RemixGui::DragFloat("Light Radius", &RtxOptions::effectLightRadiusObject(), 0.01f, 0.01f, FLT_MAX, "%.3f", sliderFlags);
         // Plasma ball has first priority
         RemixGui::Checkbox("Plasma Ball Effect", &RtxOptions::effectLightPlasmaBallObject());
-        ImGui::BeginDisabled(RtxOptions::effectLightPlasmaBall());
         RemixGui::ColorPicker3("Light Color", &RtxOptions::effectLightColorObject());
-        ImGui::EndDisabled();
         ImGui::Unindent();
       }
 
@@ -4928,29 +4811,26 @@ namespace dxvk {
       RemixGui::SliderFloat("Particle Softness", &RtxOptions::particleSoftnessFactorObject(), 0.f, 0.5f);
       RemixGui::Separator();
       if (RemixGui::CollapsingHeader("Weighted Blended OIT", collapsingHeaderClosedFlags)) {
+        // Note: WBOIT settings are always accessible.
+        // Users should have full control over Remix functionality at all times.
         RemixGui::Checkbox("Enable", &RtxOptions::wboitEnabledObject());
-        ImGui::BeginDisabled(!RtxOptions::wboitEnabled());
         RemixGui::SliderFloat("Energy Compensation", &RtxOptions::wboitEnergyLossCompensationObject(), 1.f, 10.f);
         RemixGui::SliderFloat("Depth Weight Tuning", &RtxOptions::wboitDepthWeightTuningObject(), 0.01f, 10.f);
-        ImGui::EndDisabled();
       }
       common->metaComposite().showStochasticAlphaBlendImguiSettings();
       ImGui::Unindent();
     }
 
     if (RemixGui::CollapsingHeader("Denoising", collapsingHeaderClosedFlags)) {
-      bool isRayReconstructionEnabled = RtxOptions::isRayReconstructionEnabled();
-      bool useNRD = !isRayReconstructionEnabled || common->metaRayReconstruction().enableNRDForTraining();
+      // Note: Denoising settings are always accessible.
+      // Users should have full control over Remix functionality at all times.
       ImGui::Indent();
-      ImGui::BeginDisabled(!useNRD);
       RemixGui::Checkbox("Denoising Enabled", &RtxOptions::useDenoiserObject());
       RemixGui::Checkbox("Reference Mode | Accumulation", &RtxOptions::useDenoiserReferenceModeObject());
 
       if (RtxOptions::useDenoiserReferenceMode()) {
         common->metaComposite().showAccumulationImguiSettings();
       }
-
-      ImGui::EndDisabled();
 
       if(RemixGui::CollapsingHeader("Settings", collapsingHeaderClosedFlags)) {
         ImGui::Indent();
@@ -4965,6 +4845,7 @@ namespace dxvk {
         ImGui::Unindent();
       }
       bool useDoubleDenoisers = RtxOptions::denoiseDirectAndIndirectLightingSeparately();
+      bool isRayReconstructionEnabled = RtxOptions::isRayReconstructionEnabled();
       if (isRayReconstructionEnabled) {
         if (RemixGui::CollapsingHeader("DLSS-RR", collapsingHeaderClosedFlags)) {
           ImGui::Indent();
@@ -4975,7 +4856,8 @@ namespace dxvk {
         }
       }
       
-      if (useNRD)
+      // Note: NRD denoiser settings are always accessible.
+      // Users should have full control over Remix functionality at all times.
       {
         if (useDoubleDenoisers) {
           if (RemixGui::CollapsingHeader("Primary Direct Light Denoiser", collapsingHeaderClosedFlags)) {
@@ -5037,8 +4919,8 @@ namespace dxvk {
         RemixGui::SliderInt("User Brightness", &RtxOptions::userBrightnessObject(), 0, 100, "%d");
         RemixGui::DragFloat("User Brightness EV Range", &RtxOptions::userBrightnessEVRangeObject(), 0.5f, 0.f, 10.f, "%.1f");
         RemixGui::Separator();
-        RemixGui::Combo("Tonemapping Mode", &RtxOptions::tonemappingModeObject(), "Global\0Local\0");
-        if (RtxOptions::tonemappingMode() == TonemappingMode::Global) {
+        RemixGui::Combo("Tonemapping Mode", &RtxOptions::tonemappingModeObject(), "Global\0Local\0Direct\0");
+        if (RtxOptions::tonemappingMode() == TonemappingMode::Global || RtxOptions::tonemappingMode() == TonemappingMode::Direct) {
           common->metaToneMapping().showImguiSettings();
         } else {
           common->metaLocalToneMapping().showImguiSettings();
@@ -5088,7 +4970,8 @@ namespace dxvk {
         ImGui::TextColored(ImVec4{ 250 / 255.F, 176 / 255.F, 50 / 255.F, 1.F }, "Hot-reloading active.");
         ImGui::Dummy({ 0, 2 });
       }
-      ImGui::BeginDisabled(!RtxOptions::TextureManager::samplerFeedbackEnable());
+      // Note: Texture manager settings are always accessible.
+      // Users should have full control over Remix functionality at all times.
       {
         if (RtxOptions::TextureManager::fixedBudgetEnable() && RtxOptions::TextureManager::samplerFeedbackEnable()) {
           if (RemixGui::DragFloatMB_showGB("Texture Budget##1",
@@ -5098,7 +4981,6 @@ namespace dxvk {
           }
         } else {
           // always disabled drag float just to show the available texture cache budget
-          ImGui::BeginDisabled(true);
           const char* formatstr = RtxOptions::TextureManager::samplerFeedbackEnable()
             ? "%.1f GB"
             : "UNB%0.0fUND";
@@ -5107,11 +4989,9 @@ namespace dxvk {
             ? float(g_streamedTextures_budgetBytes) / 1024.F / 1024.F / 1024.F
             : 0.F;
           RemixGui::DragFloat("Texture Cache##2", &s_dummy, 0.5f, 1.f, 32.f, formatstr, ImGuiSliderFlags_NoRoundToFormat);
-          ImGui::EndDisabled();
         }
       }
       {
-        ImGui::BeginDisabled(RtxOptions::TextureManager::fixedBudgetEnable());
         if (RemixGui::DragInt("of VRAM is dedicated to Textures",
                             &RtxOptions::TextureManager::budgetPercentageOfAvailableVramObject(),
                             10.F,
@@ -5120,13 +5000,11 @@ namespace dxvk {
                             "%d%%")) {
           ctx->getCommonObjects()->getSceneManager().requestVramCompaction();
         }
-        ImGui::EndDisabled();
       }
       if (RemixGui::Checkbox("Force Fixed Texture Budget", &RtxOptions::TextureManager::fixedBudgetEnableObject())) {
         // budgeting technique changed => ask DXVK to return unused VRAM chunks to OS to better represent consumption
         ctx->getCommonObjects()->getSceneManager().requestVramCompaction();
       }
-      ImGui::EndDisabled();
 
       ImGui::Dummy({ 0, 2 });
       if (RemixGui::CollapsingHeader("Advanced##texstream", collapsingHeaderClosedFlags)) {

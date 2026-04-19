@@ -388,6 +388,11 @@ namespace dxvk {
     // Note: Ensure the matrix is invertable.
     mathValidationAssert(dot1 != 0.0, "Attempted invert a non-invertible matrix.");
 
+    // Return identity matrix for non-invertible matrices to prevent NaN/Inf propagation
+    if (dot1 == 0.0) {
+      return Matrix4Base<T>();
+    }
+
     Matrix4Base<T> output;
 
     for (uint32_t i = 0; i < 16; i++) {

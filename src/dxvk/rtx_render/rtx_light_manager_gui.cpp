@@ -73,9 +73,7 @@ namespace dxvk {
       RemixGui::Separator();
       RemixGui::Checkbox("Enable Debug Visualization", &LightManagerGuiSettings::enableDebugModeObject());
       {
-        ImGui::BeginDisabled(!LightManagerGuiSettings::enableDebugMode());
         RemixGui::Checkbox("Draw Light Hashes", &LightManagerGuiSettings::debugDrawLightHashesObject());
-        ImGui::EndDisabled();
       }
       ImGui::Dummy({ 0,2 });
       ImGui::Unindent();
@@ -105,21 +103,17 @@ namespace dxvk {
 
       // TODO(REMIX-3124) remove this warning
       ImGui::TextColored(ImVec4{ 0.87f, 0.75f, 0.20f, 1.0f }, "Warning: changing Light Conversion values can cause crashes.\nManually entering values is safer than dragging.");
-      ImGui::BeginDisabled(disablePointSpot);
       ImGui::Text("Sphere / Spot Light settings");
       lightSettingsDirty |= RemixGui::Checkbox("Use Least Squares Intensity", &calculateLightIntensityUsingLeastSquaresObject());
       lightSettingsDirty |= RemixGui::DragFloat("Light Radius", &lightConversionSphereLightFixedRadiusObject(), 0.01f, 0.0f, FLT_MAX, "%.3f", ImGuiSliderFlags_AlwaysClamp);
       lightSettingsDirty |= RemixGui::DragFloat("Intensity Factor", &lightConversionIntensityFactorObject(), 0.01f, 0.0f, 2.f, "%.3f");
       lightSettingsDirty |= RemixGui::OptionalDragFloat("Max Intensity", &lightConversionMaxIntensityObject(), 1000000.f, 1.f, 0.0f, FLT_MAX, "%.1f", ImGuiSliderFlags_AlwaysClamp);
-      ImGui::EndDisabled();
 
       separator();
 
-      ImGui::BeginDisabled(disableDirectional);
       ImGui::Text("Distant Light settings");
       lightSettingsDirty |= RemixGui::DragFloat("Fixed Intensity", &lightConversionDistantLightFixedIntensityObject(), 0.01f, 0.0f, FLT_MAX, "%.3f", ImGuiSliderFlags_AlwaysClamp);
       lightSettingsDirty |= RemixGui::DragFloat("Fixed Angle", &lightConversionDistantLightFixedAngleObject(), 0.01f, 0.0f, kPi, "%.4f rad", ImGuiSliderFlags_AlwaysClamp);
-      ImGui::EndDisabled();
 
       separator();
 
@@ -139,9 +133,7 @@ namespace dxvk {
 
       lightSettingsDirty |= fallbackLightModeCombo.getKey(&fallbackLightModeObject());
 
-      ImGui::BeginDisabled(fallbackLightMode() == FallbackLightMode::Never);
-      {
-        lightSettingsDirty |= fallbackLightTypeCombo.getKey(&fallbackLightTypeObject());
+      {        lightSettingsDirty |= fallbackLightTypeCombo.getKey(&fallbackLightTypeObject());
 
         lightSettingsDirty |= RemixGui::DragFloat3("Fallback Light Radiance", &fallbackLightRadianceObject(), 0.1f, 0.0f, FLT_MAX, "%.3f", ImGuiSliderFlags_AlwaysClamp);
 
@@ -171,7 +163,6 @@ namespace dxvk {
           }
         }
       }
-      ImGui::EndDisabled();
 
       ImGui::Unindent();
     }

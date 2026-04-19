@@ -615,7 +615,8 @@ dxvkrt_output_targets = {
 }
 
 # PHASMOPHOBIA BUILD: Comment out tests/rtx to avoid build error
-# subdir('tests/rtx')
+# NOTE: Re-enabled for preservation property tests and bug condition exploration tests
+subdir('tests/rtx')
 
 if dxvk_is_ninja
   # this is how we force meson to reconfigure when external files change

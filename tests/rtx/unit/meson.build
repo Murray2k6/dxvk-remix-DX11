@@ -90,4 +90,19 @@ exe = executable('test_f16tof32',  files('test_f16tof32.cpp'),  include_director
 test('test_f16tof32', exe, env: test_env)
 tests += exe
 
+exe = executable('test_bug_condition_exploration',  files('test_bug_condition_exploration.cpp'), 
+  include_directories : test_include_path, dependencies : [ d3d11_dep, test_unit_deps ], link_with: [ d3d11_dll, dxvk_lib ] , win_subsystem : 'console', override_options: ['cpp_std='+dxvk_cpp_std])
+test('test_bug_condition_exploration', exe, env: test_env)
+tests += exe
+
+exe = executable('test_preservation_properties',  files('test_preservation_properties.cpp'), 
+  include_directories : test_include_path, dependencies : [ d3d11_dep, test_unit_deps ], link_with: [ d3d11_dll, dxvk_lib ] , win_subsystem : 'console', override_options: ['cpp_std='+dxvk_cpp_std])
+test('test_preservation_properties', exe, env: test_env)
+tests += exe
+
+exe = executable('test_viewport_election_bugs',  files('test_viewport_election_bugs.cpp'), 
+  dependencies : test_unit_deps, win_subsystem : 'console', override_options: ['cpp_std='+dxvk_cpp_std])
+test('test_viewport_election_bugs', exe, env: test_env)
+tests += exe
+
 alias_target('unit_tests', tests)

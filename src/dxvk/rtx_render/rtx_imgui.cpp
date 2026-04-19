@@ -1,6 +1,7 @@
 #include "rtx_imgui.h"
 #include "rtx_options.h"
 #include "../imgui/dxvk_imgui.h"
+#include "../../util/log/log.h"
 #include <functional>
 #include <optional>
 
@@ -24,33 +25,18 @@ namespace RemixGui {
       return false;
     }
 
+    // Always force-clear ALL stronger layers so the user's change sticks.
+    // No popups, no warnings — the user clicked a setting, make it work.
     const dxvk::RtxOptionLayer* targetLayer = impl->getTargetLayer();
-    const dxvk::RtxOptionLayer* blockingLayer = impl->getBlockingLayer(targetLayer, hash);
-    
-    if (blockingLayer) {
-      if (targetLayer != nullptr) {
-        impl->clearFromStrongerLayers(targetLayer, hash);
-
-        const dxvk::RtxOptionLayer* remainingBlockingLayer = impl->getBlockingLayer(targetLayer, hash);
-        if (remainingBlockingLayer == nullptr) {
-          if (onApplyAction) {
-            onApplyAction();
-          }
-
-          return false;
-        }
-      }
-      
-      // Show popup for other blocking scenarios
-      s_popupImpl = impl;
-      s_popupTargetLayer = targetLayer;
-      s_popupHash = hash;
-      s_onApplyCallback = std::move(onApplyAction);
-      s_popupPosition = ImGui::GetMousePos();  // Capture position near the clicked widget
-      s_showPopup = true;
-      return true;  // Blocked - popup shown
+    if (targetLayer) {
+      impl->clearFromStrongerLayers(targetLayer, hash);
     }
-    return false;  // Not blocked
+
+    if (onApplyAction) {
+      onApplyAction();
+    }
+
+    return false;  // Never blocked
   }
 
   void RenderRtxOptionBlockedEditPopup() {
@@ -408,7 +394,17 @@ namespace RemixGui {
   }
 
   bool Checkbox(const char* label, dxvk::RtxOption<bool>* rtxOption) {
-    IMGUI_RTXOPTION_WIDGET(Checkbox(label, &value, 0.9f))
+    RemixGui::RtxOptionUxWrapper wrapper(rtxOption);
+    auto value = rtxOption->get();
+    const bool changed = Checkbox(label, &value, 0.9f);
+    if (changed) {
+      if (dxvk::RtxOptions::graphicsPreset() != dxvk::GraphicsPreset::Custom) {
+        dxvk::RtxOptions::graphicsPresetObject().setImmediately(
+          dxvk::GraphicsPreset::Custom, dxvk::RtxOptionLayer::getQualityLayer());
+      }
+      rtxOption->setImmediately(value, dxvk::RtxOptionLayer::getQualityLayer());
+    }
+    return changed;
   }
 
   static bool Items_PairGetter(void* data, int idx, const char** out_text, const char** out_tooltip) {

@@ -334,6 +334,8 @@ dxvk_src = files([
   'rtx_render/rtx_texture_manager.h',
   'rtx_render/rtx_tone_mapping.cpp',
   'rtx_render/rtx_tone_mapping.h',
+  'rtx_render/rtx_fork_tonemap.cpp',
+  'rtx_render/rtx_fork_tonemap.h',
   'rtx_render/rtx_types.cpp',
   'rtx_render/rtx_types.h',
   'rtx_render/rtx_utils.h',

@@ -43,7 +43,7 @@ namespace dxvk {
     m_depthBias.depthBiasClamp    = desc.DepthBiasClamp;
     
     if (desc.AntialiasedLineEnable)
-      Logger::err("D3D11RasterizerState: Antialiased lines not supported");
+      Logger::warn("D3D11RasterizerState: Antialiased lines not supported");
   }
   
   

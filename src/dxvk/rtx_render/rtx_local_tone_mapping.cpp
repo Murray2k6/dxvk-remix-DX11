@@ -20,6 +20,7 @@
 * DEALINGS IN THE SOFTWARE.
 */
 #include "rtx_local_tone_mapping.h"
+#include "rtx_fork_tonemap.h"
 #include "dxvk_device.h"
 #include "dxvk_scoped_annotation.h"
 #include "rtx_render/rtx_shader_manager.h"
@@ -134,6 +135,10 @@ namespace dxvk {
     RemixGui::Checkbox("Boost Local Contrast", &boostLocalContrastObject());
     RemixGui::Checkbox("Use Gaussian Kernel", &useGaussianObject());
     RemixGui::Checkbox("Finalize With ACES", &finalizeWithACESObject());
+
+    // Tonemap operator selection (Hable Filmic, AgX, Lottes, etc.)
+    fork_tonemap::showLocalTonemapOperatorUI();
+
     RemixGui::DragFloat("Exposure Level", &exposureObject(), 0.01f, 0.f, 1000.f, "%.3f", ImGuiSliderFlags_AlwaysClamp);
     RemixGui::DragFloat("Shadow Level", &shadowsObject(), 0.01f, -10.f, 10.f, "%.3f", ImGuiSliderFlags_AlwaysClamp);
     RemixGui::DragFloat("Highlight Level", &highlightsObject(), 0.01f, -10.f, 10.f, "%.3f", ImGuiSliderFlags_AlwaysClamp);
@@ -284,6 +289,9 @@ namespace dxvk {
       case DitherMode::SpatialTemporal: pushArgs.ditherMode = ditherModeSpatialTemporal; break;
       }
       pushArgs.frameIndex = ctx->getDevice()->getCurrentFrameId();
+
+      // Populate tonemap operator fields (Hable, AgX, Lottes, Direct mode).
+      fork_tonemap::populateLocalTonemapOperatorArgs(pushArgs);
 
       ctx->pushConstants(0, sizeof(pushArgs), &pushArgs);
 

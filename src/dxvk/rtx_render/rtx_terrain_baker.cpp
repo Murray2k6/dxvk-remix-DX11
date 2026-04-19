@@ -777,9 +777,7 @@ sharedState.Stages[kTerrainBakerSecondaryTextureSlot].texturePreOffset = texture
         ImGui::Indent();
 
         const bool isPSReplacementSupportEnabled = Material::replacementSupportInPS_legacyPipeline() || Material::replacementSupportInPS_programmableShaders();
-        ImGui::BeginDisabled(!isPSReplacementSupportEnabled);
         RemixGui::Checkbox("Replacements Support in PS", &Material::replacementSupportInPSObject());
-        ImGui::EndDisabled();
 
         RemixGui::Checkbox("Bake Replacement Materials", &Material::bakeReplacementMaterialsObject());
         RemixGui::Checkbox("Bake Secondary PBR Textures", &Material::bakeSecondaryPBRTexturesObject());

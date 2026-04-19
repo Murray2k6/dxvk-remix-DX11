@@ -580,6 +580,17 @@ namespace dxvk {
   }
 
   void RtxOptionImpl::readOptionLayer(const RtxOptionLayer& optionLayer) {
+    // If the user has explicitly overridden this option via the UI, skip re-population
+    // from layers stronger than the User layer. This prevents preset/quality/config layers
+    // from overwriting the user's explicit UI change when they are re-read each frame.
+    if (m_userOverridden) {
+      const RtxOptionLayer* userLayer = RtxOptionLayer::getUserLayer();
+      if (userLayer && optionLayer.getLayerKey() < userLayer->getLayerKey()) {
+        // This layer is stronger than the User layer — skip to preserve the user's UI change
+        return;
+      }
+    }
+
     GenericValueWrapper value(m_type);
     const std::string fullName = getFullName();
     // Only insert into queue when the option can be found in the config of option layer
@@ -659,6 +670,12 @@ namespace dxvk {
     const RtxOptionLayerKey targetKey = targetLayer ? targetLayer->getLayerKey() : kRtxOptionLayerDefaultKey;
     
     bool anyModified = false;
+    
+    // If clearing stronger layers for the User layer, mark this option as user-overridden
+    // so that layer re-population from config files will skip this option.
+    if (targetLayer == RtxOptionLayer::getUserLayer()) {
+      m_userOverridden = true;
+    }
     
     // Iterate through layers stronger than target (keys < targetKey)
     // Map is sorted by RtxOptionLayerKey, strongest (lowest key) first

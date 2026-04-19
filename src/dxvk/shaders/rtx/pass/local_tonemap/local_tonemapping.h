@@ -101,12 +101,22 @@ struct FinalCombineArgs
   uint finalizeWithACES;
   uint performSRGBConversion;
   uint enableAutoExposure;
-  uint pad0;
+  uint tonemapOperator;
 
   uint ditherMode;
   uint frameIndex;
   uint useLegacyACES;
-  uint pad2;
+  uint directOperatorMode;
+
+  float operatorSlot0;
+  float operatorSlot1;
+  float operatorSlot2;
+  float operatorSlot3;
+
+  float operatorSlot4;
+  float operatorSlot5;
+  float operatorSlot6;
+  float operatorSlot7;
 };
 
 

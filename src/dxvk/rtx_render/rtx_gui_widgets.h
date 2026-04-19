@@ -141,6 +141,7 @@ namespace RemixGui {
           bool pressed = ImGui::ButtonBehavior(hitBb, id, &resetButtonHovered, &held, ImGuiButtonFlags_PressedOnClick);
           if (pressed) {
             option->resetToDefault();
+            option->clearUserOverridden();
           }
 
           const ImU32 fill = isNonDefault ? ImGui::GetColorU32((ImU32) 0xFFffc734) : ImGui::GetColorU32((ImU32) 0xFF464646);

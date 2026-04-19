@@ -69,6 +69,15 @@ public:
     m_bufferMap.clear();
   }
 
+  // Releases excess memory from the underlying vector and map.
+  // Call periodically after eviction passes to prevent monotonic memory growth.
+  void shrink_to_fit() {
+    m_objects.shrink_to_fit();
+    // Rehash the map to a bucket count appropriate for the current number of entries,
+    // releasing excess bucket memory from previous high-watermark usage.
+    m_bufferMap.rehash(0);
+  }
+
   uint32_t track(const T& obj, std::function<T(const T&)> onFirstCache = [](const T& in) { return in; }) {
     uint32_t idx;
     if (!find(obj, idx)) {

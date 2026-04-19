@@ -42,6 +42,7 @@
 #include "../../util/util_math.h"
 #include "../../util/util_vector.h"
 #include "../../util/util_string.h"
+#include "../../util/log/log.h"
 
 #include "../../d3d11/d3d11_device.h"
 #include "../../d3d11/d3d11_context_imm.h"
@@ -1597,9 +1598,17 @@ namespace {
       s_dxgiSwapChain = nullptr;
     }
     if (s_d3d11Device) {
+      constexpr ULONG maxReleaseIterations = 1000;
+      ULONG iteration = 0;
       while (true) {
         ULONG left = s_d3d11Device->Release();
         if (left == 0) {
+          break;
+        }
+        ++iteration;
+        if (iteration >= maxReleaseIterations) {
+          dxvk::Logger::err(dxvk::str::format("remixapi_Shutdown: Release loop exceeded ", maxReleaseIterations,
+            " iterations with ", left, " references remaining. Breaking to avoid infinite loop."));
           break;
         }
       }
