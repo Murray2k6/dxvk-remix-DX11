@@ -508,7 +508,9 @@ namespace dxvk {
       const uint32_t blasPrims = blasEntry->modifiedGeometryData.calculatePrimitiveCount();
 
       // Figure out if this blas should be a dynamic one
-      const bool requestDynamicBlas = instance->surface.instancesToObject != nullptr ||    // Point instancer geometry is replicated many times in a scene, we want to reuse the BLAS memory for these objects
+      const bool requestDynamicBlas = instance->usesUnorderedApproximations() ||           // Keep unstable unordered/billboard paths isolated from merged BLAS churn
+                                      instance->getBillboardCount() > 0 ||                 // Billboard-bearing meshes should keep their own BLAS lifecycle
+                                      instance->surface.instancesToObject != nullptr ||    // Point instancer geometry is replicated many times in a scene, we want to reuse the BLAS memory for these objects
                                       blasEntry->input.getSkinningState().numBones != 0 || // Skinned meshes are always desirable to give a dynamic BLAS, since we'll want to make use of BVH update for performance reasons
                                       blasEntry->getLinkedInstances().size() > 1  ||       // Meshes that are used in instances multiple times should benefit from BLAS reuse
                                       blasEntry->dynamicBlas != nullptr ||                 // If we already have a dynamic BLAS, keep using it.
@@ -628,10 +630,27 @@ namespace dxvk {
       // Try to reuse our dynamic BLAS if it exists
       Rc<PooledBlas>& selectedBlas = blasEntry->dynamicBlas;
 
-      bool build = forceRebuild || !selectedBlas.ptr() || selectedBlas->accelStructure->info().size != sizeInfo.accelerationStructureSize;
+      bool forceRebuildForStability = false;
+      if (pair.second.size() > 1 || blasEntry->input.getSkinningState().numBones != 0) {
+        forceRebuildForStability = true;
+      } else {
+        for (RtInstance* rtInstance : pair.second) {
+          if (rtInstance->usesUnorderedApproximations() || rtInstance->getBillboardCount() > 0) {
+            forceRebuildForStability = true;
+            break;
+          }
+        }
+      }
 
-      // Validate that the selected blas is compatible with the current build info for update purposes
-      bool update = blasEntry->frameLastUpdated == currentFrame;
+      bool build = forceRebuild || forceRebuildForStability || !selectedBlas.ptr() || selectedBlas->accelStructure->info().size != sizeInfo.accelerationStructureSize;
+
+      // Validate that the selected BLAS is compatible with the current build info for update purposes.
+      // For cross-vendor stability, do not use BLAS update on:
+      // - skinned meshes
+      // - dynamic BLAS shared across multiple instances
+      // - unordered / billboard-heavy geometry
+      // Those paths are more sensitive to stale geometry or vendor differences.
+      bool update = !forceRebuildForStability && blasEntry->frameLastUpdated == currentFrame;
       if (update && !build && !validateUpdateMode(selectedBlas->buildInfo, buildInfo)) {
         // If an update is requested but the BLAS is not compatible with the current build info then force a rebuild
         update = false;

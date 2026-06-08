@@ -2117,19 +2117,7 @@ namespace dxvk {
       }
     }
     if (showUI != UIType::None && useFreshDx11Ui()) {
-      // Dev-menu routing fix:
-      // The DX11 Fresh UI should own the Basic menu, but the true Developer
-      // menu must still render through showMainMenu(). Without this split,
-      // the Basic->Advanced button updates showUI correctly while the same
-      // Fresh UI keeps rendering, which makes the Dev button appear broken.
-      if (showUI == UIType::Advanced) {
-        showMainMenu(ctx);
-
-        // Uncomment to see the ImGUI demo, good reference!  Also, need to undefine IMGUI_DISABLE_DEMO_WINDOWS (in "imconfig.h")
-        //ImGui::ShowDemoWindow();
-      } else {
-        showFreshMenu(ctx, showUI);
-      }
+      showFreshMenu(ctx, showUI);
     } else if (showUI == UIType::Advanced) {
       showMainMenu(ctx);
 
@@ -3217,15 +3205,7 @@ namespace dxvk {
         }
       }
 
-      if (RemixGui::Checkbox("Always Developer Menu", &RtxOptions::defaultToAdvancedUIObject())) {
-        // Dev-menu fix only:
-        // This option previously changed only the default menu for future opens.
-        // Make the click immediately open the current Developer Menu as well.
-        if (getEffectiveUIType() == UIType::Basic && RtxOptions::defaultToAdvancedUI()) {
-          switchMenu(UIType::Advanced, true);
-          return;
-        }
-      }
+      RemixGui::Checkbox("Always Developer Menu", &RtxOptions::defaultToAdvancedUIObject());
 
       if (RemixGui::SliderFloat("Background Alpha", &backgroundAlphaObject(), 0.0f, 1.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp)) {
         adjustStyleBackgroundAlpha(backgroundAlpha());

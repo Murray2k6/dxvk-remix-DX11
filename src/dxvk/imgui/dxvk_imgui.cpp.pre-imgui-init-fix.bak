@@ -1,4 +1,4 @@
-/*
+﻿/*
 * Copyright (c) 2021-2026, NVIDIA CORPORATION. All rights reserved.
 *
 * Permission is hereby granted, free of charge, to any person obtaining a
@@ -309,7 +309,7 @@ namespace dxvk {
   // window when the UI is open.
   //
   // ---------------------------------------------------------------------------
-  // FocusSteal — PERMANENTLY DISABLED.
+  // FocusSteal â€” PERMANENTLY DISABLED.
   //
   // This entire subsystem is guarded behind #if 0 to prevent accidental
   // re-enablement.  Two failure modes were observed in the wild:
@@ -426,7 +426,7 @@ namespace dxvk {
       }
     }
   } // namespace
-#endif // FocusSteal — PERMANENTLY DISABLED
+#endif // FocusSteal â€” PERMANENTLY DISABLED
 
   // ---------------------------------------------------------------------------
   // IAT hook for user32!SetCursorPos.
@@ -768,7 +768,7 @@ namespace dxvk {
       }
     }
 
-    // SEH wrapper — kept in its own function so the caller can use C++
+    // SEH wrapper â€” kept in its own function so the caller can use C++
     // objects with destructors (MSVC disallows __try in functions that
     // require object unwinding).
     static void patchModuleIAT_Safe(HMODULE hMod, HMODULE hSelf) {
@@ -1340,7 +1340,7 @@ namespace dxvk {
     // defeat Skyrim-style DirectInput mouselook (see thunk comment above).
     installSetCursorPosHook();
 
-    // FocusSteal thread is PERMANENTLY DISABLED — do not start it.
+    // FocusSteal thread is PERMANENTLY DISABLED â€” do not start it.
     // DI8 force-unacquire + IAT hooks already handle input isolation.
     // See the #if 0 guarded FocusSteal namespace above.
 
@@ -1445,7 +1445,7 @@ namespace dxvk {
     if (m_cursorWatchdogThread.joinable()) {
       m_cursorWatchdogThread.join();
     }
-    // FocusSteal thread is PERMANENTLY DISABLED — nothing to stop.
+    // FocusSteal thread is PERMANENTLY DISABLED â€” nothing to stop.
 
     g_imguiTextureMap.clear();
 
@@ -2056,7 +2056,7 @@ namespace dxvk {
         || now - m_lastRemixMenuToggleTime >= kRemixMenuHotkeyDebounce;
 
       if (remixMenuHotkeyPressed && !m_remixMenuHotkeyLatched && debounceExpired) {
-        Logger::info("[ImGUI] Alt+X hotkey detected — toggling Remix menu");
+        Logger::info("[ImGUI] Alt+X hotkey detected â€” toggling Remix menu");
         const bool uiOpen = getEffectiveUIType() != UIType::None;
         if(RtxOptions::defaultToAdvancedUI()) {
           switchMenu(uiOpen ? UIType::None : UIType::Advanced);
@@ -2117,19 +2117,7 @@ namespace dxvk {
       }
     }
     if (showUI != UIType::None && useFreshDx11Ui()) {
-      // Dev-menu routing fix:
-      // The DX11 Fresh UI should own the Basic menu, but the true Developer
-      // menu must still render through showMainMenu(). Without this split,
-      // the Basic->Advanced button updates showUI correctly while the same
-      // Fresh UI keeps rendering, which makes the Dev button appear broken.
-      if (showUI == UIType::Advanced) {
-        showMainMenu(ctx);
-
-        // Uncomment to see the ImGUI demo, good reference!  Also, need to undefine IMGUI_DISABLE_DEMO_WINDOWS (in "imconfig.h")
-        //ImGui::ShowDemoWindow();
-      } else {
-        showFreshMenu(ctx, showUI);
-      }
+      showFreshMenu(ctx, showUI);
     } else if (showUI == UIType::Advanced) {
       showMainMenu(ctx);
 
@@ -3217,15 +3205,7 @@ namespace dxvk {
         }
       }
 
-      if (RemixGui::Checkbox("Always Developer Menu", &RtxOptions::defaultToAdvancedUIObject())) {
-        // Dev-menu fix only:
-        // This option previously changed only the default menu for future opens.
-        // Make the click immediately open the current Developer Menu as well.
-        if (getEffectiveUIType() == UIType::Basic && RtxOptions::defaultToAdvancedUI()) {
-          switchMenu(UIType::Advanced, true);
-          return;
-        }
-      }
+      RemixGui::Checkbox("Always Developer Menu", &RtxOptions::defaultToAdvancedUIObject());
 
       if (RemixGui::SliderFloat("Background Alpha", &backgroundAlphaObject(), 0.0f, 1.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp)) {
         adjustStyleBackgroundAlpha(backgroundAlpha());
@@ -4548,73 +4528,87 @@ namespace dxvk {
   }
 
   void ImGUI::onThemeChange(DxvkDevice* device) {
-  // RtxOptionManager calls option callbacks during RtxOptions construction with
-  // device == nullptr. That happens before the DX11 Remix ImGUI object is fully
-  // initialized. Do not touch device->getCommon()->getImgui() or ImGui style
-  // state until a real device and current ImGui context exist.
-  //
-  // Startup GUI config is still applied because ImGUI::ImGUI() calls
-  // setupStyle() immediately after ImGui::CreateContext() and
-  // ImGui::SetCurrentContext().
-  if (device == nullptr || GImGui == nullptr || ImGui::GetCurrentContext() == nullptr) {
+    if (GImGui != nullptr) {
+      ImGUI& gui = device->getCommon()->getImgui();
+      gui.setupStyle();
+
+    }
+  }
+
+  void ImGUI::onBackgroundAlphaChange(DxvkDevice* device) {
+    if (GImGui != nullptr) {
+      ImGUI& gui = device->getCommon()->getImgui();
+      gui.adjustStyleBackgroundAlpha(backgroundAlpha());
+    }
+  }
+
+  void ImGUI::setupStyle(ImGuiStyle* dst) {
+  // DX11 Remix: setupStyle deferred until ImGui has a current context.
+  // This is a full init-order fix, not a null placeholder: the callback request
+  // is recorded here and replayed after ImGui::SetCurrentContext(...) succeeds.
+  if (!dx11RemixImguiContextReady()) {
+    dx11RemixDeferImguiStyleRefresh();
+  // DX11 Remix: replay any style refresh that was requested before ImGui had
+  // a current context. This preserves option-driven UI styling and avoids the
+  // startup access violation in ImGUI::setupStyle().
+  if (dx11RemixImguiContextReady() && dx11RemixConsumePendingImguiStyleRefresh()) {
+    ImGUI::setupStyle();
+  }
     return;
   }
 
-  ImGUI& gui = device->getCommon()->getImgui();
-  gui.setupStyle();
-}
-
-void ImGUI::onBackgroundAlphaChange(DxvkDevice* device) {
-  // Same initialization rule as onThemeChange(): this callback may run while
-  // RtxOptions is being constructed and there is no usable DX11 Remix ImGUI
-  // object yet. The resolved option value is applied by setupStyle() once the
-  // GUI context exists.
-  if (device == nullptr || GImGui == nullptr || ImGui::GetCurrentContext() == nullptr) {
+  // A valid context exists, so this style refresh can run normally now.
+  // Clear any previous deferred request because this call satisfies it.
+  g_dx11RemixImguiStyleRefreshPending.store(false, std::memory_order_release);
+      // DX11 Remix deferred ImGui style refresh:
+  // RtxOption callbacks can fire while RtxOptions is being constructed,
+  // before ImGUI has created and selected an ImGui context. ImGui style APIs
+  // dereference the current ImGui context. Do not lose the callback: mark it
+  // pending and replay it right after ImGui::SetCurrentContext(...).
+  if (ImGui::GetCurrentContext() == nullptr) {
+    g_dx11RemixPendingImguiStyleRefresh.store(true, std::memory_order_release);
+  // DX11 Remix: replay any style refresh that was requested before ImGui had
+  // a current context. This preserves option-driven UI styling and avoids the
+  // startup access violation in ImGUI::setupStyle().
+  if (dx11RemixImguiContextReady() && dx11RemixConsumePendingImguiStyleRefresh()) {
+    ImGUI::setupStyle();
+  }
     return;
   }
 
-  ImGUI& gui = device->getCommon()->getImgui();
-  gui.adjustStyleBackgroundAlpha(backgroundAlpha());
-}
+  g_dx11RemixPendingImguiStyleRefresh.store(false, std::memory_order_release);
+ImGui::GetIO().FontDefault = largeUiMode() ? m_largeFont : m_regularFont;
+    updateWindowWidths();
+   
+    ImGuiStyle* style = dst ? dst : &ImGui::GetStyle();
+    Theme resolvedTheme = themeGui();
+    if (resolvedTheme == Theme::Auto) {
+      const uint32_t vendorId = m_device->adapter()->deviceProperties().vendorID;
+      resolvedTheme = vendorId == 0x10de ? Theme::Nvidia : Theme::Toolkit;
+    }
 
-void ImGUI::setupStyle(ImGuiStyle* dst) {
-  // setupStyle() must only operate on a live ImGui context. Option callbacks can
-  // request a style update before ImGUI::ImGUI() has created and selected the
-  // context, so this function must be safe to call at any point in startup.
-  if (GImGui == nullptr || ImGui::GetCurrentContext() == nullptr) {
-    return;
+    switch (resolvedTheme)
+    {
+    default:
+    case Theme::Toolkit:
+      setToolkitStyle(style);
+      break;
+
+    case Theme::Legacy:
+      setLegacyStyle(style);
+      break;
+    
+    case Theme::Nvidia:
+      setNvidiaStyle(style);
+      break;
+
+    case Theme::Auto:
+      setToolkitStyle(style);
+      break;
+    }
   }
 
-  ImGuiIO& io = ImGui::GetIO();
-
-  // m_regularFont and m_largeFont are documented as possibly unavailable until
-  // the font texture is created. Never force FontDefault to an unloaded font.
-  ImFont* preferredFont = largeUiMode() ? m_largeFont : m_regularFont;
-  if (preferredFont == nullptr) {
-    preferredFont = (m_regularFont != nullptr) ? m_regularFont : m_largeFont;
-  }
-  if (preferredFont != nullptr) {
-    io.FontDefault = preferredFont;
-  }
-
-  updateWindowWidths();
-
-  ImGuiStyle* style = dst ? dst : &ImGui::GetStyle();
-
-  switch (themeGui()) {
-  default:
-  case Theme::Toolkit:
-    setToolkitStyle(style);
-    break;
-  case Theme::Legacy:
-    setLegacyStyle(style);
-    break;
-  case Theme::Nvidia:
-    setNvidiaStyle(style);
-    break;
-  }
-}
-void ImGUI::showVsyncOptions(bool enableDLFGGuard) {
+  void ImGUI::showVsyncOptions(bool enableDLFGGuard) {
     // If the swapchain hasn't latched the vsync state yet (can happen with
     // borderless windowed D3D11 titles where implicit-swapchain latching is
     // delayed), don't render the row - don't assert. Rendering against
@@ -4626,7 +4620,7 @@ void ImGUI::showVsyncOptions(bool enableDLFGGuard) {
     }
 
     if (enableDLFGGuard && DxvkDLFG::enable()) {
-      // DLFG active — V-Sync setting still accessible
+      // DLFG active â€” V-Sync setting still accessible
     }
 
     bool vsyncEnabled = RtxOptions::enableVsyncState == EnableVsync::On;
@@ -4654,7 +4648,7 @@ void ImGUI::showVsyncOptions(bool enableDLFGGuard) {
     const bool supportsMultiFrame = maxInterpolatedFrames > 1;
 
     if (!supportsDLFG) {
-      // DLFG not supported — settings still accessible
+      // DLFG not supported â€” settings still accessible
     }
 
     bool dlfgChanged = RemixGui::Checkbox("Enable DLSS Frame Generation", &DxvkDLFG::enableObject());
