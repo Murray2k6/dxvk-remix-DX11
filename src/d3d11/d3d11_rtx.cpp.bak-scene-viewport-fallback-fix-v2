@@ -1501,25 +1501,20 @@ namespace dxvk {
       if (vp.Width > 0.0f && vp.Height > 0.0f) {
         float targetWidth = vp.Width;
         float targetHeight = vp.Height;
-        bool haveStableSceneExtent = false;
-        if (m_lastRemixViewportExtent.width > 0u && m_lastRemixViewportExtent.height > 0u) {
-          targetWidth = float(m_lastRemixViewportExtent.width);
-          targetHeight = float(m_lastRemixViewportExtent.height);
-          haveStableSceneExtent = true;
+        if (renderTargetWidth > 0.0f && renderTargetHeight > 0.0f) {
+          targetWidth = renderTargetWidth;
+          targetHeight = renderTargetHeight;
         } else if (m_lastOutputExtent.width > 0u && m_lastOutputExtent.height > 0u) {
           targetWidth = float(m_lastOutputExtent.width);
           targetHeight = float(m_lastOutputExtent.height);
-          haveStableSceneExtent = true;
-        } else if (renderTargetWidth > 0.0f && renderTargetHeight > 0.0f) {
-          targetWidth = renderTargetWidth;
-          targetHeight = renderTargetHeight;
+        } else if (m_lastRemixViewportExtent.width > 0u && m_lastRemixViewportExtent.height > 0u) {
+          targetWidth = float(m_lastRemixViewportExtent.width);
+          targetHeight = float(m_lastRemixViewportExtent.height);
         }
 
         const float targetArea = std::max(targetWidth * targetHeight, 1.0f);
         const float viewportArea = vp.Width * vp.Height;
         const float coverage = std::min(viewportArea, targetArea) / std::max(viewportArea, targetArea);
-        const float widthCoverage = targetWidth > 0.0f ? vp.Width / targetWidth : 0.0f;
-        const float heightCoverage = targetHeight > 0.0f ? vp.Height / targetHeight : 0.0f;
         const float candidateAspect = vp.Width / vp.Height;
         const float viewportCenterX = vp.TopLeftX + vp.Width * 0.5f;
         const float viewportCenterY = vp.TopLeftY + vp.Height * 0.5f;
@@ -1540,23 +1535,10 @@ namespace dxvk {
                                        && candidateAspect >= 0.4f
                                        && candidateAspect <= 5.0f;
         const bool centeredViewport = normalizedCenterOffsetX <= 0.18f && normalizedCenterOffsetY <= 0.18f;
-        const bool stripViewport = widthCoverage < 0.35f || heightCoverage < 0.35f;
-        const bool coversMostOfTarget = widthCoverage >= 0.80f && heightCoverage >= 0.80f;
-        const bool coversSceneLikeExtent = widthCoverage >= 0.55f && heightCoverage >= 0.55f;
+        const bool coversMostOfTarget = coverage >= 0.6f;
         const bool coversMeaningfulArea = coverage >= 0.2f;
 
-        const bool acceptViewportFallback =
-             usableViewport
-          && plausibleSceneAspect
-          && !stripViewport
-          && (
-               coversMostOfTarget
-            || (coversSceneLikeExtent && centeredViewport)
-            || (!haveStableSceneExtent && (coversMeaningfulArea && centeredViewport))
-            || (!haveStableSceneExtent && nearOrigin)
-             );
-
-        if (acceptViewportFallback) {
+        if (usableViewport && plausibleSceneAspect && (coversMostOfTarget || (coversMeaningfulArea && centeredViewport) || nearOrigin)) {
           const float aspect = candidateAspect > 0.0f ? candidateAspect : fallbackReferenceAspect;
           const float fovY   = 60.0f * (3.14159265f / 180.0f);
           const float nearZ  = 0.1f;
@@ -1581,8 +1563,6 @@ namespace dxvk {
               " h=", vp.Height,
               " aspect=", aspect,
               " coverage=", coverage,
-              " widthCov=", widthCoverage,
-              " heightCov=", heightCoverage,
               " centered=", centeredViewport ? 1 : 0,
               " remixViewport=", m_lastRemixViewportExtent.width, "x", m_lastRemixViewportExtent.height,
               " output=", targetWidth, "x", targetHeight,
@@ -1599,8 +1579,6 @@ namespace dxvk {
               " w=", vp.Width,
               " h=", vp.Height,
               " coverage=", coverage,
-              " widthCov=", widthCoverage,
-              " heightCov=", heightCoverage,
               " centered=", centeredViewport ? 1 : 0,
               " remixViewport=", m_lastRemixViewportExtent.width, "x", m_lastRemixViewportExtent.height,
               " aspect=", candidateAspect,
