@@ -1,4 +1,4 @@
-﻿/*
+/*
 * Copyright (c) 2021-2026, NVIDIA CORPORATION. All rights reserved.
 *
 * Permission is hereby granted, free of charge, to any person obtaining a
@@ -77,28 +77,6 @@
 
 
 namespace dxvk {
-namespace {
-  // DX11 Remix startup safety:
-  // RtxOptions can invoke UI style callbacks while the D3D11 device is still
-  // being created. At that point ImGui may not have a current context yet.
-  // Calling ImGui::GetStyle(), ImGui::GetIO(), or font/style accessors with no
-  // current context causes the exact launch crash seen in UE4 titles such as
-  // Hello Neighbor 2:
-  //   ImGUI::setupStyle -> RtxOptionImpl::invokeOnChangeCallback -> RtxOptions
-  std::atomic_bool g_dx11RemixImguiStyleRefreshPending { false };
-
-  inline bool dx11RemixImguiContextReady() {
-    return ImGui::GetCurrentContext() != nullptr;
-  }
-
-  inline void dx11RemixDeferImguiStyleRefresh() {
-    g_dx11RemixImguiStyleRefreshPending.store(true, std::memory_order_release);
-  }
-
-  inline bool dx11RemixConsumePendingImguiStyleRefresh() {
-    return g_dx11RemixImguiStyleRefreshPending.exchange(false, std::memory_order_acq_rel);
-  }
-}
 
 namespace {
   // Set when an RTX option callback asks ImGUI::setupStyle() to run before
@@ -309,7 +287,7 @@ namespace dxvk {
   // window when the UI is open.
   //
   // ---------------------------------------------------------------------------
-  // FocusSteal â€” PERMANENTLY DISABLED.
+  // FocusSteal — PERMANENTLY DISABLED.
   //
   // This entire subsystem is guarded behind #if 0 to prevent accidental
   // re-enablement.  Two failure modes were observed in the wild:
@@ -426,7 +404,7 @@ namespace dxvk {
       }
     }
   } // namespace
-#endif // FocusSteal â€” PERMANENTLY DISABLED
+#endif // FocusSteal — PERMANENTLY DISABLED
 
   // ---------------------------------------------------------------------------
   // IAT hook for user32!SetCursorPos.
@@ -768,7 +746,7 @@ namespace dxvk {
       }
     }
 
-    // SEH wrapper â€” kept in its own function so the caller can use C++
+    // SEH wrapper — kept in its own function so the caller can use C++
     // objects with destructors (MSVC disallows __try in functions that
     // require object unwinding).
     static void patchModuleIAT_Safe(HMODULE hMod, HMODULE hSelf) {
@@ -1315,12 +1293,6 @@ namespace dxvk {
     m_plotContext = ImPlot::CreateContext();
 
     ImGui::SetCurrentContext(m_context);
-  // DX11 Remix: replay any style refresh that was requested before ImGui had
-  // a current context. This preserves option-driven UI styling and avoids the
-  // startup access violation in ImGUI::setupStyle().
-  if (dx11RemixImguiContextReady() && dx11RemixConsumePendingImguiStyleRefresh()) {
-    ImGUI::setupStyle();
-  }
     ImPlot::SetCurrentContext(m_plotContext);
 
     // Setup custom style
@@ -1340,7 +1312,7 @@ namespace dxvk {
     // defeat Skyrim-style DirectInput mouselook (see thunk comment above).
     installSetCursorPosHook();
 
-    // FocusSteal thread is PERMANENTLY DISABLED â€” do not start it.
+    // FocusSteal thread is PERMANENTLY DISABLED — do not start it.
     // DI8 force-unacquire + IAT hooks already handle input isolation.
     // See the #if 0 guarded FocusSteal namespace above.
 
@@ -1445,17 +1417,11 @@ namespace dxvk {
     if (m_cursorWatchdogThread.joinable()) {
       m_cursorWatchdogThread.join();
     }
-    // FocusSteal thread is PERMANENTLY DISABLED â€” nothing to stop.
+    // FocusSteal thread is PERMANENTLY DISABLED — nothing to stop.
 
     g_imguiTextureMap.clear();
 
     ImGui::SetCurrentContext(m_context);
-  // DX11 Remix: replay any style refresh that was requested before ImGui had
-  // a current context. This preserves option-driven UI styling and avoids the
-  // startup access violation in ImGUI::setupStyle().
-  if (dx11RemixImguiContextReady() && dx11RemixConsumePendingImguiStyleRefresh()) {
-    ImGUI::setupStyle();
-  }
     ImPlot::SetCurrentContext(m_plotContext);
 
     if(m_init) {
@@ -1532,12 +1498,6 @@ namespace dxvk {
     // other threads can drift GImGui off the dev menu's context, causing
     // keyboard input (Alt+X etc.) to silently fail.
     ImGui::SetCurrentContext(m_context);
-  // DX11 Remix: replay any style refresh that was requested before ImGui had
-  // a current context. This preserves option-driven UI styling and avoids the
-  // startup access violation in ImGUI::setupStyle().
-  if (dx11RemixImguiContextReady() && dx11RemixConsumePendingImguiStyleRefresh()) {
-    ImGUI::setupStyle();
-  }
   // Replay deferred setupStyle() request once ImGui has a valid current context.
   if (g_dx11RemixPendingImguiStyleRefresh.exchange(false, std::memory_order_acq_rel)) {
     setupStyle();
@@ -2056,7 +2016,7 @@ namespace dxvk {
         || now - m_lastRemixMenuToggleTime >= kRemixMenuHotkeyDebounce;
 
       if (remixMenuHotkeyPressed && !m_remixMenuHotkeyLatched && debounceExpired) {
-        Logger::info("[ImGUI] Alt+X hotkey detected â€” toggling Remix menu");
+        Logger::info("[ImGUI] Alt+X hotkey detected — toggling Remix menu");
         const bool uiOpen = getEffectiveUIType() != UIType::None;
         if(RtxOptions::defaultToAdvancedUI()) {
           switchMenu(uiOpen ? UIType::None : UIType::Advanced);
@@ -4543,23 +4503,6 @@ namespace dxvk {
   }
 
   void ImGUI::setupStyle(ImGuiStyle* dst) {
-  // DX11 Remix: setupStyle deferred until ImGui has a current context.
-  // This is a full init-order fix, not a null placeholder: the callback request
-  // is recorded here and replayed after ImGui::SetCurrentContext(...) succeeds.
-  if (!dx11RemixImguiContextReady()) {
-    dx11RemixDeferImguiStyleRefresh();
-  // DX11 Remix: replay any style refresh that was requested before ImGui had
-  // a current context. This preserves option-driven UI styling and avoids the
-  // startup access violation in ImGUI::setupStyle().
-  if (dx11RemixImguiContextReady() && dx11RemixConsumePendingImguiStyleRefresh()) {
-    ImGUI::setupStyle();
-  }
-    return;
-  }
-
-  // A valid context exists, so this style refresh can run normally now.
-  // Clear any previous deferred request because this call satisfies it.
-  g_dx11RemixImguiStyleRefreshPending.store(false, std::memory_order_release);
       // DX11 Remix deferred ImGui style refresh:
   // RtxOption callbacks can fire while RtxOptions is being constructed,
   // before ImGUI has created and selected an ImGui context. ImGui style APIs
@@ -4567,12 +4510,6 @@ namespace dxvk {
   // pending and replay it right after ImGui::SetCurrentContext(...).
   if (ImGui::GetCurrentContext() == nullptr) {
     g_dx11RemixPendingImguiStyleRefresh.store(true, std::memory_order_release);
-  // DX11 Remix: replay any style refresh that was requested before ImGui had
-  // a current context. This preserves option-driven UI styling and avoids the
-  // startup access violation in ImGUI::setupStyle().
-  if (dx11RemixImguiContextReady() && dx11RemixConsumePendingImguiStyleRefresh()) {
-    ImGUI::setupStyle();
-  }
     return;
   }
 
@@ -4620,7 +4557,7 @@ ImGui::GetIO().FontDefault = largeUiMode() ? m_largeFont : m_regularFont;
     }
 
     if (enableDLFGGuard && DxvkDLFG::enable()) {
-      // DLFG active â€” V-Sync setting still accessible
+      // DLFG active — V-Sync setting still accessible
     }
 
     bool vsyncEnabled = RtxOptions::enableVsyncState == EnableVsync::On;
@@ -4648,7 +4585,7 @@ ImGui::GetIO().FontDefault = largeUiMode() ? m_largeFont : m_regularFont;
     const bool supportsMultiFrame = maxInterpolatedFrames > 1;
 
     if (!supportsDLFG) {
-      // DLFG not supported â€” settings still accessible
+      // DLFG not supported — settings still accessible
     }
 
     bool dlfgChanged = RemixGui::Checkbox("Enable DLSS Frame Generation", &DxvkDLFG::enableObject());
@@ -5632,12 +5569,6 @@ ImGui::GetIO().FontDefault = largeUiMode() ? m_largeFont : m_regularFont;
     m_lastRenderVsyncStatus = vsync;
 
     ImGui::SetCurrentContext(m_context);
-  // DX11 Remix: replay any style refresh that was requested before ImGui had
-  // a current context. This preserves option-driven UI styling and avoids the
-  // startup access violation in ImGUI::setupStyle().
-  if (dx11RemixImguiContextReady() && dx11RemixConsumePendingImguiStyleRefresh()) {
-    ImGUI::setupStyle();
-  }
     ImPlot::SetCurrentContext(m_plotContext);
 
     // Sometimes games can change windows on us, so we need to check that here and tell ImGUI
