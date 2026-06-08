@@ -794,6 +794,8 @@ namespace dxvk {
     const Vector3 worldPosition = blas.input.getGeometryData().boundingBox.getTransformedCentroid(firstInstanceObjectToWorld);
     
     const float uniqueObjectDistanceSqr = RtxOptions::getUniqueObjectDistanceSqr();
+    const XXH64_hash_t currentTexcoordHash = blas.input.getGeometryData().hashes[HashComponents::VertexTexcoord];
+    const XXH64_hash_t currentIndexHash = blas.input.getGeometryData().hashes[HashComponents::Indices];
 
     RtInstance* pSimilar = nullptr;
     float nearestDistSqr = FLT_MAX;
@@ -813,8 +815,15 @@ namespace dxvk {
           // Filter out instances by returning false if the instance:
           // - has already been updated this frame
           // - doesn't use the same material
+          // - doesn't match current UV/index identity when those hashes are available
           // - is a sub prim of a replacement instance
-          return instance->m_frameLastUpdated != currentFrameIdx && instance->m_materialHash == material.getHash() && !instance->m_primInstanceOwner.isSubPrim();
+          const bool texcoordMatches = currentTexcoordHash == kEmptyHash || instance->m_texcoordHash == currentTexcoordHash;
+          const bool indexMatches = currentIndexHash == kEmptyHash || instance->m_indexHash == currentIndexHash;
+          return instance->m_frameLastUpdated != currentFrameIdx
+              && instance->m_materialHash == material.getHash()
+              && texcoordMatches
+              && indexMatches
+              && !instance->m_primInstanceOwner.isSubPrim();
         }
       ));
       if (nearestDistSqr == 0.0f && result != nullptr) {
@@ -1913,6 +1922,7 @@ namespace dxvk {
     auto disableUnsupportedUnorderedInstance = [&](const char* reason) {
       ONCE(Logger::info(str::format("[RTX] InstanceManager: disabling unsupported unordered instance from RT path: ", reason)));
       instance.getVkInstance().mask = 0;
+      instance.m_isUnordered = false;
       instance.m_billboardCount = 0;
     };
 

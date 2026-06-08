@@ -92,14 +92,8 @@ namespace {
     const uint32_t primitiveCount = input.getGeometryData().calculatePrimitiveCount();
     if (primitiveCount >= 64u)
       score += 1.0f;
-    else if (primitiveCount >= 16u)
-      score += 0.5f;
-    else if (primitiveCount <= 2u)
-      score -= 8.0f;
     else if (primitiveCount <= 4u)
-      score -= 5.0f;
-    else if (primitiveCount <= 8u)
-      score -= 3.0f;
+      score -= 1.5f;
 
     if (std::isfinite(projection.aspectRatio) && projection.aspectRatio > 0.5f && projection.aspectRatio < 4.0f)
       score += 0.5f;
@@ -239,37 +233,10 @@ namespace dxvk {
 
     auto& camera = getCamera(cameraType);
     auto cameraSequence = RtCameraSequence::getInstance();
-    const uint32_t primitiveCount = input.getGeometryData().calculatePrimitiveCount();
     const float candidateScore = cameraType == CameraType::Main
       ? scoreMainCameraCandidate(input, decomposeProjectionParams)
       : 0.0f;
     bool shouldUpdateMainCamera = cameraType == CameraType::Main && camera.getLastUpdateFrame() != frameId;
-
-    const bool suspiciousTinyCbufferMainCandidate =
-      cameraType == CameraType::Main &&
-      !input.getTransformData().usedViewportFallbackProjection &&
-      !input.isDrawingToRaytracedRenderTarget &&
-      primitiveCount <= 2u;
-
-    if (suspiciousTinyCbufferMainCandidate
-        && (m_hasSeenRealMainCamera || camera.getLastUpdateFrame() == frameId)) {
-      m_lastSetCameraType = CameraType::Unknown;
-
-      static uint32_t sTinyCbufferMainCameraLogCount = 0;
-      if (sTinyCbufferMainCameraLogCount < 16) {
-        ++sTinyCbufferMainCameraLogCount;
-        Logger::info(str::format(
-          "[RTX] CameraManager: rejected tiny cbuffer main-camera candidate (primitives=",
-          primitiveCount,
-          " score=",
-          candidateScore,
-          " drawCallID=",
-          input.drawCallID,
-          ")"));
-      }
-
-      return input.getCategoryFlags().test(InstanceCategories::Sky) ? CameraType::Sky : CameraType::Unknown;
-    }
     bool isPlaying = RtCameraSequence::mode() == RtCameraSequence::Mode::Playback;
     bool isBrowsing = RtCameraSequence::mode() == RtCameraSequence::Mode::Browse;
     bool isCameraCut = false;

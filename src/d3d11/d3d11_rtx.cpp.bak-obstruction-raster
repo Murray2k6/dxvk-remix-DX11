@@ -3969,37 +3969,6 @@ namespace dxvk {
       }
     }
 
-    const uint32_t tinyRasterPrimitiveCount = dcs.geometryData.calculatePrimitiveCount();
-    const bool tinyRasterHasSceneDepthSignal = dcs.zEnable
-      && (dcs.zWriteEnable || dcs.maxZ >= 0.99f);
-    const bool tinyPostCameraRasterJunk =
-      cameraManager.hasSeenRealMainCamera()
-      && !dcs.transformData.usedViewportFallbackProjection
-      && indexed
-      && count <= 6u
-      && tinyRasterPrimitiveCount <= 2u
-      && !tinyRasterHasSceneDepthSignal;
-
-    if (!renderDocAttached && tinyPostCameraRasterJunk) {
-      ++m_submitRejectStats.screenSpaceGarbageSkip;
-      static uint32_t sTinyRasterJunkLogCount = 0;
-      if (sTinyRasterJunkLogCount < 16) {
-        ++sTinyRasterJunkLogCount;
-        Logger::info(str::format(
-          "[D3D11Rtx] Skipping tiny post-main-camera raster junk draw: count=",
-          count,
-          ", indexed=",
-          indexed ? 1 : 0,
-          ", primitives=",
-          tinyRasterPrimitiveCount,
-          ", zEnable=",
-          dcs.zEnable ? 1 : 0,
-          ", zWrite=",
-          dcs.zWriteEnable ? 1 : 0));
-      }
-      return;
-    }
-
     ++m_submitRejectStats.accepted;
     {
       const uint32_t primitiveCount = dcs.geometryData.calculatePrimitiveCount();

@@ -2117,19 +2117,7 @@ namespace dxvk {
       }
     }
     if (showUI != UIType::None && useFreshDx11Ui()) {
-      // Dev-menu routing fix:
-      // The DX11 Fresh UI should own the Basic menu, but the true Developer
-      // menu must still render through showMainMenu(). Without this split,
-      // the Basic->Advanced button updates showUI correctly while the same
-      // Fresh UI keeps rendering, which makes the Dev button appear broken.
-      if (showUI == UIType::Advanced) {
-        showMainMenu(ctx);
-
-        // Uncomment to see the ImGUI demo, good reference!  Also, need to undefine IMGUI_DISABLE_DEMO_WINDOWS (in "imconfig.h")
-        //ImGui::ShowDemoWindow();
-      } else {
-        showFreshMenu(ctx, showUI);
-      }
+      showFreshMenu(ctx, showUI);
     } else if (showUI == UIType::Advanced) {
       showMainMenu(ctx);
 
