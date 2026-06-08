@@ -656,15 +656,6 @@ namespace dxvk {
       }
     }
 
-    static bool safeCallAcquire(DI8_Acquire_t fn, IUnknown* dev) {
-      __try {
-        fn(dev);
-        return true;
-      } __except (EXCEPTION_EXECUTE_HANDLER) {
-        return false;
-      }
-    }
-
     static void forceUnacquireAllDI8Devices() {
       auto real = g_realUnacquire.load(std::memory_order_relaxed);
       if (!real) return;
@@ -672,16 +663,6 @@ namespace dxvk {
       for (IUnknown* dev : g_di8Devices) {
         if (!dev) continue;
         safeCallUnacquire(real, dev);
-      }
-    }
-
-    static void forceReacquireAllDI8Devices() {
-      auto real = g_realAcquire.load(std::memory_order_relaxed);
-      if (!real) return;
-      std::lock_guard<std::mutex> lk(g_di8DevicesMtx);
-      for (IUnknown* dev : g_di8Devices) {
-        if (!dev) continue;
-        safeCallAcquire(real, dev);
       }
     }
 
@@ -2197,7 +2178,6 @@ namespace dxvk {
           ::ReleaseCapture();
         }
         ::ClipCursor(nullptr);
-        forceReacquireAllDI8Devices();
       }
       m_uiWasOpenLastFrame = false;
     } else {
@@ -3574,70 +3554,6 @@ namespace dxvk {
             ImGui::EndPopup();
             return texHash;
           } else if (!objectPickingValues.empty()) {
-            for (size_t index = 0; index < objectPickingValues.size(); index++) {
-              const ObjectPickingValue pickingValue = objectPickingValues[index];
-              const auto resolvedTexHash = sceneMgr.findLegacyTextureHashByObjectPickingValue(pickingValue);
-              if (!resolvedTexHash.has_value()) {
-                continue;
-              }
-
-              const XXH64_hash_t texHash = *resolvedTexHash;
-              ImGui::TextWrapped("Resolved legacy texture hash from object picking.");
-              ImGui::Separator();
-
-              ImGui::TextWrapped("%s", makeTextureInfo(texHash, isMaterialReplacement(sceneMgr, texHash), false).c_str());
-              if (ImGui::Button("Copy Texture hash##texture_popup_from_pick")) {
-                ImGui::SetClipboardText(hashToString(texHash).c_str());
-              }
-
-              uint32_t textureFeatureFlags = 0;
-              const auto& pair = g_imguiTextureMap.find(texHash);
-              if (pair != g_imguiTextureMap.end()) {
-                textureFeatureFlags = pair->second.textureFeatureFlags;
-              }
-
-              for (auto& rtxOption : rtxTextureOptions) {
-                const TextureSelectionState selectionState = analyzeTextureSelectionState(texHash, rtxOption.textureSetOption);
-                if ((rtxOption.featureFlagMask & textureFeatureFlags) != rtxOption.featureFlagMask) {
-                  continue;
-                }
-
-                bool checkboxValue = selectionState.editableChecked();
-
-                std::string displayName = rtxOption.displayName;
-                if (selectionState.hasBlockingLayer) {
-                  displayName = std::string(rtxOption.displayName) + " [!]";
-                }
-
-                ImGui::PushID(rtxOption.uniqueId);
-                if (RemixGui::Checkbox(displayName.c_str(), &checkboxValue)) {
-                  setTextureSelection(texHash, rtxOption.uniqueId, rtxOption.textureSetOption, checkboxValue);
-                }
-                ImGui::PopID();
-
-                if (ImGui::IsItemHovered()) {
-                  std::ostringstream tooltipStream;
-                  tooltipStream << rtxOption.textureSetOption->getDescription() << "\n";
-
-                  if (selectionState.hasBlockingLayer && selectionState.editableChecked() != selectionState.resolvedChecked) {
-                    tooltipStream << "\nThis checkbox shows the editable layer state. A stronger layer is still overriding the final resolved result.\n";
-                  }
-
-                  std::string layerValues = RemixGui::FormatOptionLayerValues(rtxOption.textureSetOption, texHash, false);
-                  if (!layerValues.empty()) {
-                    tooltipStream << "\nPer-layer status for this hash:\n" << layerValues;
-                  }
-
-                  ImGui::SetTooltip("%s", tooltipStream.str().c_str());
-                }
-              }
-
-              ImGui::Separator();
-              ImGui::TextDisabled("Resolved via object picking value %u", static_cast<unsigned>(pickingValue));
-              ImGui::EndPopup();
-              return texHash;
-            }
-
             ImGui::TextWrapped("No legacy texture hash was found for this selection, but the path-traced object is still readable through object picking.");
             ImGui::Separator();
 

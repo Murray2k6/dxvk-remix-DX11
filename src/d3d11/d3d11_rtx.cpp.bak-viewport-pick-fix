@@ -773,20 +773,20 @@ namespace dxvk {
     if (semantic.perInstance || semantic.systemValue != DxbcSystemValue::None || !isSupportedTexcoordFormat(semantic.format) || semantic.componentCount < 2)
       return std::numeric_limits<int>::min();
 
-    if (semantic.componentCount > 3)
-      return std::numeric_limits<int>::min();
-
     int score = 0;
-    if (semanticNameStartsWith(semantic, "TEXCOORD")
-     || semanticNameStartsWith(semantic, "TEX")
-     || semanticNameStartsWith(semantic, "UV")
-     || semanticNameStartsWith(semantic, "TCOORD")
-     || semanticNameStartsWith(semantic, "MAP"))
+    if (semanticNameStartsWith(semantic, "TEXCOORD") ||
+        semanticNameStartsWith(semantic, "TEX") ||
+        semanticNameStartsWith(semantic, "UV") ||
+        semanticNameStartsWith(semantic, "TCOORD"))
       score += 1000;
     else if (semanticNameStartsWith(semantic, "ATTRIBUTE"))
       score += 140;
-    else if (semanticNameStartsWith(semantic, "COLOR"))
-      return std::numeric_limits<int>::min();
+    else if (semanticNameStartsWith(semantic, "COLOR")) {
+      if (!isFloatSemantic(semantic))
+        return std::numeric_limits<int>::min();
+
+      score += 20;
+    }
     else if (semanticNameStartsWith(semantic, "POSITION")
           || semanticNameStartsWith(semantic, "NORMAL")
           || semanticNameStartsWith(semantic, "BLEND"))
@@ -795,9 +795,11 @@ namespace dxvk {
     if (isFloatSemantic(semantic))
       score += 100;
     if (semantic.componentCount == 2)
-      score += 220;
+      score += 180;
     else if (semantic.componentCount == 3)
-      score += 100;
+      score += 120;
+    else
+      score += 80;
 
     if (semantic.index == 0)
       score += 70;
@@ -805,20 +807,16 @@ namespace dxvk {
       score += 40;
 
     if (semantic.registerId == 0)
-      score -= 20;
+      score -= 30;
     else
       score += 20;
 
     switch (semantic.format) {
-      case VK_FORMAT_R32G32_SFLOAT:          score += 280; break;
-      case VK_FORMAT_R16G16_SFLOAT:          score += 240; break;
-      case VK_FORMAT_R8G8_UNORM:             score += 180; break;
-      case VK_FORMAT_R16G16_UNORM:           score += 160; break;
-      case VK_FORMAT_R8G8_SNORM:             score += 120; break;
-      case VK_FORMAT_R16G16_SNORM:           score += 110; break;
-      case VK_FORMAT_R32G32B32_SFLOAT:       score += 120; break;
-      case VK_FORMAT_R16G16B16A16_SFLOAT:    score += 40; break;
-      case VK_FORMAT_R32G32B32A32_SFLOAT:    score += 20; break;
+      case VK_FORMAT_R32G32_SFLOAT:          score += 260; break;
+      case VK_FORMAT_R16G16_SFLOAT:          score += 220; break;
+      case VK_FORMAT_R32G32B32_SFLOAT:       score += 170; break;
+      case VK_FORMAT_R32G32B32A32_SFLOAT:    score += 140; break;
+      case VK_FORMAT_R16G16B16A16_SFLOAT:    score += 130; break;
       default: break;
     }
 
@@ -829,49 +827,47 @@ namespace dxvk {
     if (semantic.perInstance || semantic.systemValue != DxbcSystemValue::None || !isSupportedTexcoordFormat(semantic.format) || semantic.componentCount < 2)
       return std::numeric_limits<int>::min();
 
-    if (semantic.componentCount > 3)
-      return std::numeric_limits<int>::min();
-
     if (semanticNameStartsWith(semantic, "POSITION")
      || semanticNameStartsWith(semantic, "NORMAL")
-     || semanticNameStartsWith(semantic, "BLEND")
-     || semanticNameStartsWith(semantic, "COLOR"))
+     || semanticNameStartsWith(semantic, "BLEND"))
       return std::numeric_limits<int>::min();
 
     int score = 0;
     if (semanticNameStartsWith(semantic, "ATTRIBUTE"))
-      score += 220;
-    else
-      score += 80;
+      score += 180;
+    else if (semanticNameStartsWith(semantic, "COLOR")) {
+      if (!isFloatSemantic(semantic))
+        return std::numeric_limits<int>::min();
+      score += 120;
+    } else {
+      score += 90;
+    }
 
     if (isFloatSemantic(semantic))
-      score += 100;
+      score += 80;
 
     if (semantic.componentCount == 2)
-      score += 240;
+      score += 160;
     else if (semantic.componentCount == 3)
       score += 100;
+    else
+      score += 60;
 
     if (semantic.index == 0)
-      score += 50;
+      score += 40;
     else if (semantic.index == 1)
-      score += 35;
-
-    if (semantic.registerId == 0)
-      score -= 20;
-    else
-      score += 20;
+      score += 30;
 
     switch (semantic.format) {
-      case VK_FORMAT_R32G32_SFLOAT:          score += 300; break;
-      case VK_FORMAT_R16G16_SFLOAT:          score += 260; break;
-      case VK_FORMAT_R8G8_UNORM:             score += 200; break;
-      case VK_FORMAT_R16G16_UNORM:           score += 170; break;
-      case VK_FORMAT_R8G8_SNORM:             score += 130; break;
-      case VK_FORMAT_R16G16_SNORM:           score += 120; break;
-      case VK_FORMAT_R32G32B32_SFLOAT:       score += 100; break;
-      case VK_FORMAT_R16G16B16A16_SFLOAT:    score += 20; break;
-      case VK_FORMAT_R32G32B32A32_SFLOAT:    score += 0; break;
+      case VK_FORMAT_R32G32_SFLOAT:          score += 220; break;
+      case VK_FORMAT_R16G16_SFLOAT:          score += 180; break;
+      case VK_FORMAT_R32G32B32_SFLOAT:       score += 140; break;
+      case VK_FORMAT_R32G32B32A32_SFLOAT:    score += 120; break;
+      case VK_FORMAT_R16G16B16A16_SFLOAT:    score += 110; break;
+      case VK_FORMAT_R8G8_UNORM:             score += 100; break;
+      case VK_FORMAT_R8G8_SNORM:             score += 90; break;
+      case VK_FORMAT_R16G16_UNORM:           score += 90; break;
+      case VK_FORMAT_R16G16_SNORM:           score += 80; break;
       default: break;
     }
 
@@ -3031,29 +3027,6 @@ namespace dxvk {
     const D3D11RtxSemantic* tcSem  = selectBestSemantic(semantics, scoreTexcoordSemantic, { posSem });
     if (!tcSem)
       tcSem = selectBestSemantic(semantics, scoreTexcoordFallbackSemantic, { posSem });
-
-    if (tcSem
-     && !semanticNameStartsWith(*tcSem, "TEXCOORD")
-     && !semanticNameStartsWith(*tcSem, "TEX")
-     && !semanticNameStartsWith(*tcSem, "UV")
-     && !semanticNameStartsWith(*tcSem, "TCOORD")
-     && !semanticNameStartsWith(*tcSem, "MAP")) {
-      static uint32_t sTexcoordDiscoverLogCount = 0;
-      if (sTexcoordDiscoverLogCount < 32) {
-        ++sTexcoordDiscoverLogCount;
-        Logger::info(str::format(
-          "[D3D11Rtx] Selected fallback TEXCOORD semantic: ",
-          tcSem->name,
-          tcSem->index,
-          " fmt=",
-          static_cast<uint32_t>(tcSem->format),
-          " comps=",
-          tcSem->componentCount,
-          " reg=",
-          tcSem->registerId));
-      }
-    }
-
     const D3D11RtxSemantic* nrmSem = selectBestSemantic(semantics, scoreNormalSemantic, { posSem, tcSem });
     const D3D11RtxSemantic* colSem = selectBestSemantic(semantics, scoreColorSemantic, { posSem, tcSem, nrmSem });
     const D3D11RtxSemantic* bwSem  = selectBestSemantic(semantics, scoreBlendWeightSemantic, { posSem, tcSem, nrmSem, colSem });
@@ -3842,36 +3815,6 @@ namespace dxvk {
     // Do this only after rejecting obvious composite passes so skipped draws
     // do not pay the material/texture selection cost.
     FillMaterialData(dcs.materialData);
-
-    const uint32_t tinyFallbackPrimitiveCount = dcs.geometryData.calculatePrimitiveCount();
-    const bool tinyFallbackHasSceneDepthSignal =
-      dcs.zEnable && (dcs.zWriteEnable || dcs.maxZ >= 0.99f);
-    const bool tinyFallbackMicroRaster =
-      !renderDocAttached &&
-      dcs.transformData.usedViewportFallbackProjection &&
-      count <= 6u &&
-      tinyFallbackPrimitiveCount <= 2u &&
-      !tinyFallbackHasSceneDepthSignal;
-
-    if (tinyFallbackMicroRaster) {
-      ++m_submitRejectStats.screenSpaceGarbageSkip;
-      static uint32_t sTinyFallbackMicroRasterLogCount = 0;
-      if (sTinyFallbackMicroRasterLogCount < 16) {
-        ++sTinyFallbackMicroRasterLogCount;
-        Logger::info(str::format(
-          "[D3D11Rtx] Skipping tiny fallback-camera micro-raster draw before RT submission: count=",
-          count,
-          ", indexed=",
-          indexed ? 1 : 0,
-          ", primitives=",
-          tinyFallbackPrimitiveCount,
-          ", zEnable=",
-          dcs.zEnable ? 1 : 0,
-          ", zWrite=",
-          dcs.zWriteEnable ? 1 : 0));
-      }
-      return;
-    }
 
     uint32_t transientInputCount = 0;
     uint32_t significantInputCount = 0;
