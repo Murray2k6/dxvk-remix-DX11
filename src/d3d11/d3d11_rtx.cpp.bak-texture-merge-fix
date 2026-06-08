@@ -2645,34 +2645,6 @@ namespace dxvk {
         }
       }
 
-      const bool likelyNormalLikeTexture =
-        !colorBc &&
-        !strongAlbedoFormat &&
-        !dataOrSceneFormat &&
-        materialViewDimension &&
-        !multisampledView &&
-        !matchesRT &&
-        !hasUavBind &&
-        (fmt == VK_FORMAT_R8G8B8A8_UNORM
-          || fmt == VK_FORMAT_R8G8_UNORM
-          || fmt == VK_FORMAT_R8G8_SNORM
-          || fmt == VK_FORMAT_R16G16_UNORM
-          || fmt == VK_FORMAT_R16G16_SNORM
-          || fmt == VK_FORMAT_R16G16_SFLOAT
-          || fmt == static_cast<VkFormat>(65));
-
-      const bool likelyAtlasOrHelperTexture =
-        !bc &&
-        !colorBc &&
-        !hasMips &&
-        materialViewDimension &&
-        (imgInfo.extent.width <= 256 || imgInfo.extent.height <= 256);
-
-      if (likelyNormalLikeTexture)
-        score -= 18;
-      if (likelyAtlasOrHelperTexture)
-        score -= 10;
-
       if (doLog) {
         Logger::info(str::format("[D3D11Rtx] FillMaterialData tex candidate: slot=", slot,
           " fmt=", (uint32_t)fmt,
@@ -2702,22 +2674,10 @@ namespace dxvk {
       // The legacy material can only bind a small number of color textures,
       // but Remix tooling still needs to see every safe game material texture
       // encountered by the draw stream.
-      const bool safeForTextureBrowser =
-        !rejectTextureBrowserCandidate &&
-        (hasMips || bc || albedoFormat) &&
-        !likelyNormalLikeTexture &&
-        !likelyAtlasOrHelperTexture;
-
-      if (safeForTextureBrowser)
+      if (!rejectTextureBrowserCandidate && (hasMips || bc || albedoFormat))
         registerRemixTextureCandidate(view);
 
       if (rejectMaterialCandidate)
-        continue;
-
-      // Keep low-confidence non-albedo candidates out of the legacy material path.
-      // This prevents small helper textures and likely normal/packed textures from
-      // being merged into the two legacy color slots.
-      if (score < 8 && !strongAlbedoFormat && !colorBc)
         continue;
 
       // Insert into top-N picks (sorted descending by score, no heap alloc).
