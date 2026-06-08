@@ -3805,26 +3805,9 @@ namespace dxvk {
       && (hasStableSceneCamera
        || viewportFallbackAfterRealCamera
        || m_submitRejectStats.accepted > 0
-       || sceneManager.isPreviousFrameSceneAvailable());
-
-    const bool deferViewportFallbackScreenSpaceReject =
-      dcs.transformData.usedViewportFallbackProjection
-      && !allowViewportFallbackScreenSpaceReject;
-
-    if (deferViewportFallbackScreenSpaceReject) {
-      static uint32_t sDeferredFallbackScreenRejectLogCount = 0;
-      if (sDeferredFallbackScreenRejectLogCount < 8) {
-        ++sDeferredFallbackScreenRejectLogCount;
-        Logger::info(str::format(
-          "[D3D11Rtx] Deferring viewport-fallback screen-space rejection until a stable scene camera exists (count=",
-          count,
-          ", zEnable=",
-          zEnable ? 1 : 0,
-          ", zWrite=",
-          zWriteEnable ? 1 : 0,
-          ")"));
-      }
-    }
+       || sceneManager.isPreviousFrameSceneAvailable()
+       || count <= 12
+       || (!zEnable && !zWriteEnable));
 
     if (allowViewportFallbackScreenSpaceReject && isLikelyScreenSpaceCompositePass()) {
       ++m_submitRejectStats.compositeSkip;
@@ -3873,39 +3856,6 @@ namespace dxvk {
           zWriteEnable ? 1 : 0,
           ")"));
       }
-    }
-
-    // Launcher / helper-window guard:
-    // Many D3D11 launchers present tiny swap chains (211x36, 161x36, 480x420, 10x10, etc.)
-    // before the real game scene exists. Running full Remix material categorization and RT
-    // submission heuristics on those windows can destabilize startup while providing no useful
-    // scene data. Until a stable scene camera or previous scene exists, hard-skip these tiny
-    // outputs and wait for the real game viewport.
-    const uint32_t activeOutputWidth =
-      m_lastRemixViewportExtent.width > 0u ? m_lastRemixViewportExtent.width : m_lastOutputExtent.width;
-    const uint32_t activeOutputHeight =
-      m_lastRemixViewportExtent.height > 0u ? m_lastRemixViewportExtent.height : m_lastOutputExtent.height;
-    const bool launcherSizedOutput =
-      activeOutputWidth > 0u && activeOutputHeight > 0u &&
-      (activeOutputWidth < 640u || activeOutputHeight < 480u);
-    const bool noStableSceneYet =
-      !hasStableSceneCamera &&
-      !viewportFallbackAfterRealCamera &&
-      m_submitRejectStats.accepted == 0 &&
-      !sceneManager.isPreviousFrameSceneAvailable();
-
-    if (launcherSizedOutput && noStableSceneYet) {
-      static uint32_t sLauncherSizedOutputSkipLogCount = 0;
-      if (sLauncherSizedOutputSkipLogCount < 12) {
-        ++sLauncherSizedOutputSkipLogCount;
-        Logger::info(str::format(
-          "[D3D11Rtx] Skipping launcher/helper-window draw before RT submission: output=",
-          activeOutputWidth, "x", activeOutputHeight,
-          " count=", count,
-          " zEnable=", zEnable ? 1 : 0,
-          " zWrite=", zWriteEnable ? 1 : 0));
-      }
-      return;
     }
 
     // Register this context as the active rendering context so the primary
