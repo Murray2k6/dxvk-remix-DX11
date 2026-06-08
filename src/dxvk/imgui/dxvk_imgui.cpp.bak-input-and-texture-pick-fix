@@ -656,15 +656,6 @@ namespace dxvk {
       }
     }
 
-    static bool safeCallAcquire(DI8_Acquire_t fn, IUnknown* dev) {
-      __try {
-        fn(dev);
-        return true;
-      } __except (EXCEPTION_EXECUTE_HANDLER) {
-        return false;
-      }
-    }
-
     static void forceUnacquireAllDI8Devices() {
       auto real = g_realUnacquire.load(std::memory_order_relaxed);
       if (!real) return;
@@ -672,16 +663,6 @@ namespace dxvk {
       for (IUnknown* dev : g_di8Devices) {
         if (!dev) continue;
         safeCallUnacquire(real, dev);
-      }
-    }
-
-    static void forceReacquireAllDI8Devices() {
-      auto real = g_realAcquire.load(std::memory_order_relaxed);
-      if (!real) return;
-      std::lock_guard<std::mutex> lk(g_di8DevicesMtx);
-      for (IUnknown* dev : g_di8Devices) {
-        if (!dev) continue;
-        safeCallAcquire(real, dev);
       }
     }
 
@@ -2197,7 +2178,6 @@ namespace dxvk {
           ::ReleaseCapture();
         }
         ::ClipCursor(nullptr);
-        forceReacquireAllDI8Devices();
       }
       m_uiWasOpenLastFrame = false;
     } else {
