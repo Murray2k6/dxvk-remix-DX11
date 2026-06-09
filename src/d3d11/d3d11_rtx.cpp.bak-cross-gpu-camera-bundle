@@ -3908,35 +3908,6 @@ namespace dxvk {
       return;
     }
 
-    // Launcher / helper-window guard:
-    // Ignore tiny startup swap chains until a stable scene exists.
-    const uint32_t activeOutputWidth =
-      m_lastRemixViewportExtent.width > 0u ? m_lastRemixViewportExtent.width : m_lastOutputExtent.width;
-    const uint32_t activeOutputHeight =
-      m_lastRemixViewportExtent.height > 0u ? m_lastRemixViewportExtent.height : m_lastOutputExtent.height;
-    const bool launcherSizedOutput =
-      activeOutputWidth > 0u && activeOutputHeight > 0u &&
-      (activeOutputWidth < 640u || activeOutputHeight < 480u);
-    const bool noStableSceneYet =
-      !hasStableSceneCamera &&
-      !viewportFallbackAfterRealCamera &&
-      m_submitRejectStats.accepted == 0 &&
-      !sceneManager.isPreviousFrameSceneAvailable();
-
-    if (launcherSizedOutput && noStableSceneYet) {
-      static uint32_t sLauncherSizedOutputSkipLogCount = 0;
-      if (sLauncherSizedOutputSkipLogCount < 12) {
-        ++sLauncherSizedOutputSkipLogCount;
-        Logger::info(str::format(
-          "[D3D11Rtx] Skipping launcher/helper-window draw before RT submission: output=",
-          activeOutputWidth, "x", activeOutputHeight,
-          " count=", count,
-          " zEnable=", zEnable ? 1 : 0,
-          " zWrite=", zWriteEnable ? 1 : 0));
-      }
-      return;
-    }
-
     // Register this context as the active rendering context so the primary
     // swap chain routes EndFrame/OnPresent through us, not a video-playback
     // device that happened to present first.
@@ -4400,7 +4371,7 @@ namespace dxvk {
       RtxContext* rtx = static_cast<RtxContext*>(ctx);
       const uint32_t fid = rtx->getDevice()->getCurrentFrameId();
       bool camValid = rtx->getSceneManager().getCamera().isValid(fid);
-      const bool allowSceneCameraCarryover = trustedSceneAcceptedDraws > 0 || acceptedDraws > 0;
+      const bool allowSceneCameraCarryover = trustedSceneAcceptedDraws > 0;
       if (!camValid && (allowResizeCameraCarryover || allowSceneCameraCarryover)) {
         auto& cameraManager = rtx->getSceneManager().getCameraManager();
         auto& mainCamera = cameraManager.getCamera(CameraType::Main);
@@ -4454,13 +4425,13 @@ namespace dxvk {
       }
 
       const bool hasAcceptedSceneDraws = draws > 0 || acceptedDraws > 0;
-      const bool hasGameSceneDraws = trustedSceneAcceptedDraws > 0 || acceptedDraws > 0;
+      const bool hasGameSceneDraws = trustedSceneAcceptedDraws > 0;
       const bool previousSceneAvailable = rtx->getSceneManager().isPreviousFrameSceneAvailable();
       const bool shouldInjectRtx = shouldInjectD3D11RtxFrame(
-            backbuffer != nullptr,
-            hasGameSceneDraws,
-            camValid || hasAcceptedSceneDraws,
-            previousSceneAvailable && hasAcceptedSceneDraws);
+        backbuffer != nullptr,
+        hasGameSceneDraws,
+        camValid,
+        previousSceneAvailable && camValid && hasAcceptedSceneDraws);
 
       if (!shouldInjectRtx) {
         static uint32_t sStartupPassThroughLogCount = 0;
