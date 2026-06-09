@@ -66,7 +66,7 @@ namespace dxvk {
     return textureFeatureFlags;
   }
 
-  // Map D3D11_BLEND â†’ VkBlendFactor.  Mirrors D3D11BlendState::DecodeBlendFactor
+  // Map D3D11_BLEND → VkBlendFactor.  Mirrors D3D11BlendState::DecodeBlendFactor
   // but kept local to avoid exposing internal statics.
   static VkBlendFactor mapD3D11Blend(D3D11_BLEND b, bool isAlpha) {
     switch (b) {
@@ -91,7 +91,7 @@ namespace dxvk {
     }
   }
 
-  // Map D3D11_BLEND_OP â†’ VkBlendOp.
+  // Map D3D11_BLEND_OP → VkBlendOp.
   static VkBlendOp mapD3D11BlendOp(D3D11_BLEND_OP op) {
     switch (op) {
       case D3D11_BLEND_OP_ADD:          return VK_BLEND_OP_ADD;
@@ -204,11 +204,11 @@ namespace dxvk {
     RtxOptions::AntiCulling::Object::farPlaneScaleObject().setDeferred(10.0f, defaults);
     RtxOptions::AntiCulling::Light::enableObject().setDeferred(true, defaults);
 
-    // Use incoming vertex buffers directly (skip copy to staging â†’ saves VRAM + bandwidth).
+    // Use incoming vertex buffers directly (skip copy to staging → saves VRAM + bandwidth).
     RtxOptions::useBuffersDirectlyObject().setDeferred(true, defaults);
 
     // --- Fallback lighting ---
-    // D3D11 has no legacy lighting API â€” all lighting is shader-driven,
+    // D3D11 has no legacy lighting API — all lighting is shader-driven,
     // so Remix never receives explicit light definitions from the application.
     // Force the fallback light to Always so the scene is lit even if there are
     // no Remix USD light assets placed yet. Keep it moderate so it prevents
@@ -273,7 +273,7 @@ namespace dxvk {
       if (!s.perInstance) continue;
       if (s.componentType != DxbcScalarType::Float32 || s.componentCount != 4) continue;
 
-      // Accept any per-instance float4 row Ã¢â‚¬â€ most engines use INSTANCETRANSFORM, WORLD,
+      // Accept any per-instance float4 row â€” most engines use INSTANCETRANSFORM, WORLD,
       // INSTANCE, I, INST, or repurpose high TEXCOORD registers. Matching on row
       // shape instead of one exact VkFormat catches more real D3D11 layouts.
       if (instSlot == UINT32_MAX)
@@ -288,7 +288,7 @@ namespace dxvk {
     });
 
     if (instRows.size() < 3) {
-      // No instance transform found â€” submit once without instance data.
+      // No instance transform found — submit once without instance data.
       // This handles instancing used for non-transform data (colors, etc.)
       static uint32_t sNoInstXformLog = 0;
       if (sNoInstXformLog < 3) {
@@ -316,7 +316,7 @@ namespace dxvk {
       return;
     }
 
-    // Cap to avoid excessive submission â€” configurable via rtx.maxInstanceSubmissions
+    // Cap to avoid excessive submission — configurable via rtx.maxInstanceSubmissions
     const UINT maxInstances = std::min(instanceCount, RtxOptions::maxInstanceSubmissions());
 
     static uint32_t sInstLog = 0;
@@ -358,7 +358,7 @@ namespace dxvk {
 
       if (!valid) continue;
 
-      // If only 3 rows, the 4th row is (0,0,0,1) â€” affine transform.
+      // If only 3 rows, the 4th row is (0,0,0,1) — affine transform.
       if (instRows.size() == 3) {
         rows[3][0] = 0.f; rows[3][1] = 0.f; rows[3][2] = 0.f; rows[3][3] = 1.f;
       }
@@ -1012,16 +1012,16 @@ namespace dxvk {
   // Detect a perspective projection matrix in either memory layout.
   //
   // Row-major layout used by many D3D renderers:
-  //   m[0] = [Â±Sx, 0,   0,    0  ]
-  //   m[1] = [0,  Â±Sy,  0,    0  ]
-  //   m[2] = [Jx,  Jy,  Q,   Â±1 ]  â† perspective-divide at m[2][3]
+  //   m[0] = [±Sx, 0,   0,    0  ]
+  //   m[1] = [0,  ±Sy,  0,    0  ]
+  //   m[2] = [Jx,  Jy,  Q,   ±1 ]  ← perspective-divide at m[2][3]
   //   m[3] = [0,   0,   Wz,   0  ]
   //
   // Column-major matrices read back as row-major:
-  //   m[0] = [Â±Sx, 0,   0,    0  ]
-  //   m[1] = [0,  Â±Sy,  0,    0  ]
-  //   m[2] = [Jx,  Jy,  Q,   Wz ]  â† m[2][3] = nearPlane or 0
-  //   m[3] = [0,   0,  Â±1,    0  ]  â† perspective-divide at m[3][2]
+  //   m[0] = [±Sx, 0,   0,    0  ]
+  //   m[1] = [0,  ±Sy,  0,    0  ]
+  //   m[2] = [Jx,  Jy,  Q,   Wz ]  ← m[2][3] = nearPlane or 0
+  //   m[3] = [0,   0,  ±1,    0  ]  ← perspective-divide at m[3][2]
   //
   // Returns: 0 = not perspective, 1 = row-major, 2 = column-major-as-row.
   static int classifyPerspective(const Matrix4& m) {
@@ -1042,7 +1042,7 @@ namespace dxvk {
     if (std::abs(m[1][0]) > kTol || std::abs(m[1][3]) > kTol) return 0;
     if (std::abs(m[0][0]) < 0.1f || std::abs(m[1][1]) < 0.1f) return 0;
 
-    // Row-major check: m[2][3] â‰ˆ Â±1, m[3][3] â‰ˆ 0.
+    // Row-major check: m[2][3] ≈ ±1, m[3][3] ≈ 0.
     const bool r23 = std::abs(std::abs(m[2][3]) - 1.0f) < kTol;
     const bool r33z = std::abs(m[3][3]) < kTol;
     if (r23 && r33z) {
@@ -1051,7 +1051,7 @@ namespace dxvk {
       return 1;
     }
 
-    // Column-major-as-row check: m[3][2] â‰ˆ Â±1, m[3][3] â‰ˆ 0.
+    // Column-major-as-row check: m[3][2] ≈ ±1, m[3][3] ≈ 0.
     const bool c32 = std::abs(std::abs(m[3][2]) - 1.0f) < kTol;
     const bool c33z = std::abs(m[3][3]) < kTol;
     if (c32 && c33z) {
@@ -1114,7 +1114,7 @@ namespace dxvk {
 
   // Return true if m looks like a camera view matrix (rigid-body: rotation + translation).
   // Expects row-major convention (or column-major already transposed by the caller).
-  // The upper-left 3Ã—3 should be approximately orthonormal and the last column [0,0,0,1].
+  // The upper-left 3×3 should be approximately orthonormal and the last column [0,0,0,1].
   static bool isViewMatrix(const Matrix4& m) {
     // Row 3 must be [*, *, *, 1] (affine).
     if (std::abs(m[3][3] - 1.0f) > 0.01f) return false;
@@ -1137,7 +1137,7 @@ namespace dxvk {
     // m[0][3], m[1][3], m[2][3] should be 0 (no perspective warp).
     if (std::abs(m[0][3]) > 0.01f || std::abs(m[1][3]) > 0.01f || std::abs(m[2][3]) > 0.01f)
       return false;
-    // Reject identity â€” identity means "no view transform" which is not useful.
+    // Reject identity — identity means "no view transform" which is not useful.
     if (isIdentityExact(m)) return false;
     return true;
   }
@@ -1172,7 +1172,7 @@ namespace dxvk {
     bool projectionWasFlippedY = false;
 
     // Maximum bytes to scan per cbuffer. Projection/view/world matrices are
-    // always in the first few hundred bytes of a cbuffer â€” capping the scan
+    // always in the first few hundred bytes of a cbuffer — capping the scan
     // prevents multi-second stalls on emulators that pack all constants into
     // a single 64KB+ UBO (Xenia, Yuzu, RPCS3, Citra).
     static constexpr size_t kFastScanBytes = 8192;   // 128 matrices
@@ -1243,7 +1243,7 @@ namespace dxvk {
     // If the game has bound zero viewports (some engines leave the RS viewport
     // state dirty across a no-RT clear pass) or more than one viewport (shadow
     // cascade or split-screen passes), treat viewport[0] as a fallback hint
-    // only and do not let it drive camera detection â€” otherwise a 256x256
+    // only and do not let it drive camera detection — otherwise a 256x256
     // cascade viewport would stamp its aspect onto the primary camera and
     // cause path tracing to render the wrong frustum for the main scene.
     float viewportAspect = 0.0f;
@@ -1290,8 +1290,8 @@ namespace dxvk {
           : remixViewportAspect));
 
     // Score a perspective projection: higher = more likely main game camera.
-    // Shadow maps have square aspect, cubemaps have 90Â° FOV, tool cameras
-    // have extreme FOV â€” all score lower than a typical game camera.
+    // Shadow maps have square aspect, cubemaps have 90° FOV, tool cameras
+    // have extreme FOV — all score lower than a typical game camera.
     auto scorePerspective = [projectionReferenceAspect](const Matrix4& proj) -> float {
       const Matrix4 scoredProj = canonicalizeProjectionOrientation(proj);
       float score = 1.0f;
@@ -1377,7 +1377,7 @@ namespace dxvk {
     int      projStage  = m_projStage;
 
     // --- PROJECTION: first-draw scan (cache miss) ---
-    // Single pass across all stages â€” classifyPerspective handles both layouts.
+    // Single pass across all stages — classifyPerspective handles both layouts.
     if (projSlot == UINT32_MAX) {
       float bestScore = 0.0f;
       Matrix4 bestMat;
@@ -1428,7 +1428,7 @@ namespace dxvk {
 
       if (!valid && projSlot == m_projSlot && projStage == m_projStage) {
         // Cached location is stale (different pass). Re-scan all stages and
-        // persist the winner back to the member cache â€” otherwise we would
+        // persist the winner back to the member cache — otherwise we would
         // redo this full multi-stage scan for every subsequent draw.
         projSlot = UINT32_MAX;
         float bestScore = 0.0f;
@@ -1448,7 +1448,7 @@ namespace dxvk {
           m_projStage   = projStage;
           m_columnMajor = bestCol;
         } else {
-          // Nothing found â€” drop the stale cache so the next frame's
+          // Nothing found — drop the stale cache so the next frame's
           // first-draw scan path runs instead of this re-scan path.
           m_projSlot   = UINT32_MAX;
           m_projOffset = SIZE_MAX;
@@ -1457,7 +1457,7 @@ namespace dxvk {
       }
 
       if (projSlot != UINT32_MAX) {
-        // Strip TAA jitter â€” Remix does its own TAA.
+        // Strip TAA jitter — Remix does its own TAA.
         proj[2][0] = 0.0f;
         proj[2][1] = 0.0f;
 
@@ -1574,7 +1574,7 @@ namespace dxvk {
           if (!s_fallbackLogged) {
             s_fallbackLogged = true;
             Logger::info(str::format(
-              "[D3D11Rtx] No projection found in cbuffers â€” using viewport fallback (",
+              "[D3D11Rtx] No projection found in cbuffers — using viewport fallback (",
               "x=", vp.TopLeftX,
               " y=", vp.TopLeftY,
               " w=", vp.Width,
@@ -1593,7 +1593,7 @@ namespace dxvk {
           if (!s_fallbackRejectedLogged) {
             s_fallbackRejectedLogged = true;
             Logger::info(str::format(
-              "[D3D11Rtx] No projection found in cbuffers â€” skipping viewport fallback for implausible scene viewport (",
+              "[D3D11Rtx] No projection found in cbuffers — skipping viewport fallback for implausible scene viewport (",
               "x=", vp.TopLeftX,
               " y=", vp.TopLeftY,
               " w=", vp.Width,
@@ -1631,7 +1631,7 @@ namespace dxvk {
       }
     }
 
-    // Full scan fallback â€” same logic as before, but caches the result.
+    // Full scan fallback — same logic as before, but caches the result.
     if (!viewCacheHit && projSlot != UINT32_MAX) {
       if (projStage >= 0 && projStage < kNumStages) {
         const auto& cb = (*stageCbs[projStage])[projSlot];
@@ -1696,7 +1696,7 @@ namespace dxvk {
       }
 
       // Convention fallback: if no view matrix was found, the column-major
-      // detection may be wrong (ambiguous when near plane â‰ˆ 1). Retry with
+      // detection may be wrong (ambiguous when near plane ≈ 1). Retry with
       // the opposite convention, but only for the projection cbuffer.
       if (isIdentityExact(transforms.worldToView) && projStage >= 0 && projStage < kNumStages) {
         const auto& cb = (*stageCbs[projStage])[projSlot];
@@ -1924,7 +1924,7 @@ namespace dxvk {
       if (!m_zUpSettled) {
         const float absY = std::abs(transforms.worldToView[1][1]);
         const float absZ = std::abs(transforms.worldToView[2][1]);
-        // Only vote when there's a clear winner (avoid ambiguous 45Â° views)
+        // Only vote when there's a clear winner (avoid ambiguous 45° views)
         if (std::abs(absZ - absY) > 0.3f) {
           m_zUpVotes += (absZ > absY) ? 1 : -1;
           if (!m_zUpSettled && std::abs(m_zUpVotes) >= kVoteThreshold) {
@@ -1953,7 +1953,7 @@ namespace dxvk {
     // Floating-point rounding in cbuffer reads causes sub-pixel jitter between
     // draws/frames. Apply exponential moving average on the position to dampen
     // this without introducing visible lag. The rotation (upper 3x3) is left
-    // untouched â€” rotation jitter is rare and smoothing it causes ghosting.
+    // untouched — rotation jitter is rare and smoothing it causes ghosting.
     //
     // D3D row-major view matrix layout:
     //   [R00 R01 R02  0]    pos = -R^T * t
@@ -2003,7 +2003,7 @@ namespace dxvk {
     // Candidate filter: affine, non-identity, not perspective, not the
     // already-identified view or projection, reasonable scale factors.
     // We compare against the found view by position (stage/slot/offset),
-    // NOT by structural isViewMatrix() â€” the latter rejects unit-scale
+    // NOT by structural isViewMatrix() — the latter rejects unit-scale
     // world matrices which are the majority of game transforms.
     if (RtxOptions::useCBufferWorldMatrices()) {
       auto isWorldCandidate = [&](const Matrix4& m) -> bool {
@@ -2389,7 +2389,7 @@ namespace dxvk {
 
       hashes.precombine();
 
-      // Release buffer pins â€” allow slice recycling again.
+      // Release buffer pins — allow slice recycling again.
       if (posBuf) { posBuf->release(DxvkAccess::Read); posBuf->decRef(); }
       if (tcBuf)  { tcBuf->release(DxvkAccess::Read);  tcBuf->decRef();  }
       if (idxBuf) { idxBuf->release(DxvkAccess::Read); idxBuf->decRef(); }
@@ -2397,7 +2397,7 @@ namespace dxvk {
       return hashes;
     });
 
-    // If the worker queue was full, the lambda never runs â€” release pins now
+    // If the worker queue was full, the lambda never runs — release pins now
     // to prevent a VRAM leak (incRef/acquire above would never be undone).
     if (!future.valid()) {
       if (posBuf) { posBuf->release(DxvkAccess::Read); posBuf->decRef(); }
@@ -2557,7 +2557,7 @@ namespace dxvk {
     }
 
     // First pass: find the top-scoring texture candidates without heap allocation.
-    // We only need kMaxSupportedTextures (2) winners â€” a full sort is unnecessary.
+    // We only need kMaxSupportedTextures (2) winners — a full sort is unnecessary.
     static constexpr uint32_t kMaxPicks = LegacyMaterialData::kMaxSupportedTextures;
     struct TexPick {
       uint32_t slot = UINT32_MAX;
@@ -2609,7 +2609,7 @@ namespace dxvk {
         || srvDesc.ViewDimension == D3D11_SRV_DIMENSION_TEXTURE2DMSARRAY
         || imgInfo.sampleCount != VK_SAMPLE_COUNT_1_BIT;
 
-      // Reject Texture2DArray SRVs that cover multiple slices â€” each slice is a separate
+      // Reject Texture2DArray SRVs that cover multiple slices — each slice is a separate
       // game texture that hashes identically, causing surfaces to appear "smashed together".
       // Single-slice array views are safe: getImageHash() mixes in the layer index.
       if (srvDesc.ViewDimension == D3D11_SRV_DIMENSION_TEXTURE2DARRAY
@@ -2684,7 +2684,7 @@ namespace dxvk {
       if ((resourceDesc.BindFlags & (D3D11_BIND_RENDER_TARGET | D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_DEPTH_STENCIL)) != 0)
         score -= 4;
 
-      // Currently bound as active RT â†’ negative score (only use as absolute last resort)
+      // Currently bound as active RT → negative score (only use as absolute last resort)
       if (isCurrentRT) score = -10;
 
       // Sampler address mode: WRAP/MIRROR indicates a tiling world texture (strong positive signal).
@@ -2889,7 +2889,7 @@ namespace dxvk {
     }
 
     // Material defaults for the Remix legacy material pipeline.
-    // D3D11 bakes blending/alpha into immutable state objects â€” we extract
+    // D3D11 bakes blending/alpha into immutable state objects — we extract
     // what we can from BlendState and DepthStencilState below.
     mat.textureColorArg1Source  = RtTextureArgSource::Texture;
     mat.textureColorArg2Source  = RtTextureArgSource::None;
@@ -2968,7 +2968,7 @@ namespace dxvk {
     ++m_submitRejectStats.total;
 
     // Throttle: don't exceed the worker ring buffer capacity.
-    // Beyond this point new futures would overwrite in-flight ones â†’ corrupt hashes.
+    // Beyond this point new futures would overwrite in-flight ones → corrupt hashes.
     if (m_drawCallID >= kMaxConcurrentDraws) {
       ++m_submitRejectStats.queueOverflow;
       return;
@@ -2986,7 +2986,7 @@ namespace dxvk {
     }
 
     // Skip depth-only passes: no pixel shader means depth prepass or shadow map.
-    // Most engines draw opaque geometry twice â€” once for depth prepass (PS == null)
+    // Most engines draw opaque geometry twice — once for depth prepass (PS == null)
     // and once for the color pass (PS != null) with the same vertices.
     if (m_context->m_state.ps.shader == nullptr) {
       ++m_submitRejectStats.noPixelShader;
@@ -3014,7 +3014,7 @@ namespace dxvk {
       return;
     }
 
-    // Read actual depth/stencil state from the OM â€” don't hardcode.
+    // Read actual depth/stencil state from the OM — don't hardcode.
     bool zEnable = true;
     bool zWriteEnable = true;
     bool stencilEnabled = false;
@@ -3029,7 +3029,7 @@ namespace dxvk {
 
     // Skip fullscreen quad / postprocess draws: depth disabled + 6 or fewer
     // elements (a fullscreen triangle or quad) + no depth write.
-    // Only skip if BOTH depth test and write are off â€” some engines do
+    // Only skip if BOTH depth test and write are off — some engines do
     // "depth off, write on" for sky or "depth on, write off" for decals.
     if (!zEnable && !zWriteEnable && count <= 6) {
       ++m_submitRejectStats.fullscreenPostFx;
@@ -3093,7 +3093,7 @@ namespace dxvk {
     // and expand them into 3D inside the vertex shader using the camera basis.
     // Those draws are valid 3D content and participate in world-space lighting,
     // so they depth-test against the scene. Only reject 2D-position draws that
-    // ALSO have depth testing off â€” which is the unambiguous HUD / overlay case.
+    // ALSO have depth testing off — which is the unambiguous HUD / overlay case.
     if (posSem->format == VK_FORMAT_R32G32_SFLOAT && !zEnable) {
       ++m_submitRejectStats.position2D;
       return;
@@ -3140,7 +3140,7 @@ namespace dxvk {
 
     // Color0: the interleaver converts BGRA and RGBA packed-byte formats.
     // Both B8G8R8A8_UNORM (D3D9 D3DCOLOR) and R8G8B8A8_UNORM (D3D11) are
-    // supported â€” the interleaver swaps R/B for RGBA.  Float vertex color
+    // supported — the interleaver swaps R/B for RGBA.  Float vertex color
     // formats are not supported; Remix defaults to white when color0 is absent.
     RasterBuffer colBuffer;
     if (colSem && (colSem->format == VK_FORMAT_B8G8R8A8_UNORM
@@ -3201,7 +3201,7 @@ namespace dxvk {
         : VK_FRONT_FACE_CLOCKWISE;
     }
 
-    // Compute vertex count â€” must cover the highest vertex index accessed by
+    // Compute vertex count — must cover the highest vertex index accessed by
     // this draw so Remix doesn't read out of bounds when building BLAS.
     // geo.vertexCount is the buffer capacity; the hash uses a tighter subrange.
     const uint32_t maxVBVertices = posBuffer.stride() > 0
@@ -3598,7 +3598,7 @@ namespace dxvk {
       dcs.maxZ = 1.0f;
     }
 
-    // D3D11 has no legacy fog â€” engines bake fog into shaders.
+    // D3D11 has no legacy fog — engines bake fog into shaders.
     // FogState defaults to mode=0 (none), which is correct.
 
     const auto isLikelyScreenSpaceCompositePass = [&]() {
@@ -3910,6 +3910,32 @@ namespace dxvk {
 
     // Launcher / helper-window guard:
     // Ignore tiny startup swap chains until a stable scene exists.
+    const uint32_t activeOutputWidth =
+      m_lastRemixViewportExtent.width > 0u ? m_lastRemixViewportExtent.width : m_lastOutputExtent.width;
+    const uint32_t activeOutputHeight =
+      m_lastRemixViewportExtent.height > 0u ? m_lastRemixViewportExtent.height : m_lastOutputExtent.height;
+    const bool launcherSizedOutput =
+      activeOutputWidth > 0u && activeOutputHeight > 0u &&
+      (activeOutputWidth < 640u || activeOutputHeight < 480u);
+    const bool noStableSceneYet =
+      !hasStableSceneCamera &&
+      !viewportFallbackAfterRealCamera &&
+      m_submitRejectStats.accepted == 0 &&
+      !sceneManager.isPreviousFrameSceneAvailable();
+
+    if (launcherSizedOutput && noStableSceneYet) {
+      static uint32_t sLauncherSizedOutputSkipLogCount = 0;
+      if (sLauncherSizedOutputSkipLogCount < 12) {
+        ++sLauncherSizedOutputSkipLogCount;
+        Logger::info(str::format(
+          "[D3D11Rtx] Skipping launcher/helper-window draw before RT submission: output=",
+          activeOutputWidth, "x", activeOutputHeight,
+          " count=", count,
+          " zEnable=", zEnable ? 1 : 0,
+          " zWrite=", zWriteEnable ? 1 : 0));
+      }
+      return;
+    }
 
     // Register this context as the active rendering context so the primary
     // swap chain routes EndFrame/OnPresent through us, not a video-playback
@@ -4299,60 +4325,7 @@ namespace dxvk {
     }
 
     if (remixViewportExtent.width > 0u && remixViewportExtent.height > 0u) {
-      bool acceptRemixViewportExtent = true;
-
-      const VkExtent2D previousStableRemixViewport = m_lastRemixViewportExtent;
-      const VkExtent2D previousStableOutputExtent = m_lastOutputExtent;
-
-      const bool hadStableViewport =
-        previousStableRemixViewport.width > 0u && previousStableRemixViewport.height > 0u;
-      const bool hadStableOutput =
-        previousStableOutputExtent.width > 0u && previousStableOutputExtent.height > 0u;
-
-      const float widthCovVsViewport = hadStableViewport
-        ? float(remixViewportExtent.width) / float(previousStableRemixViewport.width)
-        : 1.0f;
-      const float heightCovVsViewport = hadStableViewport
-        ? float(remixViewportExtent.height) / float(previousStableRemixViewport.height)
-        : 1.0f;
-      const float widthCovVsOutput = hadStableOutput
-        ? float(remixViewportExtent.width) / float(previousStableOutputExtent.width)
-        : 1.0f;
-      const float heightCovVsOutput = hadStableOutput
-        ? float(remixViewportExtent.height) / float(previousStableOutputExtent.height)
-        : 1.0f;
-
-      const bool tinyHelperExtent =
-        remixViewportExtent.width < 640u || remixViewportExtent.height < 480u;
-
-      const bool muchSmallerThanStableViewport =
-        hadStableViewport && (widthCovVsViewport < 0.60f || heightCovVsViewport < 0.60f);
-
-      const bool muchSmallerThanStableOutput =
-        hadStableOutput && (widthCovVsOutput < 0.60f || heightCovVsOutput < 0.60f);
-
-      const bool looksLikeOccludingHelperWindow =
-        tinyHelperExtent || muchSmallerThanStableViewport || muchSmallerThanStableOutput;
-
-      if (looksLikeOccludingHelperWindow && m_resizeTransitionFramesRemaining == 0) {
-        acceptRemixViewportExtent = false;
-
-        static uint32_t sIgnoredSmallRemixViewportLogCount = 0;
-        if (sIgnoredSmallRemixViewportLogCount < 16) {
-          ++sIgnoredSmallRemixViewportLogCount;
-          Logger::info(str::format(
-            "[D3D11Rtx] Ignoring small/occluding Remix viewport extent update: new=",
-            remixViewportExtent.width, "x", remixViewportExtent.height,
-            " prevViewport=", previousStableRemixViewport.width, "x", previousStableRemixViewport.height,
-            " prevOutput=", previousStableOutputExtent.width, "x", previousStableOutputExtent.height,
-            " widthCov=", hadStableViewport ? widthCovVsViewport : widthCovVsOutput,
-            " heightCov=", hadStableViewport ? heightCovVsViewport : heightCovVsOutput));
-        }
-      }
-
-      if (acceptRemixViewportExtent) {
-        m_lastRemixViewportExtent = remixViewportExtent;
-      }
+      m_lastRemixViewportExtent = remixViewportExtent;
     }
 
     const uint32_t gameViewportCount = m_context->m_state.rs.numViewports;
@@ -4413,7 +4386,7 @@ namespace dxvk {
 
     ResetCommandListState();
     // Projection cache (m_projSlot, m_projOffset, m_projStage, m_columnMajor)
-    // is NOT reset â€” the validation path at the start of ExtractTransforms
+    // is NOT reset — the validation path at the start of ExtractTransforms
     // re-reads and re-scans only when the cached location becomes stale.
     // Keep the world-matrix cache for the same reason: modern games can have
     // thousands of draws per frame, and rescanning all cbuffers on every frame
@@ -4549,60 +4522,7 @@ namespace dxvk {
     }
 
     if (remixViewportExtent.width > 0u && remixViewportExtent.height > 0u) {
-      bool acceptRemixViewportExtent = true;
-
-      const VkExtent2D previousStableRemixViewport = m_lastRemixViewportExtent;
-      const VkExtent2D previousStableOutputExtent = m_lastOutputExtent;
-
-      const bool hadStableViewport =
-        previousStableRemixViewport.width > 0u && previousStableRemixViewport.height > 0u;
-      const bool hadStableOutput =
-        previousStableOutputExtent.width > 0u && previousStableOutputExtent.height > 0u;
-
-      const float widthCovVsViewport = hadStableViewport
-        ? float(remixViewportExtent.width) / float(previousStableRemixViewport.width)
-        : 1.0f;
-      const float heightCovVsViewport = hadStableViewport
-        ? float(remixViewportExtent.height) / float(previousStableRemixViewport.height)
-        : 1.0f;
-      const float widthCovVsOutput = hadStableOutput
-        ? float(remixViewportExtent.width) / float(previousStableOutputExtent.width)
-        : 1.0f;
-      const float heightCovVsOutput = hadStableOutput
-        ? float(remixViewportExtent.height) / float(previousStableOutputExtent.height)
-        : 1.0f;
-
-      const bool tinyHelperExtent =
-        remixViewportExtent.width < 640u || remixViewportExtent.height < 480u;
-
-      const bool muchSmallerThanStableViewport =
-        hadStableViewport && (widthCovVsViewport < 0.60f || heightCovVsViewport < 0.60f);
-
-      const bool muchSmallerThanStableOutput =
-        hadStableOutput && (widthCovVsOutput < 0.60f || heightCovVsOutput < 0.60f);
-
-      const bool looksLikeOccludingHelperWindow =
-        tinyHelperExtent || muchSmallerThanStableViewport || muchSmallerThanStableOutput;
-
-      if (looksLikeOccludingHelperWindow && m_resizeTransitionFramesRemaining == 0) {
-        acceptRemixViewportExtent = false;
-
-        static uint32_t sIgnoredSmallRemixViewportLogCount = 0;
-        if (sIgnoredSmallRemixViewportLogCount < 16) {
-          ++sIgnoredSmallRemixViewportLogCount;
-          Logger::info(str::format(
-            "[D3D11Rtx] Ignoring small/occluding Remix viewport extent update: new=",
-            remixViewportExtent.width, "x", remixViewportExtent.height,
-            " prevViewport=", previousStableRemixViewport.width, "x", previousStableRemixViewport.height,
-            " prevOutput=", previousStableOutputExtent.width, "x", previousStableOutputExtent.height,
-            " widthCov=", hadStableViewport ? widthCovVsViewport : widthCovVsOutput,
-            " heightCov=", hadStableViewport ? heightCovVsViewport : heightCovVsOutput));
-        }
-      }
-
-      if (acceptRemixViewportExtent) {
-        m_lastRemixViewportExtent = remixViewportExtent;
-      }
+      m_lastRemixViewportExtent = remixViewportExtent;
     }
 
     m_context->EmitCs([swapchainImage](DxvkContext* ctx) {
