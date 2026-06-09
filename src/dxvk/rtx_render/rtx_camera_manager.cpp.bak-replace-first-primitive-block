@@ -97,10 +97,10 @@ namespace {
     if (primitiveCount >= 64u)
       score += 1.0f;
     else if (primitiveCount >= 16u)
-      score += 0.25f;
-    else if (primitiveCount <= 2u) score -= (input.getTransformData().usedViewportFallbackProjection ? 0.5f : 8.0f);
-      else if (primitiveCount <= 4u) score -= (input.getTransformData().usedViewportFallbackProjection ? 0.25f : 5.0f);
-      else if (primitiveCount <= 8u) score -= (input.getTransformData().usedViewportFallbackProjection ? 0.10f : 3.0f);
+      score += 0.5f;
+    else if (primitiveCount <= 2u) score -= (input.getTransformData().usedViewportFallbackProjection ? 2.0f : 8.0f);
+      else if (primitiveCount <= 4u) score -= (input.getTransformData().usedViewportFallbackProjection ? 1.0f : 5.0f);
+      else if (primitiveCount <= 8u) score -= (input.getTransformData().usedViewportFallbackProjection ? 0.5f : 3.0f);
 
     if (std::isfinite(projection.aspectRatio) && projection.aspectRatio > 0.5f && projection.aspectRatio < 4.0f)
       score += 0.5f;

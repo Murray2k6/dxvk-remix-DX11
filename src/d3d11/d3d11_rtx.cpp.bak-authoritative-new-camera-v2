@@ -4299,45 +4299,59 @@ namespace dxvk {
     }
 
     if (remixViewportExtent.width > 0u && remixViewportExtent.height > 0u) {
-      VkExtent2D chosenExtent = remixViewportExtent;
+      bool acceptRemixViewportExtent = true;
 
-      if (m_lastOutputExtent.width > chosenExtent.width && m_lastOutputExtent.height > chosenExtent.height) {
-        chosenExtent = m_lastOutputExtent;
-      }
+      const VkExtent2D previousStableRemixViewport = m_lastRemixViewportExtent;
+      const VkExtent2D previousStableOutputExtent = m_lastOutputExtent;
 
-      const bool hadLargeStableViewport =
-        m_lastRemixViewportExtent.width >= 640u && m_lastRemixViewportExtent.height >= 480u;
-      const bool hadLargeStableOutput =
-        m_lastOutputExtent.width >= 640u && m_lastOutputExtent.height >= 480u;
+      const bool hadStableViewport =
+        previousStableRemixViewport.width > 0u && previousStableRemixViewport.height > 0u;
+      const bool hadStableOutput =
+        previousStableOutputExtent.width > 0u && previousStableOutputExtent.height > 0u;
 
-      const bool tinyHelperExtent = chosenExtent.width < 640u || chosenExtent.height < 480u;
+      const float widthCovVsViewport = hadStableViewport
+        ? float(remixViewportExtent.width) / float(previousStableRemixViewport.width)
+        : 1.0f;
+      const float heightCovVsViewport = hadStableViewport
+        ? float(remixViewportExtent.height) / float(previousStableRemixViewport.height)
+        : 1.0f;
+      const float widthCovVsOutput = hadStableOutput
+        ? float(remixViewportExtent.width) / float(previousStableOutputExtent.width)
+        : 1.0f;
+      const float heightCovVsOutput = hadStableOutput
+        ? float(remixViewportExtent.height) / float(previousStableOutputExtent.height)
+        : 1.0f;
+
+      const bool tinyHelperExtent =
+        remixViewportExtent.width < 640u || remixViewportExtent.height < 480u;
 
       const bool muchSmallerThanStableViewport =
-        hadLargeStableViewport &&
-        ((uint64_t(chosenExtent.width) * 10ull < uint64_t(m_lastRemixViewportExtent.width) * 7ull) ||
-         (uint64_t(chosenExtent.height) * 10ull < uint64_t(m_lastRemixViewportExtent.height) * 7ull));
+        hadStableViewport && (widthCovVsViewport < 0.60f || heightCovVsViewport < 0.60f);
 
       const bool muchSmallerThanStableOutput =
-        hadLargeStableOutput &&
-        ((uint64_t(chosenExtent.width) * 10ull < uint64_t(m_lastOutputExtent.width) * 7ull) ||
-         (uint64_t(chosenExtent.height) * 10ull < uint64_t(m_lastOutputExtent.height) * 7ull));
+        hadStableOutput && (widthCovVsOutput < 0.60f || heightCovVsOutput < 0.60f);
 
-      const bool ignoreAsOccludingSmallWindow =
-        (hadLargeStableViewport || hadLargeStableOutput) &&
-        (tinyHelperExtent || muchSmallerThanStableViewport || muchSmallerThanStableOutput);
+      const bool looksLikeOccludingHelperWindow =
+        tinyHelperExtent || muchSmallerThanStableViewport || muchSmallerThanStableOutput;
 
-      if (!ignoreAsOccludingSmallWindow) {
-        m_lastRemixViewportExtent = chosenExtent;
-      } else {
+      if (looksLikeOccludingHelperWindow && m_resizeTransitionFramesRemaining == 0) {
+        acceptRemixViewportExtent = false;
+
         static uint32_t sIgnoredSmallRemixViewportLogCount = 0;
         if (sIgnoredSmallRemixViewportLogCount < 16) {
           ++sIgnoredSmallRemixViewportLogCount;
           Logger::info(str::format(
             "[D3D11Rtx] Ignoring small/occluding Remix viewport extent update: new=",
-            chosenExtent.width, "x", chosenExtent.height,
-            " prevViewport=", m_lastRemixViewportExtent.width, "x", m_lastRemixViewportExtent.height,
-            " prevOutput=", m_lastOutputExtent.width, "x", m_lastOutputExtent.height));
+            remixViewportExtent.width, "x", remixViewportExtent.height,
+            " prevViewport=", previousStableRemixViewport.width, "x", previousStableRemixViewport.height,
+            " prevOutput=", previousStableOutputExtent.width, "x", previousStableOutputExtent.height,
+            " widthCov=", hadStableViewport ? widthCovVsViewport : widthCovVsOutput,
+            " heightCov=", hadStableViewport ? heightCovVsViewport : heightCovVsOutput));
         }
+      }
+
+      if (acceptRemixViewportExtent) {
+        m_lastRemixViewportExtent = remixViewportExtent;
       }
     }
 
