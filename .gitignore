@@ -43,3 +43,9 @@ metrics.txt
 nrc_session_log.txt
 python.dxvk-cache
 *.xml.user
+
+# Editor / scripted backup files — never commit these
+*.bak
+*.bak-*
+*.bak.*
+*.pre-*.bak

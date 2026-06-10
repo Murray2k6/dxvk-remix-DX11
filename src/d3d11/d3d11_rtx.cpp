@@ -45,6 +45,14 @@ namespace dxvk {
       if (!hasBackbuffer)
         return false;
 
+      // Escape hatch: some games never produce a camera that passes the
+      // validity gates below, which permanently blocks both path tracing and
+      // the Remix UI (the UI renders inside the injected composite). When
+      // rtx.dx11.forceInjection is enabled in dxvk.conf, inject every frame
+      // that has a backbuffer.
+      if (RtxOptions::forceInjection())
+        return true;
+
       // First-time RTX injection needs a real scene camera. Otherwise loading
       // screens, menus, and weak viewport-fallback candidates can replace the
       // game frame with a black Remix composite. Previous scenes may only carry
@@ -2437,8 +2445,12 @@ namespace dxvk {
         return true;
 
       switch (fmt) {
+        // Note: A8_UNORM is deliberately absent. Alpha-only textures are
+        // font/UI atlases, not albedo; treating them as albedo let a
+        // 2880x1088 glyph atlas win material selection and tile glyph
+        // noise across world geometry whenever every other candidate was
+        // rejected (observed in Sunset Overdrive).
         case DXGI_FORMAT_R8_UNORM:
-        case DXGI_FORMAT_A8_UNORM:
         case DXGI_FORMAT_R8G8_UNORM:
         case DXGI_FORMAT_R8G8B8A8_UNORM:
         case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
@@ -2874,9 +2886,15 @@ namespace dxvk {
       }
     }
 
-    if (doLog && pickCount > 0) {
+    if (doLog) {
       Logger::info(str::format("[D3D11Rtx] FillMaterialData draw #", s_logCount,
         " picked ", textureID, " of ", pickCount, " candidate(s)"));
+      // Count every logged draw, not just draws that picked a texture.
+      // Previously the counter only advanced when pickCount > 0, so in
+      // deferred engines where most draws reject all candidates the 10-draw
+      // cap never engaged and the per-draw candidate logging ran forever --
+      // tens of thousands of str::format + log writes on the draw hot path
+      // (a measurable CPU bottleneck and 30k+ line logs).
       ++s_logCount;
     }
 
@@ -4272,74 +4290,138 @@ namespace dxvk {
     }
   }
 
-  void D3D11Rtx::EndFrame(const Rc<DxvkImage>& backbuffer, VkExtent2D remixViewportExtent) {
-    auto noteResizeTransition = [this](VkExtent2D newExtent, VkExtent2D& trackedExtent) {
+  void D3D11Rtx::UpdateTrackedExtents(const Rc<DxvkImage>& outputImage, VkExtent2D remixViewportExtent) {
+    // Capture the stable previous values BEFORE any mutation. Every
+    // comparison below must run against last frame's state — comparing the
+    // incoming extent against a tracker this function already overwrote
+    // (the bug in the previous EndFrame implementation) makes the
+    // "much smaller than stable output" test compare a value against itself.
+    const VkExtent2D previousStableOutput   = m_lastOutputExtent;
+    const VkExtent2D previousStableViewport = m_lastRemixViewportExtent;
+
+    VkExtent2D outputExtent = { 0u, 0u };
+    if (outputImage != nullptr) {
+      const VkExtent3D e = outputImage->info().extent;
+      if (e.width > 0u && e.height > 0u)
+        outputExtent = { e.width, e.height };
+    }
+
+    // The Remix-owned output extent is the only fallback for a missing
+    // viewport extent. Note this is NOT the inverse promotion the old code
+    // did: a valid sub-output viewport (letterboxed scene) is preserved
+    // as-is and never silently replaced with the larger output extent,
+    // otherwise remixViewportAspect and the viewport-fallback projection
+    // would be computed from the wrong rectangle.
+    if (remixViewportExtent.width == 0u || remixViewportExtent.height == 0u)
+      remixViewportExtent = outputExtent;
+
+    // Heuristic: does this extent look like a small helper/launcher window
+    // occluding the real game output (overlay swapchains, splash windows,
+    // emulator tool panes) rather than a legitimate resize?
+    const auto isOccludingHelperExtent = [&](VkExtent2D candidate) -> bool {
+      if (candidate.width == 0u || candidate.height == 0u)
+        return false; // empty extents are skipped by applyExtent, not "occluding"
+
+      const bool hadStableViewport =
+        previousStableViewport.width >= 640u && previousStableViewport.height >= 480u;
+      const bool hadStableOutput =
+        previousStableOutput.width >= 640u && previousStableOutput.height >= 480u;
+
+      if (!hadStableViewport && !hadStableOutput)
+        return false; // nothing stable to defend yet — accept whatever arrives
+
+      const bool tiny = candidate.width < 640u || candidate.height < 480u;
+
+      const auto muchSmallerThan = [&](VkExtent2D stable) {
+        return (uint64_t(candidate.width)  * 10ull < uint64_t(stable.width)  * 7ull)
+            || (uint64_t(candidate.height) * 10ull < uint64_t(stable.height) * 7ull);
+      };
+
+      const bool muchSmallerThanViewport = hadStableViewport && muchSmallerThan(previousStableViewport);
+      const bool muchSmallerThanOutput   = hadStableOutput   && muchSmallerThan(previousStableOutput);
+
+      return tiny || muchSmallerThanViewport || muchSmallerThanOutput;
+    };
+
+    // Persistence escape hatch: a rejected extent that keeps arriving is the
+    // new reality (the user really did shrink the window below the heuristic
+    // floor). Returns true once the same extent has been rejected enough
+    // consecutive times that it should be accepted after all.
+    const auto rejectedExtentBecamePersistent = [&](VkExtent2D rejected) -> bool {
+      if (rejected.width == m_pendingRejectedExtent.width
+       && rejected.height == m_pendingRejectedExtent.height) {
+        if (++m_pendingRejectedExtentCount >= kRejectedExtentAcceptEvents) {
+          m_pendingRejectedExtentCount = 0;
+          return true;
+        }
+      } else {
+        m_pendingRejectedExtent = rejected;
+        m_pendingRejectedExtentCount = 1;
+      }
+      return false;
+    };
+
+    // driveResizeTransition: per the header contract, only m_lastOutputExtent
+    // changes may trigger resize-grace handling.
+    const auto applyExtent = [&](VkExtent2D newExtent, VkExtent2D& trackedExtent, bool driveResizeTransition) {
       if (newExtent.width == 0u || newExtent.height == 0u)
         return;
 
-      if (trackedExtent.width != 0u && trackedExtent.height != 0u
+      if (driveResizeTransition
+       && trackedExtent.width != 0u && trackedExtent.height != 0u
        && (trackedExtent.width != newExtent.width || trackedExtent.height != newExtent.height)) {
-        m_resizeTransitionFramesRemaining = kResizeCameraGraceFrames;
+        m_resizeTransitionFramesRemaining = std::max(m_resizeTransitionFramesRemaining, kResizeCameraGraceFrames);
       }
 
       trackedExtent = newExtent;
     };
 
-    // Track the Remix-owned output extent for viewport fallback. The HWND
-    // client rect is only an occlusion signal and must not drive the renderer.
-    // Only the backbuffer extent comparison below may trigger resize handling.
-    if (backbuffer != nullptr) {
-      const VkExtent3D extent = backbuffer->info().extent;
-      if (extent.width > 0u && extent.height > 0u) {
-        if (remixViewportExtent.width == 0u || remixViewportExtent.height == 0u) {
-          remixViewportExtent = { extent.width, extent.height };
-        }
-        noteResizeTransition({ extent.width, extent.height }, m_lastOutputExtent);
-      }
-    }
+    const auto considerExtent = [&](VkExtent2D candidate, VkExtent2D& trackedExtent, bool driveResizeTransition, const char* trackerName) {
+      if (candidate.width == 0u || candidate.height == 0u)
+        return;
 
-    if (remixViewportExtent.width > 0u && remixViewportExtent.height > 0u) {
-      VkExtent2D chosenExtent = remixViewportExtent;
+      // During a genuine resize transition new extents flow through freely;
+      // outside one, an occluding-helper-looking extent is rejected so a
+      // launcher/overlay swapchain cannot clobber the trackers, trigger
+      // bogus resize grace every flip-flopped present, or shrink the
+      // viewport-fallback projection. Crucially this now protects
+      // m_lastOutputExtent too — previously only the viewport tracker was
+      // guarded, so a 320x240 helper present poisoned the output extent and
+      // kept the resize-carryover camera hack permanently engaged.
+      const bool occluding = m_resizeTransitionFramesRemaining == 0
+                          && isOccludingHelperExtent(candidate);
 
-      if (m_lastOutputExtent.width > chosenExtent.width && m_lastOutputExtent.height > chosenExtent.height) {
-        chosenExtent = m_lastOutputExtent;
-      }
-
-      const bool hadLargeStableViewport =
-        m_lastRemixViewportExtent.width >= 640u && m_lastRemixViewportExtent.height >= 480u;
-      const bool hadLargeStableOutput =
-        m_lastOutputExtent.width >= 640u && m_lastOutputExtent.height >= 480u;
-
-      const bool tinyHelperExtent = chosenExtent.width < 640u || chosenExtent.height < 480u;
-
-      const bool muchSmallerThanStableViewport =
-        hadLargeStableViewport &&
-        ((uint64_t(chosenExtent.width) * 10ull < uint64_t(m_lastRemixViewportExtent.width) * 7ull) ||
-         (uint64_t(chosenExtent.height) * 10ull < uint64_t(m_lastRemixViewportExtent.height) * 7ull));
-
-      const bool muchSmallerThanStableOutput =
-        hadLargeStableOutput &&
-        ((uint64_t(chosenExtent.width) * 10ull < uint64_t(m_lastOutputExtent.width) * 7ull) ||
-         (uint64_t(chosenExtent.height) * 10ull < uint64_t(m_lastOutputExtent.height) * 7ull));
-
-      const bool ignoreAsOccludingSmallWindow =
-        (hadLargeStableViewport || hadLargeStableOutput) &&
-        (tinyHelperExtent || muchSmallerThanStableViewport || muchSmallerThanStableOutput);
-
-      if (!ignoreAsOccludingSmallWindow) {
-        m_lastRemixViewportExtent = chosenExtent;
-      } else {
-        static uint32_t sIgnoredSmallRemixViewportLogCount = 0;
-        if (sIgnoredSmallRemixViewportLogCount < 16) {
-          ++sIgnoredSmallRemixViewportLogCount;
+      if (occluding && !rejectedExtentBecamePersistent(candidate)) {
+        static uint32_t sIgnoredSmallExtentLogCount = 0;
+        if (sIgnoredSmallExtentLogCount < 16) {
+          ++sIgnoredSmallExtentLogCount;
           Logger::info(str::format(
-            "[D3D11Rtx] Ignoring small/occluding Remix viewport extent update: new=",
-            chosenExtent.width, "x", chosenExtent.height,
-            " prevViewport=", m_lastRemixViewportExtent.width, "x", m_lastRemixViewportExtent.height,
-            " prevOutput=", m_lastOutputExtent.width, "x", m_lastOutputExtent.height));
+            "[D3D11Rtx] Ignoring small/occluding ", trackerName, " extent update: new=",
+            candidate.width, "x", candidate.height,
+            " prevViewport=", previousStableViewport.width, "x", previousStableViewport.height,
+            " prevOutput=", previousStableOutput.width, "x", previousStableOutput.height,
+            " rejectStreak=", m_pendingRejectedExtentCount));
         }
+        return;
       }
+
+      applyExtent(candidate, trackedExtent, driveResizeTransition);
+    };
+
+    considerExtent(outputExtent,        m_lastOutputExtent,        true,  "output");
+    considerExtent(remixViewportExtent, m_lastRemixViewportExtent, false, "Remix viewport");
+
+    // Any accepted frame with non-occluding extents resets the persistence
+    // streak so unrelated later rejections start counting from scratch.
+    if (outputExtent.width != 0u
+     && !(m_resizeTransitionFramesRemaining == 0 && isOccludingHelperExtent(outputExtent))) {
+      m_pendingRejectedExtent = { 0u, 0u };
+      m_pendingRejectedExtentCount = 0;
     }
+  }
+
+  void D3D11Rtx::EndFrame(const Rc<DxvkImage>& backbuffer, VkExtent2D remixViewportExtent) {
+    UpdateTrackedExtents(backbuffer, remixViewportExtent);
 
     const uint32_t gameViewportCount = m_context->m_state.rs.numViewports;
     const VkExtent2D singleRemixViewportExtent = m_lastRemixViewportExtent;
@@ -4509,87 +4591,10 @@ namespace dxvk {
   }
 
   void D3D11Rtx::OnPresent(const Rc<DxvkImage>& swapchainImage, VkExtent2D remixViewportExtent) {
-    auto noteResizeTransition = [this](VkExtent2D newExtent, VkExtent2D& trackedExtent) {
-      if (newExtent.width == 0u || newExtent.height == 0u)
-        return;
-
-      if (trackedExtent.width != 0u && trackedExtent.height != 0u
-       && (trackedExtent.width != newExtent.width || trackedExtent.height != newExtent.height)) {
-        m_resizeTransitionFramesRemaining = std::max(m_resizeTransitionFramesRemaining, kResizeCameraGraceFrames);
-      }
-
-      trackedExtent = newExtent;
-    };
-
-    // Track the Remix-owned present extent for viewport fallback. The HWND
-    // client rect is only an occlusion signal and must not drive the renderer.
-    // Only the present-image extent comparison below may trigger resize handling.
-    if (swapchainImage != nullptr) {
-      const VkExtent3D extent = swapchainImage->info().extent;
-      if (extent.width > 0u && extent.height > 0u) {
-        if (remixViewportExtent.width == 0u || remixViewportExtent.height == 0u) {
-          remixViewportExtent = { extent.width, extent.height };
-        }
-        noteResizeTransition({ extent.width, extent.height }, m_lastOutputExtent);
-      }
-    }
-
-    if (remixViewportExtent.width > 0u && remixViewportExtent.height > 0u) {
-      bool acceptRemixViewportExtent = true;
-
-      const VkExtent2D previousStableRemixViewport = m_lastRemixViewportExtent;
-      const VkExtent2D previousStableOutputExtent = m_lastOutputExtent;
-
-      const bool hadStableViewport =
-        previousStableRemixViewport.width > 0u && previousStableRemixViewport.height > 0u;
-      const bool hadStableOutput =
-        previousStableOutputExtent.width > 0u && previousStableOutputExtent.height > 0u;
-
-      const float widthCovVsViewport = hadStableViewport
-        ? float(remixViewportExtent.width) / float(previousStableRemixViewport.width)
-        : 1.0f;
-      const float heightCovVsViewport = hadStableViewport
-        ? float(remixViewportExtent.height) / float(previousStableRemixViewport.height)
-        : 1.0f;
-      const float widthCovVsOutput = hadStableOutput
-        ? float(remixViewportExtent.width) / float(previousStableOutputExtent.width)
-        : 1.0f;
-      const float heightCovVsOutput = hadStableOutput
-        ? float(remixViewportExtent.height) / float(previousStableOutputExtent.height)
-        : 1.0f;
-
-      const bool tinyHelperExtent =
-        remixViewportExtent.width < 640u || remixViewportExtent.height < 480u;
-
-      const bool muchSmallerThanStableViewport =
-        hadStableViewport && (widthCovVsViewport < 0.60f || heightCovVsViewport < 0.60f);
-
-      const bool muchSmallerThanStableOutput =
-        hadStableOutput && (widthCovVsOutput < 0.60f || heightCovVsOutput < 0.60f);
-
-      const bool looksLikeOccludingHelperWindow =
-        tinyHelperExtent || muchSmallerThanStableViewport || muchSmallerThanStableOutput;
-
-      if (looksLikeOccludingHelperWindow && m_resizeTransitionFramesRemaining == 0) {
-        acceptRemixViewportExtent = false;
-
-        static uint32_t sIgnoredSmallRemixViewportLogCount = 0;
-        if (sIgnoredSmallRemixViewportLogCount < 16) {
-          ++sIgnoredSmallRemixViewportLogCount;
-          Logger::info(str::format(
-            "[D3D11Rtx] Ignoring small/occluding Remix viewport extent update: new=",
-            remixViewportExtent.width, "x", remixViewportExtent.height,
-            " prevViewport=", previousStableRemixViewport.width, "x", previousStableRemixViewport.height,
-            " prevOutput=", previousStableOutputExtent.width, "x", previousStableOutputExtent.height,
-            " widthCov=", hadStableViewport ? widthCovVsViewport : widthCovVsOutput,
-            " heightCov=", hadStableViewport ? heightCovVsViewport : heightCovVsOutput));
-        }
-      }
-
-      if (acceptRemixViewportExtent) {
-        m_lastRemixViewportExtent = remixViewportExtent;
-      }
-    }
+    // Same coherent policy as EndFrame — see UpdateTrackedExtents. The HWND
+    // client rect is only an occlusion signal and must not drive the
+    // renderer; only the present-image extent may trigger resize handling.
+    UpdateTrackedExtents(swapchainImage, remixViewportExtent);
 
     m_context->EmitCs([swapchainImage](DxvkContext* ctx) {
       RtxContext* rtx = static_cast<RtxContext*>(ctx);

@@ -191,6 +191,10 @@ namespace dxvk {
     Com<IDXGIVkSwapChain>           m_presenter;
     
     HMONITOR                        m_monitor;
+    // True only when EnterFullscreenMode actually changed the display mode;
+    // when dxgi.emulateFullscreen suppresses the mode switch there is nothing
+    // to restore on leave/destruction.
+    bool                            m_fsModeChanged = false;
     WindowState                     m_windowState;
     
     HRESULT EnterFullscreenMode(

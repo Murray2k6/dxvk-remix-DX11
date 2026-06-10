@@ -216,7 +216,8 @@ namespace dxvk {
     // post-process/menu viewport and destabilize temporal resources.
     if (cameraType == CameraType::Main
         && input.getTransformData().usedViewportFallbackProjection
-        && m_hasSeenRealMainCamera) {
+        && m_hasSeenRealMainCamera
+        && !RtxOptions::allowViewportFallbackAfterRealCamera()) {
       m_lastSetCameraType = CameraType::Unknown;
 
       static uint32_t sPostRealViewportFallbackLogCount = 0;

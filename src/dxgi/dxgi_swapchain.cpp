@@ -30,7 +30,8 @@ namespace dxvk {
   
   
   DxgiSwapChain::~DxgiSwapChain() {
-    RestoreDisplayMode(m_monitor);
+    if (m_fsModeChanged)
+      RestoreDisplayMode(m_monitor);
 
     // Decouple swap chain from monitor if necessary
     DXGI_VK_MONITOR_DATA* monitorInfo = nullptr;
@@ -373,7 +374,12 @@ namespace dxvk {
       }
       
       // If the swap chain allows it, change the display mode
-      if (m_desc.Flags & DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH) {
+      // The swapchain is only ever constructed by our DxgiFactory, so this
+    // downcast is safe; it gives access to per-app DXGI options.
+    const bool emulateFullscreen =
+      static_cast<DxgiFactory*>(m_factory.ptr())->GetOptions()->emulateFullscreen;
+
+    if (!emulateFullscreen && (m_desc.Flags & DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH)) {
         ChangeDisplayMode(output.ptr(), pNewTargetParameters);
         NotifyModeChange(m_monitor, FALSE);
       }
@@ -578,7 +584,12 @@ namespace dxvk {
     // Find a display mode that matches what we need
     ::GetWindowRect(m_window, &m_windowState.rect);
     
-    if (m_desc.Flags & DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH) {
+    // The swapchain is only ever constructed by our DxgiFactory, so this
+    // downcast is safe; it gives access to per-app DXGI options.
+    const bool emulateFullscreen =
+      static_cast<DxgiFactory*>(m_factory.ptr())->GetOptions()->emulateFullscreen;
+
+    if (!emulateFullscreen && (m_desc.Flags & DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH)) {
       DXGI_MODE_DESC displayMode;
       displayMode.Width            = m_desc.Width;
       displayMode.Height           = m_desc.Height;
@@ -593,6 +604,10 @@ namespace dxvk {
         Logger::err("DXGI: EnterFullscreenMode: Failed to change display mode");
         return DXGI_ERROR_NOT_CURRENTLY_AVAILABLE;
       }
+
+      m_fsModeChanged = true;
+    } else if (emulateFullscreen) {
+      Logger::info("DXGI: EnterFullscreenMode: dxgi.emulateFullscreen active - using borderless window, skipping display mode switch");
     }
     
     // Update swap chain description
@@ -617,7 +632,12 @@ namespace dxvk {
     
     const RECT rect = desc.DesktopCoordinates;
     
-    ::SetWindowPos(m_window, HWND_TOPMOST,
+    // HWND_TOPMOST keeps an exclusive-style window above everything, but it
+    // is exactly what drives the minimize/restore loop when focus bounces
+    // (the topmost window loses activation, the game reacts, repeat). In
+    // emulated fullscreen use plain HWND_TOP so the window behaves like a
+    // normal borderless-fullscreen window under focus changes.
+    ::SetWindowPos(m_window, emulateFullscreen ? HWND_TOP : HWND_TOPMOST,
       rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top,
       SWP_FRAMECHANGED | SWP_SHOWWINDOW | SWP_NOACTIVATE);
     
@@ -641,8 +661,9 @@ namespace dxvk {
   
   
   HRESULT DxgiSwapChain::LeaveFullscreenMode() {
-    if (FAILED(RestoreDisplayMode(m_monitor)))
+    if (m_fsModeChanged && FAILED(RestoreDisplayMode(m_monitor)))
       Logger::warn("DXGI: LeaveFullscreenMode: Failed to restore display mode");
+    m_fsModeChanged = false;
     
     // Reset gamma control and decouple swap chain from monitor
     DXGI_VK_MONITOR_DATA* monitorInfo = nullptr;
