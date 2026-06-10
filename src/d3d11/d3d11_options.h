@@ -29,6 +29,16 @@ namespace dxvk {
     /// access random data inside their shaders.
     bool constantBufferRangeCheck;
 
+    /// Allocates dynamic vertex/index/constant buffers in
+    /// host-cached system memory instead of write-combined
+    /// (and possibly device-local BAR) memory. The DX11->Remix
+    /// bridge reads these buffers on the CPU every frame for
+    /// geometry hashing and camera extraction; cached memory
+    /// makes those reads fast and consistent across Intel,
+    /// AMD, and NVIDIA instead of depending on which memory
+    /// type each driver happens to expose.
+    bool cachedDynamicBuffers;
+
     /// Zero-initialize workgroup memory
     ///
     /// Workargound for games that don't initialize
