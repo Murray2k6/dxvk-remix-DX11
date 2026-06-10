@@ -140,6 +140,22 @@ namespace dxvk {
     uint32_t                             m_drawsSinceFlush = 0;
     uint32_t                             m_resizeTransitionFramesRemaining = 0;
 
+    // Persistence escape hatch for the occluding-helper-window heuristic.
+    // If the same "occluding" extent keeps arriving, the window genuinely
+    // became small (user resized below the heuristic floor) and must
+    // eventually be accepted instead of being rejected forever. The counter
+    // accumulates rejection events (up to ~4 per frame: output + viewport
+    // tracker in both EndFrame and OnPresent), so 240 events is roughly
+    // 1-2 seconds at 60 fps.
+    VkExtent2D                           m_pendingRejectedExtent = { 0u, 0u };
+    uint32_t                             m_pendingRejectedExtentCount = 0;
+    static constexpr uint32_t kRejectedExtentAcceptEvents = 240;
+
+    // Single coherent policy for maintaining m_lastOutputExtent and
+    // m_lastRemixViewportExtent. Called from both EndFrame and OnPresent so
+    // the two paths cannot drift apart again.
+    void UpdateTrackedExtents(const Rc<DxvkImage>& outputImage, VkExtent2D remixViewportExtent);
+
     Rc<DxvkSampler> getDefaultSampler() const;
     void SubmitDraw(bool indexed, UINT count, UINT start, INT base,
                     const Matrix4* instanceTransform = nullptr);

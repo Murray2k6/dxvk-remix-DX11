@@ -827,6 +827,23 @@ namespace dxvk {
         if (option() == preferredValue)
           return;
 
+        // If the user pinned this option (rtx.conf / user settings), the User
+        // layer legitimately outranks every layer auto-detection may write to.
+        // Respect the pin: escalating through Quality/Default/Derived writes
+        // can never win, and previously this path spammed warnings and a
+        // final error every launch while trying to bulldoze the user's own
+        // choice.
+        if (option.isUserOverridden()) {
+          Logger::info(str::format(
+            "[RtxOptions] ", optionName,
+            " is pinned by a user setting (value=",
+            static_cast<int>(option()),
+            "); auto-detected value (",
+            static_cast<int>(preferredValue),
+            ") not applied. Remove the option from rtx.conf to use auto-detection."));
+          return;
+        }
+
         Logger::warn(str::format(
           "[RtxOptions] ", optionName,
           " auto-resolution is blocked by a stronger layer. Clearing stronger layers and retrying."));

@@ -15,7 +15,7 @@ DXVK-Remix is the runtime-side graphics translation layer used by RTX Remix. It 
 This DX11-focused architecture replaces the traditional D3D9-facing frontend with a Direct3D 11 frontend:
 
 - The game loads `d3d11.dll` and/or `dxgi.dll` from this project.
-- The wrapper intercepts D3D11 device, context, swap chain, resource, shader, input-layout, and draw calls.
+- The frontend interposes on D3D11 device, context, swap chain, resource, shader, input-layout, and draw calls.
 - The D3D11 state is inspected and converted into Remix-friendly scene information.
 - The backend uses Vulkan/DXVK-Remix infrastructure for resource management, rendering, presentation, and RTX Remix integration.
 - The final frame is owned by the Remix runtime path instead of being a plain game swap-chain present.
@@ -30,7 +30,7 @@ This project is a **D3D11 capture and translation frontend for DXVK-Remix**.
 
 It is meant to:
 
-- Load as a drop-in `d3d11.dll` / `dxgi.dll` wrapper.
+- Be used as a drop-in `d3d11.dll` / `dxgi.dll` frontend interposer (DLL replacement).
 - Capture D3D11 draw calls and render state.
 - Detect camera, projection, world, and view transforms from D3D11 constant buffers.
 - Extract geometry from D3D11 vertex/index buffers.
@@ -114,7 +114,7 @@ Final Presented Frame
 
 The target application loads this project's `d3d11.dll` and/or `dxgi.dll` from the application directory or configured loader path.
 
-The wrapper exposes the expected Direct3D and DXGI entry points, then forwards or implements them through the DXVK-Remix runtime path.
+This frontend provides the expected Direct3D and DXGI entry points and forwards or implements them through the DXVK-Remix runtime path.
 
 Important entry points include:
 

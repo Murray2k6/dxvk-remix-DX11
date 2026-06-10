@@ -324,6 +324,8 @@ namespace dxvk {
                     "This value must always be greater than zero.",
                     args.flags = RtxOptionFlags::UserSetting);
     RTX_OPTION("rtx", bool, skipDrawCallsPostRTXInjection, false, "Ignores all draw calls recorded after RTX Injection, the location of which varies but is currently based on when tagged UI textures begin to draw.");
+    RTX_OPTION("rtx.dx11", bool, forceInjection, false, "Forces Remix injection every frame with a backbuffer, bypassing the camera/scene-draw validity gate in the DX11 bridge. The gate prevents loading screens and menus from being replaced with a black composite, but in games whose cameras never pass validation it permanently blocks both path tracing and the Remix UI. Enable as an escape hatch for such games.");
+    RTX_OPTION("rtx.dx11", bool, allowViewportFallbackAfterRealCamera, false, "Allows synthesized viewport-fallback projections to update the Main camera even after a real cbuffer projection has been seen. Default-off suppression protects temporal stability, but games that expose a real projection only briefly (e.g. during a cutscene or video) are otherwise locked out of the fallback path for the rest of the session.");
     RTX_OPTION_ARGS("rtx", DlssPreset, dlssPreset, DlssPreset::On, "Combined DLSS Preset for quickly controlling Upscaling, Frame Interpolation and Latency Reduction.",
                     args.environment = "RTX_DLSS_PRESET",
                     args.flags = RtxOptionFlags::UserSetting);

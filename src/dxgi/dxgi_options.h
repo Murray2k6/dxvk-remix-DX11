@@ -33,6 +33,12 @@ namespace dxvk {
     /// Emulate UMA
     bool emulateUMA;
 
+    /// Emulate exclusive fullscreen as a borderless topless window without
+    /// changing the display mode. Cures games that minimize and restore in a
+    /// loop when the exclusive-mode switch interacts badly with focus changes
+    /// (overlays, second monitors, the Remix UI focus handling).
+    bool emulateFullscreen;
+
     /// Enables the legacy NvAPI vendor spoof workaround.
     /// Disabled by default in this DX11 Remix fork so adapters
     /// report their real vendor unless explicitly overridden.
