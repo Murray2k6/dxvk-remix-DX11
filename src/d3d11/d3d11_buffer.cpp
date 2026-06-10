@@ -228,8 +228,21 @@ namespace dxvk {
         memoryFlags |= VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT
                     |  VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
 
-        if (m_desc.BindFlags)
+        // The bridge reads dynamic VB/IB/CB contents on the CPU every frame
+        // (geometry/texcoord hashing, per-draw constant buffer scans for
+        // camera extraction). Write-combined memory makes those reads ~100x
+        // slower and, when a driver picks device-local BAR memory, gives
+        // each vendor different visibility/timing - the source of garbled,
+        // unstable hashes on some GPUs but not others. Host-cached system
+        // memory behaves identically everywhere.
+        if (m_parent->GetOptions()->cachedDynamicBuffers
+         && (m_desc.BindFlags & (D3D11_BIND_VERTEX_BUFFER
+                               | D3D11_BIND_INDEX_BUFFER
+                               | D3D11_BIND_CONSTANT_BUFFER))) {
+          memoryFlags |= VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
+        } else if (m_desc.BindFlags) {
           memoryFlags |= VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+        }
         break;
       
       case D3D11_USAGE_STAGING:

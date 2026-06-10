@@ -2329,12 +2329,17 @@ namespace dxvk {
     const size_t tcLength  = geo.texcoordBuffer.defined() ? geo.texcoordBuffer.length() : 0;
     const size_t idxLength = geo.indexBuffer.defined()    ? geo.indexBuffer.length()    : 0;
 
+    // Content-derived identity for CPU-unreadable buffers (set at creation
+    // from initial data). Stable across runs and GPU vendors, unlike the
+    // pointer-based fallback below.
+    const uint64_t posCookie = posBuf ? posBuf->contentCookie() : 0ull;
+
     auto future = m_pGeometryWorkers->Schedule([posData, tcData, idxData,
                                          posBuf, tcBuf, idxBuf,
                                          posStride, tcStride, idxStride,
                                          posLength, tcLength, idxLength,
                                          vertexCount, indexCount = geo.indexCount,
-                                         posOffset,
+                                         posOffset, posCookie,
                                          hashStartVertex, hashVertexCount,
                                          descHash, layoutHash]() -> GeometryHashes {
       GeometryHashes hashes;
@@ -2387,12 +2392,24 @@ namespace dxvk {
           hashes[HashComponents::Indices] = idxHash;
         }
       } else {
-        // GPU-only buffer: stable identity hash from buffer address and offset.
-        // Use a more robust hash that includes buffer size information
-        XXH64_hash_t posHash = XXH3_64bits(&posBuf, sizeof(posBuf));
-        posHash = XXH3_64bits_withSeed(&posOffset, sizeof(posOffset), posHash);
-        posHash = XXH3_64bits_withSeed(&vertexCount, sizeof(vertexCount), posHash);
-        hashes[HashComponents::VertexPosition] = posHash;
+        // GPU-only buffer the CPU cannot read. Prefer the content cookie
+        // (hashed from the buffer's initial data at creation): it is the
+        // same value every run on every GPU vendor. The pointer-based
+        // fallback below only triggers for buffers created without initial
+        // data and filled purely on the GPU; its hashes are randomized by
+        // ASLR each run and can collide when the allocator recycles
+        // addresses - the "garbled hash" failure mode.
+        if (posCookie != 0ull) {
+          XXH64_hash_t posHash = XXH3_64bits(&posCookie, sizeof(posCookie));
+          posHash = XXH3_64bits_withSeed(&posOffset, sizeof(posOffset), posHash);
+          posHash = XXH3_64bits_withSeed(&vertexCount, sizeof(vertexCount), posHash);
+          hashes[HashComponents::VertexPosition] = posHash;
+        } else {
+          XXH64_hash_t posHash = XXH3_64bits(&posBuf, sizeof(posBuf));
+          posHash = XXH3_64bits_withSeed(&posOffset, sizeof(posOffset), posHash);
+          posHash = XXH3_64bits_withSeed(&vertexCount, sizeof(vertexCount), posHash);
+          hashes[HashComponents::VertexPosition] = posHash;
+        }
       }
 
       hashes.precombine();

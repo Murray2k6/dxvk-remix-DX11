@@ -27,6 +27,7 @@ namespace dxvk {
 
     this->constantBufferRangeCheck = config.getOption<bool>("d3d11.constantBufferRangeCheck", false)
       && DxvkGpuVendor(devInfo.core.properties.vendorID) != DxvkGpuVendor::Amd;
+    this->cachedDynamicBuffers = config.getOption<bool>("d3d11.cachedDynamicBuffers", true);
 
     bool apitraceAttached = false;
     apitraceAttached = ::GetModuleHandle("dxgitrace.dll") != nullptr;

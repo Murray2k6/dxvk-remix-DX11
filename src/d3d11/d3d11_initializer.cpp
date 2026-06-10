@@ -1,7 +1,11 @@
+#include <algorithm>
 #include <cstring>
 
 #include "d3d11_device.h"
 #include "d3d11_initializer.h"
+
+#define XXH_INLINE_ALL
+#include "../util/xxHash/xxhash.h"
 
 namespace dxvk {
 
@@ -46,6 +50,26 @@ namespace dxvk {
     (memFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)
       ? InitHostVisibleBuffer(pBuffer, pInitialData)
       : InitDeviceLocalBuffer(pBuffer, pInitialData);
+
+    // Give vertex/index buffers created with initial data (the static-mesh
+    // path in most engines) a stable, content-derived identity. The bridge's
+    // geometry hashing uses this cookie for buffers the CPU cannot read,
+    // replacing the old pointer-based fallback whose hashes were randomized
+    // by ASLR every run and recycled within a run - i.e. garbled hashes on
+    // exactly the geometry that should hash most stably. Hashing is capped
+    // at 4 MiB per buffer to bound creation-time cost for huge meshes.
+    if (pInitialData != nullptr && pInitialData->pSysMem != nullptr) {
+      const auto& desc = *pBuffer->Desc();
+      if (desc.BindFlags & (D3D11_BIND_VERTEX_BUFFER | D3D11_BIND_INDEX_BUFFER)) {
+        constexpr size_t kMaxCookieBytes = 4ull << 20;
+        const size_t hashBytes = std::min<size_t>(desc.ByteWidth, kMaxCookieBytes);
+        uint64_t cookie = XXH3_64bits(pInitialData->pSysMem, hashBytes);
+        cookie = XXH3_64bits_withSeed(&desc.ByteWidth, sizeof(desc.ByteWidth), cookie);
+        if (cookie == 0ull)
+          cookie = 1ull; // zero is reserved for "unset"
+        pBuffer->GetBuffer()->setContentCookie(cookie);
+      }
+    }
   }
   
 

@@ -21,6 +21,7 @@
 */
 #pragma once
 
+#include <atomic>
 #include <unordered_map>
 #include <vector>
 
@@ -400,6 +401,28 @@ namespace dxvk {
       VkDeviceSize sliceCount, DxvkMemoryStats::Category category) const;
 
     VkDeviceSize computeSliceAlignment() const;
+
+  // NV-DXVK start: stable content cookie for the DX11 bridge
+  public:
+    /**
+     * \brief Content-derived identity for geometry hashing
+     *
+     * Set at creation time from a buffer's initial data so the DX11 bridge
+     * can hash geometry in buffers whose memory the CPU cannot read (static
+     * DEVICE_LOCAL meshes). Stable across runs and across GPU vendors,
+     * unlike the pointer-based fallback. Zero means unset.
+     */
+    uint64_t contentCookie() const {
+      return m_contentCookie.load(std::memory_order_relaxed);
+    }
+
+    void setContentCookie(uint64_t cookie) {
+      m_contentCookie.store(cookie, std::memory_order_relaxed);
+    }
+
+  private:
+    std::atomic<uint64_t> m_contentCookie = { 0ull };
+  // NV-DXVK end
 
   // NV-DXVK start: buffer clones for orphaned slices
   private:
