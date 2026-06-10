@@ -539,13 +539,56 @@ namespace dxvk {
         }
 
       } else if (vendorID == static_cast<uint32_t>(DxvkGpuVendor::Amd)) {
-        // AMD preset: VRAM-based tier selection.
-        // RDNA 3 (RX 7900 XT/XTX) = 20-24 GB, RDNA 2 (6800+) = 16 GB,
-        // mid-range (6700/7600) = 8-12 GB, budget = 4-8 GB.
+        // AMD preset: architecture-generation detection with VRAM as a
+        // secondary modifier. Generation matters more than VRAM for path
+        // tracing: RDNA 2's RT throughput sits around NVIDIA Turing class,
+        // RDNA 3 improved it only modestly (an RX 7600 falls well behind an
+        // RTX 4060 once RT is enabled), while RDNA 4 brought a major RT
+        // uplift into Ampere/Ada territory. Parse the marketing name for the
+        // series digit; fall back to VRAM tiers when unrecognized.
+        const std::string amdName = device->adapter()->deviceProperties().deviceName;
         const VkPhysicalDeviceMemoryProperties amdMemProps = device->adapter()->memoryProperties();
         const VkDeviceSize amdVidMem = getDeviceLocalMemorySize(amdMemProps);
 
-        if (amdVidMem >= 16ull * 1024 * 1024 * 1024) {
+        int radeonSeries = 0; // first digit after "RX " (6xxx / 7xxx / 9xxx)
+        {
+          const size_t rxPos = amdName.find("RX ");
+          if (rxPos != std::string::npos && rxPos + 3 < amdName.size()) {
+            const char c = amdName[rxPos + 3];
+            if (c >= '0' && c <= '9') {
+              radeonSeries = c - '0';
+            }
+          }
+        }
+
+        if (radeonSeries >= 9) {
+          // RDNA 4 (RX 9000): Ada-class RT uplift -> Medium for Remix path
+          // tracing (no SER / opacity micromaps, so one tier below NVIDIA Ada).
+          Logger::info(str::format("AMD RDNA4-class GPU detected (", amdName, "), setting preset to Medium"));
+          preferredDefault = GraphicsPreset::Medium;
+          DxvkXeSS::XessOptions::preset.setDeferred(XeSSPreset::Quality);
+          RtxOptions::nisPreset.setDeferred(NisPreset::Quality);
+          RtxOptions::taauPreset.setDeferred(TaauPreset::Balanced);
+        } else if (radeonSeries == 7 && amdVidMem >= 20ull * 1024 * 1024 * 1024) {
+          // High-end RDNA 3 (RX 7900 XT/XTX): enough raw throughput for Medium.
+          Logger::info(str::format("AMD high-end RDNA3 GPU detected (", amdName, "), setting preset to Medium"));
+          preferredDefault = GraphicsPreset::Medium;
+          DxvkXeSS::XessOptions::preset.setDeferred(XeSSPreset::Quality);
+          RtxOptions::nisPreset.setDeferred(NisPreset::Quality);
+          RtxOptions::taauPreset.setDeferred(TaauPreset::Balanced);
+        } else if (radeonSeries == 7 || radeonSeries == 6) {
+          // Mainstream RDNA 2/3: Turing-class RT throughput -> Low.
+          Logger::info(str::format("AMD RDNA2/3 GPU detected (", amdName, "), setting preset to Low"));
+          preferredDefault = GraphicsPreset::Low;
+          DxvkXeSS::XessOptions::preset.setDeferred(XeSSPreset::Balanced);
+          RtxOptions::nisPreset.setDeferred(NisPreset::Balanced);
+          RtxOptions::taauPreset.setDeferred(TaauPreset::Performance);
+          if (amdVidMem <= 8ull * 1024 * 1024 * 1024) {
+            // Budget RDNA with 8GB or less: halve ray-trace resolution to avoid TDRs.
+            RtxOptions::resolutionScale.setDeferred(0.5f);
+          }
+        } else if (amdVidMem >= 16ull * 1024 * 1024 * 1024) {
+          // Unrecognized name: fall back to the original VRAM tiers.
           Logger::info(str::format("AMD GPU detected with ", amdVidMem / (1024*1024), " MB VRAM, setting preset to Medium"));
           preferredDefault = GraphicsPreset::Medium;
           DxvkXeSS::XessOptions::preset.setDeferred(XeSSPreset::Quality);
@@ -563,40 +606,76 @@ namespace dxvk {
           DxvkXeSS::XessOptions::preset.setDeferred(XeSSPreset::Performance);
           RtxOptions::nisPreset.setDeferred(NisPreset::Performance);
           RtxOptions::taauPreset.setDeferred(TaauPreset::Performance);
-          // Budget AMD: halve ray-trace resolution to avoid TDR on low-end cards.
           RtxOptions::resolutionScale.setDeferred(0.5f);
         }
 
       } else if (vendorID == static_cast<uint32_t>(DxvkGpuVendor::Intel)) {
-        // Intel Arc preset: VRAM-based tier selection.
-        // Arc A770/B580 = 16 GB, A750 = 8 GB, A380 = 6 GB.
+        // Intel preset: architecture-generation detection. Intel's RT
+        // hardware is strong for its class - Alchemist (A-series) matches
+        // NVIDIA Ampere (RTX 3060) in RT, and Battlemage (B-series) matches
+        // or beats an RTX 4060 with RT enabled - so a blanket half-resolution
+        // penalty is wrong for discrete Arc. Reserve it for iGPUs and
+        // low-VRAM Alchemist parts.
+        const std::string intelName = device->adapter()->deviceProperties().deviceName;
         const VkPhysicalDeviceMemoryProperties intelMemProps = device->adapter()->memoryProperties();
         const VkDeviceSize intelVidMem = getDeviceLocalMemorySize(intelMemProps);
 
-        if (intelVidMem >= 12ull * 1024 * 1024 * 1024) {
-          Logger::info(str::format("Intel Arc GPU detected with ", intelVidMem / (1024*1024), " MB VRAM, setting preset to Medium"));
+        char arcGen = 0; // 'A' = Alchemist, 'B' = Battlemage, 'C' = Celestial
+        {
+          const size_t arcPos = intelName.find("Arc");
+          if (arcPos != std::string::npos) {
+            for (size_t i = arcPos + 3; i + 1 < intelName.size(); ++i) {
+              const char c = intelName[i];
+              const char n = intelName[i + 1];
+              if ((c == 'A' || c == 'B' || c == 'C') && n >= '0' && n <= '9') {
+                arcGen = c;
+                break;
+              }
+            }
+          }
+        }
+
+        if (arcGen >= 'C') {
+          // Celestial and beyond: assume another generational RT uplift.
+          Logger::info(str::format("Intel Arc Celestial-class GPU detected (", intelName, "), setting preset to High"));
+          preferredDefault = GraphicsPreset::High;
+          DxvkXeSS::XessOptions::preset.setDeferred(XeSSPreset::Quality);
+          RtxOptions::nisPreset.setDeferred(NisPreset::Quality);
+          RtxOptions::taauPreset.setDeferred(TaauPreset::Quality);
+        } else if (arcGen == 'B') {
+          // Battlemage: Ada-class RT (B580 matches/beats RTX 4060 with RT on),
+          // minus SER/OMM -> Medium, full internal resolution.
+          Logger::info(str::format("Intel Arc Battlemage GPU detected (", intelName, "), setting preset to Medium"));
           preferredDefault = GraphicsPreset::Medium;
           DxvkXeSS::XessOptions::preset.setDeferred(XeSSPreset::Quality);
           RtxOptions::nisPreset.setDeferred(NisPreset::Quality);
           RtxOptions::taauPreset.setDeferred(TaauPreset::Balanced);
+        } else if (arcGen == 'A') {
+          // Alchemist: Ampere-class RT -> Low, half resolution only on low VRAM.
+          Logger::info(str::format("Intel Arc Alchemist GPU detected (", intelName, "), setting preset to Low"));
+          preferredDefault = GraphicsPreset::Low;
+          DxvkXeSS::XessOptions::preset.setDeferred(XeSSPreset::Balanced);
+          RtxOptions::nisPreset.setDeferred(NisPreset::Balanced);
+          RtxOptions::taauPreset.setDeferred(TaauPreset::Performance);
+          if (intelVidMem <= 8ull * 1024 * 1024 * 1024) {
+            RtxOptions::resolutionScale.setDeferred(0.5f);
+          }
         } else if (intelVidMem >= 8ull * 1024 * 1024 * 1024) {
-          Logger::info(str::format("Intel Arc GPU detected with ", intelVidMem / (1024*1024), " MB VRAM, setting preset to Low"));
+          // Unrecognized discrete Intel GPU: VRAM-tier fallback.
+          Logger::info(str::format("Intel GPU detected with ", intelVidMem / (1024*1024), " MB VRAM, setting preset to Low"));
           preferredDefault = GraphicsPreset::Low;
           DxvkXeSS::XessOptions::preset.setDeferred(XeSSPreset::Balanced);
           RtxOptions::nisPreset.setDeferred(NisPreset::Balanced);
           RtxOptions::taauPreset.setDeferred(TaauPreset::Performance);
         } else {
-          Logger::info(str::format("Intel GPU detected with ", intelVidMem / (1024*1024), " MB VRAM (budget), setting preset to Low"));
+          // Integrated or very low-VRAM Intel: Low preset at half resolution.
+          Logger::info(str::format("Integrated/low-VRAM Intel GPU detected (", intelName, "), setting preset to Low at 50% resolution"));
           preferredDefault = GraphicsPreset::Low;
           DxvkXeSS::XessOptions::preset.setDeferred(XeSSPreset::Performance);
           RtxOptions::nisPreset.setDeferred(NisPreset::Performance);
           RtxOptions::taauPreset.setDeferred(TaauPreset::Performance);
+          RtxOptions::resolutionScale.setDeferred(0.5f);
         }
-
-        // Intel Arc lacks dedicated RT hardware bandwidth; halve the ray-trace resolution
-        // so the GPU renders at 50% pixels and XeSS upscales back to display res.
-        // This is a permanent code default, not a config file setting.
-        RtxOptions::resolutionScale.setDeferred(0.5f);
       } else {
         // Unknown vendor defaults to TAA-U, the broadest Vulkan-safe temporal upscaler.
         Logger::info("Unknown GPU vendor detected, setting default graphics settings to Low with TAA-U upscaling");
