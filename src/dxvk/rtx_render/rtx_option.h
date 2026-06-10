@@ -429,6 +429,12 @@ namespace dxvk {
       
       hashSet->add(value);
       targetLayer->onLayerValueChanged();
+
+      // Resolve immediately, mirroring the scalar setter above. Relying on
+      // the deferred dirty pass alone left the cached resolved set stale for
+      // consumers that read it before the pass ran - the renderer kept using
+      // the old set, so texture tags appeared to do nothing.
+      resolveValue(m_resolvedValue);
       markDirty();
     }
 
@@ -451,6 +457,12 @@ namespace dxvk {
       
       hashSet->remove(value);
       targetLayer->onLayerValueChanged();
+
+      // Resolve immediately, mirroring the scalar setter above. Relying on
+      // the deferred dirty pass alone left the cached resolved set stale for
+      // consumers that read it before the pass ran - the renderer kept using
+      // the old set, so texture tags appeared to do nothing.
+      resolveValue(m_resolvedValue);
       markDirty();
     }
 
@@ -478,7 +490,9 @@ namespace dxvk {
       if (hashSet->empty()) {
         disableLayerValue(targetLayer);
       }
-      
+
+      // Resolve immediately, mirroring the scalar setter above.
+      resolveValue(m_resolvedValue);
       markDirty();
     }
 

@@ -1563,28 +1563,45 @@ namespace dxvk {
   }
     ImPlot::SetCurrentContext(m_plotContext);
 
-    // Always forward to the overlay's gameWndProcHandler first (if overlay exists).
+    const bool isKeyMsg = (msg >= WM_KEYFIRST && msg <= WM_KEYLAST)
+                       || (msg >= WM_SYSKEYDOWN && msg <= WM_SYSDEADCHAR);
+    const bool isMouseMsg = (msg >= WM_MOUSEFIRST && msg <= WM_MOUSELAST);
+    const bool uiOpen = getEffectiveUIType() != UIType::None;
+
+    // When the UI is closed, the hook must be invisible to the game.
+    // Feeding every message into the ImGui Win32 backend regardless of UI
+    // state had real side effects: the backend calls SetCapture /
+    // ReleaseCapture on mouse buttons and answers WM_SETCURSOR, which
+    // releases the game's own mouse capture (cursor drifts out of the
+    // window, mouselook breaks) and fights games that hide the cursor -
+    // all without the UI ever being opened. Hotkey detection does not
+    // depend on this path (it uses async key-state polling), so with the
+    // UI closed we only forward non-input window-management messages to
+    // the overlay and let everything else flow untouched to the game.
+    if (!uiOpen) {
+      if (m_overlayWin.ptr() != nullptr && !isKeyMsg && !isMouseMsg && msg != WM_SETCURSOR) {
+        m_overlayWin->gameWndProcHandler(hWnd, msg, wParam, lParam);
+      }
+      return false;
+    }
+
+    // UI open: forward to the overlay's gameWndProcHandler first.
     // The overlay handles keyboard forwarding to ImGui and window management events.
     if (m_overlayWin.ptr() != nullptr) {
       m_overlayWin->gameWndProcHandler(hWnd, msg, wParam, lParam);
     }
 
-    // Always forward to ImGui's Win32 backend so it sees all input events.
+    // Forward to ImGui's Win32 backend so it sees all input events.
     // This is critical for checkbox clicks, dropdown selections, slider drags,
     // and all other widget interactions. The overlay's raw input path (WM_INPUT)
     // handles mouse position tracking, but ImGui still needs the legacy
     // WM_LBUTTONDOWN/UP, WM_MOUSEMOVE etc. for widget hit-testing and state.
     ImGui_ImplWin32_WndProcHandler(hWnd, msg, wParam, lParam);
 
-    const bool isKeyMsg = (msg >= WM_KEYFIRST && msg <= WM_KEYLAST)
-                       || (msg >= WM_SYSKEYDOWN && msg <= WM_SYSDEADCHAR);
-    const bool isMouseMsg = (msg >= WM_MOUSEFIRST && msg <= WM_MOUSELAST);
-    const bool uiOpen = getEffectiveUIType() != UIType::None;
-
-    // When the UI is open, consume ALL mouse and keyboard messages so
-    // the game never sees them. This prevents the game's mouselook,
-    // weapon swings, camera moves etc. from interfering with the UI.
-    if (uiOpen && (isMouseMsg || isKeyMsg)) {
+    // Consume ALL mouse and keyboard messages while the UI is open so the
+    // game never sees them. This prevents the game's mouselook, weapon
+    // swings, camera moves etc. from interfering with the UI.
+    if (isMouseMsg || isKeyMsg) {
       return true;
     }
     return false;
