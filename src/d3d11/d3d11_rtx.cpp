@@ -4193,6 +4193,26 @@ namespace dxvk {
       return;
     }
 
+    // Vertex-color wiring. N64-era ports and fixed-function-style renderers
+    // bake shading - or the entire surface color - into COLOR0: SM64-style
+    // characters have untextured, vertex-colored body parts. With arg1
+    // hardwired to Texture, untextured draws sampled a nonexistent texture
+    // and rendered black. When the draw carries vertex colors: untextured
+    // draws select the vertex color directly; textured draws use the classic
+    // fixed-function default, Modulate(texture, vertex color).
+    if (geo.color0Buffer.defined()) {
+      if (!dcs.materialData.usesTexture()) {
+        dcs.materialData.textureColorArg1Source = RtTextureArgSource::VertexColor0;
+        dcs.materialData.textureColorOperation  = DxvkRtTextureOperation::SelectArg1;
+        dcs.materialData.textureAlphaArg1Source = RtTextureArgSource::VertexColor0;
+        dcs.materialData.textureAlphaOperation  = DxvkRtTextureOperation::SelectArg1;
+      } else {
+        dcs.materialData.textureColorArg2Source = RtTextureArgSource::VertexColor0;
+        dcs.materialData.textureColorOperation  = DxvkRtTextureOperation::Modulate;
+      }
+      dcs.materialData.updateCachedHash();
+    }
+
     if (!geo.texcoordBuffer.defined() && dcs.materialData.usesTexture()) {
       ++m_submitRejectStats.noTexcoordLayout;
 

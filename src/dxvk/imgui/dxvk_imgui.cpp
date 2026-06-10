@@ -1566,6 +1566,11 @@ namespace dxvk {
     const bool isKeyMsg = (msg >= WM_KEYFIRST && msg <= WM_KEYLAST)
                        || (msg >= WM_SYSKEYDOWN && msg <= WM_SYSDEADCHAR);
     const bool isMouseMsg = (msg >= WM_MOUSEFIRST && msg <= WM_MOUSELAST);
+    // Raw input: games with WM_INPUT-based mouselook read the mouse through
+    // this message, not through WM_MOUSEMOVE - so consuming only legacy
+    // messages left the camera spinning while the user moved the cursor over
+    // the open UI. Treat WM_INPUT as game input to block while the UI is open.
+    const bool isRawInputMsg = (msg == WM_INPUT);
     const bool uiOpen = getEffectiveUIType() != UIType::None;
 
     // When the UI is closed, the hook must be invisible to the game.
@@ -1598,10 +1603,16 @@ namespace dxvk {
     // WM_LBUTTONDOWN/UP, WM_MOUSEMOVE etc. for widget hit-testing and state.
     ImGui_ImplWin32_WndProcHandler(hWnd, msg, wParam, lParam);
 
-    // Consume ALL mouse and keyboard messages while the UI is open so the
-    // game never sees them. This prevents the game's mouselook, weapon
-    // swings, camera moves etc. from interfering with the UI.
-    if (isMouseMsg || isKeyMsg) {
+    // Consume ALL mouse, keyboard, and raw-input messages while the UI is
+    // open so the game never sees them. This prevents the game's mouselook,
+    // weapon swings, camera moves etc. from interfering with the UI.
+    if (isMouseMsg || isKeyMsg || isRawInputMsg) {
+      if (isRawInputMsg) {
+        // Per the WM_INPUT contract the message must still reach
+        // DefWindowProc for the system to perform cleanup, even when the
+        // application swallows it.
+        ::DefWindowProcW(hWnd, msg, wParam, lParam);
+      }
       return true;
     }
     return false;
