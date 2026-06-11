@@ -1553,12 +1553,36 @@ namespace dxvk {
         const bool coversSceneLikeExtent = widthCoverage >= 0.55f && heightCoverage >= 0.55f;
         const bool coversMeaningfulArea = coverage >= 0.2f;
 
+        // Internal render-scale detection. Many engines render the 3D scene
+        // into a top-left-anchored sub-rectangle of the output target and
+        // upscale during post (Saints Row IV uses a fixed 62.5%; dynamic
+        // resolution systems roam 50-100%). The signature is a near-origin
+        // viewport with UNIFORM width/height coverage whose aspect matches
+        // the target aspect. These are scene viewports, not HUD strips, and
+        // must drive the fallback projection even though their center is
+        // offset from the target center (a 62.5% origin-anchored viewport
+        // has a normalized center offset of 0.1875 - just past the centered
+        // threshold). Shadow passes stay rejected: a square 1024x1024 pass
+        // against a 16:10 target fails both the uniformity and the aspect
+        // match.
+        const float targetAspect = targetHeight > 0.0f ? targetWidth / targetHeight : 0.0f;
+        const bool uniformScale = std::abs(widthCoverage - heightCoverage)
+                               <= 0.05f * std::max(widthCoverage, heightCoverage);
+        const bool aspectMatchesTarget = targetAspect > 0.0f
+                                      && std::abs(candidateAspect - targetAspect) <= 0.05f * targetAspect;
+        const bool renderScaleViewport = nearOrigin
+                                      && uniformScale
+                                      && aspectMatchesTarget
+                                      && widthCoverage >= 0.35f
+                                      && widthCoverage <= 1.05f;
+
         const bool acceptViewportFallback =
              usableViewport
           && plausibleSceneAspect
           && !stripViewport
           && (
                coversMostOfTarget
+            || renderScaleViewport
             || (coversSceneLikeExtent && centeredViewport)
             || (!haveStableSceneExtent && (coversMeaningfulArea && centeredViewport))
             || (!haveStableSceneExtent && nearOrigin)
@@ -2433,6 +2457,81 @@ namespace dxvk {
     return future;
   }
 
+  TextureRef D3D11Rtx::getOrCreateUntexturedPlaceholder() {
+    const auto& ps = m_context->m_state.ps;
+    const void* cacheKey = ps.shader.ptr();
+
+    auto it = m_untexturedPlaceholders.find(cacheKey);
+    if (it != m_untexturedPlaceholders.end())
+      return it->second;
+
+    // Hash from the pixel shader's content-derived key so the placeholder
+    // hash is identical across runs and machines (required for rtx.conf
+    // tags to persist); shaderless draws share a single fixed identity.
+    XXH64_hash_t hash;
+    if (ps.shader != nullptr) {
+      const std::string keyName = ps.shader->GetCommonShader()->GetShader()->getShaderKey().toString();
+      hash = XXH3_64bits(keyName.data(), keyName.size());
+    } else {
+      static const char kFixedKey[] = "remix-dx11-untextured";
+      hash = XXH3_64bits(kFixedKey, sizeof(kFixedKey) - 1);
+    }
+    if (hash == 0ull)
+      hash = 1ull;
+
+    DxvkImageCreateInfo info = {};
+    info.type        = VK_IMAGE_TYPE_2D;
+    info.format      = VK_FORMAT_R8G8B8A8_UNORM;
+    info.flags       = 0;
+    info.sampleCount = VK_SAMPLE_COUNT_1_BIT;
+    info.extent      = { 4u, 4u, 1u };
+    info.numLayers   = 1;
+    info.mipLevels   = 1;
+    info.usage       = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    info.stages      = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT
+                     | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT
+                     | VK_PIPELINE_STAGE_TRANSFER_BIT;
+    info.access      = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+    info.tiling      = VK_IMAGE_TILING_OPTIMAL;
+    info.layout      = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+
+    Rc<DxvkImage> image = m_context->m_device->createImage(
+      info, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+      DxvkMemoryStats::Category::AppTexture, "remix untextured placeholder");
+    image->setHash(hash);
+
+    DxvkImageViewCreateInfo viewInfo = {};
+    viewInfo.type      = VK_IMAGE_VIEW_TYPE_2D;
+    viewInfo.format    = info.format;
+    viewInfo.usage     = VK_IMAGE_USAGE_SAMPLED_BIT;
+    viewInfo.aspect    = VK_IMAGE_ASPECT_COLOR_BIT;
+    viewInfo.minLevel  = 0;
+    viewInfo.numLevels = 1;
+    viewInfo.minLayer  = 0;
+    viewInfo.numLayers = 1;
+
+    Rc<DxvkImageView> view = m_context->m_device->createImageView(image, viewInfo);
+
+    // Solid white at full alpha: Modulate(white, x) == x, so attaching the
+    // placeholder cannot change the rendered result of any combiner path.
+    m_context->EmitCs([cImage = image](DxvkContext* ctx) {
+      static const uint32_t kWhitePixels[16] = {
+        0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu,
+        0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu,
+        0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu,
+        0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu };
+      ctx->updateImage(cImage,
+        VkImageSubresourceLayers { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+        VkOffset3D { 0, 0, 0 },
+        VkExtent3D { 4u, 4u, 1u },
+        (void*) kWhitePixels, 4u * 4u, 4u * 4u * 4u);
+    });
+
+    TextureRef ref(view);
+    m_untexturedPlaceholders.emplace(cacheKey, ref);
+    return ref;
+  }
+
   void D3D11Rtx::FillMaterialData(LegacyMaterialData& mat) const {
     const auto& ps = m_context->m_state.ps;
     uint32_t textureID = 0;
@@ -2900,6 +2999,25 @@ namespace dxvk {
         textureID = 1;
       } else {
         mat.colorTextureSlot[0] = kInvalidResourceSlot;
+      }
+    }
+
+    // Untextured draws are invisible to every texture tool: no hash in the
+    // browser, nothing for viewport object picking to hit, nothing to tag as
+    // ignore/UI/sky. With ray tracing on, an untextured surface that fills
+    // the screen is therefore impossible to select or remove from inside the
+    // UI. Attach a tiny solid-white placeholder whose hash derives from the
+    // pixel shader identity: white modulates to the same visual result as
+    // the untextured path, the hash is stable across runs and GPUs, and the
+    // draw becomes a first-class taggable citizen (including ignore-tags
+    // that remove it entirely).
+    if (textureID == 0 && RtxOptions::taggableUntexturedDraws()) {
+      TextureRef placeholder = const_cast<D3D11Rtx*>(this)->getOrCreateUntexturedPlaceholder();
+      if (placeholder.getImageViewRc() != nullptr) {
+        mat.colorTextures[0] = std::move(placeholder);
+        mat.colorTextureSlot[0] = kInvalidResourceSlot;
+        mat.samplers[0] = getDefaultSampler();
+        textureID = 1;
       }
     }
 

@@ -156,6 +156,12 @@ namespace dxvk {
     // the two paths cannot drift apart again.
     void UpdateTrackedExtents(const Rc<DxvkImage>& outputImage, VkExtent2D remixViewportExtent);
 
+    // Synthetic placeholder textures for untextured draws, keyed by pixel
+    // shader instance, so those draws are listable / pickable / taggable in
+    // the texture tools. See getOrCreateUntexturedPlaceholder.
+    std::unordered_map<const void*, TextureRef> m_untexturedPlaceholders;
+    TextureRef getOrCreateUntexturedPlaceholder();
+
     Rc<DxvkSampler> getDefaultSampler() const;
     void SubmitDraw(bool indexed, UINT count, UINT start, INT base,
                     const Matrix4* instanceTransform = nullptr);

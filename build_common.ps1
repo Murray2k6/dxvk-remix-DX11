@@ -20,220 +20,561 @@
   DEALINGS IN THE SOFTWARE.
 #>
 
-#
-# Find vswhere (installed with recent Visual Studio versions).
-#
-If ($vsWhere = Get-Command "vswhere.exe" -ErrorAction SilentlyContinue) {
-  $vsWhere = $vsWhere.Path
-} ElseIf (Test-Path "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe") {
-  $vsWhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
-}
- Else {
-  Write-Error "vswhere not found. Aborting." -ErrorAction Stop
-}
-Write-Host "vswhere found at: $vsWhere" -ForegroundColor Yellow
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
 
-
-#
-# Get path to Visual Studio installation using vswhere.
-#
-$vsPath = &$vsWhere -latest -version "[16.0,18.0)" -products * `
- -requires Microsoft.Component.MSBuild `
- -property installationPath
-If ([string]::IsNullOrEmpty("$vsPath")) {
-  Write-Error "Failed to find Visual Studio 2019 installation. Aborting." -ErrorAction Stop
-}
-Write-Host "Using Visual Studio installation at: ${vsPath}" -ForegroundColor Yellow
-
-
-#
-# Make sure the Visual Studio Command Prompt variables are set.
-#
-If (Test-Path env:LIBPATH) {
-  Write-Host "Visual Studio Command Prompt variables already set." -ForegroundColor Yellow
-} Else {
-  # Load VC vars
-  Push-Location "${vsPath}\VC\Auxiliary\Build"
-  cmd /c "vcvarsall.bat x64&set" |
-	ForEach-Object {
-	  # Due to some odd behavior with how powershell core (pwsh) (powershell 5.X not tested) interprets a specific
-	  # predefined gitlab CI variable (in this case CI_MERGE_REQUEST_DESCRIPTION) with a value that includes ===  
-	  # The `Contains` method is used to ignore the string === to prevent pwsh from erroneously encountering an error.
-	  If ($_ -match "=") {
-		  If (-not ($_.Contains('==='))) {
-			  $v = $_.split("="); Set-Item -Force -Path "ENV:\$($v[0])" -Value "$($v[1])"
-		  }
-	  }
-	}
-  Pop-Location
-  Write-Host "Visual Studio Command Prompt variables set." -ForegroundColor Yellow
+# This script is expected to live in the repository root next to meson.build.
+$DxvkBuildRoot = if ($PSScriptRoot) {
+  [IO.Path]::GetFullPath($PSScriptRoot)
+} else {
+  [IO.Path]::GetFullPath((Get-Location).Path)
 }
 
 function Get-NormalizedFullPath {
-	param(
-		[Parameter(Mandatory)]
-		[string]$Path
-	)
+  param(
+    [Parameter(Mandatory)]
+    [string]$Path
+  )
 
-	return [IO.Path]::GetFullPath($Path).TrimEnd('\').ToLowerInvariant()
+  return [IO.Path]::GetFullPath($Path).TrimEnd([char[]]@('\', '/')).ToLowerInvariant()
+}
+
+function Add-PathEntryForCurrentProcess {
+  param(
+    [Parameter(Mandatory)]
+    [string]$PathToAdd
+  )
+
+  if ([string]::IsNullOrWhiteSpace($PathToAdd) -or -not (Test-Path $PathToAdd)) {
+    return
+  }
+
+  $normalizedPathToAdd = Get-NormalizedFullPath -Path $PathToAdd
+  $currentEntries = @()
+  if ($env:Path) {
+    $currentEntries = $env:Path -split ';' | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+  }
+
+  foreach ($entry in $currentEntries) {
+    try {
+      if ((Get-NormalizedFullPath -Path $entry) -eq $normalizedPathToAdd) {
+        return
+      }
+    } catch {
+    }
+  }
+
+  $env:Path = "$PathToAdd;$env:Path"
+  Write-Host "[build] Added Python Scripts folder to this PowerShell session PATH: $PathToAdd" -ForegroundColor Yellow
+}
+
+function Add-PythonScriptDirsToPath {
+  $candidateDirs = New-Object System.Collections.Generic.List[string]
+
+  if ($env:APPDATA) {
+    $roamingPythonRoot = Join-Path $env:APPDATA 'Python'
+    if (Test-Path $roamingPythonRoot) {
+      Get-ChildItem -Path $roamingPythonRoot -Directory -Filter 'Python*' -ErrorAction SilentlyContinue | ForEach-Object {
+        $candidateDirs.Add((Join-Path $_.FullName 'Scripts'))
+      }
+    }
+  }
+
+  if ($env:LOCALAPPDATA) {
+    $localProgramsPythonRoot = Join-Path $env:LOCALAPPDATA 'Programs\Python'
+    if (Test-Path $localProgramsPythonRoot) {
+      Get-ChildItem -Path $localProgramsPythonRoot -Directory -Filter 'Python*' -ErrorAction SilentlyContinue | ForEach-Object {
+        $candidateDirs.Add((Join-Path $_.FullName 'Scripts'))
+      }
+    }
+  }
+
+  foreach ($pyName in @('py', 'python')) {
+    $pyCmd = Get-Command $pyName -ErrorAction SilentlyContinue
+    if (-not $pyCmd) { continue }
+
+    try {
+      $scriptsDir = & $pyCmd.Path -c "import sysconfig; print(sysconfig.get_path('scripts') or '')" 2>$null
+      if ($LASTEXITCODE -eq 0 -and -not [string]::IsNullOrWhiteSpace($scriptsDir)) {
+        $candidateDirs.Add([string]$scriptsDir)
+      }
+    } catch {
+    }
+  }
+
+  $seen = @{}
+  foreach ($dir in $candidateDirs) {
+    if ([string]::IsNullOrWhiteSpace($dir)) { continue }
+    try {
+      $full = [IO.Path]::GetFullPath($dir)
+    } catch {
+      continue
+    }
+
+    $key = $full.ToLowerInvariant()
+    if ($seen.ContainsKey($key)) { continue }
+    $seen[$key] = $true
+    Add-PathEntryForCurrentProcess -PathToAdd $full
+  }
+}
+
+function Resolve-RequiredCommand {
+  param(
+    [Parameter(Mandatory)]
+    [string]$Name,
+
+    [string]$InstallHint = '',
+
+    # Optional Python module fallback. Example: mesonbuild.mesonmain lets the
+    # script run Meson even when meson.exe was not put on PATH by pip.
+    [string]$PythonModule = ''
+  )
+
+  Add-PythonScriptDirsToPath
+
+  $cmd = Get-Command $Name -ErrorAction SilentlyContinue
+  if ($cmd) {
+    return [pscustomobject]@{
+      FilePath = $cmd.Path
+      ArgumentsPrefix = @()
+      DisplayName = $cmd.Path
+    }
+  }
+
+  if (-not [string]::IsNullOrWhiteSpace($PythonModule)) {
+    foreach ($pyName in @('py', 'python')) {
+      $pyCmd = Get-Command $pyName -ErrorAction SilentlyContinue
+      if (-not $pyCmd) { continue }
+
+      try {
+        & $pyCmd.Path -m $PythonModule --version *> $null
+        if ($LASTEXITCODE -eq 0) {
+          $display = ('{0} -m {1}' -f $pyCmd.Path, $PythonModule)
+          Write-Host "[build] Using Python module fallback for $Name`: $display" -ForegroundColor Yellow
+          return [pscustomobject]@{
+            FilePath = $pyCmd.Path
+            ArgumentsPrefix = @('-m', $PythonModule)
+            DisplayName = $display
+          }
+        }
+      } catch {
+      }
+    }
+  }
+
+  $msg = "Required command '$Name' was not found in PATH or Python Scripts folders."
+  if (-not [string]::IsNullOrWhiteSpace($InstallHint)) {
+    $msg += " $InstallHint"
+  }
+  Write-Error $msg -ErrorAction Stop
+}
+
+function Invoke-CheckedNative {
+  param(
+    [Parameter(Mandatory)]
+    [string]$FilePath,
+
+    [Parameter(Mandatory)]
+    [string[]]$Arguments,
+
+    [string[]]$ArgumentsPrefix = @(),
+
+    [Parameter(Mandatory)]
+    [string]$FailureMessage,
+
+    [string]$WorkingDirectory = $DxvkBuildRoot
+  )
+
+  $fullArguments = @()
+  if ($ArgumentsPrefix) { $fullArguments += $ArgumentsPrefix }
+  if ($Arguments) { $fullArguments += $Arguments }
+
+  Push-Location $WorkingDirectory
+  try {
+    & $FilePath @fullArguments
+    $exitCode = if ($null -eq $LASTEXITCODE) { 0 } else { $LASTEXITCODE }
+    if ($exitCode -ne 0) {
+      $displayCommand = ('{0} {1}' -f $FilePath, ($fullArguments -join ' '))
+      throw ("{0} (exit code {1})`nCommand: {2}" -f $FailureMessage, $exitCode, $displayCommand)
+    }
+  } finally {
+    Pop-Location
+  }
+}
+
+function Get-MesonOptionNames {
+  param(
+    [Parameter(Mandatory)]
+    [string]$SourceDir
+  )
+
+  $optionFile = Join-Path $SourceDir 'meson_options.txt'
+  if (-not (Test-Path $optionFile)) {
+    Write-Host "[build] WARNING: meson_options.txt was not found. User Meson -D options will be skipped." -ForegroundColor Yellow
+    return @()
+  }
+
+  $text = Get-Content -Path $optionFile -Raw
+  $matches = [regex]::Matches($text, 'option\(\s*[''"]([^''"]+)[''"]')
+  $names = @()
+  foreach ($m in $matches) {
+    $names += $m.Groups[1].Value
+  }
+
+  return $names
+}
+
+function New-MesonOptionArg {
+  param(
+    [Parameter(Mandatory)]
+    [string[]]$AvailableOptions,
+
+    [Parameter(Mandatory)]
+    [string]$Name,
+
+    [Parameter(Mandatory)]
+    [string]$Value
+  )
+
+  if ($AvailableOptions -contains $Name) {
+    return "-D$Name=$Value"
+  }
+
+  Write-Host "[build] WARNING: Meson option '$Name' is not declared in meson_options.txt; not passing -D$Name=$Value" -ForegroundColor Yellow
+  return $null
 }
 
 function Get-ConfiguredMesonSourceDir {
-	param(
-		[Parameter(Mandatory)]
-		[string]$BuildDir
-	)
+  param(
+    [Parameter(Mandatory)]
+    [string]$BuildDir
+  )
 
-	$mesonInfoPath = Join-Path $BuildDir 'meson-info\meson-info.json'
-	if (Test-Path $mesonInfoPath) {
-		try {
-			$mesonInfo = Get-Content $mesonInfoPath -Raw | ConvertFrom-Json
-			if ($mesonInfo.directories.source) {
-				return $mesonInfo.directories.source
-			}
-		} catch {
-		}
-	}
+  $mesonInfoPath = Join-Path $BuildDir 'meson-info\meson-info.json'
+  if (Test-Path $mesonInfoPath) {
+    try {
+      $mesonInfo = Get-Content $mesonInfoPath -Raw | ConvertFrom-Json
+      if ($mesonInfo.directories.source) {
+        return $mesonInfo.directories.source
+      }
+    } catch {
+      Write-Host "[build] WARNING: Could not read $mesonInfoPath; build directory will be regenerated." -ForegroundColor Yellow
+    }
+  }
 
-	$buildNinjaPath = Join-Path $BuildDir 'build.ninja'
-	if (Test-Path $buildNinjaPath) {
-		$buildNinja = Get-Content $buildNinjaPath -Raw
-		$regex = [regex]'--internal regenerate\s+"([^"]+)"\s+"\."'
-		$match = $regex.Match($buildNinja)
-		if ($match.Success) {
-			return $match.Groups[1].Value
-		}
-	}
+  $buildNinjaPath = Join-Path $BuildDir 'build.ninja'
+  if (Test-Path $buildNinjaPath) {
+    $buildNinja = Get-Content $buildNinjaPath -Raw
+    $regexes = @(
+      [regex]'--internal regenerate\s+"([^"]+)"\s+"\."',
+      [regex]'--internal regenerate\s+([^\s]+)\s+\.'
+    )
+    foreach ($regex in $regexes) {
+      $match = $regex.Match($buildNinja)
+      if ($match.Success) {
+        return $match.Groups[1].Value
+      }
+    }
+  }
 
-	return $null
+  return $null
+}
+
+
+function Repair-FutureFileTimestamps {
+  param(
+    [Parameter(Mandatory)]
+    [string]$SourceDir,
+
+    [string]$BuildDir = ''
+  )
+
+  $now = Get-Date
+  $futureLimit = $now.AddSeconds(2)
+  $safeTime = $now.AddSeconds(-30)
+  $fixedCount = 0
+
+  $rootsToScan = New-Object System.Collections.Generic.List[string]
+  $rootsToScan.Add($SourceDir)
+  if (-not [string]::IsNullOrWhiteSpace($BuildDir) -and (Test-Path $BuildDir)) {
+    $rootsToScan.Add($BuildDir)
+  }
+
+  $seenFiles = @{}
+
+  foreach ($root in $rootsToScan) {
+    if ([string]::IsNullOrWhiteSpace($root) -or -not (Test-Path $root)) { continue }
+
+    # Meson checks timestamps on Meson files and files used to configure the build.
+    # When files are copied from a ZIP made on a machine with clock/timezone drift,
+    # Meson aborts with: "Clock skew detected ... has a time stamp ... in the future".
+    $candidates = @()
+    $directNames = @(
+      'meson.build',
+      'meson_options.txt',
+      'build_common.ps1',
+      'build_dxvk_all_ninja.ps1'
+    )
+
+    foreach ($name in $directNames) {
+      $directPath = Join-Path $root $name
+      if (Test-Path $directPath) {
+        $candidates += Get-Item -LiteralPath $directPath -Force -ErrorAction SilentlyContinue
+      }
+    }
+
+    try {
+      $candidates += Get-ChildItem -LiteralPath $root -Recurse -Force -File -ErrorAction SilentlyContinue |
+        Where-Object {
+          $full = $_.FullName
+          ($full -notlike '*\.git\*') -and
+          ($full -notlike '*\_output\*') -and
+          ($full -notlike '*\_Comp64Debug\*') -and
+          ($full -notlike '*\_Comp64DebugOptimized\*') -and
+          ($full -notlike '*\_Comp64Release\*') -and
+          ($_.Name -ieq 'meson.build' -or $_.Name -ieq 'meson_options.txt')
+        }
+    } catch {
+      Write-Host "[build] WARNING: Could not fully scan '$root' for future Meson timestamps: $($_.Exception.Message)" -ForegroundColor Yellow
+    }
+
+    foreach ($file in $candidates) {
+      if (-not $file) { continue }
+      $key = $file.FullName.ToLowerInvariant()
+      if ($seenFiles.ContainsKey($key)) { continue }
+      $seenFiles[$key] = $true
+
+      try {
+        $item = Get-Item -LiteralPath $file.FullName -Force
+        if ($item.LastWriteTime -gt $futureLimit) {
+          $deltaSeconds = [math]::Round(($item.LastWriteTime - $now).TotalSeconds, 3)
+          Write-Host "[build] Fixing future timestamp (+$deltaSeconds sec): $($item.FullName)" -ForegroundColor Yellow
+          $item.LastWriteTime = $safeTime
+          $item.LastAccessTime = $safeTime
+          $fixedCount++
+        }
+      } catch {
+        Write-Host "[build] WARNING: Could not repair timestamp for '$($file.FullName)': $($_.Exception.Message)" -ForegroundColor Yellow
+      }
+    }
+  }
+
+  if ($fixedCount -gt 0) {
+    Write-Host "[build] Repaired $fixedCount future file timestamp(s) before Meson setup." -ForegroundColor Yellow
+  }
 }
 
 function Repair-StaleBuildDirectory {
-	param(
-		[Parameter(Mandatory)]
-		[string]$SourceDir,
+  param(
+    [Parameter(Mandatory)]
+    [string]$SourceDir,
 
-		[Parameter(Mandatory)]
-		[string]$BuildDir
-	)
+    [Parameter(Mandatory)]
+    [string]$BuildDir
+  )
 
-	if (-not (Test-Path $BuildDir)) {
-		return $false
-	}
+  if (-not (Test-Path $BuildDir)) {
+    return $false
+  }
 
-	$configuredSourceDir = Get-ConfiguredMesonSourceDir -BuildDir $BuildDir
-	if ([string]::IsNullOrWhiteSpace($configuredSourceDir)) {
-		Write-Host "Removing partial or unreadable Meson build directory: $BuildDir" -ForegroundColor Yellow
-		Remove-Item $BuildDir -Recurse -Force
-		return $false
-	}
+  $configuredSourceDir = Get-ConfiguredMesonSourceDir -BuildDir $BuildDir
+  if ([string]::IsNullOrWhiteSpace($configuredSourceDir)) {
+    Write-Host "[build] Removing partial or unreadable Meson build directory: $BuildDir" -ForegroundColor Yellow
+    Remove-Item $BuildDir -Recurse -Force
+    return $false
+  }
 
-	$normalizedSourceDir = Get-NormalizedFullPath -Path $SourceDir
-	$normalizedConfiguredSourceDir = Get-NormalizedFullPath -Path $configuredSourceDir
-	if ($normalizedSourceDir -ne $normalizedConfiguredSourceDir) {
-		Write-Host "Removing stale Meson build directory '$BuildDir' configured for '$configuredSourceDir'" -ForegroundColor Yellow
-		Remove-Item $BuildDir -Recurse -Force
-		return $false
-	}
+  $normalizedSourceDir = Get-NormalizedFullPath -Path $SourceDir
+  $normalizedConfiguredSourceDir = Get-NormalizedFullPath -Path $configuredSourceDir
+  if ($normalizedSourceDir -ne $normalizedConfiguredSourceDir) {
+    Write-Host "[build] Removing stale Meson build directory '$BuildDir' configured for '$configuredSourceDir'" -ForegroundColor Yellow
+    Remove-Item $BuildDir -Recurse -Force
+    return $false
+  }
 
-	return $true
+  return $true
+}
+
+# Find vswhere (installed with recent Visual Studio versions).
+if ($vsWhereCommand = Get-Command 'vswhere.exe' -ErrorAction SilentlyContinue) {
+  $vsWhere = $vsWhereCommand.Path
+} elseif (Test-Path "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe") {
+  $vsWhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+} else {
+  Write-Error "vswhere not found. Install Visual Studio 2019/2022 with C++ build tools, or add vswhere.exe to PATH." -ErrorAction Stop
+}
+Write-Host "[build] vswhere found at: $vsWhere" -ForegroundColor Yellow
+
+# Get path to Visual Studio installation using vswhere.
+$vsPath = & $vsWhere -latest -version "[16.0,18.0)" -products * `
+  -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+  -property installationPath
+
+if ([string]::IsNullOrEmpty("$vsPath")) {
+  $vsPath = & $vsWhere -latest -version "[16.0,18.0)" -products * `
+    -requires Microsoft.Component.MSBuild `
+    -property installationPath
+}
+
+if ([string]::IsNullOrEmpty("$vsPath")) {
+  Write-Error "Failed to find Visual Studio 2019/2022 with MSVC C++ build tools. Aborting." -ErrorAction Stop
+}
+Write-Host "[build] Using Visual Studio installation at: ${vsPath}" -ForegroundColor Yellow
+
+# Make sure the Visual Studio Command Prompt variables are set.
+if (Test-Path env:LIBPATH) {
+  Write-Host "[build] Visual Studio Command Prompt variables already set." -ForegroundColor Yellow
+} else {
+  $vcVarsDir = Join-Path $vsPath 'VC\Auxiliary\Build'
+  if (-not (Test-Path (Join-Path $vcVarsDir 'vcvarsall.bat'))) {
+    Write-Error "vcvarsall.bat not found under '$vcVarsDir'. Install the MSVC C++ workload in Visual Studio Installer." -ErrorAction Stop
+  }
+
+  Push-Location $vcVarsDir
+  try {
+    cmd /c "vcvarsall.bat x64&set" | ForEach-Object {
+      if ($_ -match '=') {
+        # Split only once. Some PATH-like values legitimately contain '='.
+        $v = $_ -split '=', 2
+        if ($v.Count -eq 2 -and -not [string]::IsNullOrWhiteSpace($v[0])) {
+          Set-Item -Force -Path "ENV:\$($v[0])" -Value $v[1]
+        }
+      }
+    }
+  } finally {
+    Pop-Location
+  }
+  Write-Host "[build] Visual Studio Command Prompt variables set." -ForegroundColor Yellow
 }
 
 function PerformBuild {
-	param(
-		[Parameter(Mandatory)]
-		[string]$Backend,
+  param(
+    [Parameter(Mandatory)]
+    [string]$Backend,
 
-		[Parameter(Mandatory)]
-		[string]$BuildFlavour,
-		
-		[Parameter(Mandatory)]
-		[string]$BuildSubDir,
+    [Parameter(Mandatory)]
+    [ValidateSet('debug', 'debugoptimized', 'release')]
+    [string]$BuildFlavour,
 
-		[Parameter(Mandatory)]
-		[string]$EnableTracy,
+    [Parameter(Mandatory)]
+    [string]$BuildSubDir,
 
-		[string]$BuildTarget,
+    [Parameter(Mandatory)]
+    [ValidateSet('true', 'false')]
+    [string]$EnableTracy,
 
-		[string[]]$InstallTags,
+    [string]$BuildTarget,
 
-		[bool]$ConfigureOnly = $false,
+    [string[]]$InstallTags,
 
-		[bool]$ShadersOnly = $false
-	)
+    [bool]$ConfigureOnly = $false,
 
-	if (-not $InstallTags -or $InstallTags.Count -eq 0) {
-		$InstallTags = @('output')
-	}
+    [bool]$ShadersOnly = $false
+  )
 
-	$CurrentDir = Get-Location
-	$OutputDir = [IO.Path]::Combine($CurrentDir, "_output")
-	$BuildDir = [IO.Path]::Combine($CurrentDir, $BuildSubDir)
-	
-	Write-Host "[build] Starting build for $BuildFlavour..." -ForegroundColor Cyan
-	Write-Host "[build] Build directory: $BuildDir" -ForegroundColor DarkGray
-	
-	$buildDirMatchesCurrentSource = Repair-StaleBuildDirectory -SourceDir $CurrentDir -BuildDir $BuildDir
+  if (-not $InstallTags -or $InstallTags.Count -eq 0) {
+    $InstallTags = @('output')
+  }
 
-	Push-Location $CurrentDir
-		$mesonArgs = @(
-			'setup'
-		)
-		if ($buildDirMatchesCurrentSource) {
-			$mesonArgs += '--reconfigure'
-		}
-		$mesonArgs += @(
-			'--buildtype', $BuildFlavour,
-			'--backend', $Backend,
-			'-Denable_dxgi=true',
-			'-Denable_d3d11=true',
-			'-Denable_tests=false',
-			"-Denable_tracy=$EnableTracy"
-		)
-		if ( $ShadersOnly ) {
-			$mesonArgs += '-Ddownload_apics=false'
-		}
-		$mesonArgs += $BuildSubDir
-		Write-Host "[build] Running meson setup..." -ForegroundColor Cyan
-		& meson @mesonArgs
-		
-		if ( $LASTEXITCODE -ne 0 ) {
-			Write-Error "Failed to run meson setup" -ErrorAction Stop
-		}
-	Pop-Location
+  $SourceDir = [IO.Path]::GetFullPath($DxvkBuildRoot)
+  $OutputDir = [IO.Path]::Combine($SourceDir, '_output')
+  $BuildDir = [IO.Path]::Combine($SourceDir, $BuildSubDir)
 
-	if ($ShadersOnly) {
-		Write-Host "[build] Building shaders only..." -ForegroundColor Cyan
-		Push-Location $BuildDir
-			& meson compile rtx_shaders
-		Pop-Location
-		if ( $LASTEXITCODE -ne 0 ) {
-			Write-Error "Failed to build shaders" -ErrorAction Stop
-		}
-		exit $LASTEXITCODE
-	}
+  if (-not (Test-Path (Join-Path $SourceDir 'meson.build'))) {
+    Write-Error "meson.build was not found at '$SourceDir'. Put build_common.ps1 in the repository root and run it from there." -ErrorAction Stop
+  }
 
-	if (!$ConfigureOnly) {
-		Write-Host "[build] Compiling..." -ForegroundColor Cyan
-		Push-Location $BuildDir
-			& meson compile -v 
+  Repair-FutureFileTimestamps -SourceDir $SourceDir -BuildDir $BuildDir
 
-			if ( $LASTEXITCODE -ne 0 ) {
-				Write-Error "Failed to run build step" -ErrorAction Stop
-			}
+  $mesonCommand = Resolve-RequiredCommand -Name 'meson' -PythonModule 'mesonbuild.mesonmain' -InstallHint 'Install Meson with: py -m pip install --user meson'
+  if ($Backend -eq 'ninja') {
+    [void](Resolve-RequiredCommand -Name 'ninja' -InstallHint 'Install Ninja with: py -m pip install --user ninja')
+  }
 
-			# Restrict staging to the DX11 runtime output by default.
-			$tagList = $InstallTags -join ','
-			Write-Host "[build] Installing to $OutputDir..." -ForegroundColor Cyan
-			& meson install --tags $tagList
-		Pop-Location
+  $availableOptions = Get-MesonOptionNames -SourceDir $SourceDir
 
-		if ( $LASTEXITCODE -ne 0 ) {
-			Write-Error "Failed to run install step" -ErrorAction Stop
-		}
-		
-		Write-Host "[build] Build completed successfully for $BuildFlavour" -ForegroundColor Green
-	} else {
-		Write-Host "[build] Configuration completed for $BuildFlavour (no build performed)" -ForegroundColor Green
-	}
+  Write-Host "[build] Starting build for $BuildFlavour..." -ForegroundColor Cyan
+  Write-Host "[build] Source directory: $SourceDir" -ForegroundColor DarkGray
+  Write-Host "[build] Build directory:  $BuildDir" -ForegroundColor DarkGray
+
+  $buildDirMatchesCurrentSource = Repair-StaleBuildDirectory -SourceDir $SourceDir -BuildDir $BuildDir
+
+  $mesonArgs = @('setup')
+  if ($buildDirMatchesCurrentSource) {
+    $mesonArgs += '--reconfigure'
+  }
+
+  $mesonArgs += @(
+    '--buildtype', $BuildFlavour,
+    '--backend', $Backend
+  )
+
+  foreach ($opt in @(
+    @{ Name = 'enable_dxgi';   Value = 'true' },
+    @{ Name = 'enable_d3d11';  Value = 'true' },
+    @{ Name = 'enable_tests';  Value = 'false' },
+    @{ Name = 'enable_tracy';  Value = $EnableTracy }
+  )) {
+    $arg = New-MesonOptionArg -AvailableOptions $availableOptions -Name $opt.Name -Value $opt.Value
+    if ($arg) { $mesonArgs += $arg }
+  }
+
+  if ($ShadersOnly) {
+    $arg = New-MesonOptionArg -AvailableOptions $availableOptions -Name 'download_apics' -Value 'false'
+    if ($arg) { $mesonArgs += $arg }
+  }
+
+  $mesonArgs += $BuildDir
+  if (-not $buildDirMatchesCurrentSource) {
+    $mesonArgs += $SourceDir
+  }
+
+  Write-Host "[build] Running Meson setup..." -ForegroundColor Cyan
+  Invoke-CheckedNative -FilePath $mesonCommand.FilePath -ArgumentsPrefix $mesonCommand.ArgumentsPrefix -Arguments $mesonArgs -FailureMessage 'Failed to run Meson setup' -WorkingDirectory $SourceDir
+
+  if ($ShadersOnly) {
+    Write-Host "[build] Building shaders only..." -ForegroundColor Cyan
+    Invoke-CheckedNative -FilePath $mesonCommand.FilePath -ArgumentsPrefix $mesonCommand.ArgumentsPrefix -Arguments @('compile', '-C', $BuildDir, 'rtx_shaders') -FailureMessage 'Failed to build shaders' -WorkingDirectory $SourceDir
+    return
+  }
+
+  if (-not $ConfigureOnly) {
+    Write-Host "[build] Compiling..." -ForegroundColor Cyan
+    $compileArgs = @('compile', '-C', $BuildDir)
+    if (-not [string]::IsNullOrWhiteSpace($BuildTarget)) {
+      $compileArgs += $BuildTarget
+    }
+    $compileArgs += '-v'
+    Invoke-CheckedNative -FilePath $mesonCommand.FilePath -ArgumentsPrefix $mesonCommand.ArgumentsPrefix -Arguments $compileArgs -FailureMessage 'Failed to run build step' -WorkingDirectory $SourceDir
+
+    $tagList = $InstallTags -join ','
+    Write-Host "[build] Installing tag(s) '$tagList' to $OutputDir..." -ForegroundColor Cyan
+    Invoke-CheckedNative -FilePath $mesonCommand.FilePath -ArgumentsPrefix $mesonCommand.ArgumentsPrefix -Arguments @('install', '-C', $BuildDir, '--tags', $tagList) -FailureMessage 'Failed to run install step' -WorkingDirectory $SourceDir
+
+    # Deploy the NGX runtime DLLs next to every installed/built d3d11.dll.
+    $ngxSource = Join-Path $SourceDir 'nv-private\hdremix\bin\release'
+    if (Test-Path $ngxSource) {
+      $ngxDlls = Get-ChildItem -Path $ngxSource -Filter 'nvngx_*.dll' -File
+      $ngxTargets = @()
+      foreach ($searchRoot in @($OutputDir, $BuildDir)) {
+        if ($searchRoot -and (Test-Path $searchRoot)) {
+          $ngxTargets += Get-ChildItem -Path $searchRoot -Recurse -Filter 'd3d11.dll' -File -ErrorAction SilentlyContinue
+        }
+      }
+      foreach ($t in $ngxTargets) {
+        foreach ($dll in $ngxDlls) {
+          Copy-Item -Path $dll.FullName -Destination $t.DirectoryName -Force
+        }
+      }
+      if ($ngxTargets.Count -gt 0) {
+        Write-Host ("[build] Deployed {0} NGX DLLs next to {1} d3d11.dll location(s)" -f $ngxDlls.Count, $ngxTargets.Count) -ForegroundColor Cyan
+      }
+    } else {
+      Write-Host "[build] WARNING: NGX runtime DLLs not found at $ngxSource - DLSS will be unavailable in deployed builds." -ForegroundColor Yellow
+    }
+
+    Write-Host "[build] Build completed successfully for $BuildFlavour" -ForegroundColor Green
+  } else {
+    Write-Host "[build] Configuration completed for $BuildFlavour (no build performed)" -ForegroundColor Green
+  }
 }
