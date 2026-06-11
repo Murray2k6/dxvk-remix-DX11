@@ -660,12 +660,22 @@ dxvkrt_output_targets = {
   '_output': '',
   '_sdk': '',
   '_hdremix': '',
-  'unit_test': '',
 }
 
-# PHASMOPHOBIA BUILD: Comment out tests/rtx to avoid build error
-# NOTE: Re-enabled for preservation property tests and bug condition exploration tests
-subdir('tests/rtx')
+if enable_tests
+  dxvkrt_output_targets += { 'unit_test': '' }
+endif
+
+# tests/rtx must obey -Denable_tests=false. The PowerShell build scripts pass
+# that option for normal runtime builds, so leaving this unconditional makes
+# Meson configure/build test/APIC targets even when tests were explicitly off.
+if enable_tests and get_option('download_apics') and fs.is_dir('tests/rtx')
+  subdir('tests/rtx')
+elif enable_tests and not get_option('download_apics')
+  message('Skipping tests/rtx because download_apics=false')
+elif not enable_tests
+  message('Skipping tests and tests/rtx because enable_tests=false')
+endif
 
 if dxvk_is_ninja
   # this is how we force meson to reconfigure when external files change

@@ -138,6 +138,15 @@ static DWORD s_lastRawMouseMoveTime = 0;
 static DWORD s_lastRawMouseButtonTime = 0;
 static DWORD s_lastRawKeyboardTime = 0;
 
+// Software cursor for the Remix UI, integrated from raw-input deltas.
+// Games that pin the OS cursor to the screen center every frame
+// (SetCursorPos-based mouselook) make any GetCursorPos-derived position
+// snap back to mid-screen; raw deltas from the physical device keep
+// flowing regardless, so the UI cursor stays usable.
+static float s_softCursorX = 0.0f;
+static float s_softCursorY = 0.0f;
+static bool  s_softCursorValid = false;
+
 // Functions
 bool    ImGui_ImplWin32_Init(void* hwnd)
 {
@@ -563,6 +572,7 @@ IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hwnd, UINT msg, WPARA
 
       if (ri->header.dwType == RIM_TYPEMOUSE) {
         const RAWMOUSE& m = ri->data.mouse;
+        const DWORD prevRawMouseMoveTime = s_lastRawMouseMoveTime;
         s_lastRawMouseMoveTime = rawNow;
 
         constexpr USHORT rawMouseButtonMask =
@@ -574,10 +584,46 @@ IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hwnd, UINT msg, WPARA
         if ((m.usButtonFlags & rawMouseButtonMask) != 0)
           s_lastRawMouseButtonTime = rawNow;
 
-        // Mouse position from raw input
-        POINT p; GetCursorPos(&p);
-        ScreenToClient(hwnd, &p);
-        io.AddMousePosEvent((float) p.x, (float) p.y);
+        // Software cursor position from raw deltas. Reading GetCursorPos
+        // here broke whenever the game warped the OS cursor to the screen
+        // center every frame (SetCursorPos-based mouselook): the UI cursor
+        // locked to mid-screen and the menu became unusable. Integrate the
+        // raw relative deltas into a virtual cursor instead; absolute
+        // devices (tablets, RDP) map directly. After half a second without
+        // raw motion the virtual cursor re-seeds from the OS position so it
+        // appears where the user expects when the UI is reopened.
+        const bool reseed = !s_softCursorValid
+                         || prevRawMouseMoveTime == 0
+                         || (rawNow - prevRawMouseMoveTime) > 500;
+        if ((m.usFlags & MOUSE_MOVE_ABSOLUTE) != 0) {
+          const bool virtualDesktop = (m.usFlags & MOUSE_VIRTUAL_DESKTOP) != 0;
+          const int vw = ::GetSystemMetrics(virtualDesktop ? SM_CXVIRTUALSCREEN : SM_CXSCREEN);
+          const int vh = ::GetSystemMetrics(virtualDesktop ? SM_CYVIRTUALSCREEN : SM_CYSCREEN);
+          POINT ap = { (LONG) (m.lLastX / 65535.0f * vw), (LONG) (m.lLastY / 65535.0f * vh) };
+          ::ScreenToClient(hwnd, &ap);
+          s_softCursorX = (float) ap.x;
+          s_softCursorY = (float) ap.y;
+          s_softCursorValid = true;
+        } else {
+          if (reseed) {
+            POINT p; ::GetCursorPos(&p);
+            ::ScreenToClient(hwnd, &p);
+            s_softCursorX = (float) p.x;
+            s_softCursorY = (float) p.y;
+            s_softCursorValid = true;
+          }
+          s_softCursorX += (float) m.lLastX;
+          s_softCursorY += (float) m.lLastY;
+        }
+
+        RECT client = {};
+        if (::GetClientRect(hwnd, &client)) {
+          if (s_softCursorX < 0.0f) s_softCursorX = 0.0f;
+          if (s_softCursorY < 0.0f) s_softCursorY = 0.0f;
+          if (client.right  > 0 && s_softCursorX > (float) (client.right - 1))  s_softCursorX = (float) (client.right - 1);
+          if (client.bottom > 0 && s_softCursorY > (float) (client.bottom - 1)) s_softCursorY = (float) (client.bottom - 1);
+        }
+        io.AddMousePosEvent(s_softCursorX, s_softCursorY);
 
         // Mouse buttons from raw input
         if (m.usButtonFlags & RI_MOUSE_LEFT_BUTTON_DOWN)   io.AddMouseButtonEvent(0, true);
