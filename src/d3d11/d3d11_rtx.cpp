@@ -667,7 +667,11 @@ namespace dxvk {
       || format == VK_FORMAT_R16G16_UNORM
       || format == VK_FORMAT_R16G16_SNORM
       || format == VK_FORMAT_R16G16B16A16_UNORM
-      || format == VK_FORMAT_R16G16B16A16_SNORM;
+      || format == VK_FORMAT_R16G16B16A16_SNORM
+      // Fixed-point integer UVs: decoded to float by the interleaver with
+      // rtx.integerTexcoordScale (Saints Row IV: TEXCOORD0 = R16G16_SINT).
+      || format == VK_FORMAT_R16G16_SINT
+      || format == VK_FORMAT_R16G16_UINT;
   }
 
   static bool isPositionFormat(VkFormat format) {

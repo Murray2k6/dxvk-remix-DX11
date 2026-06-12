@@ -1524,7 +1524,7 @@ namespace dxvk {
 
   SceneManager::SamplerIndex SceneManager::trackSampler(Rc<DxvkSampler> sampler) {
     if (sampler == nullptr) {
-      ONCE(Logger::info("Found a null sampler. Fallback to linear-repeat"));
+      ONCE(Logger::info("Draw bound a null sampler; using the D3D11 default sampler state (MIN_MAG_MIP_LINEAR, WRAP addressing) as the spec defines for null sampler bindings."));
       sampler = patchSampler(
         VK_FILTER_LINEAR,
         VK_SAMPLER_ADDRESS_MODE_REPEAT,

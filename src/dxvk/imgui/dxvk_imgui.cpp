@@ -1603,10 +1603,18 @@ namespace dxvk {
     // WM_LBUTTONDOWN/UP, WM_MOUSEMOVE etc. for widget hit-testing and state.
     ImGui_ImplWin32_WndProcHandler(hWnd, msg, wParam, lParam);
 
+    // System task-switch keys must always flow: consuming Alt+Tab or the
+    // Windows keys traps the user inside the game window with the UI open
+    // (reported as "cursor locked into the game scene, cannot alt-tab").
+    const bool isSystemSwitchKey =
+         ((msg == WM_SYSKEYDOWN || msg == WM_SYSKEYUP) && wParam == VK_TAB)
+      || wParam == VK_LWIN
+      || wParam == VK_RWIN;
+
     // Consume ALL mouse, keyboard, and raw-input messages while the UI is
     // open so the game never sees them. This prevents the game's mouselook,
     // weapon swings, camera moves etc. from interfering with the UI.
-    if (isMouseMsg || isKeyMsg || isRawInputMsg) {
+    if ((isMouseMsg || isKeyMsg || isRawInputMsg) && !isSystemSwitchKey) {
       if (isRawInputMsg) {
         // Per the WM_INPUT contract the message must still reach
         // DefWindowProc for the system to perform cleanup, even when the

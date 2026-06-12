@@ -45,6 +45,13 @@ struct InterleaveGeometryArgs {
   uint32_t outputStride;
   uint32_t vertexCount;
   uint32_t forceNormals; // When set, reserve normal space in output even if hasNormals is false (writes zeros)
+
+  // Divisor applied when decoding integer (SINT/UINT) texcoord formats to
+  // float UVs. Engines that store UVs as fixed-point integers (Saints Row IV:
+  // R16G16_SINT) bake an implicit scale; 1024 is the common Volition scale.
+  // Appended at the end so all existing field offsets are unchanged on both
+  // the CPU and GPU sides of this shared struct.
+  float integerTexcoordScale;
 };
 
 #define INTERLEAVE_GEOMETRY_BINDING_OUTPUT           0
