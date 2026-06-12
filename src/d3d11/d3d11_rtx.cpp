@@ -1548,8 +1548,25 @@ namespace dxvk {
                                        && candidateAspect >= 0.4f
                                        && candidateAspect <= 5.0f;
         const bool centeredViewport = normalizedCenterOffsetX <= 0.18f && normalizedCenterOffsetY <= 0.18f;
-        const bool stripViewport = widthCoverage < 0.35f || heightCoverage < 0.35f;
-        const bool coversMostOfTarget = widthCoverage >= 0.80f && heightCoverage >= 0.80f;
+
+        // Aspect proximity to the output target is the strongest scene
+        // signal we have: HUD strips, square shadow targets and cube faces
+        // all have wildly different aspects from the output, while scene
+        // viewports - scaled, anamorphic, or loading-screen sized - track it.
+        const float targetAspectEarly = targetHeight > 0.0f ? targetWidth / targetHeight : 0.0f;
+        const bool aspectNearTarget10 = targetAspectEarly > 0.0f
+          && std::abs(candidateAspect - targetAspectEarly) <= 0.10f * targetAspectEarly;
+
+        // A strip is small in one dimension AND aspect-divergent. A 31%
+        // uniformly-scaled loading viewport is not a strip even though one
+        // coverage dips below the floor (SR4 loads at 600x337 = 31%).
+        const bool stripViewport = (widthCoverage < 0.35f || heightCoverage < 0.35f)
+                                && !aspectNearTarget10;
+
+        // Capped above: an oversized square depth target (2048x2048 against
+        // 1080p) "covers most of the target" numerically but is not a scene.
+        const bool coversMostOfTarget = widthCoverage >= 0.80f && heightCoverage >= 0.80f
+                                     && widthCoverage <= 1.05f && heightCoverage <= 1.05f;
         const bool coversSceneLikeExtent = widthCoverage >= 0.55f && heightCoverage >= 0.55f;
         const bool coversMeaningfulArea = coverage >= 0.2f;
 
@@ -1570,11 +1587,33 @@ namespace dxvk {
                                <= 0.05f * std::max(widthCoverage, heightCoverage);
         const bool aspectMatchesTarget = targetAspect > 0.0f
                                       && std::abs(candidateAspect - targetAspect) <= 0.05f * targetAspect;
+        // Upper bound 2.05 admits supersampled scene targets (SSAA renders
+        // at up to 2x per axis); uniformity + aspect match keep shadow
+        // targets out regardless.
         const bool renderScaleViewport = nearOrigin
                                       && uniformScale
                                       && aspectMatchesTarget
                                       && widthCoverage >= 0.35f
-                                      && widthCoverage <= 1.05f;
+                                      && widthCoverage <= 2.05f;
+
+        // Sub-native render targets anchored at the origin: engines that
+        // render at 55-85% of the output without centering (Saints Row IV's
+        // fixed 62.5% among them). Uniformity is NOT required here, unlike
+        // renderScaleViewport, so anamorphic internal targets also pass.
+        const bool subNativeOriginViewport = coversSceneLikeExtent && nearOrigin
+                                          && aspectNearTarget10;
+
+        // Loading screens render small origin-anchored rects (SR4: 600x337,
+        // 31% of output) after the scene extent has stabilized, which the
+        // unstable-only nearOrigin path below cannot accept. Allow them when
+        // the aspect still matches the output - that keeps square shadow
+        // passes (aspect 1.0 against a widescreen target) rejected.
+        const bool nearOriginSceneAspect =
+             nearOrigin
+          && widthCoverage >= kMinNearOriginCoverage
+          && heightCoverage >= kMinNearOriginCoverage
+          && targetAspect > 0.0f
+          && std::abs(candidateAspect - targetAspect) <= 0.10f * targetAspect;
 
         const bool acceptViewportFallback =
              usableViewport
@@ -1583,6 +1622,8 @@ namespace dxvk {
           && (
                coversMostOfTarget
             || renderScaleViewport
+            || subNativeOriginViewport
+            || nearOriginSceneAspect
             || (coversSceneLikeExtent && centeredViewport)
             || (!haveStableSceneExtent && (coversMeaningfulArea && centeredViewport))
             || (!haveStableSceneExtent && nearOrigin)
@@ -2515,16 +2556,21 @@ namespace dxvk {
     // Solid white at full alpha: Modulate(white, x) == x, so attaching the
     // placeholder cannot change the rendered result of any combiner path.
     m_context->EmitCs([cImage = image](DxvkContext* ctx) {
-      static const uint32_t kWhitePixels[16] = {
-        0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu,
-        0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu,
-        0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu,
-        0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu };
+      // Neutral 70% gray rather than pure white: a full-albedo surface is
+      // non-physical and lets path-traced light bounce without loss - rooms
+      // full of untextured geometry blow out to white. Gray keeps the
+      // modulate identity close (slightly darkens vertex-colored untextured
+      // surfaces) while keeping bounce energy sane.
+      static const uint32_t kGrayPixels[16] = {
+        0xFFB4B4B4u, 0xFFB4B4B4u, 0xFFB4B4B4u, 0xFFB4B4B4u,
+        0xFFB4B4B4u, 0xFFB4B4B4u, 0xFFB4B4B4u, 0xFFB4B4B4u,
+        0xFFB4B4B4u, 0xFFB4B4B4u, 0xFFB4B4B4u, 0xFFB4B4B4u,
+        0xFFB4B4B4u, 0xFFB4B4B4u, 0xFFB4B4B4u, 0xFFB4B4B4u };
       ctx->updateImage(cImage,
         VkImageSubresourceLayers { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
         VkOffset3D { 0, 0, 0 },
         VkExtent3D { 4u, 4u, 1u },
-        (void*) kWhitePixels, 4u * 4u, 4u * 4u * 4u);
+        (void*) kGrayPixels, 4u * 4u, 4u * 4u * 4u);
     });
 
     TextureRef ref(view);
@@ -3011,7 +3057,13 @@ namespace dxvk {
     // the untextured path, the hash is stable across runs and GPUs, and the
     // draw becomes a first-class taggable citizen (including ignore-tags
     // that remove it entirely).
-    if (textureID == 0 && RtxOptions::taggableUntexturedDraws()) {
+    // Depth-only prepass and shadow draws bind no color target; attaching a
+    // placeholder there turned invisible prepass geometry into solid albedo
+    // surfaces inside the path-traced scene (observed as a blown-out white
+    // screen in Unity titles, whose prepass draws have zero texture
+    // candidates). Only color-writing draws get the placeholder.
+    const bool writesColor = m_context->m_state.om.renderTargetViews[0].ptr() != nullptr;
+    if (textureID == 0 && writesColor && RtxOptions::taggableUntexturedDraws()) {
       TextureRef placeholder = const_cast<D3D11Rtx*>(this)->getOrCreateUntexturedPlaceholder();
       if (placeholder.getImageViewRc() != nullptr) {
         mat.colorTextures[0] = std::move(placeholder);
@@ -4419,6 +4471,7 @@ namespace dxvk {
         if (hasRealProjection && hasViewOrStrongProjection) {
           ++m_submitRejectStats.realSceneAccepted;
           m_hasSeenRealSceneProjection = true;
+          m_lastRealCameraFrameId = m_context->m_device->getCurrentFrameId();
         }
       }
     }
@@ -4563,6 +4616,28 @@ namespace dxvk {
       applyExtent(candidate, trackedExtent, driveResizeTransition);
     };
 
+    // Debounce output-extent changes: deferred pipelines bind several RT
+    // sizes per frame at scene transitions; committing each one re-armed
+    // resize grace every frame (resize storm). A changed extent must repeat
+    // kResizeDebounceFrames times consecutively before it commits.
+    if (outputExtent.width != 0u && outputExtent.height != 0u
+     && m_lastOutputExtent.width != 0u && m_lastOutputExtent.height != 0u
+     && (outputExtent.width != m_lastOutputExtent.width || outputExtent.height != m_lastOutputExtent.height)) {
+      if (outputExtent.width == m_pendingResizeExtent.width && outputExtent.height == m_pendingResizeExtent.height) {
+        ++m_pendingResizeCount;
+      } else {
+        m_pendingResizeExtent = outputExtent;
+        m_pendingResizeCount = 1;
+      }
+      if (m_pendingResizeCount < kResizeDebounceFrames) {
+        outputExtent = { 0u, 0u }; // not yet: skip the output-tracker update this round
+      } else {
+        m_pendingResizeCount = 0;
+      }
+    } else {
+      m_pendingResizeCount = 0;
+    }
+
     considerExtent(outputExtent,        m_lastOutputExtent,        true,  "output");
     considerExtent(remixViewportExtent, m_lastRemixViewportExtent, false, "Remix viewport");
 
@@ -4577,6 +4652,17 @@ namespace dxvk {
 
   void D3D11Rtx::EndFrame(const Rc<DxvkImage>& backbuffer, VkExtent2D remixViewportExtent) {
     UpdateTrackedExtents(backbuffer, remixViewportExtent);
+
+    // Let the real-camera latch decay after extended absence so menu and
+    // loading-screen draws (viewport-fallback reliant) are not permanently
+    // blocked once a session has run. ~4x the scene grace window.
+    if (m_hasSeenRealSceneProjection) {
+      const uint32_t currentFrame = m_context->m_device->getCurrentFrameId();
+      if (currentFrame > m_lastRealCameraFrameId
+       && (currentFrame - m_lastRealCameraFrameId) > kSceneCameraGraceFrames * 4u) {
+        m_hasSeenRealSceneProjection = false;
+      }
+    }
 
     const uint32_t gameViewportCount = m_context->m_state.rs.numViewports;
     const VkExtent2D singleRemixViewportExtent = m_lastRemixViewportExtent;
