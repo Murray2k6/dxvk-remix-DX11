@@ -151,6 +151,26 @@ namespace dxvk {
     uint32_t                             m_pendingRejectedExtentCount = 0;
     static constexpr uint32_t kRejectedExtentAcceptEvents = 240;
 
+    // Resize debounce: deferred pipelines bind several RT sizes per frame at
+    // scene transitions, which previously re-triggered resize grace every
+    // frame (a "resize storm" - 8 consecutive camera carry-forwards observed
+    // in Saints Row IV at the scene->loading boundary). A new output extent
+    // must persist for this many consecutive observations before it commits.
+    VkExtent2D m_pendingResizeExtent = { 0u, 0u };
+    uint32_t   m_pendingResizeCount = 0;
+    static constexpr uint32_t kResizeDebounceFrames = 3;
+
+    // Frame id of the most recent real cbuffer projection. Lets
+    // m_hasSeenRealSceneProjection decay after extended camera absence so
+    // menu / loading-screen draws (which rely on viewport fallback) are not
+    // permanently blocked once a session has run (Saints Row IV bug 1).
+    uint32_t m_lastRealCameraFrameId = 0;
+
+    // Minimum coverage for origin-anchored viewport-fallback acceptance once
+    // a stable scene extent exists (loading screens render small origin
+    // rects: SR4 uses 600x337 = 31% during loads).
+    static constexpr float kMinNearOriginCoverage = 0.25f;
+
     // Single coherent policy for maintaining m_lastOutputExtent and
     // m_lastRemixViewportExtent. Called from both EndFrame and OnPresent so
     // the two paths cannot drift apart again.
