@@ -895,6 +895,7 @@ namespace dxvk {
       args.texcoordOffset = input.texcoordBuffer.offsetFromSlice() / 4;
       args.texcoordStride = input.texcoordBuffer.stride() / 4;
       args.texcoordFormat = input.texcoordBuffer.vertexFormat();
+      args.integerTexcoordScale = RtxOptions::integerTexcoordScale();
       if (!interleaver::formatConversionFloatSupported(args.texcoordFormat)) {
         ONCE(Logger::info(str::format("[rtx-interleaver] Unsupported texcoord buffer format (", args.texcoordFormat, "), skipping texcoord")));
       }

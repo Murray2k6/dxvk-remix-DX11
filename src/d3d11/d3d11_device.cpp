@@ -1284,7 +1284,12 @@ namespace dxvk {
           ID3D11Counter**             ppCounter) {
     InitReturnPtr(ppCounter);
     
-    Logger::warn(str::format("D3D11: Unsupported counter: ", pCounterDesc->Counter));
+    // Vendor-specific counters (NVAPI/AGS probe ids like 0x40000000) are
+    // queried every frame by some engines; warn once instead of spamming.
+    static std::atomic<uint32_t> s_unsupportedCounterLogs = { 0u };
+    if (s_unsupportedCounterLogs.fetch_add(1u) < 4u) {
+      Logger::warn(str::format("D3D11: Unsupported counter: ", pCounterDesc->Counter, " (further occurrences suppressed)"));
+    }
     return E_INVALIDARG;
   }
   

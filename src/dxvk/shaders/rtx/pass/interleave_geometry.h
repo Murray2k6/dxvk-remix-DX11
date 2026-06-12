@@ -49,6 +49,8 @@ namespace interleaver {
     VK_FORMAT_B8G8R8A8_UNORM = 44,
     VK_FORMAT_R16G16_UNORM = 77,
     VK_FORMAT_R16G16_SNORM = 78,
+    VK_FORMAT_R16G16_UINT = 82,
+    VK_FORMAT_R16G16_SINT = 84,
     VK_FORMAT_R16G16_SFLOAT = 83,
     VK_FORMAT_R16G16B16A16_SFLOAT = 97,
     VK_FORMAT_R32G32_SFLOAT = 103,
@@ -68,6 +70,8 @@ namespace interleaver {
     case SupportedVkFormats::VK_FORMAT_R16G16_UNORM:
     case SupportedVkFormats::VK_FORMAT_R16G16_SNORM:
     case SupportedVkFormats::VK_FORMAT_A2B10G10R10_SNORM_PACK32:
+    case SupportedVkFormats::VK_FORMAT_R16G16_UINT:
+    case SupportedVkFormats::VK_FORMAT_R16G16_SINT:
       return true;
     default:
       return false;
@@ -167,8 +171,37 @@ namespace interleaver {
     return float3(1, 1, 1);
   }
 
-  float3 convertTexcoord(uint32_t format, ReadBuffer(float) input, uint32_t index) {
+  float3 convertTexcoord(uint32_t format, ReadBuffer(float) input, uint32_t index, float integerTexcoordScale) {
     switch (format) {
+    case SupportedVkFormats::VK_FORMAT_R16G16_UINT:
+    {
+      // Fixed-point unsigned integer UVs: decode and apply the engine scale.
+      uint data = asuint(input[index]);
+      const float scale = integerTexcoordScale != 0.0f ? integerTexcoordScale : 1.0f;
+      return float3(
+        float(data & 0xFFFFu) / scale,
+        float((data >> 16u) & 0xFFFFu) / scale,
+        0);
+    }
+    case SupportedVkFormats::VK_FORMAT_R16G16_SINT:
+    {
+      // Fixed-point signed integer UVs (Saints Row IV stores TEXCOORD0 as
+      // R16G16_SINT). Sign-extend each 16-bit lane, then apply the engine
+      // scale. Do NOT reinterpret the bits as IEEE float - the GPU's input
+      // assembler casts these for the game's shaders, so the interleaver
+      // must cast too.
+      uint data = asuint(input[index]);
+      int u = int(data & 0xFFFFu);
+      if (u >= 32768) {
+        u -= 65536;
+      }
+      int v = int((data >> 16u) & 0xFFFFu);
+      if (v >= 32768) {
+        v -= 65536;
+      }
+      const float scale = integerTexcoordScale != 0.0f ? integerTexcoordScale : 1.0f;
+      return float3(float(u) / scale, float(v) / scale, 0);
+    }
     case SupportedVkFormats::VK_FORMAT_R16G16_UNORM:
     {
       uint data = asuint(input[index]);
@@ -249,7 +282,7 @@ namespace interleaver {
     }
 
     if (cb.hasTexcoord) {
-      float3 texcoords = convertTexcoord(cb.texcoordFormat, srcTexcoord, srcVertexIndex * cb.texcoordStride + cb.texcoordOffset);
+      float3 texcoords = convertTexcoord(cb.texcoordFormat, srcTexcoord, srcVertexIndex * cb.texcoordStride + cb.texcoordOffset, cb.integerTexcoordScale);
       dst[idx * cb.outputStride + writeOffset++] = texcoords.x;
       dst[idx * cb.outputStride + writeOffset++] = texcoords.y;
     }
