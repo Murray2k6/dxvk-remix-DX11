@@ -1570,6 +1570,19 @@ namespace dxvk {
         availableMemorySizeMib = std::max(memBudgetMib - memUsedMib, availableMemorySizeMib);
       }
     }
+    // Keep a safety margin under the driver budget. The budget shifts as
+    // other applications allocate, and non-texture allocations (BLAS,
+    // render targets) may be restricted to device-local memory with no
+    // host fallback - observed in the wild as a 900 MiB over-budget heap,
+    // a failed 20 MiB allocation, a CS-thread exception, and device loss.
+    {
+      const VkDeviceSize headroomMib =
+        static_cast<VkDeviceSize>(std::max(RtxOptions::TextureManager::budgetHeadroomMiB(), 0));
+      availableMemorySizeMib = availableMemorySizeMib > headroomMib
+        ? availableMemorySizeMib - headroomMib
+        : 0;
+    }
+
     if (!device->getCommon()->getResources().isResourceReady()) {
       // Reserve space for various non-texture GPU resources (buffers, etc)
 

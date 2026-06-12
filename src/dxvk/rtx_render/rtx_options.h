@@ -1153,6 +1153,7 @@ namespace dxvk {
                  "replacements assets are simply too large for the target GPUs available vid mem, we may end up going overbudget "
                  "regularly.  Defaults to 50% of the available VRAM.");
       RTX_OPTION("rtx.texturemanager", bool, fixedBudgetEnable, false, "If true, rtx.texturemanager.fixedBudgetMiB is used instead of rtx.texturemanager.budgetPercentageOfAvailableVram.");
+      RTX_OPTION("rtx.texturemanager", int, budgetHeadroomMiB, 768, "Memory reserved out of the driver-reported VRAM budget before computing the texture budget, in MiB. Driver budgets fluctuate as other applications allocate, and non-texture allocations (acceleration structures, render targets) often cannot fall back to system memory - running textures at 100% of the budget therefore causes over-budget allocation failures, CS-thread exceptions, and device-lost errors. The headroom keeps those allocations inside budget.");
       RTX_OPTION_ARGS("rtx.texturemanager", int, fixedBudgetMiB, 2048, "Fixed-size VRAM budget for replacement textures. In mebibytes. To use, set rtx.texturemanager.fixedBudgetEnable to True.",
                       args.minValue = 256,
                       args.maxValue = 1024 * 32);

@@ -291,54 +291,49 @@ function Repair-FutureFileTimestamps {
 
   $now = Get-Date
   $futureLimit = $now.AddSeconds(2)
-  $safeTime = $now.AddSeconds(-30)
+  $safeTime = $now.AddSeconds(-60)
   $fixedCount = 0
 
   $rootsToScan = New-Object System.Collections.Generic.List[string]
-  $rootsToScan.Add($SourceDir)
+  if (Test-Path $SourceDir) {
+    $rootsToScan.Add([IO.Path]::GetFullPath($SourceDir))
+  }
   if (-not [string]::IsNullOrWhiteSpace($BuildDir) -and (Test-Path $BuildDir)) {
-    $rootsToScan.Add($BuildDir)
+    $rootsToScan.Add([IO.Path]::GetFullPath($BuildDir))
   }
 
   $seenFiles = @{}
+  $sourceNorm = if (Test-Path $SourceDir) { Get-NormalizedFullPath -Path $SourceDir } else { '' }
 
   foreach ($root in $rootsToScan) {
     if ([string]::IsNullOrWhiteSpace($root) -or -not (Test-Path $root)) { continue }
 
-    # Meson checks timestamps on Meson files and files used to configure the build.
-    # When files are copied from a ZIP made on a machine with clock/timezone drift,
-    # Meson aborts with: "Clock skew detected ... has a time stamp ... in the future".
-    $candidates = @()
-    $directNames = @(
-      'meson.build',
-      'meson_options.txt',
-      'build_common.ps1',
-      'build_dxvk_all_ninja.ps1'
-    )
+    $rootNorm = Get-NormalizedFullPath -Path $root
+    $rootIsSourceRoot = ($sourceNorm -and ($rootNorm -eq $sourceNorm))
 
-    foreach ($name in $directNames) {
-      $directPath = Join-Path $root $name
-      if (Test-Path $directPath) {
-        $candidates += Get-Item -LiteralPath $directPath -Force -ErrorAction SilentlyContinue
-      }
-    }
-
+    # Do not scan .git or normal output folders from the source-root pass.
+    # If BuildDir is supplied separately, it is scanned directly so Meson/Ninja
+    # metadata can also be repaired after a bad ZIP extraction or clock change.
+    $files = @()
     try {
-      $candidates += Get-ChildItem -LiteralPath $root -Recurse -Force -File -ErrorAction SilentlyContinue |
+      $files = Get-ChildItem -LiteralPath $root -Recurse -Force -File -ErrorAction SilentlyContinue |
         Where-Object {
           $full = $_.FullName
-          ($full -notlike '*\.git\*') -and
-          ($full -notlike '*\_output\*') -and
-          ($full -notlike '*\_Comp64Debug\*') -and
-          ($full -notlike '*\_Comp64DebugOptimized\*') -and
-          ($full -notlike '*\_Comp64Release\*') -and
-          ($_.Name -ieq 'meson.build' -or $_.Name -ieq 'meson_options.txt')
+          if ($full -like '*\.git\*') { return $false }
+          if ($full -like '*\_output\*') { return $false }
+          if ($rootIsSourceRoot) {
+            if ($full -like '*\_Comp64Debug\*') { return $false }
+            if ($full -like '*\_Comp64DebugOptimized\*') { return $false }
+            if ($full -like '*\_Comp64Release\*') { return $false }
+          }
+          return $true
         }
     } catch {
-      Write-Host "[build] WARNING: Could not fully scan '$root' for future Meson timestamps: $($_.Exception.Message)" -ForegroundColor Yellow
+      Write-Host "[build] WARNING: Could not fully scan '$root' for future timestamps: $($_.Exception.Message)" -ForegroundColor Yellow
+      $files = @()
     }
 
-    foreach ($file in $candidates) {
+    foreach ($file in $files) {
       if (-not $file) { continue }
       $key = $file.FullName.ToLowerInvariant()
       if ($seenFiles.ContainsKey($key)) { continue }
@@ -346,9 +341,10 @@ function Repair-FutureFileTimestamps {
 
       try {
         $item = Get-Item -LiteralPath $file.FullName -Force
-        if ($item.LastWriteTime -gt $futureLimit) {
+        if (($item.LastWriteTime -gt $futureLimit) -or ($item.LastAccessTime -gt $futureLimit) -or ($item.CreationTime -gt $futureLimit)) {
           $deltaSeconds = [math]::Round(($item.LastWriteTime - $now).TotalSeconds, 3)
           Write-Host "[build] Fixing future timestamp (+$deltaSeconds sec): $($item.FullName)" -ForegroundColor Yellow
+          $item.CreationTime = $safeTime
           $item.LastWriteTime = $safeTime
           $item.LastAccessTime = $safeTime
           $fixedCount++
@@ -360,7 +356,7 @@ function Repair-FutureFileTimestamps {
   }
 
   if ($fixedCount -gt 0) {
-    Write-Host "[build] Repaired $fixedCount future file timestamp(s) before Meson setup." -ForegroundColor Yellow
+    Write-Host "[build] Repaired $fixedCount future file timestamp(s) before Meson/Ninja setup." -ForegroundColor Yellow
   }
 }
 
@@ -481,14 +477,14 @@ function PerformBuild {
   $BuildDir = [IO.Path]::Combine($SourceDir, $BuildSubDir)
 
   if (-not (Test-Path (Join-Path $SourceDir 'meson.build'))) {
-    Write-Error "meson.build was not found at '$SourceDir'. Put build_common.ps1 in the repository root and run it from there." -ErrorAction Stop
+    Write-Error "meson.build was not found at '$SourceDir'. Put build_common.ps1 and build_dxvk_all_ninja.ps1 in the repository root next to meson.build, then run build_dxvk_all_ninja.ps1 from there." -ErrorAction Stop
   }
 
   Repair-FutureFileTimestamps -SourceDir $SourceDir -BuildDir $BuildDir
 
   $mesonCommand = Resolve-RequiredCommand -Name 'meson' -PythonModule 'mesonbuild.mesonmain' -InstallHint 'Install Meson with: py -m pip install --user meson'
   if ($Backend -eq 'ninja') {
-    [void](Resolve-RequiredCommand -Name 'ninja' -InstallHint 'Install Ninja with: py -m pip install --user ninja')
+    [void](Resolve-RequiredCommand -Name 'ninja' -PythonModule 'ninja' -InstallHint 'Install Ninja with: py -m pip install --user ninja')
   }
 
   $availableOptions = Get-MesonOptionNames -SourceDir $SourceDir
