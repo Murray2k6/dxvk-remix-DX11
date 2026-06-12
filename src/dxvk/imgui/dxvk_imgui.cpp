@@ -1908,6 +1908,24 @@ namespace dxvk {
   }
   
   void ImGUI::showMaterialOptions() {
+    if (RemixGui::CollapsingHeader("DX11 Bridge", collapsingHeaderClosedFlags)) {
+      ImGui::Indent();
+
+      RemixGui::Checkbox("Force Injection", &RtxOptions::forceInjectionObject());
+      RemixGui::SetTooltipToLastWidgetOnHover("Forces Remix injection every frame with a backbuffer. Escape hatch for games whose cameras never pass validation (which otherwise blocks both path tracing and this menu). The overflow guard keeps the acceleration structure empty while no real scene is found, so this is safe to leave on.");
+
+      RemixGui::Checkbox("Allow Viewport-Fallback Camera After Real Camera", &RtxOptions::allowViewportFallbackAfterRealCameraObject());
+      RemixGui::SetTooltipToLastWidgetOnHover("Lets menu and loading-screen draws synthesize a camera from the viewport even after a real scene camera has been seen this session.");
+
+      RemixGui::Checkbox("Taggable Untextured Draws", &RtxOptions::taggableUntexturedDrawsObject());
+      RemixGui::SetTooltipToLastWidgetOnHover("Attaches a small neutral fallback material texture to draws that bind no texture, so they appear in the texture browser and can be picked in the viewport and tagged (including ignore-tags that remove them).");
+
+      RemixGui::DragInt("VRAM Budget Headroom (MiB)", &RtxOptions::TextureManager::budgetHeadroomMiBObject(), 8.0f, 0, 4096, "%d MiB");
+      RemixGui::SetTooltipToLastWidgetOnHover("Memory reserved out of the driver-reported VRAM budget before textures claim it. Prevents over-budget allocation failures (Vulkan device-lost popups) from acceleration structures and render targets that cannot fall back to system memory.");
+
+      ImGui::Unindent();
+    }
+
     if (RemixGui::CollapsingHeader("Material Options (optional)", collapsingHeaderClosedFlags)) {
       ImGui::Indent();
 

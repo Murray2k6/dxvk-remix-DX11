@@ -3172,6 +3172,21 @@ namespace dxvk {
 
     ++m_submitRejectStats.total;
 
+    // forceInjection overflow guard: when injection is forced but the
+    // previous frame produced zero scene instances, only the first
+    // kForceInjectionProbeDraws draws are considered (enough for camera and
+    // scene discovery - SR4 finds its camera at drawCallID 41). Everything
+    // past the window is rejected before geometry processing, so the
+    // Remix UI and composite stay alive while the acceleration structure
+    // stays empty instead of rebuilding 6k junk instances per frame.
+    if (RtxOptions::forceInjection()
+     && m_prevFrameSceneAccepted == 0
+     && m_prevFrameRealSceneAccepted == 0
+     && m_submitRejectStats.total > kForceInjectionProbeDraws) {
+      ++m_submitRejectStats.forceInjectionIdle;
+      return;
+    }
+
     // Throttle: don't exceed the worker ring buffer capacity.
     // Beyond this point new futures would overwrite in-flight ones â†’ corrupt hashes.
     if (m_drawCallID >= kMaxConcurrentDraws) {
@@ -4668,6 +4683,9 @@ namespace dxvk {
     const VkExtent2D singleRemixViewportExtent = m_lastRemixViewportExtent;
     const uint32_t draws = m_drawCallID;
     const uint32_t acceptedDraws = m_submitRejectStats.accepted;
+    m_prevFrameSceneAccepted = m_submitRejectStats.sceneAccepted;
+    m_prevFrameRealSceneAccepted = m_submitRejectStats.realSceneAccepted;
+
     const uint32_t sceneAcceptedDraws = m_submitRejectStats.sceneAccepted;
     const uint32_t realSceneAcceptedDraws = m_submitRejectStats.realSceneAccepted;
     const uint32_t trustedSceneAcceptedDraws = realSceneAcceptedDraws > 0
@@ -4697,6 +4715,7 @@ namespace dxvk {
       ++s_submitSummaryLogCount;
       Logger::info(str::format(
         "[D3D11Rtx] Submit summary: total=", m_submitRejectStats.total,
+        " forceInjIdle=", m_submitRejectStats.forceInjectionIdle,
         " accepted=", m_submitRejectStats.accepted,
         " scene=", m_submitRejectStats.sceneAccepted,
         " realScene=", m_submitRejectStats.realSceneAccepted,

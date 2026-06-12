@@ -133,6 +133,7 @@ namespace dxvk {
       uint32_t screenSpaceUiSkip = 0;
       uint32_t screenSpaceGarbageSkip = 0;
       uint32_t geometryHashScheduleFailed = 0;
+      uint32_t forceInjectionIdle = 0;
     };
 
     SubmitRejectStats                    m_submitRejectStats;
@@ -170,6 +171,15 @@ namespace dxvk {
     // a stable scene extent exists (loading screens render small origin
     // rects: SR4 uses 600x337 = 31% during loads).
     static constexpr float kMinNearOriginCoverage = 0.25f;
+
+    // forceInjection overflow guard (Saints Row IV open world): with
+    // injection forced and no usable scene found in the previous frame, cap
+    // geometry submission to a probe window so camera discovery still works
+    // but the RT acceleration structure cannot balloon to thousands of junk
+    // instances (25k draws -> 6144-instance AS rebuilt every frame, ~1.4 s).
+    uint32_t m_prevFrameSceneAccepted = 0;
+    uint32_t m_prevFrameRealSceneAccepted = 0;
+    static constexpr uint32_t kForceInjectionProbeDraws = 512;
 
     // Single coherent policy for maintaining m_lastOutputExtent and
     // m_lastRemixViewportExtent. Called from both EndFrame and OnPresent so
