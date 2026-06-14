@@ -1,0 +1,5 @@
+LIBRARY "d3d11"
+EXPORTS
+  D3D11CreateDevice=_D3D11CreateDevice@40
+  D3D11CreateDeviceAndSwapChain=_D3D11CreateDeviceAndSwapChain@48
+  D3D11On12CreateDevice=_D3D11On12CreateDevice@40

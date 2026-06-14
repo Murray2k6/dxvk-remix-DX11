@@ -20,9 +20,19 @@
   DEALINGS IN THE SOFTWARE.
 #>
 
-.   ".\build_common.ps1"
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+
+$ScriptRoot = if ($PSScriptRoot) {
+  [IO.Path]::GetFullPath($PSScriptRoot)
+} else {
+  [IO.Path]::GetFullPath((Get-Location).Path)
+}
+
+. (Join-Path $ScriptRoot 'build_common.ps1')
 
 # Build a single DX11 runtime configuration directly, for example:
-# powershell -command "& { . .\build_dxvk.ps1 PerformBuild -BuildFlavour debugoptimized -BuildSubDir _CompTest -Backend vs -InstallTags output }"
+# powershell -ExecutionPolicy Bypass -File .\build_dxvk.ps1 -Architecture x86 -BuildFlavour release -BuildSubDir _Comp32Release -Backend ninja -EnableTracy false
+# powershell -ExecutionPolicy Bypass -File .\build_dxvk.ps1 -Architecture x64 -BuildFlavour debugoptimized -BuildSubDir _Comp64DebugOptimized -Backend ninja -EnableTracy false
 
 PerformBuild @args

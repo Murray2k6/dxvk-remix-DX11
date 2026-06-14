@@ -269,6 +269,9 @@ function Repair-FutureFileTimestamps {
             if ($full -like '*\_Comp64Debug\*') { return $false }
             if ($full -like '*\_Comp64DebugOptimized\*') { return $false }
             if ($full -like '*\_Comp64Release\*') { return $false }
+            if ($full -like '*\_Comp32Debug\*') { return $false }
+            if ($full -like '*\_Comp32DebugOptimized\*') { return $false }
+            if ($full -like '*\_Comp32Release\*') { return $false }
           }
           return $true
         }
@@ -360,32 +363,143 @@ if ([string]::IsNullOrWhiteSpace([string]$vsPath)) {
   Write-Error "Failed to find Visual Studio 2019/2022 with MSVC C++ build tools. Aborting." -ErrorAction Stop
 }
 Write-Host "[build] Using Visual Studio installation at: ${vsPath}" -ForegroundColor Yellow
-# Make sure the Visual Studio Command Prompt variables are set.
-if (Test-Path env:LIBPATH) {
-  Write-Host "[build] Visual Studio Command Prompt variables already set." -ForegroundColor Yellow
-} else {
-  $vcVarsDir = Join-Path $vsPath 'VC\Auxiliary\Build'
-  if (-not (Test-Path (Join-Path $vcVarsDir 'vcvarsall.bat'))) {
-    Write-Error "vcvarsall.bat not found under '$vcVarsDir'. Install the MSVC C++ workload in Visual Studio Installer." -ErrorAction Stop
-  }
-  Push-Location $vcVarsDir
-  try {
-    cmd /c "vcvarsall.bat x64&set" | ForEach-Object {
-      if ($_ -match '=') {
-        # Split only once. Some PATH-like values legitimately contain '='.
-        $v = $_ -split '=', 2
-        if ($v.Count -eq 2 -and -not [string]::IsNullOrWhiteSpace($v[0])) {
-          Set-Item -Force -Path "ENV:\$($v[0])" -Value $v[1]
-        }
-      }
+# Capture the environment before selecting a compiler architecture. Each build can
+# switch between x64 and x86 without reusing the previous architecture's CL/LIB/INCLUDE.
+$script:DxvkInitialEnvironment = @{}
+Get-ChildItem Env: | ForEach-Object { $script:DxvkInitialEnvironment[$_.Name] = $_.Value }
+
+function Restore-DxvkInitialEnvironment {
+  $currentNames = @(Get-ChildItem Env: | ForEach-Object { $_.Name })
+  foreach ($name in $currentNames) {
+    if (-not $script:DxvkInitialEnvironment.ContainsKey($name)) {
+      Remove-Item -Path "ENV:\$name" -ErrorAction SilentlyContinue
     }
-  } finally {
-    Pop-Location
   }
-  Write-Host "[build] Visual Studio Command Prompt variables set." -ForegroundColor Yellow
+  foreach ($entry in $script:DxvkInitialEnvironment.GetEnumerator()) {
+    Set-Item -Force -Path "ENV:\$($entry.Key)" -Value $entry.Value
+  }
 }
+
+function Set-VisualStudioBuildEnvironment {
+  param(
+    [Parameter(Mandatory)]
+    [ValidateSet('x64', 'x86')]
+    [string]$Architecture
+  )
+
+  Restore-DxvkInitialEnvironment
+
+  $targetArch = if ($Architecture -eq 'x86') { 'x86' } else { 'x64' }
+  $hostArch = 'Hostx64'
+
+  $vcRoot = Join-Path $vsPath 'VC\Tools\MSVC'
+  if (-not (Test-Path -LiteralPath $vcRoot)) {
+    Write-Error ('MSVC tools folder was not found: {0}. Install the MSVC C++ x64/x86 build tools workload.' -f $vcRoot) -ErrorAction Stop
+  }
+
+  $vcCandidates = @(Get-ChildItem -LiteralPath $vcRoot -Directory -ErrorAction SilentlyContinue | Where-Object {
+    Test-Path -LiteralPath (Join-Path $_.FullName ('bin\{0}\{1}\cl.exe' -f $hostArch, $targetArch))
+  } | Sort-Object Name -Descending)
+
+  if ($vcCandidates.Count -eq 0) {
+    Write-Error ('No MSVC {0}\{1} compiler was found under {2}. Install MSVC x86/x64 build tools.' -f $hostArch, $targetArch, $vcRoot) -ErrorAction Stop
+  }
+
+  $vcToolsDir = $vcCandidates[0].FullName
+  $vcBin = Join-Path $vcToolsDir ('bin\{0}\{1}' -f $hostArch, $targetArch)
+
+  $programFilesX86 = [Environment]::GetFolderPath('ProgramFilesX86')
+  $sdkRoot = $null
+  if (-not [string]::IsNullOrWhiteSpace($env:WindowsSdkDir) -and (Test-Path -LiteralPath $env:WindowsSdkDir)) {
+    $sdkRoot = $env:WindowsSdkDir
+  }
+  if ([string]::IsNullOrWhiteSpace($sdkRoot)) {
+    $candidateSdk = Join-Path $programFilesX86 'Windows Kits\10'
+    if (Test-Path -LiteralPath $candidateSdk) { $sdkRoot = $candidateSdk }
+  }
+  if ([string]::IsNullOrWhiteSpace($sdkRoot)) {
+    Write-Error 'Windows 10/11 SDK root was not found. Install Windows SDK with Visual Studio Installer.' -ErrorAction Stop
+  }
+
+  $sdkRoot = (Resolve-Path -LiteralPath $sdkRoot).ProviderPath
+  $sdkLibRoot = Join-Path $sdkRoot 'Lib'
+  $sdkIncludeRoot = Join-Path $sdkRoot 'Include'
+  $sdkBinRoot = Join-Path $sdkRoot 'bin'
+
+  $sdkVersions = @(Get-ChildItem -LiteralPath $sdkLibRoot -Directory -ErrorAction SilentlyContinue | Where-Object {
+    (Test-Path -LiteralPath (Join-Path $_.FullName ('ucrt\{0}' -f $targetArch))) -and
+    (Test-Path -LiteralPath (Join-Path $_.FullName ('um\{0}' -f $targetArch)))
+  } | Sort-Object Name -Descending)
+
+  if ($sdkVersions.Count -eq 0) {
+    Write-Error ('No Windows SDK library version for {0} was found under {1}.' -f $targetArch, $sdkLibRoot) -ErrorAction Stop
+  }
+
+  $sdkVer = $sdkVersions[0].Name
+
+  function Add-ExistingDirectory {
+    param(
+      [Parameter(Mandatory)] [object]$List,
+      [string]$Path
+    )
+    if (-not [string]::IsNullOrWhiteSpace($Path) -and (Test-Path -LiteralPath $Path)) {
+      [void]$List.Add((Resolve-Path -LiteralPath $Path).ProviderPath)
+    }
+  }
+
+  $pathList = New-Object System.Collections.ArrayList
+  Add-ExistingDirectory -List $pathList -Path $vcBin
+  Add-ExistingDirectory -List $pathList -Path (Join-Path $sdkBinRoot (Join-Path $sdkVer 'x64'))
+  Add-ExistingDirectory -List $pathList -Path (Join-Path $sdkBinRoot (Join-Path $sdkVer $targetArch))
+  if (-not [string]::IsNullOrWhiteSpace($env:PATH)) {
+    foreach ($p in ($env:PATH -split ';')) {
+      if (-not [string]::IsNullOrWhiteSpace($p)) { [void]$pathList.Add($p) }
+    }
+  }
+
+  $includeList = New-Object System.Collections.ArrayList
+  Add-ExistingDirectory -List $includeList -Path (Join-Path $vcToolsDir 'include')
+  foreach ($part in @('ucrt', 'shared', 'um', 'winrt', 'cppwinrt')) {
+    Add-ExistingDirectory -List $includeList -Path (Join-Path $sdkIncludeRoot (Join-Path $sdkVer $part))
+  }
+
+  $libList = New-Object System.Collections.ArrayList
+  Add-ExistingDirectory -List $libList -Path (Join-Path $vcToolsDir (Join-Path 'lib' $targetArch))
+  Add-ExistingDirectory -List $libList -Path (Join-Path $sdkLibRoot (Join-Path $sdkVer (Join-Path 'ucrt' $targetArch)))
+  Add-ExistingDirectory -List $libList -Path (Join-Path $sdkLibRoot (Join-Path $sdkVer (Join-Path 'um' $targetArch)))
+
+  $libPathList = New-Object System.Collections.ArrayList
+  Add-ExistingDirectory -List $libPathList -Path (Join-Path $vcToolsDir (Join-Path 'lib' $targetArch))
+  Add-ExistingDirectory -List $libPathList -Path (Join-Path $sdkLibRoot (Join-Path $sdkVer (Join-Path 'ucrt' $targetArch)))
+  Add-ExistingDirectory -List $libPathList -Path (Join-Path $sdkLibRoot (Join-Path $sdkVer (Join-Path 'um' $targetArch)))
+
+  if ($includeList.Count -eq 0 -or $libList.Count -eq 0) {
+    Write-Error ('MSVC/SDK INCLUDE or LIB paths were empty for {0}. MSVC={1} SDK={2}' -f $targetArch, $vcToolsDir, $sdkRoot) -ErrorAction Stop
+  }
+
+  $env:PATH = ($pathList.ToArray() -join ';')
+  $env:INCLUDE = ($includeList.ToArray() -join ';')
+  $env:LIB = ($libList.ToArray() -join ';')
+  $env:LIBPATH = ($libPathList.ToArray() -join ';')
+  $env:DXVK_BUILD_ARCH = $Architecture
+  $env:VSCMD_ARG_HOST_ARCH = 'x64'
+  $env:VSCMD_ARG_TGT_ARCH = $targetArch
+  $env:Platform = if ($targetArch -eq 'x86') { 'Win32' } else { 'x64' }
+  $env:VCToolsInstallDir = ($vcToolsDir.TrimEnd('\') + '\')
+  $env:VCToolsVersion = Split-Path $vcToolsDir -Leaf
+  $env:WindowsSdkDir = ($sdkRoot.TrimEnd('\') + '\')
+  $env:WindowsSDKVersion = ($sdkVer.TrimEnd('\') + '\')
+  $env:WindowsSdkVerBinPath = (Join-Path $sdkBinRoot ($sdkVer + '\'))
+  $env:UCRTVersion = $sdkVer
+  $env:UniversalCRTSdkDir = ($sdkRoot.TrimEnd('\') + '\')
+
+  Write-Host ('[build] MSVC environment set directly for {0}: MSVC {1}, SDK {2}' -f $Architecture, $env:VCToolsVersion, $sdkVer) -ForegroundColor Yellow
+}
+
 function PerformBuild {
   param(
+    [ValidateSet('x64', 'x86')]
+    [string]$Architecture = 'x64',
     [Parameter(Mandatory)]
     [string]$Backend,
     [Parameter(Mandatory)]
@@ -405,8 +519,9 @@ function PerformBuild {
     $InstallTags = @('output')
   }
   $SourceDir = [IO.Path]::GetFullPath($DxvkBuildRoot)
-  $OutputDir = [IO.Path]::Combine($SourceDir, '_output')
+  $OutputDir = [IO.Path]::Combine($SourceDir, '_output', $Architecture)
   $BuildDir = [IO.Path]::Combine($SourceDir, $BuildSubDir)
+  Set-VisualStudioBuildEnvironment -Architecture $Architecture
   if (-not (Test-Path (Join-Path $SourceDir 'meson.build'))) {
     Write-Error "meson.build was not found at '$SourceDir'. Put build_common.ps1 and build_dxvk_all_ninja.ps1 in the repository root next to meson.build, then run build_dxvk_all_ninja.ps1 from there." -ErrorAction Stop
   }
@@ -416,7 +531,7 @@ function PerformBuild {
     [void](Resolve-RequiredCommand -Name 'ninja' -InstallHint 'Install Ninja with: py -m pip install --user ninja')
   }
   $availableOptions = Get-MesonOptionNames -SourceDir $SourceDir
-  Write-Host "[build] Starting build for $BuildFlavour..." -ForegroundColor Cyan
+  Write-Host "[build] Starting $Architecture build for $BuildFlavour..." -ForegroundColor Cyan
   Write-Host "[build] Source directory: $SourceDir" -ForegroundColor DarkGray
   Write-Host "[build] Build directory:  $BuildDir" -ForegroundColor DarkGray
   $buildDirMatchesCurrentSource = Repair-StaleBuildDirectory -SourceDir $SourceDir -BuildDir $BuildDir
@@ -484,8 +599,8 @@ function PerformBuild {
     } else {
       Write-Host "[build] WARNING: NGX runtime DLLs not found at $ngxSource - DLSS will be unavailable in deployed builds." -ForegroundColor Yellow
     }
-    Write-Host "[build] Build completed successfully for $BuildFlavour" -ForegroundColor Green
+    Write-Host "[build] Build completed successfully for $Architecture $BuildFlavour" -ForegroundColor Green
   } else {
-    Write-Host "[build] Configuration completed for $BuildFlavour (no build performed)" -ForegroundColor Green
+    Write-Host "[build] Configuration completed for $Architecture $BuildFlavour (no build performed)" -ForegroundColor Green
   }
 }

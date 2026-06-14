@@ -28,7 +28,10 @@ param(
   # Compile only the rtx_shaders Meson target and skip APIC download.
   [switch]$ShadersOnly,
   # Compile one Meson target instead of the default full build.
-  [string]$BuildTarget
+  [string]$BuildTarget,
+  # Build both architectures by default. Use -Architecture x64 or -Architecture x86 to limit it.
+  [ValidateSet('both', 'x64', 'x86')]
+  [string]$Architecture = 'both'
 )
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
@@ -46,13 +49,35 @@ if (-not (Test-Path (Join-Path $ScriptRoot 'meson.build'))) {
 Repair-FutureFileTimestamps -SourceDir $ScriptRoot
 if ($ReleaseOnly) {
   $BuildFlavours = @('release')
-  $BuildSubDirs  = @('_Comp64Release')
 } else {
   $BuildFlavours = @('debug', 'debugoptimized', 'release')
-  $BuildSubDirs  = @('_Comp64Debug', '_Comp64DebugOptimized', '_Comp64Release')
 }
+
+$BuildArchitectures = switch ($Architecture) {
+  'x64'  { @('x64') }
+  'x86'  { @('x86') }
+  default { @('x64', 'x86') }
+}
+
+function Get-DxvkBuildSubDir {
+  param(
+    [Parameter(Mandatory)]
+    [ValidateSet('x64', 'x86')]
+    [string]$Arch,
+    [Parameter(Mandatory)]
+    [ValidateSet('debug', 'debugoptimized', 'release')]
+    [string]$Flavour
+  )
+  $prefix = if ($Arch -eq 'x86') { '_Comp32' } else { '_Comp64' }
+  switch ($Flavour) {
+    'debug'          { return ($prefix + 'Debug') }
+    'debugoptimized' { return ($prefix + 'DebugOptimized') }
+    'release'        { return ($prefix + 'Release') }
+  }
+}
+
 if ($Clean) {
-  foreach ($dirName in @('_Comp64Debug', '_Comp64DebugOptimized', '_Comp64Release')) {
+  foreach ($dirName in @('_Comp64Debug', '_Comp64DebugOptimized', '_Comp64Release', '_Comp32Debug', '_Comp32DebugOptimized', '_Comp32Release')) {
     $dir = Join-Path $ScriptRoot $dirName
     if (Test-Path $dir) {
       Write-Host "[build] Removing clean build directory: $dir" -ForegroundColor Yellow
@@ -61,15 +86,18 @@ if ($Clean) {
   }
 }
 $EnableTracyValue = if ($Tracy) { 'true' } else { 'false' }
-for ($i = 0; $i -lt $BuildFlavours.Length; $i++) {
-  $performArgs = @{
-    BuildFlavour = $BuildFlavours[$i]
-    BuildSubDir = $BuildSubDirs[$i]
-    Backend = 'ninja'
-    EnableTracy = $EnableTracyValue
-    ConfigureOnly = [bool]$ConfigureOnly
-    ShadersOnly = [bool]$ShadersOnly
-    BuildTarget = $BuildTarget
+foreach ($arch in $BuildArchitectures) {
+  foreach ($flavour in $BuildFlavours) {
+    $performArgs = @{
+      Architecture = $arch
+      BuildFlavour = $flavour
+      BuildSubDir = Get-DxvkBuildSubDir -Arch $arch -Flavour $flavour
+      Backend = 'ninja'
+      EnableTracy = $EnableTracyValue
+      ConfigureOnly = [bool]$ConfigureOnly
+      ShadersOnly = [bool]$ShadersOnly
+      BuildTarget = $BuildTarget
+    }
+    PerformBuild @performArgs
   }
-  PerformBuild @performArgs
 }
