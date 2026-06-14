@@ -17,8 +17,9 @@
   DEALINGS IN THE SOFTWARE.
 #>
 param(
-  # Build with the Tracy profiler compiled in.
-  [switch]$Tracy,
+  # Tracy profiler support is compiled in by default for this fork.
+  # Pass -NoTracy to produce a build without it.
+  [switch]$NoTracy,
   # Only configure Meson; do not compile or install.
   [switch]$ConfigureOnly,
   # Build only release instead of debug, debugoptimized, and release.
@@ -85,7 +86,7 @@ if ($Clean) {
     }
   }
 }
-$EnableTracyValue = if ($Tracy) { 'true' } else { 'false' }
+$EnableTracyValue = if ($NoTracy) { 'false' } else { 'true' }
 foreach ($arch in $BuildArchitectures) {
   foreach ($flavour in $BuildFlavours) {
     $performArgs = @{

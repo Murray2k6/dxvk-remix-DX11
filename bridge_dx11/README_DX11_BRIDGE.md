@@ -13,7 +13,7 @@ Outputs:
 ```text
 _output\x86\debug\d3d11.dll
 _output\x86\debug\dxgi.dll
-_output\x86\debug\.trex\NvRemixBridge.exe
+_output\x86\debug\.trex\NvRemixDx11Bridge.exe
 ```
 
 The x64 DX11 runtime must be staged separately into the `.trex` folders by the top-level build script.

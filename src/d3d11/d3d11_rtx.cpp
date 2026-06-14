@@ -4577,6 +4577,27 @@ static bool isPositionFormat(VkFormat format) {
       return;
     }
 
+    // UE-style significance selection. If the previous frame overflowed the
+    // instance budget, admit only draws nearer than the adapted threshold so
+    // the budget is spent on what is closest to the camera rather than on
+    // whatever the engine submitted first. The camera-space depth of the
+    // draw's origin is the significance metric (Unreal scores by distance /
+    // screen size); translation.z of objectToView is that depth directly.
+    if (m_significanceCullingActive && RtxOptions::significanceCulling()) {
+      const Vector3 camSpacePos = Vector3{ dcs.transformData.objectToView[3].xyz() };
+      const float distanceSq = lengthSqr(camSpacePos);
+      ++m_significanceConsideredThisFrame;
+      m_prevFrameFarthestAcceptedSq = std::max(m_prevFrameFarthestAcceptedSq, 0.0f);
+      if (m_significanceMaxDistanceSq > 0.0f && distanceSq > m_significanceMaxDistanceSq) {
+        ++m_submitRejectStats.significanceCulled;
+        return;
+      }
+      // Track the farthest distance we actually accepted this frame so the
+      // next frame's threshold can relax if we came in under budget.
+      m_prevFrameFarthestAcceptedSq = std::max(m_prevFrameFarthestAcceptedSq, distanceSq);
+      ++m_significanceAcceptedThisFrame;
+    }
+
     ++m_submitRejectStats.accepted;
     {
       const uint32_t primitiveCount = dcs.geometryData.calculatePrimitiveCount();
@@ -4780,6 +4801,60 @@ static bool isPositionFormat(VkFormat format) {
   void D3D11Rtx::EndFrame(const Rc<DxvkImage>& backbuffer, VkExtent2D remixViewportExtent) {
     UpdateTrackedExtents(backbuffer, remixViewportExtent);
 
+    // Adapt the significance distance threshold from this frame's outcome
+    // (UE-style importance budgeting). The budget is rtx.maxInstanceSubmissions;
+    // kMaxConcurrentDraws is the hard ring-buffer ceiling. If we accepted more
+    // than the budget this frame, geometry will overflow next frame, so arm
+    // significance culling and set the cutoff to the farthest thing we kept,
+    // pulled in by 10% to shed the most distant draws. If we were comfortably
+    // under budget, relax the cutoff by 15% so detail returns as the camera
+    // turns toward sparser views; once well under, disarm entirely.
+    {
+      const uint32_t budget = std::max(RtxOptions::maxInstanceSubmissions(), 1u);
+      const uint32_t acceptedThisFrame = m_submitRejectStats.accepted;
+      const uint32_t culledThisFrame = m_submitRejectStats.significanceCulled;
+      const uint32_t sceneDemand = acceptedThisFrame + culledThisFrame;
+
+      if (!m_significanceCullingActive) {
+        // Arm only when real demand exceeds the budget. Seed the threshold
+        // from the full extent of what we accepted, so the first culling
+        // frame removes nothing and simply measures the scene.
+        if ((sceneDemand > budget || m_submitRejectStats.queueOverflow > 0)
+         && m_prevFrameFarthestAcceptedSq > 0.0f) {
+          m_significanceMaxDistanceSq = m_prevFrameFarthestAcceptedSq;
+          m_significanceCullingActive = true;
+        }
+      } else {
+        // Multiplicative control loop toward the budget (stable: it settles
+        // rather than ratcheting). The accept ratio is the error signal -
+        // accepted above budget shrinks the squared-distance threshold,
+        // below budget grows it. sqrt gain with a per-frame clamp keeps the
+        // image from popping. The exact gain is conservative; profile with
+        // Tracy on the target scene and raise kSignificanceGainClamp if the
+        // budget is tracked too slowly for very draw-heavy worlds.
+        const float acceptRatio = float(acceptedThisFrame) / float(budget);
+        constexpr float kSignificanceGainClamp = 0.40f; // max +/-40% step/frame
+        float factor = 1.0f;
+        if (acceptRatio > 0.0f) {
+          factor = 1.0f / std::sqrt(acceptRatio);
+        } else {
+          factor = 1.0f + kSignificanceGainClamp;
+        }
+        factor = std::clamp(factor, 1.0f - kSignificanceGainClamp, 1.0f + kSignificanceGainClamp);
+        m_significanceMaxDistanceSq *= factor;
+
+        // Disarm when the scene comfortably fits again, so full detail
+        // returns in sparse views with no lingering distance cap.
+        if (acceptedThisFrame < (budget / 2u) && sceneDemand * 100u < budget * 60u) {
+          m_significanceCullingActive = false;
+          m_significanceMaxDistanceSq = 0.0f;
+        }
+      }
+      m_significanceAcceptedThisFrame = 0;
+      m_significanceConsideredThisFrame = 0;
+      m_prevFrameFarthestAcceptedSq = 0.0f;
+    }
+
     // Let the real-camera latch decay after extended absence so menu and
     // loading-screen draws (viewport-fallback reliant) are not permanently
     // blocked once a session has run. ~4x the scene grace window.
@@ -4828,6 +4903,7 @@ static bool isPositionFormat(VkFormat format) {
       Logger::info(str::format(
         "[D3D11Rtx] Submit summary: total=", m_submitRejectStats.total,
         " forceInjIdle=", m_submitRejectStats.forceInjectionIdle,
+        " significanceCulled=", m_submitRejectStats.significanceCulled,
         " accepted=", m_submitRejectStats.accepted,
         " scene=", m_submitRejectStats.sceneAccepted,
         " realScene=", m_submitRejectStats.realSceneAccepted,
