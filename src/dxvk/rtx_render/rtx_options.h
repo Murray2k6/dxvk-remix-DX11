@@ -1289,6 +1289,7 @@ namespace dxvk {
                "Maximum number of instances submitted per instanced draw call.\n"
                "Each D3D11 instance with a per-instance world matrix becomes a separate Remix draw. Lower values improve performance;\n"
                "raise if distant instanced geometry (foliage, props) is visibly cut off. Set to 1 to disable instancing expansion entirely.");
+    RTX_OPTION("rtx", bool, significanceCulling, true, "When a frame submits more raytraceable draws than rtx.maxInstanceSubmissions allows, keep the draws nearest the camera instead of whichever the game happened to submit first. Modeled on Unreal Engine\'s Significance Manager (importance-by-distance). Prevents close, on-screen geometry from being dropped in favor of distant terrain or skybox in draw-call-heavy open worlds. When false, the budget is filled in submission order.");
 
     RTX_OPTION("rtx.terrain", bool, terrainAsDecalsEnabledIfNoBaker, false, "If terrain baker is disabled, attempt to blend with the decals.");
     RTX_OPTION("rtx.terrain", bool, terrainAsDecalsAllowOverModulate, false, "Set to true, if it's known that terrain layers with ModulateX2 / ModulateX4 flags do not contain a lighting info, but ModulateX2 / ModulateX4 are used only to blend layers.");

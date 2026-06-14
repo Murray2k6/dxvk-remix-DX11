@@ -9,7 +9,7 @@ param(
     [string]$Backend = 'ninja',
 
     [ValidateSet('true', 'false')]
-    [string]$EnableTracy = 'false',
+    [string]$EnableTracy = 'true',
 
     [string[]]$InstallTags = @('output'),
 

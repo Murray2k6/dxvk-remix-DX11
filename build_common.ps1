@@ -578,8 +578,24 @@ function PerformBuild {
     $tagList = $InstallTags -join ','
     Write-Host "[build] Installing tag(s) '$tagList' to $OutputDir..." -ForegroundColor Cyan
     Invoke-CheckedNative -FilePath $mesonCommand.FilePath -ArgumentsPrefix $mesonCommand.ArgumentsPrefix -Arguments @('install', '-C', $BuildDir, '--tags', $tagList) -FailureMessage 'Failed to run install step' -WorkingDirectory $SourceDir
-    # Deploy the NGX runtime DLLs next to every installed/built d3d11.dll.
-    $ngxSource = Join-Path $SourceDir 'nv-private\hdremix\bin\release'
+    # Deploy the NGX runtime DLLs (DLSS / Ray Reconstruction / Frame
+    # Generation) next to every installed/built d3d11.dll. NGX DLLs cannot
+    # cross the process-bitness boundary - a 32-bit game process loads 32-bit
+    # DLLs, a 64-bit process loads 64-bit ones - so each architecture needs
+    # its own NGX binaries. The hdremix runtime ships 64-bit NGX; if you have
+    # 32-bit NGX DLLs for x86 builds, drop them in nv-private\hdremix\bin\release-x86
+    # (or set DXVK_NGX_SOURCE_X86) and they will be deployed for x86 builds.
+    if ($Architecture -eq 'x86') {
+      $ngxSource = $env:DXVK_NGX_SOURCE_X86
+      if ([string]::IsNullOrWhiteSpace($ngxSource)) {
+        $ngxSource = Join-Path $SourceDir 'nv-private\hdremix\bin\release-x86'
+      }
+    } else {
+      $ngxSource = $env:DXVK_NGX_SOURCE_X64
+      if ([string]::IsNullOrWhiteSpace($ngxSource)) {
+        $ngxSource = Join-Path $SourceDir 'nv-private\hdremix\bin\release'
+      }
+    }
     if (Test-Path $ngxSource) {
       $ngxDlls = Get-ChildItem -Path $ngxSource -Filter 'nvngx_*.dll' -File
       $ngxTargets = @()
@@ -597,7 +613,11 @@ function PerformBuild {
         Write-Host ("[build] Deployed {0} NGX DLLs next to {1} d3d11.dll location(s)" -f $ngxDlls.Count, $ngxTargets.Count) -ForegroundColor Cyan
       }
     } else {
-      Write-Host "[build] WARNING: NGX runtime DLLs not found at $ngxSource - DLSS will be unavailable in deployed builds." -ForegroundColor Yellow
+      if ($Architecture -eq 'x86') {
+        Write-Host "[build] NGX runtime DLLs not found at $ngxSource - DLSS unavailable for this x86 build. Provide 32-bit NGX DLLs there (or via DXVK_NGX_SOURCE_X86) to enable it; the renderer otherwise falls back to XeSS/TAA-U." -ForegroundColor Yellow
+      } else {
+        Write-Host "[build] WARNING: NGX runtime DLLs not found at $ngxSource - DLSS will be unavailable in deployed builds." -ForegroundColor Yellow
+      }
     }
     Write-Host "[build] Build completed successfully for $Architecture $BuildFlavour" -ForegroundColor Green
   } else {

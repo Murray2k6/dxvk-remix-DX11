@@ -25,7 +25,7 @@ option('enable_dxgi',  type : 'boolean', value : false, description: 'Build DXGI
 option('enable_d3d11', type : 'boolean', value : true, description: 'Build D3D11')
 option('build_id',     type : 'boolean', value : false)
 
-option('enable_tracy',  type : 'boolean', value : false, description: 'Enable Tracy profiler support')
+option('enable_tracy',  type : 'boolean', value : true, description: 'Enable Tracy profiler support (default on for this fork; configure with -Denable_tracy=false to disable)')
 
 option('tracy_on_demand', type : 'boolean', value : false, description : 'On-demand profiling')
 option('tracy_callstack', type : 'boolean', value : false, description : 'Enfore callstack collection for tracy regions')

@@ -134,6 +134,7 @@ namespace dxvk {
       uint32_t screenSpaceGarbageSkip = 0;
       uint32_t geometryHashScheduleFailed = 0;
       uint32_t forceInjectionIdle = 0;
+      uint32_t significanceCulled = 0;
     };
 
     SubmitRejectStats                    m_submitRejectStats;
@@ -180,6 +181,22 @@ namespace dxvk {
     uint32_t m_prevFrameSceneAccepted = 0;
     uint32_t m_prevFrameRealSceneAccepted = 0;
     static constexpr uint32_t kForceInjectionProbeDraws = 512;
+
+    // UE-style significance selection. When a frame submits more raytraceable
+    // draws than the instance budget allows, dropping in submission order is
+    // arbitrary - an open world issues skybox and distant terrain early and
+    // the building in front of the camera late, so order-based dropping can
+    // discard exactly what the player is looking at. Instead we score each
+    // draw by camera distance (Unreal's Significance Manager uses the same
+    // distance/screen-size heuristic) and, when overflowing, admit the
+    // nearest draws first via a threshold adapted from the previous frame.
+    // This is a self-tuning cutoff rather than a per-frame sort, so it adds
+    // only a distance compare per draw.
+    bool   m_significanceCullingActive = false; // set when prev frame overflowed the budget
+    float  m_significanceMaxDistanceSq = 0.0f;  // accept draws closer than this (camera-space, squared)
+    float  m_prevFrameFarthestAcceptedSq = 0.0f;
+    uint32_t m_significanceAcceptedThisFrame = 0;
+    uint32_t m_significanceConsideredThisFrame = 0;
 
     // Single coherent policy for maintaining m_lastOutputExtent and
     // m_lastRemixViewportExtent. Called from both EndFrame and OnPresent so

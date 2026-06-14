@@ -229,9 +229,9 @@ function Build-Client([string]$Cfg) {
   $dxgiObj = Join-Path $obj 'dxgi_exports.obj'
   $d3d11Dll = Join-Path $out 'd3d11.dll'
   $dxgiDll = Join-Path $out 'dxgi.dll'
-  $d3d11Args = @('/NOLOGO','/DLL','/MACHINE:X86',('/OUT:' + $d3d11Dll),('/IMPLIB:' + (Join-Path $out 'd3d11.lib')),('/DEF:' + (Join-Path $src 'd3d11_client.def')),$commonObj,$d3d11Obj,'kernel32.lib','user32.lib','advapi32.lib','shlwapi.lib','ole32.lib','uuid.lib')
+  $d3d11Args = @('/NOLOGO','/DLL','/MACHINE:X86','/LARGEADDRESSAWARE',('/OUT:' + $d3d11Dll),('/IMPLIB:' + (Join-Path $out 'd3d11.lib')),('/DEF:' + (Join-Path $src 'd3d11_client.def')),$commonObj,$d3d11Obj,'kernel32.lib','user32.lib','advapi32.lib','shlwapi.lib','ole32.lib','uuid.lib')
   Invoke-ToolRsp -Exe $tc.Link -ToolArgs $d3d11Args -WorkDir $out -LogPath $log -Label 'link_d3d11'
-  $dxgiArgs = @('/NOLOGO','/DLL','/MACHINE:X86',('/OUT:' + $dxgiDll),('/IMPLIB:' + (Join-Path $out 'dxgi.lib')),('/DEF:' + (Join-Path $src 'dxgi_client.def')),$commonObj,$dxgiObj,'kernel32.lib','user32.lib','advapi32.lib','shlwapi.lib','ole32.lib','uuid.lib')
+  $dxgiArgs = @('/NOLOGO','/DLL','/MACHINE:X86','/LARGEADDRESSAWARE',('/OUT:' + $dxgiDll),('/IMPLIB:' + (Join-Path $out 'dxgi.lib')),('/DEF:' + (Join-Path $src 'dxgi_client.def')),$commonObj,$dxgiObj,'kernel32.lib','user32.lib','advapi32.lib','shlwapi.lib','ole32.lib','uuid.lib')
   Invoke-ToolRsp -Exe $tc.Link -ToolArgs $dxgiArgs -WorkDir $out -LogPath $log -Label 'link_dxgi'
   Assert-PeMachine $d3d11Dll 'x86'
   Assert-PeMachine $dxgiDll 'x86'
@@ -252,7 +252,9 @@ function Build-Server([string]$Cfg) {
   if (!(Test-Path -LiteralPath $srcFile)) { throw "Missing x64 server source: $srcFile" }
   $objFile = Join-Path $obj 'dx11_bridge_server.obj'
   Compile-One $tc $Cfg $srcFile $objFile $obj $log
-  $exe = Join-Path $out 'NvRemixBridge.exe'
+  # DX11-specific name so it never collides with the stock NVIDIA
+  # NvRemixBridge.exe (D3D9 GUID-handshake server) in a game's .trex folder.
+  $exe = Join-Path $out 'NvRemixDx11Bridge.exe'
   $linkArgs = @('/NOLOGO','/SUBSYSTEM:WINDOWS','/MACHINE:X64',('/OUT:' + $exe),$objFile,'kernel32.lib','user32.lib','advapi32.lib','shlwapi.lib','ole32.lib','uuid.lib','d3d11.lib','dxgi.lib')
   Invoke-ToolRsp -Exe $tc.Link -ToolArgs $linkArgs -WorkDir $out -LogPath $log -Label 'link_server'
   Assert-PeMachine $exe 'x64'
@@ -266,7 +268,7 @@ function Stage-Config([string]$Cfg, [string]$ClientDir, [string]$ServerDir) {
   Ensure-Dir $trex
   Copy-Item -LiteralPath (Join-Path $ClientDir 'd3d11.dll') -Destination (Join-Path $x86 'd3d11.dll') -Force
   Copy-Item -LiteralPath (Join-Path $ClientDir 'dxgi.dll') -Destination (Join-Path $x86 'dxgi.dll') -Force
-  Copy-Item -LiteralPath (Join-Path $ServerDir 'NvRemixBridge.exe') -Destination (Join-Path $trex 'NvRemixBridge.exe') -Force
+  Copy-Item -LiteralPath (Join-Path $ServerDir 'NvRemixDx11Bridge.exe') -Destination (Join-Path $trex 'NvRemixDx11Bridge.exe') -Force
   $x64Runtime = Join-Path $OutRoot ("x64\$Cfg")
   if (Test-Path -LiteralPath $x64Runtime) {
     Copy-TreeContents $x64Runtime $trex
@@ -275,7 +277,7 @@ function Stage-Config([string]$Cfg, [string]$ClientDir, [string]$ServerDir) {
   }
   Assert-PeMachine (Join-Path $x86 'd3d11.dll') 'x86'
   Assert-PeMachine (Join-Path $x86 'dxgi.dll') 'x86'
-  Assert-PeMachine (Join-Path $trex 'NvRemixBridge.exe') 'x64'
+  Assert-PeMachine (Join-Path $trex 'NvRemixDx11Bridge.exe') 'x64'
   if (Test-Path -LiteralPath (Join-Path $trex 'd3d11.dll')) { Assert-PeMachine (Join-Path $trex 'd3d11.dll') 'x64' }
   if (Test-Path -LiteralPath (Join-Path $trex 'dxgi.dll')) { Assert-PeMachine (Join-Path $trex 'dxgi.dll') 'x64' }
   Write-Info "staged _output\x86\$Cfg"

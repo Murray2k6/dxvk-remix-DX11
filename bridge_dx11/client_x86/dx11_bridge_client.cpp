@@ -24,6 +24,41 @@ static BOOL CALLBACK InitOnceFn(PINIT_ONCE, PVOID, PVOID*) {
   GetModuleFileNameW(self, g_folder, MAX_PATH);
   PathRemoveFileSpecW(g_folder);
   StringCchPrintfW(g_pipeName, 256, L"\\.\\pipe\\NvRemixDx11Bridge_%lu", GetCurrentProcessId());
+
+  // Report the 32-bit host's usable address space once at startup. The bridge
+  // keeps the large RTX allocations (BVH, replacement textures, the path
+  // tracer's working set) in the x64 server, so the 32-bit game process only
+  // ever holds its own assets plus this thin proxy. The remaining limit is the
+  // game .exe's own user address space: 2 GB unless the EXE header has the
+  // LARGEADDRESSAWARE bit, which raises it to 4 GB on 64-bit Windows. Flipping
+  // that bit requires patching the game's PE header (a launcher/installer
+  // step, not something a loaded DLL can do to its already-running host), so
+  // we surface the current state clearly instead.
+  {
+    MEMORYSTATUSEX ms = {}; ms.dwLength = sizeof(ms);
+    GlobalMemoryStatusEx(&ms);
+
+    bool exeIsLargeAddressAware = false;
+    if (HMODULE exe = GetModuleHandleW(nullptr)) {
+      auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(exe);
+      if (dos->e_magic == IMAGE_DOS_SIGNATURE) {
+        auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(
+          reinterpret_cast<const uint8_t*>(exe) + dos->e_lfanew);
+        if (nt->Signature == IMAGE_NT_SIGNATURE) {
+          exeIsLargeAddressAware =
+            (nt->FileHeader.Characteristics & IMAGE_FILE_LARGE_ADDRESS_AWARE) != 0;
+        }
+      }
+    }
+
+    Log(L"host process: %.0f MB total VA, LargeAddressAware=%d (%s). Large RTX "
+        L"allocations live in the x64 server; the 32-bit game's own address "
+        L"space is the only in-process limit.",
+        (double) (ms.ullTotalVirtual / (1024ull * 1024ull)),
+        exeIsLargeAddressAware ? 1 : 0,
+        exeIsLargeAddressAware ? L"4 GB user space"
+                               : L"2 GB user space - patch the EXE LAA bit for 4 GB");
+  }
   return TRUE;
 }
 static void Init() { InitOnceExecuteOnce(&g_once, InitOnceFn, nullptr, nullptr); }
@@ -51,13 +86,28 @@ bool StartDx11BridgeServer() {
   Init();
   if (g_serverProcess) return true;
   wchar_t trex[MAX_PATH]; StringCchPrintfW(trex, MAX_PATH, L"%s\\.trex", g_folder);
-  wchar_t exe[MAX_PATH]; StringCchPrintfW(exe, MAX_PATH, L"%s\\NvRemixBridge.exe", trex);
-  if (!PathFileExistsW(exe)) { Log(L"missing DX11 bridge server: %s", exe); return false; }
 
-  wchar_t guid[64]; NewGuidString(guid, 64);
+  // Launch OUR server under its own name (NvRemixDx11Bridge.exe), never the
+  // stock NVIDIA NvRemixBridge.exe. A game folder that previously had any
+  // NVIDIA Remix runtime installed will already contain NvRemixBridge.exe,
+  // and that stock server speaks the D3D9 GUID-handshake protocol - launching
+  // it produced "Server was invoked with invalid GUID! Unable to establish
+  // bridge, exiting..." in bridge64.log because it never sees our env pipe.
+  // Prefer the DX11-named binary; fall back to the legacy name only if a
+  // DX11-named one is not staged (older deploys), and warn in that case.
+  wchar_t exe[MAX_PATH]; StringCchPrintfW(exe, MAX_PATH, L"%s\\NvRemixDx11Bridge.exe", trex);
+  if (!PathFileExistsW(exe)) {
+    wchar_t legacy[MAX_PATH]; StringCchPrintfW(legacy, MAX_PATH, L"%s\\NvRemixBridge.exe", trex);
+    if (!PathFileExistsW(legacy)) { Log(L"missing DX11 bridge server: %s", exe); return false; }
+    Log(L"WARNING: NvRemixDx11Bridge.exe not found; launching %s. If this is the stock NVIDIA D3D9 bridge the handshake will fail - stage the DX11 server build into the .trex folder.", legacy);
+    StringCchCopyW(exe, MAX_PATH, legacy);
+  }
+
   wchar_t cmd[2048];
-  // NVIDIA bridge server expects argv[1]=GUID argv[2]=version. Keep that order; expose DX11 pipe in env.
-  StringCchPrintfW(cmd, 2048, L"\"%s\" %s remix-dx11", exe, guid);
+  // Our server reads the pipe name from the environment (NVREMIX_DX11_BRIDGE_PIPE)
+  // and ignores argv, but we still pass a version token for forward-compat and
+  // so the process command line is self-describing in a debugger / log.
+  StringCchPrintfW(cmd, 2048, L"\"%s\" remix-dx11 v%u", exe, (unsigned) kProtocolVersion);
   wchar_t env[4096];
   StringCchPrintfW(env, 4096, L"NVREMIX_DX11_BRIDGE_PIPE=%s\0NVREMIX_DX11_CLIENT_PID=%lu\0NVREMIX_BRIDGE_API=dx11\0\0", g_pipeName, GetCurrentProcessId());
 
