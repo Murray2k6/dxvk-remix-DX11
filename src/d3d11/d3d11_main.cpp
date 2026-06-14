@@ -328,9 +328,31 @@ extern "C" {
     }
     
     if (flId == FeatureLevels) {
+    Logger::warn("D3D11CoreCreateDevice: requested feature level list failed; probing Remix source compatibility fallback levels");
+    static const std::array<D3D_FEATURE_LEVEL, 7> compatFeatureLevels = {
+      D3D_FEATURE_LEVEL_11_1,
+      D3D_FEATURE_LEVEL_11_0,
+      D3D_FEATURE_LEVEL_10_1,
+      D3D_FEATURE_LEVEL_10_0,
+      D3D_FEATURE_LEVEL_9_3,
+      D3D_FEATURE_LEVEL_9_2,
+      D3D_FEATURE_LEVEL_9_1,
+    };
+    UINT compatFlId = 0;
+    for (; compatFlId < compatFeatureLevels.size(); ++compatFlId) {
+      Logger::info(str::format("D3D11CoreCreateDevice: Compat probing ", compatFeatureLevels[compatFlId]));
+      if (D3D11Device::CheckFeatureLevelSupport(dxvkInstance, dxvkAdapter, compatFeatureLevels[compatFlId]))
+        break;
+    }
+    if (compatFlId == compatFeatureLevels.size()) {
       Logger::err("D3D11CoreCreateDevice: Requested feature level not supported");
       return E_INVALIDARG;
     }
+    pFeatureLevels = compatFeatureLevels.data();
+    FeatureLevels = static_cast<UINT>(compatFeatureLevels.size());
+    flId = compatFlId;
+    Logger::warn(str::format("D3D11CoreCreateDevice: using compatibility fallback ", pFeatureLevels[flId]));
+  }
     
     // Try to create the device with the given parameters.
     const D3D_FEATURE_LEVEL fl = pFeatureLevels[flId];

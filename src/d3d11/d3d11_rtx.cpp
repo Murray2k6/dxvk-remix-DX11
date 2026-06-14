@@ -33,6 +33,7 @@
 namespace dxvk {
 
   namespace {
+static constexpr uint32_t kRtxDx11HotPathSrvScanLimit = 64u;
 
     bool isRenderDocAttached() {
       return ::GetModuleHandleW(L"renderdoc.dll") != nullptr;
@@ -165,7 +166,7 @@ namespace dxvk {
     // Scale geometry workers to available cores (min 2, max 6).
     // D3D11 games typically have high draw call counts, so more workers pay off.
     const uint32_t cores = std::max(2u, std::thread::hardware_concurrency());
-    const uint32_t workers = std::min(std::max(cores / 2, 2u), 6u);
+    const uint32_t workers = std::min(std::max(cores > 2u ? cores - 2u : 2u, 2u), 12u);
     m_pGeometryWorkers = std::make_unique<GeometryProcessor>(workers, "d3d11-geometry");
 
     // --- D3D11 sensible defaults (Default layer = lowest priority) ---
@@ -646,7 +647,130 @@ namespace dxvk {
       name);
   }
 
-  static bool semanticNameStartsWith(const D3D11RtxSemantic& semantic, const char* prefix) {
+  
+
+static XXH64_hash_t hashSampledStridedVertexRange(
+        const uint8_t* data,
+        size_t dataLength,
+        uint32_t stride,
+        uint32_t startVertex,
+        uint32_t vertexCount,
+        XXH64_hash_t seed) {
+  if (data == nullptr || stride == 0 || vertexCount == 0)
+    return seed;
+
+  static constexpr uint32_t kMaxHashSamples = 256;
+  const uint32_t sampleCount = std::min(vertexCount, kMaxHashSamples);
+  XXH64_hash_t h = seed;
+  for (uint32_t sample = 0; sample < sampleCount; ++sample) {
+    const uint32_t vertex = sampleCount <= 1
+      ? startVertex
+      : startVertex + uint32_t((uint64_t(sample) * uint64_t(vertexCount - 1u)) / uint64_t(sampleCount - 1u));
+    const size_t byteOffset = size_t(vertex) * size_t(stride);
+    if (byteOffset >= dataLength)
+      continue;
+    const size_t bytes = std::min<size_t>(stride, dataLength - byteOffset);
+    h = XXH3_64bits_withSeed(data + byteOffset, bytes, h);
+  }
+  h = XXH3_64bits_withSeed(&startVertex, sizeof(startVertex), h);
+  h = XXH3_64bits_withSeed(&vertexCount, sizeof(vertexCount), h);
+  h = XXH3_64bits_withSeed(&stride, sizeof(stride), h);
+  return h;
+}
+static bool isIntegerTexcoordFormat(VkFormat format) {
+  switch (format) {
+    case VK_FORMAT_R8G8_UINT:
+    case VK_FORMAT_R8G8_SINT:
+    case VK_FORMAT_R16G16_UINT:
+    case VK_FORMAT_R16G16_SINT:
+      return true;
+    default:
+      return false;
+  }
+}
+
+static bool decodeTexcoord2ToFloat(const uint8_t* src, VkFormat format, float& u, float& v) {
+  // D3D11 input assembly converts integer formats for the shader, but the
+  // Remix CPU-side bridge must do the conversion explicitly before handing
+  // texcoords to the Remix geometry interleaver. 1024 is the Volition/SR4
+  // fixed-point scale used for R16G16_SINT UV streams and is also a safe
+  // source-level fallback for other fixed-point integer UVs.
+  static constexpr float kFixedPointUvScale = 1.0f / 1024.0f;
+
+  switch (format) {
+    case VK_FORMAT_R8G8_UINT:
+      u = float(src[0]) * kFixedPointUvScale;
+      v = float(src[1]) * kFixedPointUvScale;
+      return std::isfinite(u) && std::isfinite(v);
+    case VK_FORMAT_R8G8_SINT: {
+      const int8_t* s = reinterpret_cast<const int8_t*>(src);
+      u = float(s[0]) * kFixedPointUvScale;
+      v = float(s[1]) * kFixedPointUvScale;
+      return std::isfinite(u) && std::isfinite(v);
+    }
+    case VK_FORMAT_R16G16_UINT: {
+      const uint16_t* s = reinterpret_cast<const uint16_t*>(src);
+      u = float(s[0]) * kFixedPointUvScale;
+      v = float(s[1]) * kFixedPointUvScale;
+      return std::isfinite(u) && std::isfinite(v);
+    }
+    case VK_FORMAT_R16G16_SINT: {
+      const int16_t* s = reinterpret_cast<const int16_t*>(src);
+      u = float(s[0]) * kFixedPointUvScale;
+      v = float(s[1]) * kFixedPointUvScale;
+      return std::isfinite(u) && std::isfinite(v);
+    }
+    default:
+      return false;
+  }
+}
+
+static RasterBuffer createFloatTexcoordBufferForIntegerStream(
+        const Rc<DxvkDevice>& device,
+        const RasterBuffer& srcBuffer,
+        uint32_t vertexCount) {
+  if (!srcBuffer.defined() || !isIntegerTexcoordFormat(srcBuffer.vertexFormat()) || vertexCount == 0)
+    return RasterBuffer();
+
+  const uint32_t srcStride = srcBuffer.stride();
+  if (srcStride == 0)
+    return RasterBuffer();
+
+  const VkDeviceSize outSize = VkDeviceSize(vertexCount) * VkDeviceSize(sizeof(float) * 2u);
+  Rc<DxvkBuffer> outBuffer = createHostVisibleHelperBuffer(device, outSize, "d3d11 decoded integer texcoords");
+  if (outBuffer == nullptr)
+    return RasterBuffer();
+
+  float* dst = reinterpret_cast<float*>(outBuffer->mapPtr(0));
+  if (dst == nullptr)
+    return RasterBuffer();
+
+  bool anyValid = false;
+  const size_t srcOffsetBase = srcBuffer.offsetFromSlice();
+  const size_t srcLength = srcBuffer.length();
+  for (uint32_t vertex = 0; vertex < vertexCount; ++vertex) {
+    const size_t srcOffset = srcOffsetBase + size_t(vertex) * size_t(srcStride);
+    float u = 0.0f;
+    float v = 0.0f;
+    if (srcOffset + 4u <= srcLength) {
+      const uint8_t* src = reinterpret_cast<const uint8_t*>(srcBuffer.mapPtr(srcOffset));
+      if (src != nullptr && decodeTexcoord2ToFloat(src, srcBuffer.vertexFormat(), u, v))
+        anyValid = true;
+    }
+    dst[size_t(vertex) * 2u + 0u] = u;
+    dst[size_t(vertex) * 2u + 1u] = v;
+  }
+
+  if (!anyValid)
+    return RasterBuffer();
+
+  return RasterBuffer(
+    DxvkBufferSlice { outBuffer, 0, outSize },
+    0,
+    sizeof(float) * 2u,
+    VK_FORMAT_R32G32_SFLOAT);
+}
+static bool semanticNameStartsWith(const D3D11RtxSemantic& semantic, const char* prefix) {
     return std::strncmp(semantic.name, prefix, std::strlen(prefix)) == 0;
   }
 
@@ -655,26 +779,30 @@ namespace dxvk {
   }
 
   static bool isSupportedTexcoordFormat(VkFormat format) {
-    return format == VK_FORMAT_R32G32B32A32_SFLOAT
-        || format == VK_FORMAT_R32G32B32_SFLOAT
-        || format == VK_FORMAT_R32G32_SFLOAT
-      || format == VK_FORMAT_R16G16_SFLOAT
-      || format == VK_FORMAT_R16G16B16A16_SFLOAT
-      || format == VK_FORMAT_R8G8_UNORM
-      || format == VK_FORMAT_R8G8_SNORM
-      || format == VK_FORMAT_R8G8B8A8_UNORM
-      || format == VK_FORMAT_R8G8B8A8_SNORM
-      || format == VK_FORMAT_R16G16_UNORM
-      || format == VK_FORMAT_R16G16_SNORM
-      || format == VK_FORMAT_R16G16B16A16_UNORM
-      || format == VK_FORMAT_R16G16B16A16_SNORM
-      // Fixed-point integer UVs: decoded to float by the interleaver with
-      // rtx.integerTexcoordScale (Saints Row IV: TEXCOORD0 = R16G16_SINT).
-      || format == VK_FORMAT_R16G16_SINT
-      || format == VK_FORMAT_R16G16_UINT;
+  switch (format) {
+    case VK_FORMAT_R32G32_SFLOAT:
+    case VK_FORMAT_R32G32B32_SFLOAT:
+    case VK_FORMAT_R32G32B32A32_SFLOAT:
+    case VK_FORMAT_R16G16_SFLOAT:
+    case VK_FORMAT_R16G16B16A16_SFLOAT:
+    case VK_FORMAT_R8G8_UNORM:
+    case VK_FORMAT_R8G8_SNORM:
+    case VK_FORMAT_R8G8_UINT:
+    case VK_FORMAT_R8G8_SINT:
+    case VK_FORMAT_R8G8B8A8_UNORM:
+    case VK_FORMAT_R8G8B8A8_SNORM:
+    case VK_FORMAT_R16G16_UNORM:
+    case VK_FORMAT_R16G16_SNORM:
+    case VK_FORMAT_R16G16_UINT:
+    case VK_FORMAT_R16G16_SINT:
+    case VK_FORMAT_R16G16B16A16_UNORM:
+    case VK_FORMAT_R16G16B16A16_SNORM:
+      return true;
+    default:
+      return false;
   }
-
-  static bool isPositionFormat(VkFormat format) {
+}
+static bool isPositionFormat(VkFormat format) {
     return format == VK_FORMAT_R32G32_SFLOAT
         || format == VK_FORMAT_R32G32B32_SFLOAT
         || format == VK_FORMAT_R32G32B32A32_SFLOAT
@@ -2418,40 +2546,9 @@ namespace dxvk {
       if (posData && posStride > 0) {
         // Hash only the drawn subrange [hashStartVertex, hashStartVertex + hashVertexCount).
         // Clamp to actual buffer length to prevent OOB reads on shared/dynamic VBs.
-        const size_t startByte = static_cast<size_t>(hashStartVertex) * posStride;
-        size_t posBytes = static_cast<size_t>(hashVertexCount) * posStride;
-        if (startByte >= posLength) {
-          posBytes = 0;
-        } else if (startByte + posBytes > posLength) {
-          posBytes = posLength - startByte;
-        }
-        if (posBytes > 0) {
-          const auto* posBase = static_cast<const uint8_t*>(posData) + startByte;
-          hashes[HashComponents::VertexPosition] =
-            XXH3_64bits_withSeed(posBase, posBytes, static_cast<XXH64_hash_t>(hashStartVertex));
-        } else {
-          hashes[HashComponents::VertexPosition] =
-            XXH3_64bits(&posOffset, sizeof(posOffset));
-        }
+        const auto* posBase = static_cast<const uint8_t*>(posData); hashes[HashComponents::VertexPosition] = hashSampledStridedVertexRange(posBase, posLength, posStride, hashStartVertex, hashVertexCount, XXH3_64bits(&posOffset, sizeof(posOffset)));
 
-        if (tcData && tcStride > 0) {
-          const size_t tcStartByte = static_cast<size_t>(hashStartVertex) * tcStride;
-          size_t tcBytes = static_cast<size_t>(hashVertexCount) * tcStride;
-          if (tcStartByte >= tcLength) {
-            tcBytes = 0;
-          } else if (tcStartByte + tcBytes > tcLength) {
-            tcBytes = tcLength - tcStartByte;
-          }
-          if (tcBytes > 0) {
-            const auto* tcBase = static_cast<const uint8_t*>(tcData) + tcStartByte;
-            // Use a more robust hash for texture coordinates
-            // Include vertex count to ensure different geometries with same TC data hash differently
-            XXH64_hash_t tcHash = XXH3_64bits(tcBase, tcBytes);
-            tcHash = XXH3_64bits_withSeed(&hashStartVertex, sizeof(hashStartVertex), tcHash);
-            tcHash = XXH3_64bits_withSeed(&vertexCount, sizeof(vertexCount), tcHash);
-            hashes[HashComponents::VertexTexcoord] = tcHash;
-          }
-        }
+        if (tcData && tcStride > 0) { const auto* tcBase = static_cast<const uint8_t*>(tcData); XXH64_hash_t tcHash = hashSampledStridedVertexRange(tcBase, tcLength, tcStride, hashStartVertex, hashVertexCount, XXH3_64bits(&vertexCount, sizeof(vertexCount))); hashes[HashComponents::VertexTexcoord] = tcHash; }
         if (idxData && idxStride > 0) {
            const size_t idxBytes = static_cast<size_t>(std::min(indexCount, kMaxHashedIndices)) * idxStride;
           // Use a more robust hash for indices
@@ -2473,12 +2570,7 @@ namespace dxvk {
           posHash = XXH3_64bits_withSeed(&posOffset, sizeof(posOffset), posHash);
           posHash = XXH3_64bits_withSeed(&vertexCount, sizeof(vertexCount), posHash);
           hashes[HashComponents::VertexPosition] = posHash;
-        } else {
-          XXH64_hash_t posHash = XXH3_64bits(&posBuf, sizeof(posBuf));
-          posHash = XXH3_64bits_withSeed(&posOffset, sizeof(posOffset), posHash);
-          posHash = XXH3_64bits_withSeed(&vertexCount, sizeof(vertexCount), posHash);
-          hashes[HashComponents::VertexPosition] = posHash;
-        }
+        } else { const uint64_t gpuOnlyStableKey[6] = { uint64_t(posLength), uint64_t(posStride), uint64_t(posOffset), uint64_t(vertexCount), uint64_t(hashStartVertex), uint64_t(layoutHash) }; XXH64_hash_t posHash = XXH3_64bits(gpuOnlyStableKey, sizeof(gpuOnlyStableKey)); hashes[HashComponents::VertexPosition] = posHash; }
       }
 
       hashes.precombine();
@@ -2760,7 +2852,7 @@ namespace dxvk {
       }
     };
 
-    for (uint32_t slot = 0; slot < D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT; ++slot) {
+    for (uint32_t slot = 0; slot < std::min<uint32_t>(D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT, kRtxDx11HotPathSrvScanLimit); ++slot) {
       D3D11ShaderResourceView* srv = ps.shaderResources.views[slot].ptr();
       if (!srv) continue;
       if (srv->GetResourceType() != D3D11_RESOURCE_DIMENSION_TEXTURE2D) continue;
@@ -3565,11 +3657,27 @@ namespace dxvk {
     }
 
     geo.blendWeightBuffer = skinWeightBuffer;
-    geo.blendIndicesBuffer = skinIndexBuffer;
-    geo.numBonesPerVertex = skinBonesPerVertex;
+  geo.blendIndicesBuffer = skinIndexBuffer;
+  geo.numBonesPerVertex = skinBonesPerVertex;
 
-    geo.futureGeometryHashes = ComputeGeometryHashes(geo, drawVertexCount,
-                                                     hashStart, hashCount);
+  // Decoded integer TEXCOORD stream: fixes DX11 games that store UVs as
+  // R16G16_SINT/R16G16_UINT. Without this, the interleaver sees unsupported
+  // integer texcoords, geometry falls into texgen, scene remains zero, and
+  // hashes become unstable/view-dependent.
+  if (tcBuffer.defined() && isIntegerTexcoordFormat(tcBuffer.vertexFormat())) {
+    RasterBuffer decodedTcBuffer = createFloatTexcoordBufferForIntegerStream(m_context->m_device, tcBuffer, drawVertexCount);
+    if (decodedTcBuffer.defined()) {
+      tcBuffer = decodedTcBuffer;
+      geo.texcoordBuffer = tcBuffer;
+      static uint32_t sDecodedIntegerTexcoordLogCount = 0;
+      if (sDecodedIntegerTexcoordLogCount < 8) {
+        ++sDecodedIntegerTexcoordLogCount;
+        Logger::info(str::format("[D3D11Rtx] Decoded integer TEXCOORD stream to R32G32_SFLOAT for Remix geometry; vertices=", drawVertexCount));
+      }
+    }
+  }
+
+  geo.futureGeometryHashes = ComputeGeometryHashes(geo, drawVertexCount, hashStart, hashCount);
     if (!geo.futureGeometryHashes.valid()) {
       ++m_submitRejectStats.geometryHashScheduleFailed;
       return;
@@ -3875,7 +3983,7 @@ namespace dxvk {
       uint32_t rtSizedCount = 0;
       uint32_t contentLikeCount = 0;
 
-      for (uint32_t slot = 0; slot < D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT; ++slot) {
+      for (uint32_t slot = 0; slot < std::min<uint32_t>(D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT, kRtxDx11HotPathSrvScanLimit); ++slot) {
         D3D11ShaderResourceView* srv = m_context->m_state.ps.shaderResources.views[slot].ptr();
         if (!srv || srv->GetResourceType() != D3D11_RESOURCE_DIMENSION_TEXTURE2D)
           continue;
@@ -3962,7 +4070,7 @@ namespace dxvk {
       uint32_t candidateCount = 0;
       uint32_t uiLikeCount = 0;
 
-      for (uint32_t slot = 0; slot < D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT; ++slot) {
+      for (uint32_t slot = 0; slot < std::min<uint32_t>(D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT, kRtxDx11HotPathSrvScanLimit); ++slot) {
         D3D11ShaderResourceView* srv = m_context->m_state.ps.shaderResources.views[slot].ptr();
         if (!srv || srv->GetResourceType() != D3D11_RESOURCE_DIMENSION_TEXTURE2D)
           continue;
@@ -4301,7 +4409,7 @@ namespace dxvk {
       transientInputCount = 0;
       significantInputCount = 0;
 
-      for (uint32_t slot = 0; slot < D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT; ++slot) {
+      for (uint32_t slot = 0; slot < std::min<uint32_t>(D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT, kRtxDx11HotPathSrvScanLimit); ++slot) {
         D3D11ShaderResourceView* srv = m_context->m_state.ps.shaderResources.views[slot].ptr();
         if (!srv || srv->GetResourceType() != D3D11_RESOURCE_DIMENSION_TEXTURE2D)
           continue;

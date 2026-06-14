@@ -1,0 +1,7 @@
+LIBRARY "dxgi"
+EXPORTS
+  CreateDXGIFactory=_CreateDXGIFactory@8
+  CreateDXGIFactory1=_CreateDXGIFactory1@8
+  CreateDXGIFactory2=_CreateDXGIFactory2@12
+  DXGIGetDebugInterface1=_DXGIGetDebugInterface1@12
+  DXGIDeclareAdapterRemovalSupport=_DXGIDeclareAdapterRemovalSupport@0

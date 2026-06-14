@@ -1,8 +1,5 @@
 @echo off
 setlocal
-
-set "SCRIPT_DIR=%~dp0"
-powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File build_dxvk_all_ninja.ps1" %*
-set "EXITCODE=%ERRORLEVEL%"
-
-endlocal & exit /b %EXITCODE%
+cd /d "%~dp0"
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0build_dx11_all.ps1" %*
+exit /b %ERRORLEVEL%
