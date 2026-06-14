@@ -59,7 +59,17 @@ fs = import('fs')
 cpu_family = target_machine.cpu_family()
 build_os = build_machine.system()
 
-assert(cpu_family != 'x86', 'dxvk-remix-nv can\'t be built in x86. Make sure you\'re running this from a regular Powershell window.')
+if cpu_family == 'x86'
+  message('Configuring 32-bit x86 target. Output will be installed under _output/x86.')
+endif
+
+target_arch_dir = cpu_family == 'x86' ? 'x86' : 'x64'
+ngx_windows_arch_dir = cpu_family == 'x86' ? 'Windows_x86' : 'Windows_x86_64'
+nvapi_arch_dir = cpu_family == 'x86' ? 'x86' : 'amd64'
+nvapi_lib_name = cpu_family == 'x86' ? 'nvapi' : 'nvapi64'
+aftermath_arch_dir = cpu_family == 'x86' ? 'x86' : 'x64'
+aftermath_lib_name = cpu_family == 'x86' ? 'GFSDK_Aftermath_Lib.x86' : 'GFSDK_Aftermath_Lib.x64'
+boost_arch_suffix = cpu_family == 'x86' ? 'x86' : 'x64'
 
 add_project_arguments('-DNOMINMAX', language : 'cpp')
 vs_project_defines = 'NOMINMAX;'
@@ -448,7 +458,7 @@ dxvk_version = vcs_tag(
 # Handle external dependencies ##
 #################################
 
-output_dir = join_paths(global_src_root_norm, '_output/')
+output_dir = join_paths(global_src_root_norm, '_output', target_arch_dir)
 
 # Get script paths
 if build_os == 'windows'
@@ -507,8 +517,8 @@ usd_plugin_deps = []
 usd_plugin_delay_load_args = []
 
 nvapi_include_paths = include_directories('submodules/nvapi')
-nvapi_lib_path = join_paths(global_src_root_norm, 'submodules/nvapi/amd64')
-nvapi_lib = dxvk_compiler.find_library('nvapi64', dirs : nvapi_lib_path)
+nvapi_lib_path = join_paths(global_src_root_norm, 'submodules/nvapi', nvapi_arch_dir)
+nvapi_lib = dxvk_compiler.find_library(nvapi_lib_name, dirs : nvapi_lib_path)
 
 # Cache lib locations
 external_dll_paths += usd_lib_path
@@ -567,8 +577,8 @@ nvusd_deplibs = [
   'python310',
   'plug',
   'tbbmalloc',
-  get_option('buildtype') == 'debug' ? 'boost_python310-vc142-mt-gd-x64-1_76' :
-                                       'boost_python310-vc142-mt-x64-1_76',
+  get_option('buildtype') == 'debug' ? 'boost_python310-vc142-mt-gd-' + boost_arch_suffix + '-1_76' :
+                                       'boost_python310-vc142-mt-' + boost_arch_suffix + '-1_76',
   get_option('buildtype') == 'debug' ? 'tbb_debug' :
                                        'tbb',    # NOTE: remixsdk also depends on tbb.dll, assuming both USD / remixsdk use the same tbb version
 ]
@@ -584,16 +594,16 @@ external_dll_paths += reflex_lib_path
 reflex_lib = dxvk_compiler.find_library('NvLowLatencyVk', dirs : reflex_lib_path)
 
 aftermath_include_path = include_directories( 'external/aftermath/include')
-aftermath_lib_path = join_paths(global_src_root_norm, 'external/aftermath/lib/x64/')
+aftermath_lib_path = join_paths(global_src_root_norm, 'external/aftermath/lib', aftermath_arch_dir)
 external_dll_paths += aftermath_lib_path
-aftermath_lib = dxvk_compiler.find_library('GFSDK_Aftermath_Lib.x64', dirs : aftermath_lib_path)
+aftermath_lib = dxvk_compiler.find_library(aftermath_lib_name, dirs : aftermath_lib_path)
 
 # this is repeated below, since we overwrite dlss_lib_path in src/dxvk/meson.build for some reason
 dlss_root_path = 'external/ngx_sdk_310_6_0'
-dlss_lib_path = join_paths(global_src_root_norm, dlss_root_path, 'lib/Windows_x86_64/rel/')
+dlss_lib_path = join_paths(global_src_root_norm, dlss_root_path, 'lib', ngx_windows_arch_dir, 'rel')
 external_dll_paths += dlss_lib_path
 dlfg_root_path = 'external/ngx_sdk_dlfg'
-dlfg_lib_path = join_paths(global_src_root_norm, dlfg_root_path, 'lib/Windows_x86_64/rel/')
+dlfg_lib_path = join_paths(global_src_root_norm, dlfg_root_path, 'lib', ngx_windows_arch_dir, 'rel')
 external_dll_paths += dlfg_lib_path
 
 nrc_dll_name = 'NRC_Vulkan.dll'
@@ -695,9 +705,9 @@ if dxvk_is_ninja
 
   # ... and now we do this again, because src/dxvk/meson.build overwrites this for some reason
   dlss_root_path = 'external/ngx_sdk_310_6_0'
-  dlss_lib_path = join_paths(global_src_root_norm, dlss_root_path, 'lib/Windows_x86_64/rel/')
+  dlss_lib_path = join_paths(global_src_root_norm, dlss_root_path, 'lib', ngx_windows_arch_dir, 'rel')
   dlfg_root_path = 'external/ngx_sdk_dlfg'
-  dlfg_lib_path = join_paths(global_src_root_norm, dlfg_root_path, 'lib/Windows_x86_64/rel/')
+  dlfg_lib_path = join_paths(global_src_root_norm, dlfg_root_path, 'lib', ngx_windows_arch_dir, 'rel')
 
   # meson seems to force / as the path separator in custom_target
   # ... except in the case where the path separators are inconsistent, in which case it does nothing
@@ -796,12 +806,22 @@ if dxvk_is_ninja
       install_tag: target_suffix 
     )
 
-    install_data(join_paths(nrc_dll_path, nrc_dll_name), install_dir : output_path, install_tag: target_suffix) 
-    install_data(join_paths(nrc_dll_path, 'cudart64_12.dll'), install_dir : output_path, install_tag: target_suffix) 
-    install_data(join_paths(nrc_dll_path, 'nvrtc64_120_0.dll'), install_dir : output_path, install_tag: target_suffix) 
-    install_data(join_paths(nrc_dll_path, 'nvrtc-builtins64_125.dll'), install_dir : output_path, install_tag: target_suffix) 
+    if fs.exists(join_paths(nrc_dll_path, nrc_dll_name))
+      install_data(join_paths(nrc_dll_path, nrc_dll_name), install_dir : output_path, install_tag: target_suffix)
+    endif 
+    if fs.exists(join_paths(nrc_dll_path, 'cudart64_12.dll'))
+      install_data(join_paths(nrc_dll_path, 'cudart64_12.dll'), install_dir : output_path, install_tag: target_suffix)
+    endif 
+    if fs.exists(join_paths(nrc_dll_path, 'nvrtc64_120_0.dll'))
+      install_data(join_paths(nrc_dll_path, 'nvrtc64_120_0.dll'), install_dir : output_path, install_tag: target_suffix)
+    endif 
+    if fs.exists(join_paths(nrc_dll_path, 'nvrtc-builtins64_125.dll'))
+      install_data(join_paths(nrc_dll_path, 'nvrtc-builtins64_125.dll'), install_dir : output_path, install_tag: target_suffix)
+    endif 
 
-    install_data(join_paths(nrd_lib_path, 'NRD.dll'), install_dir : output_path, install_tag: target_suffix) 
+    if fs.exists(join_paths(nrd_lib_path, 'NRD.dll'))
+      install_data(join_paths(nrd_lib_path, 'NRD.dll'), install_dir : output_path, install_tag: target_suffix)
+    endif 
     
     foreach xess_dll : [
       'libxess.dll',
@@ -828,19 +848,31 @@ if dxvk_is_ninja
       endif
     endforeach
 
-    install_data(join_paths(dlss_lib_path, 'nvngx_dlss.dll'), install_dir : output_path, install_tag: target_suffix) 
-    install_data(join_paths(dlss_lib_path, 'nvngx_dlssd.dll'), install_dir : output_path, install_tag: target_suffix) 
+    if fs.exists(join_paths(dlss_lib_path, 'nvngx_dlss.dll'))
+      install_data(join_paths(dlss_lib_path, 'nvngx_dlss.dll'), install_dir : output_path, install_tag: target_suffix)
+    endif 
+    if fs.exists(join_paths(dlss_lib_path, 'nvngx_dlssd.dll'))
+      install_data(join_paths(dlss_lib_path, 'nvngx_dlssd.dll'), install_dir : output_path, install_tag: target_suffix)
+    endif 
 
     # Use NVIDIA's public 310.6.0 runtime while keeping DLFG headers from the
     # Remix DLFG package, because the public SDK does not ship those headers.
-    install_data(join_paths(dlss_lib_path, 'nvngx_dlssg.dll'), install_dir : output_path, install_tag: target_suffix) 
+    if fs.exists(join_paths(dlss_lib_path, 'nvngx_dlssg.dll'))
+      install_data(join_paths(dlss_lib_path, 'nvngx_dlssg.dll'), install_dir : output_path, install_tag: target_suffix)
+    endif 
 
-    install_data(join_paths(reflex_lib_path, 'NvLowLatencyVk.dll'), install_dir : output_path, install_tag: target_suffix) 
+    if fs.exists(join_paths(reflex_lib_path, 'NvLowLatencyVk.dll'))
+      install_data(join_paths(reflex_lib_path, 'NvLowLatencyVk.dll'), install_dir : output_path, install_tag: target_suffix)
+    endif 
 
-    install_data(join_paths(aftermath_lib_path, 'GFSDK_Aftermath_Lib.x64.dll'), install_dir : output_path, install_tag: target_suffix) 
+    if fs.exists(join_paths(aftermath_lib_path, aftermath_lib_name + '.dll'))
+      install_data(join_paths(aftermath_lib_path, aftermath_lib_name + '.dll'), install_dir : output_path, install_tag: target_suffix)
+    endif 
 
     if enable_rtxio == true
-      install_data(join_paths(rtxio_bin_path, 'rtxio.dll'), install_dir : output_path, install_tag: target_suffix) 
+      if fs.exists(join_paths(rtxio_bin_path, 'rtxio.dll'))
+        install_data(join_paths(rtxio_bin_path, 'rtxio.dll'), install_dir : output_path, install_tag: target_suffix)
+      endif 
     endif
 
     if src_exe != ''
