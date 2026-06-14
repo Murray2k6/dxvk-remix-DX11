@@ -269,6 +269,9 @@ function Repair-FutureFileTimestamps {
             if ($full -like '*\_Comp64Debug\*') { return $false }
             if ($full -like '*\_Comp64DebugOptimized\*') { return $false }
             if ($full -like '*\_Comp64Release\*') { return $false }
+            if ($full -like '*\_Comp32Debug\*') { return $false }
+            if ($full -like '*\_Comp32DebugOptimized\*') { return $false }
+            if ($full -like '*\_Comp32Release\*') { return $false }
           }
           return $true
         }
@@ -360,32 +363,80 @@ if ([string]::IsNullOrWhiteSpace([string]$vsPath)) {
   Write-Error "Failed to find Visual Studio 2019/2022 with MSVC C++ build tools. Aborting." -ErrorAction Stop
 }
 Write-Host "[build] Using Visual Studio installation at: ${vsPath}" -ForegroundColor Yellow
-# Make sure the Visual Studio Command Prompt variables are set.
-if (Test-Path env:LIBPATH) {
-  Write-Host "[build] Visual Studio Command Prompt variables already set." -ForegroundColor Yellow
-} else {
-  $vcVarsDir = Join-Path $vsPath 'VC\Auxiliary\Build'
-  if (-not (Test-Path (Join-Path $vcVarsDir 'vcvarsall.bat'))) {
-    Write-Error "vcvarsall.bat not found under '$vcVarsDir'. Install the MSVC C++ workload in Visual Studio Installer." -ErrorAction Stop
+# Capture the environment before selecting a compiler architecture. Each build can
+# switch between x64 and x86 without reusing the previous architecture's CL/LIB/INCLUDE.
+$script:DxvkInitialEnvironment = @{}
+Get-ChildItem Env: | ForEach-Object { $script:DxvkInitialEnvironment[$_.Name] = $_.Value }
+
+function Restore-DxvkInitialEnvironment {
+  $currentNames = @(Get-ChildItem Env: | ForEach-Object { $_.Name })
+  foreach ($name in $currentNames) {
+    if (-not $script:DxvkInitialEnvironment.ContainsKey($name)) {
+      Remove-Item -Path "ENV:\$name" -ErrorAction SilentlyContinue
+    }
   }
-  Push-Location $vcVarsDir
-  try {
-    cmd /c "vcvarsall.bat x64&set" | ForEach-Object {
-      if ($_ -match '=') {
-        # Split only once. Some PATH-like values legitimately contain '='.
-        $v = $_ -split '=', 2
+  foreach ($entry in $script:DxvkInitialEnvironment.GetEnumerator()) {
+    Set-Item -Force -Path "ENV:\$($entry.Key)" -Value $entry.Value
+  }
+}
+
+function Set-VisualStudioBuildEnvironment {
+  param(
+    [Parameter(Mandatory)]
+    [ValidateSet('x64', 'x86')]
+    [string]$Architecture
+  )
+
+  $vcVarsAll = Join-Path $vsPath 'VC\Auxiliary\Build\vcvarsall.bat'
+  if (-not (Test-Path $vcVarsAll)) {
+    Write-Error "vcvarsall.bat not found under '$(Split-Path $vcVarsAll -Parent)'. Install the MSVC C++ workload in Visual Studio Installer." -ErrorAction Stop
+  }
+
+  Restore-DxvkInitialEnvironment
+
+  $vcVarCandidates = if ($Architecture -eq 'x86') {
+    @('x64_x86', 'x86')
+  } else {
+    @('x64', 'amd64')
+  }
+
+  $lastError = $null
+  foreach ($vcArg in $vcVarCandidates) {
+    Write-Host "[build] Setting Visual Studio compiler environment for $Architecture using vcvarsall.bat $vcArg" -ForegroundColor Yellow
+    $cmdLine = 'call "' + $vcVarsAll + '" ' + $vcArg + ' >nul && set'
+    $envLines = & $env:ComSpec /d /s /c $cmdLine 2>&1
+    $exitCode = if ($null -eq $LASTEXITCODE) { 0 } else { $LASTEXITCODE }
+    if ($exitCode -ne 0) {
+      $lastError = ($envLines | Out-String).Trim()
+      continue
+    }
+
+    foreach ($line in $envLines) {
+      if ($line -match '=') {
+        $v = [string]$line -split '=', 2
         if ($v.Count -eq 2 -and -not [string]::IsNullOrWhiteSpace($v[0])) {
           Set-Item -Force -Path "ENV:\$($v[0])" -Value $v[1]
         }
       }
     }
-  } finally {
-    Pop-Location
+
+    $env:DXVK_BUILD_ARCH = $Architecture
+    if ($env:VSCMD_ARG_TGT_ARCH) {
+      Write-Host "[build] Visual Studio target architecture: $env:VSCMD_ARG_TGT_ARCH" -ForegroundColor Yellow
+    }
+    return
   }
-  Write-Host "[build] Visual Studio Command Prompt variables set." -ForegroundColor Yellow
+
+  if ([string]::IsNullOrWhiteSpace($lastError)) {
+    $lastError = 'vcvarsall.bat did not return a usable environment.'
+  }
+  Write-Error "Failed to initialize Visual Studio compiler environment for $Architecture. $lastError" -ErrorAction Stop
 }
+
 function PerformBuild {
   param(
+    [ValidateSet('x64', 'x86')]
+    [string]$Architecture = 'x64',
     [Parameter(Mandatory)]
     [string]$Backend,
     [Parameter(Mandatory)]
@@ -405,8 +456,9 @@ function PerformBuild {
     $InstallTags = @('output')
   }
   $SourceDir = [IO.Path]::GetFullPath($DxvkBuildRoot)
-  $OutputDir = [IO.Path]::Combine($SourceDir, '_output')
+  $OutputDir = [IO.Path]::Combine($SourceDir, '_output', $Architecture)
   $BuildDir = [IO.Path]::Combine($SourceDir, $BuildSubDir)
+  Set-VisualStudioBuildEnvironment -Architecture $Architecture
   if (-not (Test-Path (Join-Path $SourceDir 'meson.build'))) {
     Write-Error "meson.build was not found at '$SourceDir'. Put build_common.ps1 and build_dxvk_all_ninja.ps1 in the repository root next to meson.build, then run build_dxvk_all_ninja.ps1 from there." -ErrorAction Stop
   }
@@ -416,7 +468,7 @@ function PerformBuild {
     [void](Resolve-RequiredCommand -Name 'ninja' -InstallHint 'Install Ninja with: py -m pip install --user ninja')
   }
   $availableOptions = Get-MesonOptionNames -SourceDir $SourceDir
-  Write-Host "[build] Starting build for $BuildFlavour..." -ForegroundColor Cyan
+  Write-Host "[build] Starting $Architecture build for $BuildFlavour..." -ForegroundColor Cyan
   Write-Host "[build] Source directory: $SourceDir" -ForegroundColor DarkGray
   Write-Host "[build] Build directory:  $BuildDir" -ForegroundColor DarkGray
   $buildDirMatchesCurrentSource = Repair-StaleBuildDirectory -SourceDir $SourceDir -BuildDir $BuildDir
@@ -484,8 +536,8 @@ function PerformBuild {
     } else {
       Write-Host "[build] WARNING: NGX runtime DLLs not found at $ngxSource - DLSS will be unavailable in deployed builds." -ForegroundColor Yellow
     }
-    Write-Host "[build] Build completed successfully for $BuildFlavour" -ForegroundColor Green
+    Write-Host "[build] Build completed successfully for $Architecture $BuildFlavour" -ForegroundColor Green
   } else {
-    Write-Host "[build] Configuration completed for $BuildFlavour (no build performed)" -ForegroundColor Green
+    Write-Host "[build] Configuration completed for $Architecture $BuildFlavour (no build performed)" -ForegroundColor Green
   }
 }
