@@ -115,6 +115,8 @@ namespace dxvk {
       uint32_t accepted = 0;
       uint32_t sceneAccepted = 0;
       uint32_t realSceneAccepted = 0;
+      uint32_t sceneCandidates = 0;
+      uint32_t significanceCulled = 0;
       uint32_t queueOverflow = 0;
       uint32_t nonTriangleTopology = 0;
       uint32_t noPixelShader = 0;
@@ -180,6 +182,20 @@ namespace dxvk {
     uint32_t m_prevFrameSceneAccepted = 0;
     uint32_t m_prevFrameRealSceneAccepted = 0;
     static constexpr uint32_t kForceInjectionProbeDraws = 512;
+
+    // UE-style significance manager (rtx.significanceCulling, default OFF).
+    // Unreal's Significance Manager spends a fixed budget by importance, not by
+    // arrival order. Applied here so that when a frame's scene draws exceed
+    // rtx.maxInstanceSubmissions, the draws KEPT are the ones nearest the
+    // camera (importance = camera-space depth), instead of whatever the engine
+    // happened to submit first - which in a 25k-draw open world is often
+    // distant terrain/skybox while the geometry you are looking at is dropped.
+    // A multiplicative control loop adjusts a squared-distance threshold toward
+    // the budget each frame, so it is temporal (no hard pop) and arms only when
+    // real demand exceeds budget. m_significanceMaxDistanceSq == 0 means
+    // "no limit / disarmed".
+    float    m_significanceMaxDistanceSq = 0.0f;
+    uint32_t m_prevFrameSceneCandidates = 0;
 
     // Single coherent policy for maintaining m_lastOutputExtent and
     // m_lastRemixViewportExtent. Called from both EndFrame and OnPresent so

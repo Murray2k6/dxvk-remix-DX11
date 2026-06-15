@@ -358,14 +358,26 @@ namespace dxvk {
     s_prevResolutionScalePercent = resolutionScalePercent;
 
     if (active) {
-      Logger::warn(str::format(
-        "[RTX-Performance] Adaptive path tracing performance mode active: frameTimeMs=",
-        GlobalTime::get().deltaTimeMs(),
-        " severe=",
-        severe ? 1 : 0,
-        " maxInternalResolutionScale=",
-        resolutionScalePercent,
-        "%"));
+      // Only warn when adaptive mode is actually constraining the renderer -
+      // i.e. it is severe, or it has dropped internal resolution below 100%.
+      // An "active" state at full resolution with a fast frame time (e.g.
+      // 3.6 ms) is not degrading anything and was producing noisy warnings;
+      // log that case at info level instead.
+      if (severe || resolutionScalePercent < 100) {
+        Logger::warn(str::format(
+          "[RTX-Performance] Adaptive path tracing performance mode active: frameTimeMs=",
+          GlobalTime::get().deltaTimeMs(),
+          " severe=",
+          severe ? 1 : 0,
+          " maxInternalResolutionScale=",
+          resolutionScalePercent,
+          "%"));
+      } else {
+        Logger::info(str::format(
+          "[RTX-Performance] Adaptive path tracing monitoring active (no quality reduction): frameTimeMs=",
+          GlobalTime::get().deltaTimeMs(),
+          " scale=", resolutionScalePercent, "%"));
+      }
     } else {
       Logger::info("[RTX-Performance] Adaptive path tracing performance mode inactive; restoring selected render workload.");
     }
@@ -2018,6 +2030,20 @@ namespace dxvk {
 
     if (requestedMode != resolvedMode) {
       Logger::info(str::format("[RTX] Neural Radiance Cache is not supported on this hardware. Using the supported indirect illumination mode selected by the active preset/configuration."));
+
+      // Enforce the fallback, do not merely log it. NRC is an NVIDIA-only
+      // path (it needs VK_NVX_binary_import / VK_NVX_image_view_handle, absent
+      // on AMD and Intel). Per REMIX-4105, dispatching a frame with NRC active
+      // when it is unsupported hangs/crashes the GPU - which is exactly the
+      // first-frame freeze seen on every non-NVIDIA GPU when a user.conf pins
+      // rtx.integrateIndirectMode to NeuralRadianceCache. Force the resolved
+      // mode immediately AND clear NRC from any stronger (user/config) layer so
+      // it cannot resolve back to NRC on the frame that follows.
+      RtxOptions::integrateIndirectMode.setImmediately(resolvedMode, RtxOptionLayer::getQualityLayer());
+      if (RtxOptions::integrateIndirectMode() != resolvedMode) {
+        RtxOptions::integrateIndirectMode.clearFromStrongerLayers(RtxOptionLayer::getQualityLayer());
+        RtxOptions::integrateIndirectMode.setImmediately(resolvedMode, RtxOptionLayer::getQualityLayer());
+      }
     }
   }
 
