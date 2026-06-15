@@ -60,7 +60,7 @@ if (-not (Test-Path (Join-Path $ScriptRoot 'meson.build'))) {
 # DX11 x86 in this fork is bridge-based, not a local 32-bit USD runtime build.
 # When x86 or both is requested, delegate to the dual-output builder so x64 and
 # x86 are staged into output\x64 and output\x86 with their correct layouts.
-$DualOutputScript = Join-Path $ScriptRoot 'Build-DX11-DualOutput-V50.ps1'
+$DualOutputScript = Join-Path $ScriptRoot 'Build-DX11-DualOutput-V51.ps1'
 if (($Architecture -eq 'both' -or $Architecture -eq 'x86') -and (Test-Path -LiteralPath $DualOutputScript -PathType Leaf)) {
   Write-Host '[build] DX11 x86 requested; using bridge-based dual-output build instead of local x86 USD build.' -ForegroundColor Cyan
   $dualArgs = @()

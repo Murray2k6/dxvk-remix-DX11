@@ -62,8 +62,8 @@
 using namespace Commands;
 using namespace bridge_util;
 using namespace remixapi::util;
-#ifndef DX11_BRIDGE_REGISTER_HELPER_V50
-#define DX11_BRIDGE_REGISTER_HELPER_V50
+#ifndef DX11_BRIDGE_REGISTER_HELPER_V51
+#define DX11_BRIDGE_REGISTER_HELPER_V51
 static inline void BridgeRegisterRemixD3D11DeviceForDx11Bridge(IUnknown* pDeviceUnknown) {
   if (!GlobalOptions::getExposeRemixApi()) {
     return;
