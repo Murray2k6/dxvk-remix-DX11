@@ -57,7 +57,7 @@ namespace dxvk {
       // screens, menus, and weak viewport-fallback candidates can replace the
       // game frame with a black Remix composite. Previous scenes may only carry
       // when the current game frame still has a valid camera.
-      return hasValidCamera && (hasGameSceneDraws || previousSceneAvailable);
+      return hasValidCamera && hasGameSceneDraws && (hasGameSceneDraws || previousSceneAvailable); // DX11_V124_CAMERA_ARTIFACT_STABILITY: do not inject fallback-only bootstrap/menu composite frames
     }
 
   }
@@ -4419,7 +4419,23 @@ namespace dxvk {
         return;
       }
 
-      if (dcs.transformData.texgenMode == TexGenMode::None) {
+      if (dcs.transformData.usedViewportFallbackProjection) {
+      ++m_submitRejectStats.screenSpaceGarbageSkip;
+      static uint32_t sDx11V124NoUvFallbackSkipLogCount = 0;
+      if (sDx11V124NoUvFallbackSkipLogCount < 16) {
+        ++sDx11V124NoUvFallbackSkipLogCount;
+        Logger::info(str::format(
+          "[D3D11Rtx] DX11_V124: skipping textured no-TEXCOORD draw under viewport-fallback camera to prevent white/color flash artifacts (count=",
+          count,
+          ", indexed=",
+          indexed ? 1 : 0,
+          ", primitives=",
+          primitiveCountNoUv,
+          ")"));
+      }
+      return;
+    }
+    if (dcs.transformData.texgenMode == TexGenMode::None) {
         dcs.transformData.texgenMode = TexGenMode::ViewPositions;
         ++m_submitRejectStats.texcoordGenerated;
 

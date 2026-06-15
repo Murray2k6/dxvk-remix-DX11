@@ -1356,8 +1356,11 @@ function Get-DX11ClientGlobalsSourceIntegrated {
 @'
 #include "util_guid.h"
 
+// DX11_V125_UNIFY_CLIENT_GUID_FOR_IPC
+// These globals are consumed by util_devicecommand/util_modulecommand and must
+// be the same symbols used by the DX11 client when launching NvRemixBridge.exe.
 bridge_util::Guid gUniqueIdentifier;
-bool gbBridgeRunning = false;
+bool gbBridgeRunning = true;
 '@
 }
 
@@ -1369,9 +1372,20 @@ function Patch-DX11ClientCppIntegrated {
   $t = [regex]::Replace($t, "(?ms)\s*// >>> V91_DX11_CLIENT_GLOBAL_LINKAGE.*?// <<< V91_DX11_CLIENT_GLOBAL_LINKAGE\s*\r?\n?", "`r`n")
   $t = [regex]::Replace($t, "(?m)^\s*bridge_util::Guid\s+gUniqueIdentifier\s*;\s*\r?\n?", "")
   $t = [regex]::Replace($t, "(?m)^\s*Guid\s+gUniqueIdentifier\s*;\s*\r?\n?", "")
-  $t = [regex]::Replace($t, "(?m)^\s*bool\s+gbBridgeRunning\s*=\s*false\s*;\s*\r?\n?", "")
+  $t = [regex]::Replace($t, "(?m)^\s*static\s+Guid\s+gUniqueIdentifier\s*;\s*\r?\n?", "")
+  $t = [regex]::Replace($t, "(?m)^\s*bridge_util::Guid\s+gUniqueIdentifier\s*;\s*\r?\n?", "")
+  $t = [regex]::Replace($t, "(?m)^\s*bool\s+gbBridgeRunning\s*=\s*(?:true|false)\s*;\s*\r?\n?", "")
   $t = [regex]::Replace($t, 'SetEnvironmentVariableA\(\s*"DX11_BRIDGE_MODE"\s*\)', 'SetEnvironmentVariableA("DX11_BRIDGE_MODE", "1")')
   $t = [regex]::Replace($t, 'SetEnvironmentVariableW\(\s*L"DX11_BRIDGE_MODE"\s*\)', 'SetEnvironmentVariableW(L"DX11_BRIDGE_MODE", L"1")')
+
+  if ($t -notmatch 'DX11_V125_UNIFY_CLIENT_GUID_FOR_IPC') {
+    $marker = "using namespace bridge_util;`r`n`r`nnamespace dx11_bridge_client {"
+    $replacement = "using namespace bridge_util;`r`n`r`n// DX11_V125_UNIFY_CLIENT_GUID_FOR_IPC`r`n// Use the global GUID/running symbols consumed by bridge IPC utilities.`r`nextern Guid gUniqueIdentifier;`r`nextern bool gbBridgeRunning;`r`n`r`nnamespace dx11_bridge_client {"
+    if ($t.Contains($marker)) {
+      $t = $t.Replace($marker, $replacement)
+    }
+  }
+
   if ($t -ne $original) {
     Write-TextNoBom -Path $ClientCpp -Text $t
     Log "Patched DX11 client source globals/env call: $ClientCpp"
@@ -1523,7 +1537,7 @@ function Normalize-BridgeSrcMesonClientDx11 {
 }
 
 
-function Remove-DummyDx11BridgeServerWorkV122 {
+function Remove-DummyDx11BridgeServerWorkV125 {
   $work = Join-Path $Root 'bridge_dx11_work'
   $main = Join-Path $work 'src\server\main.cpp'
   if (!(Test-Path -LiteralPath $main -PathType Leaf)) { return }
@@ -1536,18 +1550,18 @@ function Remove-DummyDx11BridgeServerWorkV122 {
     ($text -match 'DX11_BRIDGE_SERVER_WAIT_MS')
 
   if ($isDummy) {
-    Log "V122 removing dummy/stub bridge_dx11_work because it cannot send Bridge_Ack: $work"
+    Log "V125 removing dummy/stub bridge_dx11_work because it cannot send Bridge_Ack: $work"
     Remove-DirectoryRobust $work
   }
 }
 
-function Assert-RealBridgeServerCanAckV122 {
+function Assert-RealBridgeServerCanAckV125 {
   param([Parameter(Mandatory)][string]$BridgeWork)
 
   $main = Join-Path $BridgeWork 'src\server\main.cpp'
   $module = Join-Path $BridgeWork 'src\server\module_processing.cpp'
-  if (!(Test-Path -LiteralPath $main -PathType Leaf)) { Die "V122 real bridge server check failed; missing main.cpp: $main" }
-  if (!(Test-Path -LiteralPath $module -PathType Leaf)) { Die "V122 real bridge server check failed; missing module_processing.cpp: $module" }
+  if (!(Test-Path -LiteralPath $main -PathType Leaf)) { Die "V125 real bridge server check failed; missing main.cpp: $main" }
+  if (!(Test-Path -LiteralPath $module -PathType Leaf)) { Die "V125 real bridge server check failed; missing module_processing.cpp: $module" }
 
   $mainText = [System.IO.File]::ReadAllText($main)
   $moduleText = [System.IO.File]::ReadAllText($module)
@@ -1555,31 +1569,31 @@ function Assert-RealBridgeServerCanAckV122 {
   if ($mainText -match 'DX11-only bridge server bootstrap starting' -or
       $mainText -match 'No D3D9 server command processor is compiled' -or
       $mainText -match 'Dx11BridgeRun') {
-    Die "V122 real bridge server check failed: src\server\main.cpp is still the dummy DX11 bootstrap that never sends Bridge_Ack."
+    Die "V125 real bridge server check failed: src\server\main.cpp is still the dummy DX11 bootstrap that never sends Bridge_Ack."
   }
 
   if ($mainText -notmatch 'initModuleBridge\s*\(') {
-    Die "V122 real bridge server check failed: main.cpp does not initialize module bridge IPC."
+    Die "V125 real bridge server check failed: main.cpp does not initialize module bridge IPC."
   }
 
   if ($mainText -notmatch 'initDeviceBridge\s*\(') {
-    Die "V122 real bridge server check failed: main.cpp does not initialize device bridge IPC."
+    Die "V125 real bridge server check failed: main.cpp does not initialize device bridge IPC."
   }
 
   if (($mainText + $moduleText) -notmatch 'Bridge_Ack') {
-    Die "V122 real bridge server check failed: server source does not reference Bridge_Ack, so the x86 client would wait forever."
+    Die "V125 real bridge server check failed: server source does not reference Bridge_Ack, so the x86 client would wait forever."
   }
 
-  Log "V122 verified real bridge server source has IPC init and Bridge_Ack path."
+  Log "V125 verified real bridge server source has IPC init and Bridge_Ack path."
 }
 
 
-function Patch-BridgeServerRemoveLegacyD3D9RegistrationV122 {
+function Patch-BridgeServerRemoveLegacyD3D9RegistrationV125 {
   param([Parameter(Mandatory)][string]$BridgeWork)
 
   $mainCpp = Join-Path $BridgeWork 'src\server\main.cpp'
   if (!(Test-Path -LiteralPath $mainCpp -PathType Leaf)) {
-    Die "V122 legacy D3D9 registration patch failed; missing server main.cpp: $mainCpp"
+    Die "V125 legacy D3D9 registration patch failed; missing server main.cpp: $mainCpp"
   }
 
   $headerCandidates = @(
@@ -1598,12 +1612,12 @@ function Patch-BridgeServerRemoveLegacyD3D9RegistrationV122 {
   $original = $text
 
   if ($headerHasD3D9Register) {
-    Log "V122: remix_c.h still exposes dxvk_RegisterD3D9Device; no server D3D9 registration removal needed."
+    Log "V125: remix_c.h still exposes dxvk_RegisterD3D9Device; no server D3D9 registration removal needed."
     return
   }
 
   if ($text -notmatch '\bdxvk_RegisterD3D9Device\b') {
-    Log "V122: server main.cpp already has no dxvk_RegisterD3D9Device references."
+    Log "V125: server main.cpp already has no dxvk_RegisterD3D9Device references."
     return
   }
 
@@ -1612,16 +1626,16 @@ function Patch-BridgeServerRemoveLegacyD3D9RegistrationV122 {
   # Do not replace the real IPC server with a stub. Only remove/neutralize the
   # stale D3D9 registration calls that prevent the real server from compiling.
   $marker = @'
-#ifndef DX11_BRIDGE_SKIP_LEGACY_D3D9_REGISTER_V122
-#define DX11_BRIDGE_SKIP_LEGACY_D3D9_REGISTER_V122
-static inline remixapi_ErrorCode BridgeSkipLegacyD3D9RegisterForDx11HeaderV122() {
+#ifndef DX11_BRIDGE_SKIP_LEGACY_D3D9_REGISTER_V125
+#define DX11_BRIDGE_SKIP_LEGACY_D3D9_REGISTER_V125
+static inline remixapi_ErrorCode BridgeSkipLegacyD3D9RegisterForDx11HeaderV125() {
   Logger::info("DX11 bridge: skipped legacy dxvk_RegisterD3D9Device call because the active Remix API header is DX11 and has no D3D9 registration member.");
   return REMIXAPI_ERROR_CODE_SUCCESS;
 }
 #endif
 '@
 
-  if ($text -notmatch 'DX11_BRIDGE_SKIP_LEGACY_D3D9_REGISTER_V122') {
+  if ($text -notmatch 'DX11_BRIDGE_SKIP_LEGACY_D3D9_REGISTER_V125') {
     $insertAfter = 'using namespace remixapi::util;'
     if ($text -match [regex]::Escape($insertAfter)) {
       $text = $text -replace [regex]::Escape($insertAfter), ($insertAfter + "`r`n" + $marker)
@@ -1650,7 +1664,7 @@ static inline remixapi_ErrorCode BridgeSkipLegacyD3D9RegisterForDx11HeaderV122()
   $text = [regex]::Replace(
     $text,
     $assignPattern,
-    '$1$2 = BridgeSkipLegacyD3D9RegisterForDx11HeaderV122();'
+    '$1$2 = BridgeSkipLegacyD3D9RegisterForDx11HeaderV125();'
   )
 
   # Direct statement form:
@@ -1658,7 +1672,7 @@ static inline remixapi_ErrorCode BridgeSkipLegacyD3D9RegisterForDx11HeaderV122()
   $text = [regex]::Replace(
     $text,
     'remixapi::g_remix\.dxvk_RegisterD3D9Device\s*\([^;]*\);',
-    'BridgeSkipLegacyD3D9RegisterForDx11HeaderV122();'
+    'BridgeSkipLegacyD3D9RegisterForDx11HeaderV125();'
   )
 
   # Older helper/token attempts may leave type aliases for the missing D3D9 register.
@@ -1669,20 +1683,20 @@ static inline remixapi_ErrorCode BridgeSkipLegacyD3D9RegisterForDx11HeaderV122()
   )
 
   if ($text -match '\bdxvk_RegisterD3D9Device\b') {
-    # The only allowed remaining copy is inside strings/comments in the V122 helper.
-    $nonMarker = [regex]::Replace($text, '(?s)#ifndef DX11_BRIDGE_SKIP_LEGACY_D3D9_REGISTER_V122.*?#endif', '')
+    # The only allowed remaining copy is inside strings/comments in the V125 helper.
+    $nonMarker = [regex]::Replace($text, '(?s)#ifndef DX11_BRIDGE_SKIP_LEGACY_D3D9_REGISTER_V125.*?#endif', '')
     if ($nonMarker -match '\bdxvk_RegisterD3D9Device\b') {
-      Write-TextNoBom -Path (Join-Path $BridgeWork 'V122_D3D9_REGISTER_PATCH_FAILED_main.cpp') -Text $text
-      Die "V122 failed to remove all compile-active dxvk_RegisterD3D9Device references from server main.cpp."
+      Write-TextNoBom -Path (Join-Path $BridgeWork 'V125_D3D9_REGISTER_PATCH_FAILED_main.cpp') -Text $text
+      Die "V125 failed to remove all compile-active dxvk_RegisterD3D9Device references from server main.cpp."
     }
   }
 
   if ($text -ne $original) {
-    if (!(Test-Path -LiteralPath "$mainCpp.v122.before")) {
-      Copy-Item -LiteralPath $mainCpp -Destination "$mainCpp.v122.before" -Force
+    if (!(Test-Path -LiteralPath "$mainCpp.v125.before")) {
+      Copy-Item -LiteralPath $mainCpp -Destination "$mainCpp.v125.before" -Force
     }
     Write-TextNoBom -Path $mainCpp -Text $text
-    Log "V122 patched server main.cpp: removed legacy dxvk_RegisterD3D9Device calls while keeping real IPC server."
+    Log "V125 patched server main.cpp: removed legacy dxvk_RegisterD3D9Device calls while keeping real IPC server."
   }
 
   foreach ($d in @(
@@ -1691,13 +1705,13 @@ static inline remixapi_ErrorCode BridgeSkipLegacyD3D9RegisterForDx11HeaderV122()
   )) {
     if (Test-Path -LiteralPath $d -PathType Container) {
       Remove-Item -LiteralPath $d -Recurse -Force -ErrorAction SilentlyContinue
-      Log "V122 removed stale bridge server build dir after server registration patch: $d"
+      Log "V125 removed stale bridge server build dir after server registration patch: $d"
     }
   }
 }
 
 
-function Remove-StaleX86ClientForDx9AckV122 {
+function Remove-StaleX86ClientForUnifiedGuidV125 {
   foreach ($d in @(
     (Join-Path $Root 'bridge_dx11_work\_Comp32Release'),
     (Join-Path $Root 'bridge_dx11_work\_Comp32Debug'),
@@ -1707,13 +1721,13 @@ function Remove-StaleX86ClientForDx9AckV122 {
   )) {
     if (Test-Path -LiteralPath $d -PathType Container) {
       Remove-Item -LiteralPath $d -Recurse -Force -ErrorAction SilentlyContinue
-      Log "V122 removed stale x86 client build dir after handshake queue fix: $d"
+      Log "V125 removed stale x86 client build dir after handshake queue fix: $d"
     }
   }
 }
 
 
-function Remove-StaleX86ClientForDx9AckV122 {
+function Remove-StaleX86ClientForUnifiedGuidV125 {
   foreach ($d in @(
     (Join-Path $Root 'bridge_dx11_work\_Comp32Release'),
     (Join-Path $Root 'bridge_dx11_work\_Comp32Debug'),
@@ -1723,7 +1737,23 @@ function Remove-StaleX86ClientForDx9AckV122 {
   )) {
     if (Test-Path -LiteralPath $d -PathType Container) {
       Remove-Item -LiteralPath $d -Recurse -Force -ErrorAction SilentlyContinue
-      Log "V122 removed stale x86 client build dir after DX9 ACK sequence restore: $d"
+      Log "V125 removed stale x86 client build dir after DX9 ACK sequence restore: $d"
+    }
+  }
+}
+
+
+function Remove-StaleX86ClientForUnifiedGuidV125 {
+  foreach ($d in @(
+    (Join-Path $Root 'bridge_dx11_work\_Comp32Release'),
+    (Join-Path $Root 'bridge_dx11_work\_Comp32Debug'),
+    (Join-Path $Root 'bridge_dx11_work\_Comp32ReleaseOptimized'),
+    (Join-Path $Root 'bridge_dx11_work\_dx11_client_x86_joined'),
+    (Join-Path $Root 'bridge_dx11_work\_dx11_launcher_x86')
+  )) {
+    if (Test-Path -LiteralPath $d -PathType Container) {
+      Remove-Item -LiteralPath $d -Recurse -Force -ErrorAction SilentlyContinue
+      Log "V125 removed stale x86 client build dir after GUID/IPC unification: $d"
     }
   }
 }
@@ -1783,11 +1813,11 @@ function Prepare-DX11BridgeSource([string]$PackDir) {
   Patch-BridgeServerRegisterD3D11 -BridgeWork $work
   Patch-BridgeServerDx11ArgFallback -BridgeWork $work
   Patch-BridgeServerDx11ModeV63 -BridgeWork $work
-  Assert-RealBridgeServerCanAckV122 -BridgeWork $work
-  Patch-BridgeServerRemoveLegacyD3D9RegistrationV122 -BridgeWork $work
-  Assert-RealBridgeServerCanAckV122 -BridgeWork $work
+  Assert-RealBridgeServerCanAckV125 -BridgeWork $work
+  Patch-BridgeServerRemoveLegacyD3D9RegistrationV125 -BridgeWork $work
+  Assert-RealBridgeServerCanAckV125 -BridgeWork $work
   Ensure-DX11ClientGlobalsIntegrated -BridgeWork $work
-  Remove-StaleX86ClientForDx9AckV122
+  Remove-StaleX86ClientForUnifiedGuidV125
   return $work
 }
 
@@ -1859,7 +1889,7 @@ function Find-MSVCVersionRoot([string]$VsInstall) {
   return $v.FullName
 }
 function Build-DX11ClientDirect([string]$VsInstall, [string]$ClientSrc) {
-  # V122: Direct build is launcher-only.
+  # V125: Direct build is launcher-only.
   # Meson builds the x86 game-side proxy DLLs (d3d11.dll/dxgi.dll) with their
   # common dx11_bridge_client.cpp object/dependencies. Rebuilding those DLLs here
   # caused LNK2019 because only d3d11_dx11bridge.obj was linked.
@@ -1984,6 +2014,157 @@ static bool pathLooksRooted(const wchar_t* p) {
   return (p && ((wcslen(p) > 2 && p[1] == L':') || (p[0] == L'\\' && p[1] == L'\\')));
 }
 
+
+// DX11_V125_STEAM_AWARE_FALLBACK_HELPER
+// Normal Steam/Unity path: start the game through Steam, then the game loads
+// local d3d11.dll/dxgi.dll and those DLLs run the bridge client.
+// This launcher remains packaged as required fallback/helper, but if it is used
+// inside steamapps/common, it must hand off to Steam instead of direct-launching
+// the Unity EXE, or SteamAPI may exit/relaunch the process.
+static const wchar_t* findNoCaseW(const wchar_t* haystack, const wchar_t* needle) {
+  if (!haystack || !needle || !needle[0]) return nullptr;
+  const size_t needleLen = wcslen(needle);
+  for (const wchar_t* p = haystack; *p; ++p) {
+    if (_wcsnicmp(p, needle, needleLen) == 0) return p;
+  }
+  return nullptr;
+}
+
+static bool readTextFileA(const wchar_t* path, char* out, DWORD cap) {
+  if (!out || cap < 2) return false;
+  out[0] = 0;
+  HANDLE h = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (h == INVALID_HANDLE_VALUE) return false;
+  DWORD read = 0;
+  BOOL ok = ReadFile(h, out, cap - 1, &read, nullptr);
+  CloseHandle(h);
+  if (!ok) return false;
+  out[read] = 0;
+  return true;
+}
+
+static bool parseFirstDigitsA(const char* text, wchar_t* out, DWORD cap) {
+  if (!text || !out || cap < 2) return false;
+  const char* p = text;
+  while (*p && (*p < '0' || *p > '9')) ++p;
+  if (!*p) return false;
+  DWORD n = 0;
+  while (*p >= '0' && *p <= '9' && n + 1 < cap) out[n++] = (wchar_t)*p++;
+  out[n] = 0;
+  return n > 0;
+}
+
+static bool parseAcfQuotedValueA(const char* text, const char* key, char* out, DWORD cap) {
+  if (!text || !key || !out || cap < 2) return false;
+  out[0] = 0;
+  const char* p = strstr(text, key);
+  if (!p) return false;
+  p += strlen(key);
+  while (*p && *p != '"') ++p;
+  if (!*p) return false;
+  ++p;
+  DWORD n = 0;
+  while (*p && *p != '"' && n + 1 < cap) out[n++] = *p++;
+  out[n] = 0;
+  return n > 0;
+}
+
+static bool strEqNoCaseA(const char* a, const char* b) {
+  if (!a || !b) return false;
+  while (*a && *b) {
+    char ca = *a++, cb = *b++;
+    if (ca >= 'A' && ca <= 'Z') ca = char(ca - 'A' + 'a');
+    if (cb >= 'A' && cb <= 'Z') cb = char(cb - 'A' + 'a');
+    if (ca != cb) return false;
+  }
+  return *a == 0 && *b == 0;
+}
+
+static bool getLeafDirNameA(const wchar_t* root, char* out, DWORD cap) {
+  if (!root || !out || cap < 2) return false;
+  wchar_t tmp[MAX_PATH] = {};
+  lstrcpynW(tmp, root, MAX_PATH);
+  size_t len = wcslen(tmp);
+  while (len > 0 && (tmp[len - 1] == L'\\' || tmp[len - 1] == L'/')) tmp[--len] = 0;
+  const wchar_t* slash = wcsrchr(tmp, L'\\');
+  const wchar_t* leaf = slash ? slash + 1 : tmp;
+  int got = WideCharToMultiByte(CP_UTF8, 0, leaf, -1, out, cap, nullptr, nullptr);
+  return got > 1;
+}
+
+static bool findSteamAppsRoot(const wchar_t* root, wchar_t* out, DWORD cap) {
+  const wchar_t* marker = findNoCaseW(root, L"\\steamapps\\common\\");
+  if (!marker) return false;
+  size_t prefixLen = (size_t)(marker - root) + wcslen(L"\\steamapps\\");
+  if (prefixLen + 1 >= cap) return false;
+  wcsncpy_s(out, cap, root, prefixLen);
+  out[prefixLen] = 0;
+  return true;
+}
+
+static bool findSteamAppId(const wchar_t* root, wchar_t* appid, DWORD appidCap) {
+  appid[0] = 0;
+  wchar_t appidTxt[MAX_PATH] = {};
+  lstrcpynW(appidTxt, root, MAX_PATH);
+  lstrcatW(appidTxt, L"steam_appid.txt");
+  char small[256] = {};
+  if (readTextFileA(appidTxt, small, sizeof(small)) && parseFirstDigitsA(small, appid, appidCap)) return true;
+
+  wchar_t steamapps[MAX_PATH] = {};
+  if (!findSteamAppsRoot(root, steamapps, MAX_PATH)) return false;
+
+  char installDir[260] = {};
+  if (!getLeafDirNameA(root, installDir, sizeof(installDir))) return false;
+
+  wchar_t pattern[MAX_PATH] = {};
+  lstrcpynW(pattern, steamapps, MAX_PATH);
+  lstrcatW(pattern, L"appmanifest_*.acf");
+
+  WIN32_FIND_DATAW fd = {};
+  HANDLE hFind = FindFirstFileW(pattern, &fd);
+  if (hFind == INVALID_HANDLE_VALUE) return false;
+
+  bool found = false;
+  do {
+    if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+    wchar_t path[MAX_PATH] = {};
+    lstrcpynW(path, steamapps, MAX_PATH);
+    lstrcatW(path, fd.cFileName);
+    char acf[65536] = {};
+    if (!readTextFileA(path, acf, sizeof(acf))) continue;
+    char acfInstall[260] = {};
+    char acfAppid[64] = {};
+    if (!parseAcfQuotedValueA(acf, "\"installdir\"", acfInstall, sizeof(acfInstall))) continue;
+    if (!strEqNoCaseA(acfInstall, installDir)) continue;
+    if (!parseAcfQuotedValueA(acf, "\"appid\"", acfAppid, sizeof(acfAppid))) continue;
+    MultiByteToWideChar(CP_UTF8, 0, acfAppid, -1, appid, appidCap);
+    found = appid[0] != 0;
+    break;
+  } while (FindNextFileW(hFind, &fd));
+
+  FindClose(hFind);
+  return found;
+}
+
+static bool handOffToSteamIfSteamGame(const wchar_t* root) {
+  wchar_t appid[64] = {};
+  if (!findSteamAppId(root, appid, 64)) return false;
+  wchar_t uri[128] = {};
+  swprintf_s(uri, L"steam://run/%s", appid);
+  wchar_t msg[512] = {};
+  swprintf_s(msg, L"Steam game detected. Handing off to %s. The Steam-launched game will load local d3d11.dll/dxgi.dll bridge client.", uri);
+  appendLog(root, msg);
+  HINSTANCE result = ShellExecuteW(nullptr, L"open", uri, nullptr, root, SW_SHOWNORMAL);
+  INT_PTR code = reinterpret_cast<INT_PTR>(result);
+  if (code <= 32) {
+    wchar_t err[512] = {};
+    swprintf_s(err, L"ShellExecuteW(%s) failed with code %Id. Start the game from Steam normally.", uri, code);
+    appendLog(root, err);
+    MessageBoxW(nullptr, err, L"DX11 Remix Launcher", MB_ICONERROR);
+  }
+  return true;
+}
+
 int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
   wchar_t self[MAX_PATH] = {};
   GetModuleFileNameW(nullptr, self, MAX_PATH);
@@ -2044,6 +2225,10 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
     return 5;
   }
 
+  if (handOffToSteamIfSteamGame(root)) {
+    return 0;
+  }
+
   wchar_t oldPath[32767] = {};
   GetEnvironmentVariableW(L"PATH", oldPath, 32767);
   wchar_t newPath[32767] = {};
@@ -2061,7 +2246,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
   if (extra[0]) { lstrcatW(cmd, L" "); lstrcatW(cmd, extra); }
 
   wchar_t logMsg[8192] = {};
-  swprintf_s(logMsg, L"Launching game: %s ; cwd=%s", cmd, root);
+  swprintf_s(logMsg, L"Launching non-Steam game directly: %s ; cwd=%s", cmd, root);
   appendLog(root, logMsg);
 
   STARTUPINFOW si = {};
@@ -2101,8 +2286,8 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
   if (!(Test-Path -LiteralPath $launcherExe -PathType Leaf)) { Die "NvRemixLauncher32.exe link finished but output is missing: $launcherExe" }
   Test-PeMachine $launcherExe 'x86'
 
-  Set-Content -LiteralPath (Join-Path $out 'DX11_V122_LAUNCHER_ONLY_DIRECT_BUILD.txt') -Encoding UTF8 -Value @"
-DX11_V122_LAUNCHER_ONLY_DIRECT_BUILD
+  Set-Content -LiteralPath (Join-Path $out 'DX11_V125_LAUNCHER_ONLY_DIRECT_BUILD.txt') -Encoding UTF8 -Value @"
+DX11_V125_LAUNCHER_ONLY_DIRECT_BUILD
 
 Build-DX11ClientDirect now builds only:
   NvRemixLauncher32.exe
@@ -2275,6 +2460,14 @@ HMODULE LoadSystemDll(const char* dllName);
 
 using namespace bridge_util;
 
+// DX11_V125_UNIFY_CLIENT_GUID_FOR_IPC
+// The bridge IPC utilities and the launched x64 server must use the same global
+// gUniqueIdentifier and gbBridgeRunning. Do not create a private namespace-static
+// copy here, or the client will initialize queues under one GUID and launch the
+// server under another GUID.
+extern Guid gUniqueIdentifier;
+extern bool gbBridgeRunning;
+
 namespace dx11_bridge_client {
 
 static HMODULE gModule = nullptr;
@@ -2282,11 +2475,9 @@ static std::mutex gAttachMutex;
 static std::mutex gServerMutex;
 static bool gAttached = false;
 static std::string gRemixFolder;
-static Guid gUniqueIdentifier;
 static Process* gpServer = nullptr;
 static NamedSemaphore* gpPresent = nullptr;
 static std::chrono::steady_clock::time_point gTimeStart;
-bool gbBridgeRunning = true;
 
 static std::string GetFolderFromModule(HMODULE moduleHandle) {
   char path[MAX_PATH] = {};
@@ -2321,7 +2512,7 @@ void LogLine(const char* tag, const char* text) {
   }
 }
 
-// DX11_V122_DEFINE_SERVER_MESSAGE_CHANNEL_FOR_DX9_ACK
+// DX11_V125_DEFINE_SERVER_MESSAGE_CHANNEL_FOR_DX9_ACK
 // DX9 gets this helper from client/message_channels.h. The generated DX11
 // bridge client is standalone, so it defines the same server-side message
 // channel setup locally before using the DX9 Bridge_Ack sequence.
@@ -2425,13 +2616,13 @@ bool EnsureServer() {
   }
 
   BridgeState::setServerState(BridgeState::ProcessState::Init);
-  LogLine("bridge", "Sending Bridge_Syn and waiting for Bridge_Ack from x64 server on DeviceBridge using DX9 ACK sequence. DX11_V122_USE_DX9_BRIDGE_ACK_SEQUENCE");
+  LogLine("bridge", "Sending Bridge_Syn and waiting for Bridge_Ack from x64 server on DeviceBridge using DX9 ACK sequence. DX11_V125_USE_DX9_BRIDGE_ACK_SEQUENCE");
   {
     ClientMessage syn(Commands::Bridge_Syn, reinterpret_cast<uintptr_t>(gpServer->GetCurrentProcessHandle()));
   }
   BridgeState::setClientState(BridgeState::ProcessState::Handshaking);
 
-  // DX11_V122_USE_DX9_BRIDGE_ACK_SEQUENCE
+  // DX11_V125_USE_DX9_BRIDGE_ACK_SEQUENCE
   // Match NVIDIA's working DX9 bridge handshake:
   //   Bridge_Syn -> DeviceBridge::waitForCommand(Bridge_Ack)
   //   DeviceBridge::pop_front()
@@ -2647,7 +2838,7 @@ Log 'Configuring x86 DX11 bridge client with Meson/Ninja and NVIDIA IPC utilitie
   Test-PeMachine $d3d11[0].FullName 'x86'
   Test-PeMachine $dxgi[0].FullName 'x86'
 
-  # V122: Meson builds the proxy DLLs, but the launcher EXE is generated by
+  # V125: Meson builds the proxy DLLs, but the launcher EXE is generated by
   # Build-DX11ClientDirect. Stage from one joined folder so the launcher-client
   # and the game-side proxy DLLs are always packaged together.
   $clientSrc = Join-Path $BridgeWork 'src\client_dx11'
@@ -2655,7 +2846,7 @@ Log 'Configuring x86 DX11 bridge client with Meson/Ninja and NVIDIA IPC utilitie
   $directLauncher = Join-Path $directOut 'NvRemixLauncher32.exe'
   $directLauncherPdb = Join-Path $directOut 'NvRemixLauncher32.pdb'
   if (!(Test-Path -LiteralPath $directLauncher -PathType Leaf)) {
-    Die "V122 launcher-only direct x86 build did not produce NvRemixLauncher32.exe: $directLauncher"
+    Die "V125 launcher-only direct x86 build did not produce NvRemixLauncher32.exe: $directLauncher"
   }
   Test-PeMachine $directLauncher 'x86'
 
@@ -2675,13 +2866,13 @@ Log 'Configuring x86 DX11 bridge client with Meson/Ninja and NVIDIA IPC utilitie
   Test-PeMachine (Join-Path $joined 'NvRemixLauncher32.exe') 'x86'
 
   $manifest = @"
-DX11_V122_JOINED_X86_CLIENT_OUTPUT
+DX11_V125_JOINED_X86_CLIENT_OUTPUT
 
 This folder is the x86 launcher-client output used for staging.
 
 NvRemixLauncher32.exe = x86 DX11 bridge client / entrypoint
-d3d11.dll             = x86 game-side DX11 proxy DLL
-dxgi.dll              = x86 game-side DXGI proxy DLL
+d3d11.dll             = x86 DX11 bridge client/interposer DLL
+dxgi.dll              = x86 DXGI bridge client/interposer DLL
 
 Meson output source:
   d3d11.dll = $($d3d11[0].FullName)
@@ -2690,17 +2881,17 @@ Meson output source:
 Direct launcher source:
   NvRemixLauncher32.exe = $directLauncher
 "@
-  Set-Content -LiteralPath (Join-Path $joined 'DX11_V122_JOINED_X86_CLIENT_OUTPUT.txt') -Encoding UTF8 -Value $manifest
-  Log "V122 joined x86 launcher-client output: $joined"
+  Set-Content -LiteralPath (Join-Path $joined 'DX11_V125_JOINED_X86_CLIENT_OUTPUT.txt') -Encoding UTF8 -Value $manifest
+  Log "V125 joined x86 launcher-client output: $joined"
   return $joined
 }
 
 function Build-DX11Bridge([string]$BridgeWork, [string]$VsInstall, [string]$Meson, [string]$Ninja) {
-  Patch-BridgeServerRemoveLegacyD3D9RegistrationV122 -BridgeWork $BridgeWork
-  Assert-RealBridgeServerCanAckV122 -BridgeWork $BridgeWork
+  Patch-BridgeServerRemoveLegacyD3D9RegistrationV125 -BridgeWork $BridgeWork
+  Assert-RealBridgeServerCanAckV125 -BridgeWork $BridgeWork
   $b64 = Join-Path $BridgeWork '_Comp64Release'
   if (Test-Path $b64) {
-    Log "V122 removing bridge server build dir so real Bridge_Ack-capable NvRemixBridge.exe is rebuilt: $b64"
+    Log "V125 removing bridge server build dir so real Bridge_Ack-capable NvRemixBridge.exe is rebuilt: $b64"
     Remove-Item -LiteralPath $b64 -Recurse -Force
   }
   if (!$SkipBridgeBuild) {
@@ -2709,7 +2900,7 @@ function Build-DX11Bridge([string]$BridgeWork, [string]$VsInstall, [string]$Meso
     $env:Path = (Split-Path -Parent $Ninja) + ';' + $env:Path
     Repair-MesonUtf8NoBom $BridgeWork
     $buildNinja = Join-Path $b64 'build.ninja'
-# V122_REAL_BRIDGE_SERVER_ACK: removed V90 dummy DX11 server rewrite; keep real bridge server so Bridge_Ack is sent.
+# V125_REAL_BRIDGE_SERVER_ACK: removed V90 dummy DX11 server rewrite; keep real bridge server so Bridge_Ack is sent.
     Log 'Building official x64 bridge server from source.'
     if (!(Test-Path $buildNinja)) { Invoke-Logged -Label 'bridge-server-meson-x64' -Exe $Meson -CommandArgs @('setup','--buildtype=release','--backend=ninja','-Dwerror=false','-Denable_tests=false',$b64,$BridgeWork) -WorkingDirectory $BridgeWork -AllowIfFileExists $buildNinja | Out-Null }
     Invoke-Logged -Label 'bridge-server-ninja-x64' -Exe $Ninja -CommandArgs @('-C',$b64,'-v') -WorkingDirectory $BridgeWork | Out-Null
@@ -2859,7 +3050,7 @@ function Write-BridgeVersionFile {
 }
 
 
-function Assert-DX11X86LauncherClientLayoutV122 {
+function Assert-DX11X86LauncherClientLayoutV125 {
   param(
     [Parameter(Mandatory)][string]$X86Out,
     [Parameter(Mandatory)][string]$X64Out
@@ -2867,22 +3058,22 @@ function Assert-DX11X86LauncherClientLayoutV122 {
 
   $trex = Join-Path $X86Out '.trex'
   $checks = @(
-    @{ Path = (Join-Path $X86Out 'NvRemixLauncher32.exe'); Machine = 'x86'; Role = 'ROOT x86 bridge client / game launcher NvRemixLauncher32.exe' },
-    @{ Path = (Join-Path $X86Out 'd3d11.dll'); Machine = 'x86'; Role = 'ROOT x86 game-side DX11 proxy d3d11.dll' },
-    @{ Path = (Join-Path $X86Out 'dxgi.dll');  Machine = 'x86'; Role = 'ROOT x86 game-side DXGI proxy dxgi.dll' },
+    @{ Path = (Join-Path $X86Out 'NvRemixLauncher32.exe'); Machine = 'x86'; Role = 'required x86 NvRemixLauncher32.exe fallback/helper component' },
+    @{ Path = (Join-Path $X86Out 'd3d11.dll'); Machine = 'x86'; Role = 'ROOT x86 DX11 bridge client/interposer d3d11.dll' },
+    @{ Path = (Join-Path $X86Out 'dxgi.dll');  Machine = 'x86'; Role = 'ROOT x86 DXGI bridge client/interposer dxgi.dll' },
     @{ Path = (Join-Path $trex 'NvRemixBridge.exe'); Machine = 'x64'; Role = '.trex x64 Remix bridge server NvRemixBridge.exe' },
     @{ Path = (Join-Path $trex 'd3d11.dll'); Machine = 'x64'; Role = '.trex x64 Remix DX11 runtime d3d11.dll' },
     @{ Path = (Join-Path $trex 'dxgi.dll');  Machine = 'x64'; Role = '.trex x64 Remix DXGI runtime dxgi.dll' }
   )
 
   $report = New-Object System.Collections.Generic.List[string]
-  $report.Add('DX11 x86 launcher-client game-root layout V122')
+  $report.Add('DX11 x86 launcher-client game-root layout V125')
   $report.Add(('Generated: {0}' -f (Get-Date)))
   $report.Add('')
   $report.Add('Required layout for any 32-bit DX11 game:')
-  $report.Add('  <game exe folder>\NvRemixLauncher32.exe    = x86 bridge client / entrypoint')
-  $report.Add('  <game exe folder>\d3d11.dll                = x86 game-side DX11 proxy loaded by the game')
-  $report.Add('  <game exe folder>\dxgi.dll                 = x86 game-side DXGI proxy loaded by the game')
+  $report.Add('  <game exe folder>\NvRemixLauncher32.exe    = required x86 launcher fallback/helper component')
+  $report.Add('  <game exe folder>\d3d11.dll                = x86 DX11 bridge client/interposer loaded by the game')
+  $report.Add('  <game exe folder>\dxgi.dll                 = x86 DXGI bridge client/interposer loaded by the game')
   $report.Add('  <game exe folder>\.trex\NvRemixBridge.exe  = local x64 Remix bridge server')
   $report.Add('  <game exe folder>\.trex\d3d11.dll          = local x64 Remix runtime')
   $report.Add('  <game exe folder>\.trex\dxgi.dll           = local x64 Remix runtime')
@@ -2897,15 +3088,15 @@ function Assert-DX11X86LauncherClientLayoutV122 {
     $machine = [string]$c.Machine
     if (!(Test-Path -LiteralPath $p -PathType Leaf)) {
       $report.Add(('BAD missing: {0} -> {1}' -f $role, $p))
-      Set-Content -LiteralPath (Join-Path $X86Out 'DX11_V122_LAUNCHER_CLIENT_LAYOUT.txt') -Encoding UTF8 -Value ($report -join "`r`n")
-      Die ("V122 layout check failed; missing {0}: {1}" -f $role, $p)
+      Set-Content -LiteralPath (Join-Path $X86Out 'DX11_V125_LAUNCHER_CLIENT_LAYOUT.txt') -Encoding UTF8 -Value ($report -join "`r`n")
+      Die ("V125 layout check failed; missing {0}: {1}" -f $role, $p)
     }
     Test-PeMachine $p $machine
     $len = (Get-Item -LiteralPath $p).Length
     if ($len -lt 32768) {
       $report.Add(('BAD too small: {0} size={1} -> {2}' -f $role, $len, $p))
-      Set-Content -LiteralPath (Join-Path $X86Out 'DX11_V122_LAUNCHER_CLIENT_LAYOUT.txt') -Encoding UTF8 -Value ($report -join "`r`n")
-      Die ("V122 layout check failed; {0} is too small to be the real built artifact: {1}" -f $role, $p)
+      Set-Content -LiteralPath (Join-Path $X86Out 'DX11_V125_LAUNCHER_CLIENT_LAYOUT.txt') -Encoding UTF8 -Value ($report -join "`r`n")
+      Die ("V125 layout check failed; {0} is too small to be the real built artifact: {1}" -f $role, $p)
     }
     $report.Add(('OK {0}: {1} bytes -> {2}' -f $role, $len, $p))
   }
@@ -2913,8 +3104,8 @@ function Assert-DX11X86LauncherClientLayoutV122 {
   $bridgeVersion = Join-Path $trex 'bridge_version.txt'
   if (!(Test-Path -LiteralPath $bridgeVersion -PathType Leaf)) {
     $report.Add(('BAD missing bridge_version.txt: {0}' -f $bridgeVersion))
-    Set-Content -LiteralPath (Join-Path $X86Out 'DX11_V122_LAUNCHER_CLIENT_LAYOUT.txt') -Encoding UTF8 -Value ($report -join "`r`n")
-    Die "V122 layout check failed; .trex\bridge_version.txt is missing."
+    Set-Content -LiteralPath (Join-Path $X86Out 'DX11_V125_LAUNCHER_CLIENT_LAYOUT.txt') -Encoding UTF8 -Value ($report -join "`r`n")
+    Die "V125 layout check failed; .trex\bridge_version.txt is missing."
   }
   $report.Add(('OK .trex bridge version file: {0}' -f $bridgeVersion))
 
@@ -2930,7 +3121,7 @@ The root d3d11.dll and dxgi.dll are x86 game-side bridge proxy DLLs that the gam
 No files go in System32 or SysWOW64.
 The game folder is the install/run folder.
 "@
-  Set-Content -LiteralPath (Join-Path $X86Out 'DX11_V122_LAUNCHER_IS_CLIENT.txt') -Encoding UTF8 -Value $clientLog
+  Set-Content -LiteralPath (Join-Path $X86Out 'DX11_V125_LAUNCHER_IS_CLIENT.txt') -Encoding UTF8 -Value $clientLog
 
   $runBat = @'
 @echo off
@@ -2940,7 +3131,7 @@ echo Start the actual game executable normally from this folder.
 echo NvRemixLauncher32.exe is required and must remain here, but this helper does not launch it as the game command.
 pause
 '@
-  Set-Content -LiteralPath (Join-Path $X86Out 'RUN_GAME_WITH_DX11_REMIX_V122.bat') -Encoding ASCII -Value $runBat
+  Set-Content -LiteralPath (Join-Path $X86Out 'RUN_GAME_WITH_DX11_REMIX_V125.bat') -Encoding ASCII -Value $runBat
 
   $verifyPs = @'
 param([string]$GameDir = "")
@@ -2970,16 +3161,16 @@ if ([string]::IsNullOrWhiteSpace($GameDir)) { $GameDir = Split-Path -Parent $PSC
 $GameDir = [System.IO.Path]::GetFullPath($GameDir)
 
 $items = @(
-  @{ Path = (Join-Path $GameDir "NvRemixLauncher32.exe"); Expect = "x86"; Role = "x86 launcher client / entrypoint" },
-  @{ Path = (Join-Path $GameDir "d3d11.dll"); Expect = "x86"; Role = "x86 game-side DX11 proxy" },
-  @{ Path = (Join-Path $GameDir "dxgi.dll"); Expect = "x86"; Role = "x86 game-side DXGI proxy" },
+  @{ Path = (Join-Path $GameDir "NvRemixLauncher32.exe"); Expect = "x86"; Role = "required x86 launcher fallback/helper component" },
+  @{ Path = (Join-Path $GameDir "d3d11.dll"); Expect = "x86"; Role = "x86 DX11 bridge client/interposer" },
+  @{ Path = (Join-Path $GameDir "dxgi.dll"); Expect = "x86"; Role = "x86 DXGI bridge client/interposer" },
   @{ Path = (Join-Path $GameDir ".trex\NvRemixBridge.exe"); Expect = "x64"; Role = "local .trex x64 bridge server" },
   @{ Path = (Join-Path $GameDir ".trex\d3d11.dll"); Expect = "x64"; Role = "local .trex x64 DX11 runtime" },
   @{ Path = (Join-Path $GameDir ".trex\dxgi.dll"); Expect = "x64"; Role = "local .trex x64 DXGI runtime" }
 )
 
 $bad = 0
-Write-Host "[dx11-v122] Verifying launcher-client game-root layout: $GameDir" -ForegroundColor Cyan
+Write-Host "[dx11-v125] Verifying launcher-client game-root layout: $GameDir" -ForegroundColor Cyan
 foreach ($i in $items) {
   $actual = Get-Machine $i.Path
   if ($actual -ne $i.Expect) {
@@ -3000,27 +3191,27 @@ if (!(Test-Path -LiteralPath $ver -PathType Leaf)) {
 }
 
 if ($bad -ne 0) { throw "DX11 x86 launcher-client game-root layout failed with $bad problem(s)." }
-Write-Host "[dx11-v122] Layout is valid. Run the game normally from this folder. Keep NvRemixLauncher32.exe beside the proxy DLLs." -ForegroundColor Cyan
+Write-Host "[dx11-v125] Layout is valid. Run the game normally from this folder. Keep NvRemixLauncher32.exe beside the proxy DLLs." -ForegroundColor Cyan
 '@
 
   $verifyBat = @'
 @echo off
 setlocal
 cd /d "%~dp0"
-powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0VERIFY_DX11_V122_LAUNCHER_CLIENT_LAYOUT.ps1"
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0VERIFY_DX11_V125_LAUNCHER_CLIENT_LAYOUT.ps1"
 pause
 '@
 
-  Set-Content -LiteralPath (Join-Path $X86Out 'VERIFY_DX11_V122_LAUNCHER_CLIENT_LAYOUT.ps1') -Encoding UTF8 -Value $verifyPs
-  Set-Content -LiteralPath (Join-Path $X86Out 'RUN_VERIFY_DX11_V122_LAUNCHER_CLIENT_LAYOUT.bat') -Encoding ASCII -Value $verifyBat
+  Set-Content -LiteralPath (Join-Path $X86Out 'VERIFY_DX11_V125_LAUNCHER_CLIENT_LAYOUT.ps1') -Encoding UTF8 -Value $verifyPs
+  Set-Content -LiteralPath (Join-Path $X86Out 'RUN_VERIFY_DX11_V125_LAUNCHER_CLIENT_LAYOUT.bat') -Encoding ASCII -Value $verifyBat
 
   $report.Add('')
-  $report.Add('OK: NvRemixLauncher32.exe is the x86 bridge client / entrypoint.')
+  $report.Add('OK: d3d11.dll/dxgi.dll are the x86 DX11 bridge client/interposer loaded by the game. NvRemixLauncher32.exe is required in the package as a fallback/helper component.')
   $report.Add('OK: root d3d11.dll/dxgi.dll are x86 game-side proxy DLLs.')
   $report.Add('OK: .trex contains the local x64 Remix bridge/runtime.')
   $report.Add('OK: run script and verifier written into x86 output.')
-  Set-Content -LiteralPath (Join-Path $X86Out 'DX11_V122_LAUNCHER_CLIENT_LAYOUT.txt') -Encoding UTF8 -Value ($report -join "`r`n")
-  Log "V122 verified x86 launcher-client game-root layout: $X86Out"
+  Set-Content -LiteralPath (Join-Path $X86Out 'DX11_V125_LAUNCHER_CLIENT_LAYOUT.txt') -Encoding UTF8 -Value ($report -join "`r`n")
+  Log "V125 verified x86 launcher-client game-root layout: $X86Out"
 }
 
 
@@ -3078,14 +3269,14 @@ function Stage-DualOutput([string]$RuntimeBuild, [hashtable]$BridgeBuilds) {
   $launcher32 = Join-Path $BridgeBuilds.Build32 'NvRemixLauncher32.exe'
   $launcher32Pdb = Join-Path $BridgeBuilds.Build32 'NvRemixLauncher32.pdb'
   if (!(Test-Path -LiteralPath $launcher32 -PathType Leaf)) {
-    Die "NvRemixLauncher32.exe was not built. V122 requires the x86 launcher EXE as the bridge client / entrypoint."
+    Die "NvRemixLauncher32.exe was not built. V125 requires the x86 launcher EXE as the bridge client / entrypoint."
   }
   Copy-FileIfDifferent -Source $launcher32 -Destination (Join-Path $x86Out 'NvRemixLauncher32.exe')
   Test-PeMachine (Join-Path $x86Out 'NvRemixLauncher32.exe') 'x86'
   if (Test-Path -LiteralPath $launcher32Pdb -PathType Leaf) { Copy-FileIfDifferent -Source $launcher32Pdb -Destination (Join-Path $x86Out 'NvRemixLauncher32.pdb') }
 
   $artifactReadme = @"
-DXVK Remix DX11 x86 Launcher-Client Package v122
+DXVK Remix DX11 x86 Launcher-Client Package v125
 ======================================
 
 Placement matches the NVIDIA x86 bridge package style:
@@ -3106,9 +3297,9 @@ Root:
   *.dll                      64-bit support DLLs mirrored from _output\x64
 
 Usage:
-  Copy this folder next to the 32-bit DX11 game exe and run NvRemixLauncher32.exe from that same game folder. The launcher EXE is the client/entrypoint. The root d3d11.dll/dxgi.dll are game-side DX11/DXGI proxy DLLs loaded by the game from the game folder.
+  Copy this folder next to the 32-bit DX11 game exe and run NvRemixLauncher32.exe from that same game folder. The root d3d11.dll/dxgi.dll are the bridge client/interposer loaded by the game from the game folder. NvRemixLauncher32.exe is required but only a fallback/helper component.
 
-NvRemixLauncher32.exe is intentionally staged in the root as the x86 DX11 bridge client/entrypoint. d3d11.dll and dxgi.dll are root game-side proxy DLLs.
+d3d11.dll and dxgi.dll are intentionally staged in the root as the x86 DX11 bridge client/interposer loaded by the game. NvRemixLauncher32.exe is also required in the package as a fallback/helper component.
 "@
   Set-Content -LiteralPath (Join-Path $x86Out 'artifacts_readme.txt') -Encoding UTF8 -Value $artifactReadme
 
@@ -3251,7 +3442,7 @@ d3d11.dll is intentionally staged for this DX11 build.
   Test-PeMachine (Join-Path $x86Out 'dxgi.dll') 'x86'
   Test-PeMachine (Join-Path $x86Trex 'd3d11.dll') 'x64'
   Test-PeMachine (Join-Path $x86Trex 'dxgi.dll') 'x64'
-  Assert-DX11X86LauncherClientLayoutV122 -X86Out $x86Out -X64Out $x64Out
+  Assert-DX11X86LauncherClientLayoutV125 -X86Out $x86Out -X64Out $x64Out
 
   if (Test-Path -LiteralPath $zip) { Remove-Item -LiteralPath $zip -Force }
   Add-Type -AssemblyName System.IO.Compression.FileSystem
@@ -3335,7 +3526,7 @@ Log "Meson: $meson"
 Log "Ninja: $ninja"
 Repair-MesonUtf8NoBom $Root
 Repair-MesonNestedTernary $Root
-Remove-DummyDx11BridgeServerWorkV122
+Remove-DummyDx11BridgeServerWorkV125
 $bridgeWork = Prepare-DX11BridgeSource $Root
 if ($SourceOnly) { Log "Source-only requested. Work tree: $bridgeWork"; exit 0 }
 $runtimeBuild = Build-X64Runtime $vs $meson $ninja

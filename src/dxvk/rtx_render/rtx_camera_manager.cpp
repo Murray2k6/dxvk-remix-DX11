@@ -27,8 +27,8 @@
 
 namespace {
   constexpr float kFovToleranceRadians = 0.001f;
-  constexpr float kMaxProjectionShear = 1.5f;
-  constexpr float kMinViewportFallbackMainCameraScore = -6.0f;
+  constexpr float kMaxProjectionShear = 0.35f; // DX11_V124_CAMERA_ARTIFACT_STABILITY: reject heavily skewed non-scene camera matrices
+  constexpr float kMinViewportFallbackMainCameraScore = 6.0f; // DX11_V124_CAMERA_ARTIFACT_STABILITY: fallback camera must be strong, not bootstrap/menu/8x8
 
   bool isFiniteMatrix(const dxvk::Matrix4& matrix) {
     for (uint32_t row = 0; row < 4; ++row) {
@@ -301,7 +301,7 @@ namespace dxvk {
     if (cameraType == CameraType::Main && camera.getLastUpdateFrame() == frameId && !isPlaying && !isBrowsing) {
       const bool shouldReplaceCurrentMain = (m_mainCameraCandidateUsedFallback != candidateUsesFallbackProjection)
         ? (m_mainCameraCandidateUsedFallback && !candidateUsesFallbackProjection)
-        : (candidateScore > m_mainCameraCandidateScore + 0.5f);
+        : (candidateScore > m_mainCameraCandidateScore + 3.0f);
       if (!shouldReplaceCurrentMain) {
         m_lastSetCameraType = cameraType;
         return cameraType;

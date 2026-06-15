@@ -71,6 +71,157 @@ static bool pathLooksRooted(const wchar_t* p) {
   return (p && ((wcslen(p) > 2 && p[1] == L':') || (p[0] == L'\\' && p[1] == L'\\')));
 }
 
+
+// DX11_V125_STEAM_AWARE_FALLBACK_HELPER
+// Normal Steam/Unity path: start the game through Steam, then the game loads
+// local d3d11.dll/dxgi.dll and those DLLs run the bridge client.
+// This launcher remains packaged as required fallback/helper, but if it is used
+// inside steamapps/common, it must hand off to Steam instead of direct-launching
+// the Unity EXE, or SteamAPI may exit/relaunch the process.
+static const wchar_t* findNoCaseW(const wchar_t* haystack, const wchar_t* needle) {
+  if (!haystack || !needle || !needle[0]) return nullptr;
+  const size_t needleLen = wcslen(needle);
+  for (const wchar_t* p = haystack; *p; ++p) {
+    if (_wcsnicmp(p, needle, needleLen) == 0) return p;
+  }
+  return nullptr;
+}
+
+static bool readTextFileA(const wchar_t* path, char* out, DWORD cap) {
+  if (!out || cap < 2) return false;
+  out[0] = 0;
+  HANDLE h = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (h == INVALID_HANDLE_VALUE) return false;
+  DWORD read = 0;
+  BOOL ok = ReadFile(h, out, cap - 1, &read, nullptr);
+  CloseHandle(h);
+  if (!ok) return false;
+  out[read] = 0;
+  return true;
+}
+
+static bool parseFirstDigitsA(const char* text, wchar_t* out, DWORD cap) {
+  if (!text || !out || cap < 2) return false;
+  const char* p = text;
+  while (*p && (*p < '0' || *p > '9')) ++p;
+  if (!*p) return false;
+  DWORD n = 0;
+  while (*p >= '0' && *p <= '9' && n + 1 < cap) out[n++] = (wchar_t)*p++;
+  out[n] = 0;
+  return n > 0;
+}
+
+static bool parseAcfQuotedValueA(const char* text, const char* key, char* out, DWORD cap) {
+  if (!text || !key || !out || cap < 2) return false;
+  out[0] = 0;
+  const char* p = strstr(text, key);
+  if (!p) return false;
+  p += strlen(key);
+  while (*p && *p != '"') ++p;
+  if (!*p) return false;
+  ++p;
+  DWORD n = 0;
+  while (*p && *p != '"' && n + 1 < cap) out[n++] = *p++;
+  out[n] = 0;
+  return n > 0;
+}
+
+static bool strEqNoCaseA(const char* a, const char* b) {
+  if (!a || !b) return false;
+  while (*a && *b) {
+    char ca = *a++, cb = *b++;
+    if (ca >= 'A' && ca <= 'Z') ca = char(ca - 'A' + 'a');
+    if (cb >= 'A' && cb <= 'Z') cb = char(cb - 'A' + 'a');
+    if (ca != cb) return false;
+  }
+  return *a == 0 && *b == 0;
+}
+
+static bool getLeafDirNameA(const wchar_t* root, char* out, DWORD cap) {
+  if (!root || !out || cap < 2) return false;
+  wchar_t tmp[MAX_PATH] = {};
+  lstrcpynW(tmp, root, MAX_PATH);
+  size_t len = wcslen(tmp);
+  while (len > 0 && (tmp[len - 1] == L'\\' || tmp[len - 1] == L'/')) tmp[--len] = 0;
+  const wchar_t* slash = wcsrchr(tmp, L'\\');
+  const wchar_t* leaf = slash ? slash + 1 : tmp;
+  int got = WideCharToMultiByte(CP_UTF8, 0, leaf, -1, out, cap, nullptr, nullptr);
+  return got > 1;
+}
+
+static bool findSteamAppsRoot(const wchar_t* root, wchar_t* out, DWORD cap) {
+  const wchar_t* marker = findNoCaseW(root, L"\\steamapps\\common\\");
+  if (!marker) return false;
+  size_t prefixLen = (size_t)(marker - root) + wcslen(L"\\steamapps\\");
+  if (prefixLen + 1 >= cap) return false;
+  wcsncpy_s(out, cap, root, prefixLen);
+  out[prefixLen] = 0;
+  return true;
+}
+
+static bool findSteamAppId(const wchar_t* root, wchar_t* appid, DWORD appidCap) {
+  appid[0] = 0;
+  wchar_t appidTxt[MAX_PATH] = {};
+  lstrcpynW(appidTxt, root, MAX_PATH);
+  lstrcatW(appidTxt, L"steam_appid.txt");
+  char small[256] = {};
+  if (readTextFileA(appidTxt, small, sizeof(small)) && parseFirstDigitsA(small, appid, appidCap)) return true;
+
+  wchar_t steamapps[MAX_PATH] = {};
+  if (!findSteamAppsRoot(root, steamapps, MAX_PATH)) return false;
+
+  char installDir[260] = {};
+  if (!getLeafDirNameA(root, installDir, sizeof(installDir))) return false;
+
+  wchar_t pattern[MAX_PATH] = {};
+  lstrcpynW(pattern, steamapps, MAX_PATH);
+  lstrcatW(pattern, L"appmanifest_*.acf");
+
+  WIN32_FIND_DATAW fd = {};
+  HANDLE hFind = FindFirstFileW(pattern, &fd);
+  if (hFind == INVALID_HANDLE_VALUE) return false;
+
+  bool found = false;
+  do {
+    if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+    wchar_t path[MAX_PATH] = {};
+    lstrcpynW(path, steamapps, MAX_PATH);
+    lstrcatW(path, fd.cFileName);
+    char acf[65536] = {};
+    if (!readTextFileA(path, acf, sizeof(acf))) continue;
+    char acfInstall[260] = {};
+    char acfAppid[64] = {};
+    if (!parseAcfQuotedValueA(acf, "\"installdir\"", acfInstall, sizeof(acfInstall))) continue;
+    if (!strEqNoCaseA(acfInstall, installDir)) continue;
+    if (!parseAcfQuotedValueA(acf, "\"appid\"", acfAppid, sizeof(acfAppid))) continue;
+    MultiByteToWideChar(CP_UTF8, 0, acfAppid, -1, appid, appidCap);
+    found = appid[0] != 0;
+    break;
+  } while (FindNextFileW(hFind, &fd));
+
+  FindClose(hFind);
+  return found;
+}
+
+static bool handOffToSteamIfSteamGame(const wchar_t* root) {
+  wchar_t appid[64] = {};
+  if (!findSteamAppId(root, appid, 64)) return false;
+  wchar_t uri[128] = {};
+  swprintf_s(uri, L"steam://run/%s", appid);
+  wchar_t msg[512] = {};
+  swprintf_s(msg, L"Steam game detected. Handing off to %s. The Steam-launched game will load local d3d11.dll/dxgi.dll bridge client.", uri);
+  appendLog(root, msg);
+  HINSTANCE result = ShellExecuteW(nullptr, L"open", uri, nullptr, root, SW_SHOWNORMAL);
+  INT_PTR code = reinterpret_cast<INT_PTR>(result);
+  if (code <= 32) {
+    wchar_t err[512] = {};
+    swprintf_s(err, L"ShellExecuteW(%s) failed with code %Id. Start the game from Steam normally.", uri, code);
+    appendLog(root, err);
+    MessageBoxW(nullptr, err, L"DX11 Remix Launcher", MB_ICONERROR);
+  }
+  return true;
+}
+
 int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
   wchar_t self[MAX_PATH] = {};
   GetModuleFileNameW(nullptr, self, MAX_PATH);
@@ -131,6 +282,10 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
     return 5;
   }
 
+  if (handOffToSteamIfSteamGame(root)) {
+    return 0;
+  }
+
   wchar_t oldPath[32767] = {};
   GetEnvironmentVariableW(L"PATH", oldPath, 32767);
   wchar_t newPath[32767] = {};
@@ -148,7 +303,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
   if (extra[0]) { lstrcatW(cmd, L" "); lstrcatW(cmd, extra); }
 
   wchar_t logMsg[8192] = {};
-  swprintf_s(logMsg, L"Launching game: %s ; cwd=%s", cmd, root);
+  swprintf_s(logMsg, L"Launching non-Steam game directly: %s ; cwd=%s", cmd, root);
   appendLog(root, logMsg);
 
   STARTUPINFOW si = {};
