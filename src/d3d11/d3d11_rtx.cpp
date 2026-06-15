@@ -4486,6 +4486,23 @@ namespace dxvk {
       if (hasSceneDepthSignal
        && primitiveCount >= 1u
        && ((hasRealProjection && hasViewOrStrongProjection) || strongViewportFallbackScene)) {
+
+        // UE-style significance culling: this draw is a scene candidate. Count
+        // it, and if the budgeting loop has armed a distance threshold, drop
+        // candidates farther than it so the per-frame budget is spent on the
+        // nearest (most important) geometry rather than arrival order. The
+        // camera-space depth is column 3, row 2 of objectToView (the object
+        // origin's view-space Z); abs() since view Z is negative looking down -Z.
+        ++m_submitRejectStats.sceneCandidates;
+        if (RtxOptions::significanceCulling() && m_significanceMaxDistanceSq > 0.0f) {
+          const float viewZ = dcs.transformData.objectToView[3][2];
+          const float distSq = viewZ * viewZ;
+          if (distSq > m_significanceMaxDistanceSq) {
+            ++m_submitRejectStats.significanceCulled;
+            return;
+          }
+        }
+
         ++m_submitRejectStats.sceneAccepted;
         if (hasRealProjection && hasViewOrStrongProjection) {
           ++m_submitRejectStats.realSceneAccepted;
@@ -4690,6 +4707,40 @@ namespace dxvk {
     m_prevFrameSceneAccepted = m_submitRejectStats.sceneAccepted;
     m_prevFrameRealSceneAccepted = m_submitRejectStats.realSceneAccepted;
 
+    // UE-style significance control loop. Adjust the squared-distance threshold
+    // toward the instance budget for next frame: if this frame had more scene
+    // candidates than the budget, tighten (admit only nearer geometry); if it
+    // comfortably fit, relax/disarm so sparse views regain full detail. The
+    // step is multiplicative and clamped to +/-40%/frame, so the threshold
+    // glides rather than popping. Disarmed (==0) means "no limit".
+    if (RtxOptions::significanceCulling()) {
+      const uint32_t budget = std::max(RtxOptions::maxInstanceSubmissions(), 1u);
+      const uint32_t candidates = m_submitRejectStats.sceneCandidates;
+      const float farthestKeptSq = m_significanceMaxDistanceSq;
+      if (candidates > budget) {
+        // Over budget: tighten. Seed from the current accepted set's implied
+        // reach if disarmed, else shrink by the overshoot ratio (capped).
+        const float ratio = static_cast<float>(budget) / static_cast<float>(candidates);
+        const float shrink = std::max(ratio, 0.6f); // never below 60%/frame
+        if (m_significanceMaxDistanceSq <= 0.0f) {
+          // First arm: start generous (a large reach) so only the farthest are cut.
+          m_significanceMaxDistanceSq = 1.0e12f * shrink;
+        } else {
+          m_significanceMaxDistanceSq *= shrink;
+        }
+      } else if (m_significanceMaxDistanceSq > 0.0f) {
+        // Within budget: relax by up to 40%/frame; disarm once very large.
+        m_significanceMaxDistanceSq *= 1.4f;
+        if (m_significanceMaxDistanceSq > 1.0e13f) {
+          m_significanceMaxDistanceSq = 0.0f; // disarm: no limit needed
+        }
+      }
+      (void) farthestKeptSq;
+    } else {
+      m_significanceMaxDistanceSq = 0.0f;
+    }
+    m_prevFrameSceneCandidates = m_submitRejectStats.sceneCandidates;
+
     const uint32_t sceneAcceptedDraws = m_submitRejectStats.sceneAccepted;
     const uint32_t realSceneAcceptedDraws = m_submitRejectStats.realSceneAccepted;
     const uint32_t trustedSceneAcceptedDraws = realSceneAcceptedDraws > 0
@@ -4723,6 +4774,8 @@ namespace dxvk {
         " accepted=", m_submitRejectStats.accepted,
         " scene=", m_submitRejectStats.sceneAccepted,
         " realScene=", m_submitRejectStats.realSceneAccepted,
+        " sceneCand=", m_submitRejectStats.sceneCandidates,
+        " sigCulled=", m_submitRejectStats.significanceCulled,
         " overflow=", m_submitRejectStats.queueOverflow,
         " nonTriangle=", m_submitRejectStats.nonTriangleTopology,
         " noPS=", m_submitRejectStats.noPixelShader,

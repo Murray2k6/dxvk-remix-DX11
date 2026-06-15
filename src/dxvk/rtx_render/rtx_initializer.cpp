@@ -83,11 +83,13 @@ namespace dxvk {
     }
 
     // Configure shader manager to understand bindless layouts
+    Logger::info("[RTX-Init] phase: configuring bindless layouts");
     ShaderManager::getInstance()->addGlobalExtraLayout(pCommon->getSceneManager().getBindlessResourceManager().getGlobalBindlessTableLayout(BindlessResourceManager::Buffers));
     ShaderManager::getInstance()->addGlobalExtraLayout(pCommon->getSceneManager().getBindlessResourceManager().getGlobalBindlessTableLayout(BindlessResourceManager::Textures));
     ShaderManager::getInstance()->addGlobalExtraLayout(pCommon->getSceneManager().getBindlessResourceManager().getGlobalBindlessTableLayout(BindlessResourceManager::Samplers));
 
     // Need to promote all of the hardware support Options before prewarming shaders.
+    Logger::info("[RTX-Init] phase: applying pending option values");
     RtxOptionManager::applyPendingValues(m_device, /* forceOnChange */ true);
 
     // The earlier updateGraphicsPresets call was a no-op because RtxOptions was not yet
@@ -97,9 +99,11 @@ namespace dxvk {
     RtxOptions::updateGraphicsPresets(m_device);
 
     // Kick off shader prewarming
+    Logger::info("[RTX-Init] phase: starting shader prewarm");
     startPrewarmShaders();
 
     // Load assets (if any) as early as possible
+    Logger::info("[RTX-Init] phase: loading assets");
     if (RtxOptions::asyncAssetLoading()) {
       // Async asset loading (USD)
       m_asyncAssetLoadThread = dxvk::thread([this] {
@@ -109,13 +113,16 @@ namespace dxvk {
     } else {
       loadAssets();
     }
+    Logger::info("[RTX-Init] phase: initializing DLSS/DLFG meta objects");
     pCommon->metaDLSS(); // Lazy allocator triggers init in ctor
     pCommon->metaDLFG();
 
     if (!asyncShaderFinalizing()) {
       // Wait for all prewarming to complete before calling "RTX initialized"
+      Logger::info("[RTX-Init] phase: waiting for shader prewarm to finish");
       waitForShaderPrewarm();
     }
+    Logger::info("[RTX-Init] phase: initialize() complete");
   }
 
   void RtxInitializer::release() {

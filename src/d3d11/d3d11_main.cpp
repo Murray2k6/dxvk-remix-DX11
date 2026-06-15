@@ -1,4 +1,5 @@
 #include <array>
+#include <atomic>
 #include <filesystem>
 #include <utility>
 
@@ -50,6 +51,22 @@ namespace {
 //                     SetDllDirectoryW(NULL).  Only participates in search
 //                     when the process opted into LOAD_LIBRARY_SEARCH_* via
 //                     SetDefaultDllDirectories (some games or runtimes do).
+void logRemixDx11BuildBanner() {
+  // First lines of any log: makes the running build unambiguous so a stale
+  // d3d11.dll left in a game folder can never again be mistaken for a fresh
+  // one. This function is in the global namespace (before `namespace dxvk`),
+  // so dxvk symbols are fully qualified here.
+  static std::atomic<bool> s_logged = { false };
+  bool expected = false;
+  if (!s_logged.compare_exchange_strong(expected, true))
+    return;
+  dxvk::Logger::info("=====================================================");
+  dxvk::Logger::info(dxvk::str::format("[Remix-DX11] build stamp: ", __DATE__, " ", __TIME__));
+  dxvk::Logger::info("[Remix-DX11] fixes: nrcVendorFallback texcoordSINT SR4viewport budgetHeadroom inputSeparation grayPlaceholder");
+  dxvk::Logger::info("[Remix-DX11] if this line is absent or older than your last build, the game loaded a STALE d3d11.dll.");
+  dxvk::Logger::info("=====================================================");
+}
+
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
   if (reason == DLL_PROCESS_ATTACH) {
     g_d3d11Module = hModule;
@@ -275,6 +292,8 @@ extern "C" {
       Logger::initRtxLog();
       util::RtxFileSys::print();
     );
+
+    logRemixDx11BuildBanner();
 
     Rc<DxvkAdapter>  dxvkAdapter;
     Rc<DxvkInstance> dxvkInstance;

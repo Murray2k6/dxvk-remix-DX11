@@ -1,4 +1,4 @@
-#############################################################################
+﻿#############################################################################
 # Copyright (c) 2021-2025, NVIDIA CORPORATION. All rights reserved.
 #
 # Permission is hereby granted, free of charge, to any person obtaining a
@@ -30,31 +30,30 @@ project(
 global_src_root_norm = meson.global_source_root().replace('\\', '/')
 current_build_dir_norm = meson.current_build_dir().replace('\\', '/')
 
+fs = import('fs')
+
 # Fetch dependencies
-#   `get_dependencies` is intentionally called twice. Why?:
-#     (1) On a clean clone, the `include_directories` calls below will fail without
-#           having fetched the dependencies, since all meson scripts complete entirely
-#           before the first build target (fetch_packman_target) is called.
-#     (2) On already built trees with no meson changes, the script is not rerun, so
-#           run_command will not be executed again, therefore a default build target
-#           version is required to pull updated packman info.
-#   Implications: in very rare circumstances (clean clone, editing meson), get_dependencies
-#     script will be called twice on the same build. This will not be noticeable as packman
-#     early outs if everything's already fetched, so the waste is negligible + forgiveable.
+# The Windows build wrapper fetches packman dependencies BEFORE Meson with a real
+# timeout. That prevents Meson setup from looking hung forever when packman is
+# blocked by network/proxy/TLS. Keep the old Meson-side fetch available for
+# people who run meson directly.
 get_dependencies_script_path = join_paths(global_src_root_norm, 'scripts-common/update-deps.cmd')
-message('Downloading dependencies...')
-packman_out = run_command(get_dependencies_script_path, 'packman-external.xml', 'update-deps.log', check: true)
-message(packman_out.stdout().strip())
-if packman_out.returncode() != 0
-  message(packman_out.stderr().strip())
-  error('Failed to get dependencies.')
+if get_option('skip_packman_fetch')
+  message('Skipping Meson-side packman fetch; build wrapper already checked/fetched dependencies.')
+else
+  message('Downloading dependencies...')
+  packman_out = run_command(get_dependencies_script_path, 'packman-external.xml', 'update-deps.log', check: false)
+  message(packman_out.stdout().strip())
+  if packman_out.returncode() != 0
+    message(packman_out.stderr().strip())
+    error('Failed to get dependencies.')
+  endif
 endif
 fetch_packman_target = custom_target('fetch_packman',
   input            : ['packman-external.xml', get_dependencies_script_path],
   output           : 'update-deps.log',
   command          : [get_dependencies_script_path, '@INPUT0@', '@OUTPUT0@' ] )
 
-fs = import('fs')
 
 cpu_family = target_machine.cpu_family()
 build_os = build_machine.system()
@@ -69,7 +68,7 @@ nvapi_arch_dir = cpu_family == 'x86' ? 'x86' : 'amd64'
 nvapi_lib_name = cpu_family == 'x86' ? 'nvapi' : 'nvapi64'
 aftermath_arch_dir = cpu_family == 'x86' ? 'x86' : 'x64'
 aftermath_lib_name = cpu_family == 'x86' ? 'GFSDK_Aftermath_Lib.x86' : 'GFSDK_Aftermath_Lib.x64'
-boost_arch_suffix = cpu_family == 'x86' ? 'x86' : 'x64'
+boost_arch_suffix = cpu_family == 'x86' ? 'x32' : 'x64'
 
 add_project_arguments('-DNOMINMAX', language : 'cpp')
 vs_project_defines = 'NOMINMAX;'
@@ -496,7 +495,7 @@ embedding_compiler = generator(xxd_exe,
 
 mdl_include_dir = include_directories('external/omni_core_materials')
 
-usd_debug_release_dir = 'external/nv_usd_' + usd_debug_or_release + '/'
+usd_debug_release_dir = cpu_family == 'x86' ? 'external/nv_usd_x86_' + usd_debug_or_release + '/' : 'external/nv_usd_' + usd_debug_or_release + '/'
 usd_lib_path = join_paths(global_src_root_norm, usd_debug_release_dir)
 
 # NOTE newer versions of meson prefer relative paths for include directories
@@ -943,3 +942,5 @@ endif # dxvk_is_ninja
 if fs.is_dir('nv-private')
   subdir('nv-private')
 endif
+
+

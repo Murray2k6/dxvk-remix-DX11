@@ -29,12 +29,24 @@ param(
   [switch]$ShadersOnly,
   # Compile one Meson target instead of the default full build.
   [string]$BuildTarget,
-  # Build both architectures by default. Use -Architecture x64 or -Architecture x86 to limit it.
+  # Build both architectures when requested. build.bat defaults to x64 release to avoid looking hung.
   [ValidateSet('both', 'x64', 'x86')]
-  [string]$Architecture = 'both'
+  [string]$Architecture = 'x64',
+  # Build debug + debugoptimized + release. Without this, release is the default.
+  [switch]$AllConfigs,
+  # Do not run packman. Use only when external\ folders are already populated.
+  [switch]$NoDepsFetch,
+  # Timeout for scripts-common\update-deps.cmd / packman dependency fetch.
+  [int]$DepsTimeoutSeconds = 900,
+  # Timeout for Meson setup/reconfigure. Prevents Meson/dependency setup from hanging forever.
+  [int]$MesonSetupTimeoutSeconds = 900,
+  # 0 disables compile timeout because a full Remix compile can legitimately be long.
+  [int]$BuildTimeoutSeconds = 0,
+  [int]$InstallTimeoutSeconds = 600
 )
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+try {
 $ScriptRoot = if ($PSScriptRoot) {
   [IO.Path]::GetFullPath($PSScriptRoot)
 } else {
@@ -44,20 +56,38 @@ if (-not (Test-Path (Join-Path $ScriptRoot 'meson.build'))) {
   throw "meson.build was not found next to this script. Copy build_dxvk_all_ninja.ps1, build_common.ps1, meson.build, and meson_options.txt into the dxvk-remix-DX11 repo root."
 }
 . (Join-Path $ScriptRoot 'build_common.ps1')
-# Repair timestamps before clean/setup too. Meson and Ninja can stop on files that
-# were extracted from ZIPs with clocks ahead of the local Windows clock.
-Repair-FutureFileTimestamps -SourceDir $ScriptRoot
-if ($ReleaseOnly) {
-  $BuildFlavours = @('release')
+
+# DX11 x86 in this fork is bridge-based, not a local 32-bit USD runtime build.
+# When x86 or both is requested, delegate to the dual-output builder so x64 and
+# x86 are staged into output\x64 and output\x86 with their correct layouts.
+$DualOutputScript = Join-Path $ScriptRoot 'Build-DX11-DualOutput-V50.ps1'
+if (($Architecture -eq 'both' -or $Architecture -eq 'x86') -and (Test-Path -LiteralPath $DualOutputScript -PathType Leaf)) {
+  Write-Host '[build] DX11 x86 requested; using bridge-based dual-output build instead of local x86 USD build.' -ForegroundColor Cyan
+  $dualArgs = @()
+  if ($Clean) { $dualArgs += '-Clean' }
+  if ($NoDepsFetch) { $dualArgs += '-NoDepsFetch' }
+  & $DualOutputScript @dualArgs
+  exit $LASTEXITCODE
+}
+# Do not do a second full-tree timestamp scan here. PerformBuild repairs timestamps
+# once per active build directory with output folders excluded.
+if ($AllConfigs -and -not $ReleaseOnly) {
+  [string[]]$BuildFlavours = @('debug', 'debugoptimized', 'release')
 } else {
-  $BuildFlavours = @('debug', 'debugoptimized', 'release')
+  [string[]]$BuildFlavours = @('release')
 }
 
-$BuildArchitectures = switch ($Architecture) {
-  'x64'  { @('x64') }
-  'x86'  { @('x86') }
-  default { @('x64', 'x86') }
-}
+# PowerShell 5 strict mode can collapse a single switch result into a scalar string.
+# Force a real array so .Count and nested foreach are safe for x64-only/release-only builds.
+[string[]]$BuildArchitectures = @(
+  switch ($Architecture) {
+    'x64'  { 'x64' }
+    'x86'  { 'x86' }
+    default { 'x64'; 'x86' }
+  }
+)
+$BuildFlavours = @($BuildFlavours)
+$BuildArchitectures = @($BuildArchitectures)
 
 function Get-DxvkBuildSubDir {
   param(
@@ -86,8 +116,13 @@ if ($Clean) {
   }
 }
 $EnableTracyValue = if ($Tracy) { 'true' } else { 'false' }
-foreach ($arch in $BuildArchitectures) {
-  foreach ($flavour in $BuildFlavours) {
+$totalBuilds = @($BuildArchitectures).Count * @($BuildFlavours).Count
+$currentBuild = 0
+Write-Host ("[build] Build plan: architecture(s)={0}; config(s)={1}; jobs={2}" -f ($BuildArchitectures -join ','), ($BuildFlavours -join ','), $totalBuilds) -ForegroundColor Cyan
+foreach ($arch in @($BuildArchitectures)) {
+  foreach ($flavour in @($BuildFlavours)) {
+    $currentBuild++
+    Write-Host ("[build] ===== Job {0}/{1}: {2} {3} =====" -f $currentBuild, $totalBuilds, $arch, $flavour) -ForegroundColor Cyan
     $performArgs = @{
       Architecture = $arch
       BuildFlavour = $flavour
@@ -97,7 +132,21 @@ foreach ($arch in $BuildArchitectures) {
       ConfigureOnly = [bool]$ConfigureOnly
       ShadersOnly = [bool]$ShadersOnly
       BuildTarget = $BuildTarget
+      FetchDependencies = -not [bool]$NoDepsFetch
+      DepsTimeoutSeconds = $DepsTimeoutSeconds
+      MesonSetupTimeoutSeconds = $MesonSetupTimeoutSeconds
+      BuildTimeoutSeconds = $BuildTimeoutSeconds
+      InstallTimeoutSeconds = $InstallTimeoutSeconds
     }
     PerformBuild @performArgs
   }
+}
+
+} catch {
+  Write-Host ('[build] ERROR: ' + $_.Exception.Message) -ForegroundColor Red
+  if ($_.ScriptStackTrace) {
+    Write-Host '[build] PowerShell stack:' -ForegroundColor DarkYellow
+    Write-Host $_.ScriptStackTrace -ForegroundColor DarkYellow
+  }
+  exit 1
 }
