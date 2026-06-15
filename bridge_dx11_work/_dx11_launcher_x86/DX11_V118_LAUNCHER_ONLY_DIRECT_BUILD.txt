@@ -1,4 +1,4 @@
-﻿DX11_V116_LAUNCHER_ONLY_DIRECT_BUILD
+﻿DX11_V118_LAUNCHER_ONLY_DIRECT_BUILD
 
 Build-DX11ClientDirect now builds only:
   NvRemixLauncher32.exe
