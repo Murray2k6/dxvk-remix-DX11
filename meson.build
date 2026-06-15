@@ -1,4 +1,4 @@
-﻿#############################################################################
+#############################################################################
 # Copyright (c) 2021-2025, NVIDIA CORPORATION. All rights reserved.
 #
 # Permission is hereby granted, free of charge, to any person obtaining a

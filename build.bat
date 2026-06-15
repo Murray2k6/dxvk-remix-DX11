@@ -1,9 +1,9 @@
 @echo off
 setlocal EnableExtensions
 set "SCRIPT_DIR=%~dp0"
-set "PS1=%SCRIPT_DIR%Build-DX11-DualOutput-V58.ps1"
+set "PS1=%SCRIPT_DIR%build_dxvk_all_ninja.ps1"
 if not exist "%PS1%" (
-  echo [build] ERROR: Build-DX11-DualOutput-V58.ps1 was not found next to build.bat.
+  echo [build] ERROR: build_dxvk_all_ninja.ps1 was not found next to build.bat.
   exit /b 1
 )
 pushd "%SCRIPT_DIR%" >nul || exit /b 1

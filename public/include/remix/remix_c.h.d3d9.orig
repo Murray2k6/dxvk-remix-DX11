@@ -167,6 +167,7 @@ extern "C" {
   typedef const wchar_t* remixapi_Path;
 
 
+
   typedef struct remixapi_StartupInfo {
     remixapi_StructType sType;
     void*               pNext;
@@ -182,6 +183,7 @@ extern "C" {
 
   typedef remixapi_ErrorCode(REMIXAPI_PTR* PFN_remixapi_Startup)(const remixapi_StartupInfo* info);
   typedef remixapi_ErrorCode(REMIXAPI_PTR* PFN_remixapi_Shutdown)(void);
+
 
 
   typedef struct remixapi_MaterialInfoOpaqueEXT {
@@ -324,6 +326,7 @@ extern "C" {
     remixapi_MeshHandle       handle);
 
 
+
   typedef enum remixapi_CameraType {
     REMIXAPI_CAMERA_TYPE_WORLD,
     REMIXAPI_CAMERA_TYPE_SKY,
@@ -353,6 +356,7 @@ extern "C" {
 
   typedef remixapi_ErrorCode(REMIXAPI_PTR* PFN_remixapi_SetupCamera)(
     const remixapi_CameraInfo* info);
+
 
 
 #define REMIXAPI_INSTANCE_INFO_MAX_BONES_COUNT 256
@@ -671,6 +675,7 @@ extern "C" {
     uint8_t                   colorB);
 
 
+
   typedef remixapi_ErrorCode(REMIXAPI_PTR* PFN_remixapi_dxvk_CreateD3D11Device)(
     remixapi_Bool       editorModeEnabled,
     ID3D11Device**      out_pD3D11Device);
@@ -709,13 +714,15 @@ extern "C" {
     uint64_t            version;
   } remixapi_InitializeLibraryInfo;
 
-  #ifndef DX11_REMIXAPI_DX11_BRIDGE_API
-#define DX11_REMIXAPI_DX11_BRIDGE_API 1
-typedef remixapi_ErrorCode(REMIXAPI_PTR* PFN_remixapi_dxvk_CreateD3D11)(remixapi_Bool editorModeEnabled, void** out_pD3D11);
+  #ifndef DX11_REMIXAPI_LEGACY_D3D9_BRIDGE_COMPAT
+#define DX11_REMIXAPI_LEGACY_D3D9_BRIDGE_COMPAT 1
+typedef remixapi_ErrorCode(REMIXAPI_PTR* PFN_remixapi_dxvk_CreateD3D9)(
+  remixapi_Bool editorModeEnabled,
+  IDirect3D9Ex** out_pD3D9);
+typedef remixapi_ErrorCode(REMIXAPI_PTR* PFN_remixapi_dxvk_RegisterD3D9Device)(
+  IDirect3DDevice9Ex* d3d9Device);
 #endif
 typedef struct remixapi_Interface {
-  PFN_remixapi_dxvk_CreateD3D11 dxvk_CreateD3D11;
-  PFN_remixapi_dxvk_RegisterD3D11Device dxvk_RegisterD3D11Device;
     PFN_remixapi_Shutdown           Shutdown;
     PFN_remixapi_CreateMaterial     CreateMaterial;
     PFN_remixapi_DestroyMaterial    DestroyMaterial;
@@ -727,9 +734,12 @@ typedef struct remixapi_Interface {
     PFN_remixapi_DestroyLight       DestroyLight;
     PFN_remixapi_DrawLightInstance  DrawLightInstance;
     PFN_remixapi_SetConfigVariable  SetConfigVariable;
+  PFN_remixapi_dxvk_CreateD3D9 dxvk_CreateD3D9;
+  PFN_remixapi_dxvk_RegisterD3D9Device dxvk_RegisterD3D9Device;
 
     // DXVK interoperability
     PFN_remixapi_dxvk_CreateD3D11Device     dxvk_CreateD3D11Device;
+    PFN_remixapi_dxvk_RegisterD3D11Device   dxvk_RegisterD3D11Device;
     PFN_remixapi_dxvk_GetExternalSwapchain  dxvk_GetExternalSwapchain;
     PFN_remixapi_dxvk_GetVkImage            dxvk_GetVkImage;
     PFN_remixapi_dxvk_CopyRenderingOutput   dxvk_CopyRenderingOutput;

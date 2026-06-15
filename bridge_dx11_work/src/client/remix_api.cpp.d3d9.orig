@@ -389,7 +389,7 @@ remixapi_ErrorCode REMIXAPI_CALL remixapi_SetConfigVariable(const char* var, con
 
 remixapi_ErrorCode REMIXAPI_CALL remixapi_dxvk_CreateD3D9(
   remixapi_Bool       editorModeEnabled,
-  ID3D11Device**      out_pD3D9) {
+  IDirect3D9Ex**      out_pD3D9) {
   ASSERT_REMIXAPI_PFN_TYPE(remixapi_dxvk_CreateD3D9);
   Logger::err("[remixapi_dxvk_CreateD3D9] Not yet supported. Device used by Remix API defaults to "
                                          "most recently created by client application.");
@@ -397,7 +397,7 @@ remixapi_ErrorCode REMIXAPI_CALL remixapi_dxvk_CreateD3D9(
   return REMIXAPI_ERROR_CODE_GENERAL_FAILURE;
 }
 
-remixapi_ErrorCode REMIXAPI_CALL remixapi_dxvk_RegisterD3D9Device(ID3D11Device* d3d9Device) {
+remixapi_ErrorCode REMIXAPI_CALL remixapi_dxvk_RegisterD3D9Device(IDirect3DDevice9Ex* d3d9Device) {
   ASSERT_REMIXAPI_PFN_TYPE(remixapi_dxvk_RegisterD3D9Device);
   if (!d3d9Device) {
     return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;

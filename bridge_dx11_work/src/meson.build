@@ -22,14 +22,14 @@
 
 subdir('tracy')
 subdir('util')
-
-if not enable_tests
-	if cpu_family == 'x86'
-		subdir('client')
+
 if cpu_family == 'x86'
   subdir('client_dx11')
 endif
-		subdir('server')
+
+if not enable_tests
+	if cpu_family == 'x86'
+subdir('server')
 		subdir('launcher')
 	elif cpu_family == 'x86_64'
 		subdir('server')
