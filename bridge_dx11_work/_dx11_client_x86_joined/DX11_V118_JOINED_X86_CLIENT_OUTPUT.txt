@@ -1,4 +1,4 @@
-﻿DX11_V116_JOINED_X86_CLIENT_OUTPUT
+﻿DX11_V118_JOINED_X86_CLIENT_OUTPUT
 
 This folder is the x86 launcher-client output used for staging.
 

@@ -61,13 +61,6 @@
 using namespace Commands;
 using namespace bridge_util;
 using namespace remixapi::util;
-#ifndef DX11_BRIDGE_SKIP_LEGACY_D3D9_REGISTER_V118
-#define DX11_BRIDGE_SKIP_LEGACY_D3D9_REGISTER_V118
-static inline remixapi_ErrorCode BridgeSkipLegacyD3D9RegisterForDx11HeaderV118() {
-  Logger::info("DX11 bridge: skipped legacy dxvk_RegisterD3D9Device call because the active Remix API header is DX11 and has no D3D9 registration member.");
-  return REMIXAPI_ERROR_CODE_SUCCESS;
-}
-#endif
 
 // NOTE: This extension is really useful for debugging the Bridge child process from the parent process:
 // https://marketplace.visualstudio.com/items?itemName=vsdbgplat.MicrosoftChildProcessDebuggingPowerTool
@@ -339,7 +332,7 @@ void ProcessDeviceCommandQueue() {
           gpD3DDevices[pHandle] = pD3DDevice;
           if(GlobalOptions::getExposeRemixApi()) {
             remixapi::g_device = pD3DDevice;
-            BridgeSkipLegacyD3D9RegisterForDx11HeaderV118();
+            remixapi::g_remix.dxvk_RegisterD3D9Device(remixapi::g_device);
           }
         }
 
@@ -374,7 +367,7 @@ void ProcessDeviceCommandQueue() {
           gpD3DDevices[pHandle] = (IDirect3DDevice9Ex*) pD3DDevice;
           if(GlobalOptions::getExposeRemixApi()) {
             remixapi::g_device = (IDirect3DDevice9Ex*) pD3DDevice;
-            BridgeSkipLegacyD3D9RegisterForDx11HeaderV118();
+            remixapi::g_remix.dxvk_RegisterD3D9Device(remixapi::g_device);
           }
         }
 
