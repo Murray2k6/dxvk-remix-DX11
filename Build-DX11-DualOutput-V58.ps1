@@ -8,6 +8,7 @@ param(
   [switch]$RebuildRuntime,
   [switch]$NoDepsFetch,
   [string]$OutputRoot = '_output',
+  [string]$Dx11BridgeFixedGuidV58 = 'f8d7419c-4317-47e8-95ee-e405415bc471',
   [string]$BridgeRepoUrl = 'https://github.com/NVIDIAGameWorks/dxvk-remix.git',
   [string]$BridgeBranch = 'main'
 )
@@ -19,9 +20,9 @@ $Root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $LogDir = Join-Path $Root '_build_logs'
 New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
 
-function Log([string]$m) { Write-Host "[dx11-output-v57] $m" }
-function Warn([string]$m) { Write-Host "[dx11-output-v57] WARNING: $m" -ForegroundColor Yellow }
-function Die([string]$m) { throw "[dx11-output-v57] $m" }
+function Log([string]$m) { Write-Host "[dx11-output-v58] $m" }
+function Warn([string]$m) { Write-Host "[dx11-output-v58] WARNING: $m" -ForegroundColor Yellow }
+function Die([string]$m) { throw "[dx11-output-v58] $m" }
 function Get-CommandFilePath([string]$Name) {
   $cmds = @(Get-Command $Name -ErrorAction SilentlyContinue)
   foreach ($cmd in $cmds) {
@@ -326,14 +327,14 @@ Detected D3D9 register in header: $hasD3D9
     return
   }
 
-  if ($text -notmatch 'DX11_BRIDGE_REGISTER_HELPER_V57') {
+  if ($text -notmatch 'DX11_BRIDGE_REGISTER_HELPER_V58') {
     if ($text -notmatch '#include\s+<d3d11\.h>') {
       $text = $text -replace '#include\s+<d3d9\.h>', "#include <d3d9.h>`r`n#include <d3d11.h>"
     }
     $helper = @'
 
-#ifndef DX11_BRIDGE_REGISTER_HELPER_V57
-#define DX11_BRIDGE_REGISTER_HELPER_V57
+#ifndef DX11_BRIDGE_REGISTER_HELPER_V58
+#define DX11_BRIDGE_REGISTER_HELPER_V58
 static inline void BridgeRegisterRemixD3D11DeviceForDx11Bridge(IUnknown* pDeviceUnknown) {
   if (!GlobalOptions::getExposeRemixApi()) {
     return;
@@ -398,7 +399,7 @@ function Ensure-DX11ClientSources {
 
   $packClient = Join-Path $PackDir 'src\client_dx11'
   $copied = $false
-  # v57: always refresh the generated DX11 client source. Older runs left stale
+  # v58: always refresh the generated DX11 client source. Older runs left stale
   # client DLL source that launched NvRemixBridge.exe with the wrong command line.
   # Do not trust existing bridge_dx11_work\src\client_dx11 contents.
   if (Test-Path -LiteralPath $packClient -PathType Container) {
@@ -411,7 +412,7 @@ function Ensure-DX11ClientSources {
   }
 
   if (!$copied) {
-    Log 'Writing embedded DX11 client source files with v57 GUID/version bridge launch fix.'
+    Log 'Writing embedded DX11 client source files with v58 GUID/version bridge launch fix.'
     Write-TextNoBom -Path (Join-Path $DstClient 'd3d11_dx11bridge.cpp') -Text @'
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -569,7 +570,7 @@ inline void logLine(const char* tag, const char* msg) {
 inline HMODULE loadSystemDll(const char* name) {
   char sys[MAX_PATH] = {};
   GetSystemDirectoryA(sys, MAX_PATH);
-  lstrcatA(sys, "\");
+  lstrcatA(sys, "\\");
   lstrcatA(sys, name);
   HMODULE mod = LoadLibraryA(sys);
   if (!mod) {
@@ -621,9 +622,54 @@ inline bool readBridgeVersion(char* out, DWORD cap) {
   return false;
 }
 
+inline bool isValidBridgeGuid36(const char* s) {
+  if (!s || strlen(s) != 36) return false;
+  for (int i = 0; i < 36; ++i) {
+    const char c = s[i];
+    if (i == 8 || i == 13 || i == 18 || i == 23) { if (c != '-') return false; }
+    else if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'))) return false;
+  }
+  return true;
+}
+
+inline bool readFixedGuid(char* out, DWORD cap) {
+  if (!out || cap < 37) return false;
+  out[0] = 0;
+
+  char envGuid[64] = {};
+  DWORD gotEnv = GetEnvironmentVariableA("DX11_BRIDGE_FIXED_GUID", envGuid, sizeof(envGuid));
+  if (gotEnv > 0 && gotEnv < sizeof(envGuid)) {
+    trimAscii(envGuid);
+    if (isValidBridgeGuid36(envGuid)) {
+      lstrcpynA(out, envGuid, cap);
+      logLine("bridge", "Using DX11_BRIDGE_FIXED_GUID override.");
+      return true;
+    }
+  }
+
+  char dir[MAX_PATH] = {};
+  getDllFolder(dir, MAX_PATH);
+  char path[MAX_PATH] = {};
+  lstrcpynA(path, dir, MAX_PATH);
+  lstrcatA(path, ".trex\\dx11_bridge_guid.txt");
+  if (readTextFileSmall(path, out, cap) && isValidBridgeGuid36(out)) {
+    logLine("bridge", "Using .trex dx11_bridge_guid.txt fixed GUID.");
+    return true;
+  }
+
+  return false;
+}
+
 inline bool makeGuidString(char* out, DWORD cap) {
   if (!out || cap < 37) return false;
   out[0] = 0;
+
+  if (readFixedGuid(out, cap)) {
+    char fixedMsg[160] = {};
+    wsprintfA(fixedMsg, "Using bridge GUID '%s' len=%lu", out, static_cast<unsigned long>(strlen(out)));
+    logLine("bridge", fixedMsg);
+    return true;
+  }
 
   GUID g = {};
   HRESULT hr = CoCreateGuid(&g);
@@ -690,7 +736,7 @@ inline void launchBridgeServerOnce() {
   if (InterlockedCompareExchange(&launched, 1, 0) != 0) return;
 
   char mutexName[96] = {};
-  sprintf_s(mutexName, sizeof(mutexName), "Local\DxvkRemixDx11BridgeLauncher_%lu", GetCurrentProcessId());
+  sprintf_s(mutexName, sizeof(mutexName), "Local\\DxvkRemixDx11BridgeLauncher_%lu", GetCurrentProcessId());
   static HANDLE launchMutex = nullptr;
   launchMutex = CreateMutexA(nullptr, TRUE, mutexName);
   if (!launchMutex) {
@@ -710,7 +756,7 @@ inline void launchBridgeServerOnce() {
   getDllFolder(dir, MAX_PATH);
   char server[MAX_PATH] = {};
   lstrcpynA(server, dir, MAX_PATH);
-  lstrcatA(server, ".trex\NvRemixBridge.exe");
+  lstrcatA(server, ".trex\\NvRemixBridge.exe");
 
   if (!fileExists(server)) {
     logLine("bridge", "No .trex\NvRemixBridge.exe next to d3d11.dll/dxgi.dll; running DX11 passthrough only.");
@@ -739,8 +785,10 @@ inline void launchBridgeServerOnce() {
   // Use lpApplicationName=server and lpCommandLine=GUID VERSION so WinMain's
   // pCmdLine is exactly what NvRemixBridge.exe expects, with no executable path
   // accidentally becoming argList[0].
-  char cmd[MAX_PATH + 320] = {};
-  sprintf_s(cmd, sizeof(cmd), "%s %s", guid, version);
+  char cmd[MAX_PATH + 640] = {};
+  sprintf_s(cmd, sizeof(cmd), "\"%s\" %s %s", server, guid, version);
+  char bareArgs[512] = {};
+  sprintf_s(bareArgs, sizeof(bareArgs), "%s %s", guid, version);
 
   // Also provide fallback paths for the patched DX11 bridge server.
   // These are inherited by NvRemixBridge.exe and used only if pCmdLine is empty
@@ -751,7 +799,7 @@ inline void launchBridgeServerOnce() {
 
   char argFile[MAX_PATH] = {};
   lstrcpynA(argFile, dir, MAX_PATH);
-  lstrcatA(argFile, ".trex\dx11_bridge_args.txt");
+  lstrcatA(argFile, ".trex\\dx11_bridge_args.txt");
   HANDLE af = CreateFileA(argFile, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
   if (af != INVALID_HANDLE_VALUE) {
     DWORD wrote = 0;
@@ -763,14 +811,21 @@ inline void launchBridgeServerOnce() {
   }
 
   char logMsg[768] = {};
-  sprintf_s(logMsg, sizeof(logMsg), "Launching NVIDIA-style DX11 client->server app='%s' args='%s' cwd='%s' envGUID='%s' envVersion='%s' argsFile='%s'", server, cmd, dir, guid, version, argFile);
+  sprintf_s(logMsg, sizeof(logMsg), "Launching NVIDIA-style DX11 client->server cmd='%s' bareArgs='%s' cwd='%s' envGUID='%s' envVersion='%s' argsFile='%s'", cmd, bareArgs, dir, guid, version, argFile);
   logLine("bridge", logMsg);
   appendLaunchLog(logMsg);
 
   STARTUPINFOA si = {};
   PROCESS_INFORMATION pi = {};
   si.cb = sizeof(si);
-  BOOL ok = CreateProcessA(server, cmd, nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, dir, &si, &pi);
+  BOOL ok = CreateProcessA(nullptr, cmd, nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, dir, &si, &pi);
+  if (!ok) {
+    char fail1[256] = {};
+    wsprintfA(fail1, "CreateProcess full command failed err=%lu; retrying with lpApplicationName + bare args", GetLastError());
+    logLine("bridge", fail1);
+    appendLaunchLog(fail1);
+    ok = CreateProcessA(server, bareArgs, nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, dir, &si, &pi);
+  }
   if (ok) {
     CloseHandle(pi.hThread);
     CloseHandle(pi.hProcess);
@@ -1129,7 +1184,7 @@ function Build-DX11ClientDirect([string]$VsInstall, [string]$ClientSrc) {
   Test-PeMachine $dxgiDll 'x86'
 
 
-  # v57: build the NVIDIA-style 32-bit launcher EXE at the same root level
+  # v58: build the NVIDIA-style 32-bit launcher EXE at the same root level
   # as the x86 DX11 bridge DLLs. This mirrors the public x86 Remix package
   # placement: root launcher + root interposer DLLs + .trex x64 runtime/server.
   $launcherCpp = Join-Path $out 'NvRemixLauncher32.cpp'
@@ -1338,32 +1393,32 @@ function Patch-BridgeServerDx11ArgFallback {
   $main = Join-Path $BridgeWork 'src\server\main.cpp'
   if (!(Test-Path -LiteralPath $main -PathType Leaf)) { Die "Bridge server main.cpp missing: $main" }
   $text = Get-Content -LiteralPath $main -Raw
-  if ($text -match 'DX11_BRIDGE_ARG_FALLBACK_V57') {
+  if ($text -match 'DX11_BRIDGE_ARG_FALLBACK_V58') {
     Log 'Bridge server DX11 arg fallback already patched.'
     return
   }
 
   $helper = @'
 
-// DX11_BRIDGE_ARG_FALLBACK_V57
+// DX11_BRIDGE_ARG_FALLBACK_V58
 // The stock bridge server expects wWinMain pCmdLine to contain exactly:
 //   <36-char-guid> <BRIDGE_VERSION_W>
 // For DX11 bridge bring-up we also accept DX11_BRIDGE_GUID/DX11_BRIDGE_VERSION
 // from the x86 launcher environment, and .trex\dx11_bridge_args.txt as a file
 // fallback. This prevents the server from exiting before the DX11 client IPC path
 // can be brought up.
-static wchar_t g_Dx11BridgeGuidArgV57[64] = {};
-static wchar_t g_Dx11BridgeVersionArgV57[256] = {};
-static LPWSTR g_Dx11BridgeArgListV57[2] = { g_Dx11BridgeGuidArgV57, g_Dx11BridgeVersionArgV57 };
+static wchar_t g_Dx11BridgeGuidArgV58[64] = {};
+static wchar_t g_Dx11BridgeVersionArgV58[256] = {};
+static LPWSTR g_Dx11BridgeArgListV58[2] = { g_Dx11BridgeGuidArgV58, g_Dx11BridgeVersionArgV58 };
 
-static bool Dx11BridgeReadEnvArgV57(const wchar_t* name, wchar_t* out, DWORD cap) {
+static bool Dx11BridgeReadEnvArgV58(const wchar_t* name, wchar_t* out, DWORD cap) {
   if (!name || !out || cap == 0) return false;
   out[0] = 0;
   const DWORD got = GetEnvironmentVariableW(name, out, cap);
   return got > 0 && got < cap && out[0] != 0;
 }
 
-static bool Dx11BridgeReadArgsFileV57(wchar_t* guidOut, DWORD guidCap, wchar_t* verOut, DWORD verCap) {
+static bool Dx11BridgeReadArgsFileV58(wchar_t* guidOut, DWORD guidCap, wchar_t* verOut, DWORD verCap) {
   wchar_t path[MAX_PATH] = {};
   if (GetModuleFileNameW(nullptr, path, MAX_PATH) == 0) return false;
   wchar_t* slash = wcsrchr(path, L'\\');
@@ -1407,17 +1462,17 @@ static bool Dx11BridgeReadArgsFileV57(wchar_t* guidOut, DWORD guidCap, wchar_t* 
   return guidOut[0] != 0 && verOut[0] != 0;
 }
 
-static LPWSTR* Dx11BridgeBuildFallbackArgListV57(int* pArgCount) {
+static LPWSTR* Dx11BridgeBuildFallbackArgListV58(int* pArgCount) {
   if (!pArgCount) return nullptr;
   *pArgCount = 0;
-  bool gotGuid = Dx11BridgeReadEnvArgV57(L"DX11_BRIDGE_GUID", g_Dx11BridgeGuidArgV57, _countof(g_Dx11BridgeGuidArgV57));
-  bool gotVer = Dx11BridgeReadEnvArgV57(L"DX11_BRIDGE_VERSION", g_Dx11BridgeVersionArgV57, _countof(g_Dx11BridgeVersionArgV57));
+  bool gotGuid = Dx11BridgeReadEnvArgV58(L"DX11_BRIDGE_GUID", g_Dx11BridgeGuidArgV58, _countof(g_Dx11BridgeGuidArgV58));
+  bool gotVer = Dx11BridgeReadEnvArgV58(L"DX11_BRIDGE_VERSION", g_Dx11BridgeVersionArgV58, _countof(g_Dx11BridgeVersionArgV58));
   if (!gotGuid || !gotVer) {
-    gotGuid = gotVer = Dx11BridgeReadArgsFileV57(g_Dx11BridgeGuidArgV57, _countof(g_Dx11BridgeGuidArgV57), g_Dx11BridgeVersionArgV57, _countof(g_Dx11BridgeVersionArgV57));
+    gotGuid = gotVer = Dx11BridgeReadArgsFileV58(g_Dx11BridgeGuidArgV58, _countof(g_Dx11BridgeGuidArgV58), g_Dx11BridgeVersionArgV58, _countof(g_Dx11BridgeVersionArgV58));
   }
   if (!gotGuid || !gotVer) return nullptr;
   *pArgCount = 2;
-  return g_Dx11BridgeArgListV57;
+  return g_Dx11BridgeArgListV58;
 }
 '@
 
@@ -1426,7 +1481,7 @@ static LPWSTR* Dx11BridgeBuildFallbackArgListV57(int* pArgCount) {
   $text = $text.Replace($marker, $helper + "`r`n" + $marker)
 
   $old = 'int argCount; LPWSTR* argList = CommandLineToArgvW(pCmdLine, &argCount); BRIDGE_ASSERT_LOG((argCount >= 2), "Command line argument count received to launch server is not as expected");'
-  $new = 'int argCount = 0; LPWSTR* argList = CommandLineToArgvW(pCmdLine, &argCount); bool dx11FallbackArgListV57 = false; if (argCount < 2 || argList == nullptr) { Logger::warn("DX11 bridge: missing/empty command line arguments; trying DX11_BRIDGE_GUID/DX11_BRIDGE_VERSION fallback."); if (argList) { LocalFree(argList); argList = nullptr; } argList = Dx11BridgeBuildFallbackArgListV57(&argCount); dx11FallbackArgListV57 = true; } if (argCount < 2 || argList == nullptr) { Logger::err("DX11 bridge: server still has no GUID/version after command-line and fallback parsing."); return 1; }'
+  $new = 'int argCount = 0; LPWSTR* argList = CommandLineToArgvW(pCmdLine, &argCount); bool dx11FallbackArgListV58 = false; if (argCount < 2 || argList == nullptr) { Logger::warn("DX11 bridge: missing/empty command line arguments; trying DX11_BRIDGE_GUID/DX11_BRIDGE_VERSION fallback."); if (argList) { LocalFree(argList); argList = nullptr; } argList = Dx11BridgeBuildFallbackArgListV58(&argCount); dx11FallbackArgListV58 = true; } if (argCount < 2 || argList == nullptr) { Logger::err("DX11 bridge: server still has no GUID/version after command-line and fallback parsing."); return 1; }'
   if ($text.Contains($old)) {
     $text = $text.Replace($old, $new)
   } else {
@@ -1437,7 +1492,7 @@ static LPWSTR* Dx11BridgeBuildFallbackArgListV57(int* pArgCount) {
     $text = $text2
   }
 
-  $text = $text.Replace('LocalFree(argList); initModuleBridge();', 'if (!dx11FallbackArgListV57 && argList) { LocalFree(argList); } initModuleBridge();')
+  $text = $text.Replace('LocalFree(argList); initModuleBridge();', 'if (!dx11FallbackArgListV58 && argList) { LocalFree(argList); } initModuleBridge();')
   Write-TextNoBom -Path $main -Text $text
   Log 'Patched bridge server: GUID/version command-line fallback for DX11 launcher.'
 }
@@ -1587,11 +1642,17 @@ function Write-BridgeVersionFile {
   New-Item -ItemType Directory -Force -Path $TrexDir | Out-Null
   $dst = Join-Path $TrexDir 'bridge_version.txt'
   Set-Content -LiteralPath $dst -Value $ver -Encoding ASCII -NoNewline
+  $guidPath = Join-Path $TrexDir 'dx11_bridge_guid.txt'
+  Set-Content -LiteralPath $guidPath -Value $script:Dx11BridgeFixedGuidV58 -Encoding ASCII -NoNewline
+  $argsPath = Join-Path $TrexDir 'dx11_bridge_args.txt'
+  Set-Content -LiteralPath $argsPath -Value ($script:Dx11BridgeFixedGuidV58 + "`r`n" + $ver + "`r`n") -Encoding ASCII
   Log "Wrote bridge version for x86 client/server launch: $dst = $ver"
+  Log "Wrote fixed DX11 bridge GUID fallback: $guidPath = $script:Dx11BridgeFixedGuidV58"
+  Log "Wrote DX11 bridge fallback args file: $argsPath"
 }
 
 function Stage-DualOutput([string]$RuntimeBuild, [hashtable]$BridgeBuilds) {
-  # v57: final user-facing layout is _output\x64 and _output\x86, matching the folder
+  # v58: final user-facing layout is _output\x64 and _output\x86, matching the folder
   # the repo already uses for the x64 Meson install tree. Do not delete _output\x64
   # when it is also the installed runtime tree; keep its support DLL layout intact.
   $outRoot = if ([IO.Path]::IsPathRooted($OutputRoot)) { $OutputRoot } else { Join-Path $Root $OutputRoot }
@@ -1652,7 +1713,7 @@ function Stage-DualOutput([string]$RuntimeBuild, [hashtable]$BridgeBuilds) {
   }
 
   $artifactReadme = @"
-DXVK Remix DX11 x86 Bridge Package v57
+DXVK Remix DX11 x86 Bridge Package v58
 ======================================
 
 Placement matches the NVIDIA x86 bridge package style:
@@ -1704,7 +1765,7 @@ No d3d9.dll is staged in this DX11 package.
   Remove-D3D9Artifacts $x86Out
 
   $x64Readme = @"
-DXVK Remix DX11 x64 output v57
+DXVK Remix DX11 x64 output v58
 ==============================
 
 Use this folder for native 64-bit DX11 games.
@@ -1717,10 +1778,10 @@ This folder intentionally matches the repo's normal _output\x64 structure:
 
 No d3d9.dll is staged here.
 "@
-  Set-Content -LiteralPath (Join-Path $x64Out 'README_X64_DX11_OUTPUT_V57.txt') -Encoding UTF8 -Value $x64Readme
+  Set-Content -LiteralPath (Join-Path $x64Out 'README_X64_DX11_OUTPUT_V58.txt') -Encoding UTF8 -Value $x64Readme
 
   $x86Readme = @"
-DXVK Remix DX11 x86 bridge output v57
+DXVK Remix DX11 x86 bridge output v58
 =====================================
 
 Use this folder for 32-bit DX11 games.
@@ -1739,11 +1800,11 @@ Root layout:
 
 No d3d9.dll is staged here.
 "@
-  Set-Content -LiteralPath (Join-Path $x86Out 'README_X86_DX11_BRIDGE_OUTPUT_V57.txt') -Encoding UTF8 -Value $x86Readme
+  Set-Content -LiteralPath (Join-Path $x86Out 'README_X86_DX11_BRIDGE_OUTPUT_V58.txt') -Encoding UTF8 -Value $x86Readme
 
   $pkgRoot = Join-Path $Root '_packages'
   New-Item -ItemType Directory -Force -Path $pkgRoot | Out-Null
-  $zip = Join-Path $pkgRoot 'dxvk-remix-dx11-output-x64-x86-v57.zip'
+  $zip = Join-Path $pkgRoot 'dxvk-remix-dx11-output-x64-x86-v58.zip'
   if (Test-Path -LiteralPath $zip) { Remove-Item -LiteralPath $zip -Force }
   Add-Type -AssemblyName System.IO.Compression.FileSystem
   [System.IO.Compression.ZipFile]::CreateFromDirectory($outRoot, $zip)
@@ -1754,7 +1815,7 @@ No d3d9.dll is staged here.
 }
 
 function Stage-Package([string]$RuntimeBuild, [hashtable]$BridgeBuilds) {
-  $pkg = Join-Path $Root '_packages\rtx-remix-dx11-x86-bridge-getgoing-v57'
+  $pkg = Join-Path $Root '_packages\rtx-remix-dx11-x86-bridge-getgoing-v58'
   if (Test-Path $pkg) { Remove-Item -LiteralPath $pkg -Recurse -Force }
   $trex = Join-Path $pkg '.trex'
   New-Item -ItemType Directory -Force -Path $trex | Out-Null
@@ -1788,7 +1849,7 @@ function Stage-Package([string]$RuntimeBuild, [hashtable]$BridgeBuilds) {
   foreach ($bad in @((Join-Path $pkg 'd3d9.dll'), (Join-Path $trex 'd3d9.dll'))) { if (Test-Path $bad) { Remove-Item -LiteralPath $bad -Force } }
 
   $readme = @"
-RTX Remix DX11 x86 Bridge Get-Going Package v57
+RTX Remix DX11 x86 Bridge Get-Going Package v58
 ================================================
 
 Layout:
@@ -1801,7 +1862,7 @@ Layout:
 
 No d3d9.dll is included.
 
-v57 fixes:
+v58 fixes:
   - launches NvRemixBridge.exe with required GUID and matching BRIDGE_VERSION arguments
   - writes .trex\bridge_version.txt from bridge server version.h
 - wires the x86 root d3d11.dll/dxgi.dll as the client bootstrap to .trex\NvRemixBridge.exe
@@ -1811,7 +1872,7 @@ v57 fixes:
   - continues if Meson exits nonzero after creating build.ninja
   - builds the x86 root d3d11.dll/dxgi.dll directly with HostX64\\x86 cl.exe, avoiding vcvarsall x64_x86 quoting failures
 "@
-  Set-Content -Path (Join-Path $pkg 'README_DX11_BRIDGE_GETGOING_V57.txt') -Value $readme -Encoding UTF8
+  Set-Content -Path (Join-Path $pkg 'README_DX11_BRIDGE_GETGOING_V58.txt') -Value $readme -Encoding UTF8
   $zip = "$pkg.zip"
   if (Test-Path $zip) { Remove-Item -LiteralPath $zip -Force }
   Add-Type -AssemblyName System.IO.Compression.FileSystem

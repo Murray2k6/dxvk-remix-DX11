@@ -62,8 +62,8 @@
 using namespace Commands;
 using namespace bridge_util;
 using namespace remixapi::util;
-#ifndef DX11_BRIDGE_REGISTER_HELPER_V57
-#define DX11_BRIDGE_REGISTER_HELPER_V57
+#ifndef DX11_BRIDGE_REGISTER_HELPER_V58
+#define DX11_BRIDGE_REGISTER_HELPER_V58
 static inline void BridgeRegisterRemixD3D11DeviceForDx11Bridge(IUnknown* pDeviceUnknown) {
   if (!GlobalOptions::getExposeRemixApi()) {
     return;
@@ -3427,25 +3427,25 @@ static inline bool initFileSys() {
 }
 
 
-// DX11_BRIDGE_ARG_FALLBACK_V57
+// DX11_BRIDGE_ARG_FALLBACK_V58
 // The stock bridge server expects wWinMain pCmdLine to contain exactly:
 //   <36-char-guid> <BRIDGE_VERSION_W>
 // For DX11 bridge bring-up we also accept DX11_BRIDGE_GUID/DX11_BRIDGE_VERSION
 // from the x86 launcher environment, and .trex\dx11_bridge_args.txt as a file
 // fallback. This prevents the server from exiting before the DX11 client IPC path
 // can be brought up.
-static wchar_t g_Dx11BridgeGuidArgV57[64] = {};
-static wchar_t g_Dx11BridgeVersionArgV57[256] = {};
-static LPWSTR g_Dx11BridgeArgListV57[2] = { g_Dx11BridgeGuidArgV57, g_Dx11BridgeVersionArgV57 };
+static wchar_t g_Dx11BridgeGuidArgV58[64] = {};
+static wchar_t g_Dx11BridgeVersionArgV58[256] = {};
+static LPWSTR g_Dx11BridgeArgListV58[2] = { g_Dx11BridgeGuidArgV58, g_Dx11BridgeVersionArgV58 };
 
-static bool Dx11BridgeReadEnvArgV57(const wchar_t* name, wchar_t* out, DWORD cap) {
+static bool Dx11BridgeReadEnvArgV58(const wchar_t* name, wchar_t* out, DWORD cap) {
   if (!name || !out || cap == 0) return false;
   out[0] = 0;
   const DWORD got = GetEnvironmentVariableW(name, out, cap);
   return got > 0 && got < cap && out[0] != 0;
 }
 
-static bool Dx11BridgeReadArgsFileV57(wchar_t* guidOut, DWORD guidCap, wchar_t* verOut, DWORD verCap) {
+static bool Dx11BridgeReadArgsFileV58(wchar_t* guidOut, DWORD guidCap, wchar_t* verOut, DWORD verCap) {
   wchar_t path[MAX_PATH] = {};
   if (GetModuleFileNameW(nullptr, path, MAX_PATH) == 0) return false;
   wchar_t* slash = wcsrchr(path, L'\\');
@@ -3489,17 +3489,17 @@ static bool Dx11BridgeReadArgsFileV57(wchar_t* guidOut, DWORD guidCap, wchar_t* 
   return guidOut[0] != 0 && verOut[0] != 0;
 }
 
-static LPWSTR* Dx11BridgeBuildFallbackArgListV57(int* pArgCount) {
+static LPWSTR* Dx11BridgeBuildFallbackArgListV58(int* pArgCount) {
   if (!pArgCount) return nullptr;
   *pArgCount = 0;
-  bool gotGuid = Dx11BridgeReadEnvArgV57(L"DX11_BRIDGE_GUID", g_Dx11BridgeGuidArgV57, _countof(g_Dx11BridgeGuidArgV57));
-  bool gotVer = Dx11BridgeReadEnvArgV57(L"DX11_BRIDGE_VERSION", g_Dx11BridgeVersionArgV57, _countof(g_Dx11BridgeVersionArgV57));
+  bool gotGuid = Dx11BridgeReadEnvArgV58(L"DX11_BRIDGE_GUID", g_Dx11BridgeGuidArgV58, _countof(g_Dx11BridgeGuidArgV58));
+  bool gotVer = Dx11BridgeReadEnvArgV58(L"DX11_BRIDGE_VERSION", g_Dx11BridgeVersionArgV58, _countof(g_Dx11BridgeVersionArgV58));
   if (!gotGuid || !gotVer) {
-    gotGuid = gotVer = Dx11BridgeReadArgsFileV57(g_Dx11BridgeGuidArgV57, _countof(g_Dx11BridgeGuidArgV57), g_Dx11BridgeVersionArgV57, _countof(g_Dx11BridgeVersionArgV57));
+    gotGuid = gotVer = Dx11BridgeReadArgsFileV58(g_Dx11BridgeGuidArgV58, _countof(g_Dx11BridgeGuidArgV58), g_Dx11BridgeVersionArgV58, _countof(g_Dx11BridgeVersionArgV58));
   }
   if (!gotGuid || !gotVer) return nullptr;
   *pArgCount = 2;
-  return g_Dx11BridgeArgListV57;
+  return g_Dx11BridgeArgListV58;
 }
 int WINAPI wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance, _In_ PWSTR pCmdLine, _In_ int nCmdShow) {
   gTimeStart = std::chrono::high_resolution_clock::now();
@@ -3525,7 +3525,7 @@ int WINAPI wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance, 
   Logger::warn("Running in x86 mode! Are you sure this is what you want? RTX will not work this way, please run the 64-bit server instead!");
 #endif
 
-  int argCount = 0; LPWSTR* argList = CommandLineToArgvW(pCmdLine, &argCount); bool dx11FallbackArgListV57 = false; if (argCount < 2 || argList == nullptr) { Logger::warn("DX11 bridge: missing/empty command line arguments; trying DX11_BRIDGE_GUID/DX11_BRIDGE_VERSION fallback."); if (argList) { LocalFree(argList); argList = nullptr; } argList = Dx11BridgeBuildFallbackArgListV57(&argCount); dx11FallbackArgListV57 = true; } if (argCount < 2 || argList == nullptr) { Logger::err("DX11 bridge: server still has no GUID/version after command-line and fallback parsing."); return 1; }
+  int argCount = 0; LPWSTR* argList = CommandLineToArgvW(pCmdLine, &argCount); bool dx11FallbackArgListV58 = false; if (argCount < 2 || argList == nullptr) { Logger::warn("DX11 bridge: missing/empty command line arguments; trying DX11_BRIDGE_GUID/DX11_BRIDGE_VERSION fallback."); if (argList) { LocalFree(argList); argList = nullptr; } argList = Dx11BridgeBuildFallbackArgListV58(&argCount); dx11FallbackArgListV58 = true; } if (argCount < 2 || argList == nullptr) { Logger::err("DX11 bridge: server still has no GUID/version after command-line and fallback parsing."); return 1; }
   if (gUniqueIdentifier.setGuid(&argList[0])) {
     Logger::info("Launched server with GUID " + gUniqueIdentifier.toString());
   } else {

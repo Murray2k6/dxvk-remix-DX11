@@ -7,13 +7,13 @@ param(
 )
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
-function Log([string]$m) { Write-Host "[dx11-visual-v57] $m" }
-function Die([string]$m) { throw "[dx11-visual-v57] $m" }
+function Log([string]$m) { Write-Host "[dx11-visual-v58] $m" }
+function Die([string]$m) { throw "[dx11-visual-v58] $m" }
 $Root = Split-Path -Parent $MyInvocation.MyCommand.Path
 if (-not (Test-Path (Join-Path $Root 'src\d3d11\d3d11_rtx.cpp'))) {
   Die "Run this from the dxvk-remix-DX11 repo root. Could not find src\d3d11\d3d11_rtx.cpp"
 }
-$backup = Join-Path $Root ('_dx11_visual_v57_backup_' + (Get-Date -Format 'yyyyMMdd_HHmmss'))
+$backup = Join-Path $Root ('_dx11_visual_v58_backup_' + (Get-Date -Format 'yyyyMMdd_HHmmss'))
 New-Item -ItemType Directory -Force -Path $backup | Out-Null
 function Read-Text([string]$Path) {
   return [System.IO.File]::ReadAllText($Path)
@@ -41,7 +41,7 @@ function Replace-Once([string]$Path, [string]$Find, [string]$Replace, [string]$N
 function Write-Dx11Config([string]$Dir) {
   New-Item -ItemType Directory -Force -Path $Dir | Out-Null
   $rtx = @'
-# DX11 visual/runtime fix pack v57
+# DX11 visual/runtime fix pack v58
 # Stops the option-layer blocker seen in the logs by setting the raytrace modes explicitly.
 # The logs showed Auto failed to apply renderPassIntegrateIndirectRaytraceMode expected=2.
 rtx.raytraceModePreset = 0
@@ -54,7 +54,7 @@ rtx.dx11.forceInjection = True
 rtx.taggableUntexturedDraws = True
 '@
   $dxvk = @'
-# DX11 visual/runtime fix pack v57
+# DX11 visual/runtime fix pack v58
 # Keep presentation immediate like the current logs, but avoid stale HUD/output ambiguity.
 dxgi.deferSurfaceCreation = True
 dxgi.tearFree = Auto
@@ -89,10 +89,10 @@ if (-not $NoConfigPatch) {
     if (Test-Path $d) { Write-Dx11Config $d }
   }
 }
-Log "v57 visual/source fix pass complete. Backup: $backup"
+Log "v58 visual/source fix pass complete. Backup: $backup"
 if ($Build) {
-  $build = Join-Path $Root 'Build-DX11-DualOutput-V57.ps1'
-  if (-not (Test-Path $build)) { Die "Build-DX11-DualOutput-V57.ps1 not found next to this patcher." }
+  $build = Join-Path $Root 'Build-DX11-DualOutput-V58.ps1'
+  if (-not (Test-Path $build)) { Die "Build-DX11-DualOutput-V58.ps1 not found next to this patcher." }
   & powershell -NoProfile -ExecutionPolicy Bypass -File $build @($Clean ? '-Clean' : $null)
   if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 }
