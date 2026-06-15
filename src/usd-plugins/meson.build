@@ -1,4 +1,4 @@
-﻿fs = import('fs')
+fs = import('fs')
 
 usd_schema_plugins_cpp_compiler = meson.get_compiler('cpp')
 if usd_schema_plugins_cpp_compiler.get_id() != 'msvc'
@@ -34,7 +34,19 @@ endif
 fs.read(join_paths(meson.current_source_dir(), 'packman-external.xml'))
 
 usd_schema_plugins_python = join_paths(meson.current_source_dir(), '_external', 'python', 'python.exe')
-usd_schema_plugins_nvusd_dir = usd_schema_plugins_cpu_family == 'x86' ? (usd_schema_plugins_isdebug ? '_external/nv_usd_x86/debug/' : '_external/nv_usd_x86/release/') : (usd_schema_plugins_isdebug ? '_external/nv_usd/debug/' : '_external/nv_usd/release/')
+if usd_schema_plugins_cpu_family == 'x86'
+  if usd_schema_plugins_isdebug
+    usd_schema_plugins_nvusd_dir = '_external/nv_usd_x86/debug/'
+  else
+    usd_schema_plugins_nvusd_dir = '_external/nv_usd_x86/release/'
+  endif
+else
+  if usd_schema_plugins_isdebug
+    usd_schema_plugins_nvusd_dir = '_external/nv_usd/debug/'
+  else
+    usd_schema_plugins_nvusd_dir = '_external/nv_usd/release/'
+  endif
+endif
 usd_schema_plugins_nvusd_libdir = join_paths(meson.current_source_dir(), usd_schema_plugins_nvusd_dir, 'lib')
 usd_schema_plugins_nvusd_bindir = join_paths(meson.current_source_dir(), usd_schema_plugins_nvusd_dir, 'bin')
 usd_libpython_dir = join_paths(usd_schema_plugins_nvusd_libdir, 'python')

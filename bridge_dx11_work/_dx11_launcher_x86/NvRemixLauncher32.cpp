@@ -77,9 +77,8 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
   wchar_t root[MAX_PATH] = {};
   dirnameOf(self, root, MAX_PATH);
 
-  appendLog(root, L"NvRemixLauncher32 DX11 started.");
+  appendLog(root, L"NvRemixLauncher32 DX11 client started.");
 
-  // Match the x86 Remix package placement: launcher in root, x64 runtime/server in .trex.
   wchar_t trex[MAX_PATH] = {};
   lstrcpynW(trex, root, MAX_PATH);
   lstrcatW(trex, L".trex\\");
@@ -132,7 +131,6 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
     return 5;
   }
 
-  // Inherit a PATH where the game can resolve root x86 DLLs and .trex support DLLs.
   wchar_t oldPath[32767] = {};
   GetEnvironmentVariableW(L"PATH", oldPath, 32767);
   wchar_t newPath[32767] = {};
