@@ -61,9 +61,9 @@
 using namespace Commands;
 using namespace bridge_util;
 using namespace remixapi::util;
-#ifndef DX11_BRIDGE_SKIP_LEGACY_D3D9_REGISTER_V122
-#define DX11_BRIDGE_SKIP_LEGACY_D3D9_REGISTER_V122
-static inline remixapi_ErrorCode BridgeSkipLegacyD3D9RegisterForDx11HeaderV122() {
+#ifndef DX11_BRIDGE_SKIP_LEGACY_D3D9_REGISTER_V125
+#define DX11_BRIDGE_SKIP_LEGACY_D3D9_REGISTER_V125
+static inline remixapi_ErrorCode BridgeSkipLegacyD3D9RegisterForDx11HeaderV125() {
   Logger::info("DX11 bridge: skipped legacy dxvk_RegisterD3D9Device call because the active Remix API header is DX11 and has no D3D9 registration member.");
   return REMIXAPI_ERROR_CODE_SUCCESS;
 }
@@ -339,7 +339,7 @@ void ProcessDeviceCommandQueue() {
           gpD3DDevices[pHandle] = pD3DDevice;
           if(GlobalOptions::getExposeRemixApi()) {
             remixapi::g_device = pD3DDevice;
-            BridgeSkipLegacyD3D9RegisterForDx11HeaderV122();
+            BridgeSkipLegacyD3D9RegisterForDx11HeaderV125();
           }
         }
 
@@ -374,7 +374,7 @@ void ProcessDeviceCommandQueue() {
           gpD3DDevices[pHandle] = (IDirect3DDevice9Ex*) pD3DDevice;
           if(GlobalOptions::getExposeRemixApi()) {
             remixapi::g_device = (IDirect3DDevice9Ex*) pD3DDevice;
-            BridgeSkipLegacyD3D9RegisterForDx11HeaderV122();
+            BridgeSkipLegacyD3D9RegisterForDx11HeaderV125();
           }
         }
 

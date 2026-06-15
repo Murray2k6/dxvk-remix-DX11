@@ -24,6 +24,14 @@
 
 using namespace bridge_util;
 
+// DX11_V125_UNIFY_CLIENT_GUID_FOR_IPC
+// The bridge IPC utilities and the launched x64 server must use the same global
+// gUniqueIdentifier and gbBridgeRunning. Do not create a private namespace-static
+// copy here, or the client will initialize queues under one GUID and launch the
+// server under another GUID.
+extern Guid gUniqueIdentifier;
+extern bool gbBridgeRunning;
+
 namespace dx11_bridge_client {
 
 static HMODULE gModule = nullptr;
@@ -31,11 +39,9 @@ static std::mutex gAttachMutex;
 static std::mutex gServerMutex;
 static bool gAttached = false;
 static std::string gRemixFolder;
-static Guid gUniqueIdentifier;
 static Process* gpServer = nullptr;
 static NamedSemaphore* gpPresent = nullptr;
 static std::chrono::steady_clock::time_point gTimeStart;
-bool gbBridgeRunning = true;
 
 static std::string GetFolderFromModule(HMODULE moduleHandle) {
   char path[MAX_PATH] = {};
@@ -70,7 +76,7 @@ void LogLine(const char* tag, const char* text) {
   }
 }
 
-// DX11_V122_DEFINE_SERVER_MESSAGE_CHANNEL_FOR_DX9_ACK
+// DX11_V125_DEFINE_SERVER_MESSAGE_CHANNEL_FOR_DX9_ACK
 // DX9 gets this helper from client/message_channels.h. The generated DX11
 // bridge client is standalone, so it defines the same server-side message
 // channel setup locally before using the DX9 Bridge_Ack sequence.
@@ -174,13 +180,13 @@ bool EnsureServer() {
   }
 
   BridgeState::setServerState(BridgeState::ProcessState::Init);
-  LogLine("bridge", "Sending Bridge_Syn and waiting for Bridge_Ack from x64 server on DeviceBridge using DX9 ACK sequence. DX11_V122_USE_DX9_BRIDGE_ACK_SEQUENCE");
+  LogLine("bridge", "Sending Bridge_Syn and waiting for Bridge_Ack from x64 server on DeviceBridge using DX9 ACK sequence. DX11_V125_USE_DX9_BRIDGE_ACK_SEQUENCE");
   {
     ClientMessage syn(Commands::Bridge_Syn, reinterpret_cast<uintptr_t>(gpServer->GetCurrentProcessHandle()));
   }
   BridgeState::setClientState(BridgeState::ProcessState::Handshaking);
 
-  // DX11_V122_USE_DX9_BRIDGE_ACK_SEQUENCE
+  // DX11_V125_USE_DX9_BRIDGE_ACK_SEQUENCE
   // Match NVIDIA's working DX9 bridge handshake:
   //   Bridge_Syn -> DeviceBridge::waitForCommand(Bridge_Ack)
   //   DeviceBridge::pop_front()
