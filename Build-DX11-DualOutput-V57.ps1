@@ -19,9 +19,9 @@ $Root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $LogDir = Join-Path $Root '_build_logs'
 New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
 
-function Log([string]$m) { Write-Host "[dx11-output-v51] $m" }
-function Warn([string]$m) { Write-Host "[dx11-output-v51] WARNING: $m" -ForegroundColor Yellow }
-function Die([string]$m) { throw "[dx11-output-v51] $m" }
+function Log([string]$m) { Write-Host "[dx11-output-v57] $m" }
+function Warn([string]$m) { Write-Host "[dx11-output-v57] WARNING: $m" -ForegroundColor Yellow }
+function Die([string]$m) { throw "[dx11-output-v57] $m" }
 function Get-CommandFilePath([string]$Name) {
   $cmds = @(Get-Command $Name -ErrorAction SilentlyContinue)
   foreach ($cmd in $cmds) {
@@ -326,14 +326,14 @@ Detected D3D9 register in header: $hasD3D9
     return
   }
 
-  if ($text -notmatch 'DX11_BRIDGE_REGISTER_HELPER_V51') {
+  if ($text -notmatch 'DX11_BRIDGE_REGISTER_HELPER_V57') {
     if ($text -notmatch '#include\s+<d3d11\.h>') {
       $text = $text -replace '#include\s+<d3d9\.h>', "#include <d3d9.h>`r`n#include <d3d11.h>"
     }
     $helper = @'
 
-#ifndef DX11_BRIDGE_REGISTER_HELPER_V51
-#define DX11_BRIDGE_REGISTER_HELPER_V51
+#ifndef DX11_BRIDGE_REGISTER_HELPER_V57
+#define DX11_BRIDGE_REGISTER_HELPER_V57
 static inline void BridgeRegisterRemixD3D11DeviceForDx11Bridge(IUnknown* pDeviceUnknown) {
   if (!GlobalOptions::getExposeRemixApi()) {
     return;
@@ -398,17 +398,20 @@ function Ensure-DX11ClientSources {
 
   $packClient = Join-Path $PackDir 'src\client_dx11'
   $copied = $false
+  # v57: always refresh the generated DX11 client source. Older runs left stale
+  # client DLL source that launched NvRemixBridge.exe with the wrong command line.
+  # Do not trust existing bridge_dx11_work\src\client_dx11 contents.
   if (Test-Path -LiteralPath $packClient -PathType Container) {
     $items = @(Get-ChildItem -LiteralPath $packClient -Force -ErrorAction SilentlyContinue)
     if ($items.Count -gt 0) {
       Copy-Item -Path (Join-Path $packClient '*') -Destination $DstClient -Recurse -Force -ErrorAction Stop
       $copied = $true
-      Log "Copied DX11 client source from bundled folder: $packClient"
+      Log "Refreshed DX11 client source from bundled folder: $packClient"
     }
   }
 
   if (!$copied) {
-    Log 'Bundled src\client_dx11 folder was not found next to the script; writing embedded DX11 client source files.'
+    Log 'Writing embedded DX11 client source files with v57 GUID/version bridge launch fix.'
     Write-TextNoBom -Path (Join-Path $DstClient 'd3d11_dx11bridge.cpp') -Text @'
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -620,6 +623,8 @@ inline bool readBridgeVersion(char* out, DWORD cap) {
 
 inline bool makeGuidString(char* out, DWORD cap) {
   if (!out || cap < 37) return false;
+  out[0] = 0;
+
   GUID g = {};
   HRESULT hr = CoCreateGuid(&g);
   if (FAILED(hr)) {
@@ -628,15 +633,56 @@ inline bool makeGuidString(char* out, DWORD cap) {
     logLine("bridge", msg);
     return false;
   }
-  sprintf_s(out, cap, "%08x-%04x-%04x-%02x%02x-%02x%02x%02x%02x%02x%02x",
-    static_cast<unsigned int>(g.Data1),
-    static_cast<unsigned int>(g.Data2),
-    static_cast<unsigned int>(g.Data3),
-    static_cast<unsigned int>(g.Data4[0]), static_cast<unsigned int>(g.Data4[1]),
-    static_cast<unsigned int>(g.Data4[2]), static_cast<unsigned int>(g.Data4[3]),
-    static_cast<unsigned int>(g.Data4[4]), static_cast<unsigned int>(g.Data4[5]),
-    static_cast<unsigned int>(g.Data4[6]), static_cast<unsigned int>(g.Data4[7]));
+
+  wchar_t wideGuid[64] = {};
+  int wideLen = StringFromGUID2(g, wideGuid, 64); // produces {xxxxxxxx-....}
+  if (wideLen <= 0) {
+    logLine("bridge", "StringFromGUID2 failed.");
+    return false;
+  }
+
+  char tmp[64] = {};
+  int mb = WideCharToMultiByte(CP_ACP, 0, wideGuid, -1, tmp, sizeof(tmp), nullptr, nullptr);
+  if (mb <= 0) {
+    logLine("bridge", "WideCharToMultiByte failed for GUID.");
+    return false;
+  }
+
+  // NVIDIA bridge server's Guid::setGuid expects exactly 36 chars, no braces.
+  // StringFromGUID2 returns braces, so strip them deterministically.
+  size_t len = strlen(tmp);
+  if (len == 38 && tmp[0] == '{' && tmp[37] == '}') {
+    memcpy(out, tmp + 1, 36);
+    out[36] = 0;
+  } else if (len == 36) {
+    lstrcpynA(out, tmp, cap);
+  } else {
+    char msg[128] = {};
+    wsprintfA(msg, "Unexpected GUID string length %lu", static_cast<unsigned long>(len));
+    logLine("bridge", msg);
+    return false;
+  }
+
+  char msg[128] = {};
+  wsprintfA(msg, "Generated bridge GUID '%s' len=%lu", out, static_cast<unsigned long>(strlen(out)));
+  logLine("bridge", msg);
   return strlen(out) == 36;
+}
+
+inline void appendLaunchLog(const char* text) {
+  char dir[MAX_PATH] = {};
+  getDllFolder(dir, MAX_PATH);
+  char path[MAX_PATH] = {};
+  lstrcpynA(path, dir, MAX_PATH);
+  lstrcatA(path, "dx11_bridge_launch.log");
+  HANDLE h = CreateFileA(path, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (h == INVALID_HANDLE_VALUE) return;
+  DWORD wrote = 0;
+  if (text) WriteFile(h, text, (DWORD)strlen(text), &wrote, nullptr);
+  const char* crlf = "
+";
+  WriteFile(h, crlf, 2, &wrote, nullptr);
+  CloseHandle(h);
 }
 
 inline void launchBridgeServerOnce() {
@@ -644,17 +690,19 @@ inline void launchBridgeServerOnce() {
   if (InterlockedCompareExchange(&launched, 1, 0) != 0) return;
 
   char mutexName[96] = {};
-  sprintf_s(mutexName, sizeof(mutexName), "Local\\DxvkRemixDx11BridgeLauncher_%lu", GetCurrentProcessId());
+  sprintf_s(mutexName, sizeof(mutexName), "Local\DxvkRemixDx11BridgeLauncher_%lu", GetCurrentProcessId());
   static HANDLE launchMutex = nullptr;
   launchMutex = CreateMutexA(nullptr, TRUE, mutexName);
   if (!launchMutex) {
     char msg[128] = {};
     wsprintfA(msg, "CreateMutex failed err=%lu", GetLastError());
     logLine("bridge", msg);
+    appendLaunchLog(msg);
     return;
   }
   if (GetLastError() == ERROR_ALREADY_EXISTS) {
     logLine("bridge", "Bridge server launch already owned by another DX11 bridge DLL in this process.");
+    appendLaunchLog("Bridge server launch already owned by another DX11 bridge DLL in this process.");
     return;
   }
 
@@ -662,38 +710,77 @@ inline void launchBridgeServerOnce() {
   getDllFolder(dir, MAX_PATH);
   char server[MAX_PATH] = {};
   lstrcpynA(server, dir, MAX_PATH);
-  lstrcatA(server, ".trex\\NvRemixBridge.exe");
+  lstrcatA(server, ".trex\NvRemixBridge.exe");
 
   if (!fileExists(server)) {
-    logLine("bridge", "No .trex\\NvRemixBridge.exe next to d3d11.dll/dxgi.dll; running DX11 passthrough only.");
+    logLine("bridge", "No .trex\NvRemixBridge.exe next to d3d11.dll/dxgi.dll; running DX11 passthrough only.");
+    appendLaunchLog("No .trex\NvRemixBridge.exe next to d3d11.dll/dxgi.dll; running DX11 passthrough only.");
     return;
   }
 
   char version[128] = {};
-  if (!readBridgeVersion(version, sizeof(version))) return;
+  if (!readBridgeVersion(version, sizeof(version))) {
+    appendLaunchLog("Missing bridge_version.txt; cannot launch NvRemixBridge.exe with matching version.");
+    return;
+  }
 
   char guid[64] = {};
-  if (!makeGuidString(guid, sizeof(guid))) return;
+  if (!makeGuidString(guid, sizeof(guid))) {
+    appendLaunchLog("GUID generation failed; not launching NvRemixBridge.exe.");
+    return;
+  }
 
-  char cmd[MAX_PATH + 256] = {};
-  sprintf_s(cmd, sizeof(cmd), "\"%s\" %s %s", server, guid, version);
+  // NVIDIA bridge bootstrap rule: the server must see pCmdLine as:
+  //   <GUID> <BRIDGE_VERSION>
+  // Its server main parses CommandLineToArgvW(pCmdLine), then expects
+  // argList[0] to be the 36-char GUID and argList[1] to be BRIDGE_VERSION_W.
+  // This DLL is the bridge client bootstrap. NvRemixLauncher32.exe is only an
+  // optional injector for games that refuse to load the root DLL by search order.
+  // Use lpApplicationName=server and lpCommandLine=GUID VERSION so WinMain's
+  // pCmdLine is exactly what NvRemixBridge.exe expects, with no executable path
+  // accidentally becoming argList[0].
+  char cmd[MAX_PATH + 320] = {};
+  sprintf_s(cmd, sizeof(cmd), "%s %s", guid, version);
 
-  char logMsg[256] = {};
-  sprintf_s(logMsg, sizeof(logMsg), "Launching .trex\\NvRemixBridge.exe with GUID %s and version %s", guid, version);
+  // Also provide fallback paths for the patched DX11 bridge server.
+  // These are inherited by NvRemixBridge.exe and used only if pCmdLine is empty
+  // or a launcher/CRT strips it unexpectedly.
+  SetEnvironmentVariableA("DX11_BRIDGE_GUID", guid);
+  SetEnvironmentVariableA("DX11_BRIDGE_VERSION", version);
+  SetEnvironmentVariableA("DX11_BRIDGE_MODE", "d3d11");
+
+  char argFile[MAX_PATH] = {};
+  lstrcpynA(argFile, dir, MAX_PATH);
+  lstrcatA(argFile, ".trex\dx11_bridge_args.txt");
+  HANDLE af = CreateFileA(argFile, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (af != INVALID_HANDLE_VALUE) {
+    DWORD wrote = 0;
+    WriteFile(af, guid, (DWORD)strlen(guid), &wrote, nullptr);
+    WriteFile(af, "\r\n", 2, &wrote, nullptr);
+    WriteFile(af, version, (DWORD)strlen(version), &wrote, nullptr);
+    WriteFile(af, "\r\n", 2, &wrote, nullptr);
+    CloseHandle(af);
+  }
+
+  char logMsg[768] = {};
+  sprintf_s(logMsg, sizeof(logMsg), "Launching NVIDIA-style DX11 client->server app='%s' args='%s' cwd='%s' envGUID='%s' envVersion='%s' argsFile='%s'", server, cmd, dir, guid, version, argFile);
   logLine("bridge", logMsg);
+  appendLaunchLog(logMsg);
 
   STARTUPINFOA si = {};
   PROCESS_INFORMATION pi = {};
   si.cb = sizeof(si);
-  BOOL ok = CreateProcessA(nullptr, cmd, nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, dir, &si, &pi);
+  BOOL ok = CreateProcessA(server, cmd, nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, dir, &si, &pi);
   if (ok) {
     CloseHandle(pi.hThread);
     CloseHandle(pi.hProcess);
-    logLine("bridge", "Started .trex\\NvRemixBridge.exe with GUID/version arguments.");
+    logLine("bridge", "Started .trex\NvRemixBridge.exe with GUID/version arguments.");
+    appendLaunchLog("Started .trex\NvRemixBridge.exe with GUID/version arguments.");
   } else {
     char msg[256] = {};
     wsprintfA(msg, "Failed to start NvRemixBridge.exe err=%lu", GetLastError());
     logLine("bridge", msg);
+    appendLaunchLog(msg);
   }
 }
 
@@ -879,6 +966,7 @@ function Prepare-DX11BridgeSource([string]$PackDir) {
     }
   }
   Patch-BridgeServerRegisterD3D11 -BridgeWork $work
+  Patch-BridgeServerDx11ArgFallback -BridgeWork $work
   return $work
 }
 
@@ -1039,7 +1127,319 @@ function Build-DX11ClientDirect([string]$VsInstall, [string]$ClientSrc) {
   if (!(Test-Path -LiteralPath $dxgiDll -PathType Leaf)) { Die "dxgi client link finished but output DLL is missing: $dxgiDll" }
   Test-PeMachine $d3d11Dll 'x86'
   Test-PeMachine $dxgiDll 'x86'
+
+
+  # v57: build the NVIDIA-style 32-bit launcher EXE at the same root level
+  # as the x86 DX11 bridge DLLs. This mirrors the public x86 Remix package
+  # placement: root launcher + root interposer DLLs + .trex x64 runtime/server.
+  $launcherCpp = Join-Path $out 'NvRemixLauncher32.cpp'
+  $launcherObj = Join-Path $out 'NvRemixLauncher32.obj'
+  $launcherExe = Join-Path $out 'NvRemixLauncher32.exe'
+  $launcherPdb = Join-Path $out 'NvRemixLauncher32.pdb'
+  Set-Content -LiteralPath $launcherCpp -Encoding UTF8 -Value @'
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#include <shellapi.h>
+#include <stdio.h>
+#include <wchar.h>
+
+static void dirnameOf(const wchar_t* in, wchar_t* out, DWORD cap) {
+  out[0] = 0;
+  if (!in || !in[0]) return;
+  lstrcpynW(out, in, cap);
+  wchar_t* slash = wcsrchr(out, L'\\');
+  if (slash) slash[1] = 0;
+}
+
+static void appendLog(const wchar_t* root, const wchar_t* msg) {
+  wchar_t path[MAX_PATH] = {};
+  lstrcpynW(path, root, MAX_PATH);
+  lstrcatW(path, L"NvRemixLauncher32.log");
+  HANDLE h = CreateFileW(path, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (h == INVALID_HANDLE_VALUE) return;
+  SYSTEMTIME st; GetLocalTime(&st);
+  char line[4096] = {};
+  char m[3072] = {};
+  WideCharToMultiByte(CP_UTF8, 0, msg ? msg : L"", -1, m, sizeof(m), nullptr, nullptr);
+  int n = sprintf_s(line, sizeof(line), "[%04u-%02u-%02u %02u:%02u:%02u.%03u] %s\r\n",
+    st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, m);
+  DWORD wrote = 0;
+  if (n > 0) WriteFile(h, line, (DWORD)n, &wrote, nullptr);
+  CloseHandle(h);
+}
+
+static bool existsFile(const wchar_t* p) {
+  DWORD a = GetFileAttributesW(p);
+  return a != INVALID_FILE_ATTRIBUTES && !(a & FILE_ATTRIBUTE_DIRECTORY);
+}
+
+static bool isExcludedExe(const wchar_t* name) {
+  return _wcsicmp(name, L"NvRemixLauncher32.exe") == 0 ||
+         _wcsicmp(name, L"NvRemixBridge.exe") == 0 ||
+         _wcsicmp(name, L"dxvk-remix.exe") == 0 ||
+         _wcsicmp(name, L"setup.exe") == 0 ||
+         _wcsicmp(name, L"unins000.exe") == 0;
+}
+
+static bool autoFindGameExe(const wchar_t* root, wchar_t* out, DWORD cap) {
+  wchar_t pattern[MAX_PATH] = {};
+  lstrcpynW(pattern, root, MAX_PATH);
+  lstrcatW(pattern, L"*.exe");
+  WIN32_FIND_DATAW fd = {};
+  HANDLE h = FindFirstFileW(pattern, &fd);
+  if (h == INVALID_HANDLE_VALUE) return false;
+  do {
+    if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) && !isExcludedExe(fd.cFileName)) {
+      lstrcpynW(out, root, cap);
+      lstrcatW(out, fd.cFileName);
+      FindClose(h);
+      return true;
+    }
+  } while (FindNextFileW(h, &fd));
+  FindClose(h);
+  return false;
+}
+
+static void quoteAppend(wchar_t* dst, DWORD cap, const wchar_t* s) {
+  lstrcatW(dst, L"\"");
+  lstrcatW(dst, s);
+  lstrcatW(dst, L"\"");
+}
+
+static bool pathLooksRooted(const wchar_t* p) {
+  return (p && ((wcslen(p) > 2 && p[1] == L':') || (p[0] == L'\\' && p[1] == L'\\')));
+}
+
+int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
+  wchar_t self[MAX_PATH] = {};
+  GetModuleFileNameW(nullptr, self, MAX_PATH);
+  wchar_t root[MAX_PATH] = {};
+  dirnameOf(self, root, MAX_PATH);
+
+  appendLog(root, L"NvRemixLauncher32 DX11 started.");
+
+  // Match the x86 Remix package placement: launcher in root, x64 runtime/server in .trex.
+  wchar_t trex[MAX_PATH] = {};
+  lstrcpynW(trex, root, MAX_PATH);
+  lstrcatW(trex, L".trex\\");
+
+  wchar_t d3d11[MAX_PATH] = {}, dxgi[MAX_PATH] = {}, bridge[MAX_PATH] = {};
+  lstrcpynW(d3d11, root, MAX_PATH); lstrcatW(d3d11, L"d3d11.dll");
+  lstrcpynW(dxgi,  root, MAX_PATH); lstrcatW(dxgi,  L"dxgi.dll");
+  lstrcpynW(bridge, trex, MAX_PATH); lstrcatW(bridge, L"NvRemixBridge.exe");
+
+  if (!existsFile(d3d11) || !existsFile(dxgi)) {
+    appendLog(root, L"ERROR: root d3d11.dll/dxgi.dll missing beside launcher.");
+    MessageBoxW(nullptr, L"DX11 Remix root d3d11.dll/dxgi.dll is missing beside NvRemixLauncher32.exe.", L"DX11 Remix Launcher", MB_ICONERROR);
+    return 2;
+  }
+  if (!existsFile(bridge)) {
+    appendLog(root, L"ERROR: .trex\\NvRemixBridge.exe missing.");
+    MessageBoxW(nullptr, L".trex\\NvRemixBridge.exe is missing beside the DX11 Remix package.", L"DX11 Remix Launcher", MB_ICONERROR);
+    return 3;
+  }
+
+  int argc = 0;
+  LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+
+  wchar_t target[MAX_PATH] = {};
+  wchar_t extra[4096] = {};
+  if (argv && argc >= 2) {
+    if (pathLooksRooted(argv[1])) {
+      lstrcpynW(target, argv[1], MAX_PATH);
+    } else {
+      lstrcpynW(target, root, MAX_PATH);
+      lstrcatW(target, argv[1]);
+    }
+    for (int i = 2; i < argc; i++) {
+      if (extra[0]) lstrcatW(extra, L" ");
+      quoteAppend(extra, 4096, argv[i]);
+    }
+  } else {
+    if (!autoFindGameExe(root, target, MAX_PATH)) {
+      appendLog(root, L"ERROR: no game exe argument and no auto-detected exe in package root.");
+      MessageBoxW(nullptr, L"Put NvRemixLauncher32.exe beside the 32-bit DX11 game exe, or run:\nNvRemixLauncher32.exe Game.exe", L"DX11 Remix Launcher", MB_ICONERROR);
+      if (argv) LocalFree(argv);
+      return 4;
+    }
+  }
+  if (argv) LocalFree(argv);
+
+  if (!existsFile(target)) {
+    appendLog(root, L"ERROR: requested game exe does not exist.");
+    MessageBoxW(nullptr, L"Requested game executable was not found.", L"DX11 Remix Launcher", MB_ICONERROR);
+    return 5;
+  }
+
+  // Inherit a PATH where the game can resolve root x86 DLLs and .trex support DLLs.
+  wchar_t oldPath[32767] = {};
+  GetEnvironmentVariableW(L"PATH", oldPath, 32767);
+  wchar_t newPath[32767] = {};
+  lstrcpynW(newPath, root, 32767);
+  lstrcatW(newPath, L";");
+  lstrcatW(newPath, trex);
+  lstrcatW(newPath, L";");
+  lstrcatW(newPath, oldPath);
+  SetEnvironmentVariableW(L"PATH", newPath);
+  SetEnvironmentVariableW(L"DXVK_REMIX_DX11_BRIDGE", L"1");
+  SetEnvironmentVariableW(L"DXVK_REMIX_LAUNCHED_BY_NVREMIXLAUNCHER32", L"1");
+
+  wchar_t cmd[8192] = {};
+  quoteAppend(cmd, 8192, target);
+  if (extra[0]) { lstrcatW(cmd, L" "); lstrcatW(cmd, extra); }
+
+  wchar_t logMsg[8192] = {};
+  swprintf_s(logMsg, L"Launching game: %s ; cwd=%s", cmd, root);
+  appendLog(root, logMsg);
+
+  STARTUPINFOW si = {};
+  PROCESS_INFORMATION pi = {};
+  si.cb = sizeof(si);
+  BOOL ok = CreateProcessW(nullptr, cmd, nullptr, nullptr, TRUE, 0, nullptr, root, &si, &pi);
+  if (!ok) {
+    wchar_t e[512] = {};
+    swprintf_s(e, L"ERROR: CreateProcessW failed. GetLastError=%lu", GetLastError());
+    appendLog(root, e);
+    MessageBoxW(nullptr, e, L"DX11 Remix Launcher", MB_ICONERROR);
+    return 6;
+  }
+  CloseHandle(pi.hThread);
+  CloseHandle(pi.hProcess);
+  appendLog(root, L"Game process started successfully.");
+  return 0;
+}
+'@
+
+  Log "Compiling x86 NvRemixLauncher32.exe with: $cl"
+  Invoke-Logged -Label 'launcher32-x86-compile' -Exe $cl -CommandArgs @(
+    '/nologo','/c','/O2','/MT','/EHsc','/std:c++17','/utf-8','/Zc:__cplusplus',
+    ('/Fo:' + $launcherObj),
+    $launcherCpp
+  ) -WorkingDirectory $Root | Out-Null
+
+  Log "Linking x86 NvRemixLauncher32.exe"
+  Invoke-Logged -Label 'launcher32-x86-link' -Exe $link -CommandArgs @(
+    '/NOLOGO','/MACHINE:X86','/SUBSYSTEM:WINDOWS',
+    ('/OUT:' + $launcherExe),
+    ('/PDB:' + $launcherPdb),
+    $launcherObj,
+    'user32.lib','kernel32.lib','shell32.lib'
+  ) -WorkingDirectory $Root | Out-Null
+
+  if (!(Test-Path -LiteralPath $launcherExe -PathType Leaf)) { Die "NvRemixLauncher32.exe link finished but output is missing: $launcherExe" }
+  Test-PeMachine $launcherExe 'x86'
+
   return $out
+}
+
+
+function Patch-BridgeServerDx11ArgFallback {
+  param([Parameter(Mandatory)][string]$BridgeWork)
+  $main = Join-Path $BridgeWork 'src\server\main.cpp'
+  if (!(Test-Path -LiteralPath $main -PathType Leaf)) { Die "Bridge server main.cpp missing: $main" }
+  $text = Get-Content -LiteralPath $main -Raw
+  if ($text -match 'DX11_BRIDGE_ARG_FALLBACK_V57') {
+    Log 'Bridge server DX11 arg fallback already patched.'
+    return
+  }
+
+  $helper = @'
+
+// DX11_BRIDGE_ARG_FALLBACK_V57
+// The stock bridge server expects wWinMain pCmdLine to contain exactly:
+//   <36-char-guid> <BRIDGE_VERSION_W>
+// For DX11 bridge bring-up we also accept DX11_BRIDGE_GUID/DX11_BRIDGE_VERSION
+// from the x86 launcher environment, and .trex\dx11_bridge_args.txt as a file
+// fallback. This prevents the server from exiting before the DX11 client IPC path
+// can be brought up.
+static wchar_t g_Dx11BridgeGuidArgV57[64] = {};
+static wchar_t g_Dx11BridgeVersionArgV57[256] = {};
+static LPWSTR g_Dx11BridgeArgListV57[2] = { g_Dx11BridgeGuidArgV57, g_Dx11BridgeVersionArgV57 };
+
+static bool Dx11BridgeReadEnvArgV57(const wchar_t* name, wchar_t* out, DWORD cap) {
+  if (!name || !out || cap == 0) return false;
+  out[0] = 0;
+  const DWORD got = GetEnvironmentVariableW(name, out, cap);
+  return got > 0 && got < cap && out[0] != 0;
+}
+
+static bool Dx11BridgeReadArgsFileV57(wchar_t* guidOut, DWORD guidCap, wchar_t* verOut, DWORD verCap) {
+  wchar_t path[MAX_PATH] = {};
+  if (GetModuleFileNameW(nullptr, path, MAX_PATH) == 0) return false;
+  wchar_t* slash = wcsrchr(path, L'\\');
+  if (!slash) return false;
+  slash[1] = 0;
+  if (wcslen(path) + wcslen(L"dx11_bridge_args.txt") + 1 >= MAX_PATH) return false;
+  wcscat_s(path, L"dx11_bridge_args.txt");
+
+  HANDLE h = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (h == INVALID_HANDLE_VALUE) {
+    if (GetModuleFileNameW(nullptr, path, MAX_PATH) == 0) return false;
+    slash = wcsrchr(path, L'\\');
+    if (!slash) return false;
+    slash[1] = 0;
+    if (wcslen(path) + wcslen(L".trex\\dx11_bridge_args.txt") + 1 >= MAX_PATH) return false;
+    wcscat_s(path, L".trex\\dx11_bridge_args.txt");
+    h = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+  }
+
+  char buf[512] = {};
+  DWORD got = 0;
+  BOOL ok = ReadFile(h, buf, sizeof(buf) - 1, &got, nullptr);
+  CloseHandle(h);
+  if (!ok || got == 0) return false;
+  buf[got] = 0;
+
+  char* first = buf;
+  while (*first == ' ' || *first == '\t' || *first == '\r' || *first == '\n') ++first;
+  char* second = first;
+  while (*second && *second != '\r' && *second != '\n') ++second;
+  if (*second) *second++ = 0;
+  while (*second == ' ' || *second == '\t' || *second == '\r' || *second == '\n') ++second;
+  char* end2 = second;
+  while (*end2 && *end2 != '\r' && *end2 != '\n') ++end2;
+  *end2 = 0;
+  if (!first[0] || !second[0]) return false;
+
+  MultiByteToWideChar(CP_ACP, 0, first, -1, guidOut, guidCap);
+  MultiByteToWideChar(CP_ACP, 0, second, -1, verOut, verCap);
+  return guidOut[0] != 0 && verOut[0] != 0;
+}
+
+static LPWSTR* Dx11BridgeBuildFallbackArgListV57(int* pArgCount) {
+  if (!pArgCount) return nullptr;
+  *pArgCount = 0;
+  bool gotGuid = Dx11BridgeReadEnvArgV57(L"DX11_BRIDGE_GUID", g_Dx11BridgeGuidArgV57, _countof(g_Dx11BridgeGuidArgV57));
+  bool gotVer = Dx11BridgeReadEnvArgV57(L"DX11_BRIDGE_VERSION", g_Dx11BridgeVersionArgV57, _countof(g_Dx11BridgeVersionArgV57));
+  if (!gotGuid || !gotVer) {
+    gotGuid = gotVer = Dx11BridgeReadArgsFileV57(g_Dx11BridgeGuidArgV57, _countof(g_Dx11BridgeGuidArgV57), g_Dx11BridgeVersionArgV57, _countof(g_Dx11BridgeVersionArgV57));
+  }
+  if (!gotGuid || !gotVer) return nullptr;
+  *pArgCount = 2;
+  return g_Dx11BridgeArgListV57;
+}
+'@
+
+  $marker = 'int WINAPI wWinMain('
+  if ($text -notmatch [regex]::Escape($marker)) { Die 'Could not find wWinMain in bridge server main.cpp for DX11 arg fallback patch.' }
+  $text = $text.Replace($marker, $helper + "`r`n" + $marker)
+
+  $old = 'int argCount; LPWSTR* argList = CommandLineToArgvW(pCmdLine, &argCount); BRIDGE_ASSERT_LOG((argCount >= 2), "Command line argument count received to launch server is not as expected");'
+  $new = 'int argCount = 0; LPWSTR* argList = CommandLineToArgvW(pCmdLine, &argCount); bool dx11FallbackArgListV57 = false; if (argCount < 2 || argList == nullptr) { Logger::warn("DX11 bridge: missing/empty command line arguments; trying DX11_BRIDGE_GUID/DX11_BRIDGE_VERSION fallback."); if (argList) { LocalFree(argList); argList = nullptr; } argList = Dx11BridgeBuildFallbackArgListV57(&argCount); dx11FallbackArgListV57 = true; } if (argCount < 2 || argList == nullptr) { Logger::err("DX11 bridge: server still has no GUID/version after command-line and fallback parsing."); return 1; }'
+  if ($text.Contains($old)) {
+    $text = $text.Replace($old, $new)
+  } else {
+    # Current dxvk-remix bridge may have line breaks; use a conservative regex.
+    $pat = 'int\s+argCount\s*;\s*LPWSTR\*\s*argList\s*=\s*CommandLineToArgvW\(pCmdLine,\s*&argCount\);\s*BRIDGE_ASSERT_LOG\s*\(\s*\(argCount\s*>=\s*2\)\s*,\s*"Command line argument count received to launch server is not as expected"\s*\);'
+    $text2 = [regex]::Replace($text, $pat, $new, 1)
+    if ($text2 -eq $text) { Die 'Could not patch bridge server argument parser.' }
+    $text = $text2
+  }
+
+  $text = $text.Replace('LocalFree(argList); initModuleBridge();', 'if (!dx11FallbackArgListV57 && argList) { LocalFree(argList); } initModuleBridge();')
+  Write-TextNoBom -Path $main -Text $text
+  Log 'Patched bridge server: GUID/version command-line fallback for DX11 launcher.'
 }
 
 function Build-DX11Bridge([string]$BridgeWork, [string]$VsInstall, [string]$Meson, [string]$Ninja) {
@@ -1191,7 +1591,7 @@ function Write-BridgeVersionFile {
 }
 
 function Stage-DualOutput([string]$RuntimeBuild, [hashtable]$BridgeBuilds) {
-  # v51: final user-facing layout is _output\x64 and _output\x86, matching the folder
+  # v57: final user-facing layout is _output\x64 and _output\x86, matching the folder
   # the repo already uses for the x64 Meson install tree. Do not delete _output\x64
   # when it is also the installed runtime tree; keep its support DLL layout intact.
   $outRoot = if ([IO.Path]::IsPathRooted($OutputRoot)) { $OutputRoot } else { Join-Path $Root $OutputRoot }
@@ -1241,6 +1641,45 @@ function Stage-DualOutput([string]$RuntimeBuild, [hashtable]$BridgeBuilds) {
   Test-PeMachine (Join-Path $x86Out 'd3d11.dll') 'x86'
   Test-PeMachine (Join-Path $x86Out 'dxgi.dll') 'x86'
 
+  $launcher32 = Join-Path $BridgeBuilds.Build32 'NvRemixLauncher32.exe'
+  $launcher32Pdb = Join-Path $BridgeBuilds.Build32 'NvRemixLauncher32.pdb'
+  if (Test-Path -LiteralPath $launcher32 -PathType Leaf) {
+    Copy-FileIfDifferent -Source $launcher32 -Destination (Join-Path $x86Out 'NvRemixLauncher32.exe')
+    Test-PeMachine (Join-Path $x86Out 'NvRemixLauncher32.exe') 'x86'
+    if (Test-Path -LiteralPath $launcher32Pdb -PathType Leaf) { Copy-FileIfDifferent -Source $launcher32Pdb -Destination (Join-Path $x86Out 'NvRemixLauncher32.pdb') }
+  } else {
+    Warn "NvRemixLauncher32.exe was not built; x86 output will still load through normal game launch if d3d11.dll/dxgi.dll are in the game folder."
+  }
+
+  $artifactReadme = @"
+DXVK Remix DX11 x86 Bridge Package v57
+======================================
+
+Placement matches the NVIDIA x86 bridge package style:
+
+Root:
+  d3d11.dll                  32-bit DX11 bridge pickup DLL
+  dxgi.dll                   32-bit DXGI bridge pickup DLL
+  NvRemixLauncher32.exe      32-bit launcher/bootstrap helper for DX11 games
+  NvRemixLauncher32.pdb      launcher symbols when built
+  artifacts_readme.txt       this file
+
+.trex:
+  NvRemixBridge.exe          64-bit bridge server
+  bridge_version.txt         bridge version passed by the root DX11 bridge DLLs
+  d3d11.dll                  64-bit DX11 runtime from this repo
+  dxgi.dll                   64-bit DXGI runtime from this repo
+  usd\                       USD runtime/data when available
+  *.dll                      64-bit support DLLs mirrored from _output\x64
+
+Usage:
+  Preferred: copy this folder next to the 32-bit DX11 game exe and launch the game normally. The root d3d11.dll/dxgi.dll are the DX11 bridge client and start/connect to .trex\NvRemixBridge.exe automatically. NvRemixLauncher32.exe is optional injection fallback only.
+  Also works: launch the game normally after copying d3d11.dll, dxgi.dll, and .trex beside the game exe.
+
+No d3d9.dll is staged in this DX11 package.
+"@
+  Set-Content -LiteralPath (Join-Path $x86Out 'artifacts_readme.txt') -Encoding UTF8 -Value $artifactReadme
+
   # The 32-bit package needs the complete x64 runtime/support tree inside .trex,
   # not just d3d11.dll and dxgi.dll. Mirror the final x64 folder so the x86 layout
   # has the same support DLLs/USD structure as the native x64 output.
@@ -1265,7 +1704,7 @@ function Stage-DualOutput([string]$RuntimeBuild, [hashtable]$BridgeBuilds) {
   Remove-D3D9Artifacts $x86Out
 
   $x64Readme = @"
-DXVK Remix DX11 x64 output v51
+DXVK Remix DX11 x64 output v57
 ==============================
 
 Use this folder for native 64-bit DX11 games.
@@ -1278,10 +1717,10 @@ This folder intentionally matches the repo's normal _output\x64 structure:
 
 No d3d9.dll is staged here.
 "@
-  Set-Content -LiteralPath (Join-Path $x64Out 'README_X64_DX11_OUTPUT_V51.txt') -Encoding UTF8 -Value $x64Readme
+  Set-Content -LiteralPath (Join-Path $x64Out 'README_X64_DX11_OUTPUT_V57.txt') -Encoding UTF8 -Value $x64Readme
 
   $x86Readme = @"
-DXVK Remix DX11 x86 bridge output v51
+DXVK Remix DX11 x86 bridge output v57
 =====================================
 
 Use this folder for 32-bit DX11 games.
@@ -1289,6 +1728,8 @@ Use this folder for 32-bit DX11 games.
 Root layout:
   d3d11.dll                 x86 DX11 bridge pickup/interposer DLL
   dxgi.dll                  x86 DXGI bridge pickup/interposer DLL
+  NvRemixLauncher32.exe     optional x86 injection helper; the root d3d11.dll/dxgi.dll are the client by default
+  artifacts_readme.txt      root package layout notes
   .trex\NvRemixBridge.exe   x64 bridge server when the bridge build produced it
   .trex\bridge_version.txt   exact server BRIDGE_VERSION passed by x86 launcher
   .trex\d3d11.dll           x64 DX11 runtime from this repo
@@ -1298,11 +1739,11 @@ Root layout:
 
 No d3d9.dll is staged here.
 "@
-  Set-Content -LiteralPath (Join-Path $x86Out 'README_X86_DX11_BRIDGE_OUTPUT_V51.txt') -Encoding UTF8 -Value $x86Readme
+  Set-Content -LiteralPath (Join-Path $x86Out 'README_X86_DX11_BRIDGE_OUTPUT_V57.txt') -Encoding UTF8 -Value $x86Readme
 
   $pkgRoot = Join-Path $Root '_packages'
   New-Item -ItemType Directory -Force -Path $pkgRoot | Out-Null
-  $zip = Join-Path $pkgRoot 'dxvk-remix-dx11-output-x64-x86-v51.zip'
+  $zip = Join-Path $pkgRoot 'dxvk-remix-dx11-output-x64-x86-v57.zip'
   if (Test-Path -LiteralPath $zip) { Remove-Item -LiteralPath $zip -Force }
   Add-Type -AssemblyName System.IO.Compression.FileSystem
   [System.IO.Compression.ZipFile]::CreateFromDirectory($outRoot, $zip)
@@ -1313,7 +1754,7 @@ No d3d9.dll is staged here.
 }
 
 function Stage-Package([string]$RuntimeBuild, [hashtable]$BridgeBuilds) {
-  $pkg = Join-Path $Root '_packages\rtx-remix-dx11-x86-bridge-getgoing-v51'
+  $pkg = Join-Path $Root '_packages\rtx-remix-dx11-x86-bridge-getgoing-v57'
   if (Test-Path $pkg) { Remove-Item -LiteralPath $pkg -Recurse -Force }
   $trex = Join-Path $pkg '.trex'
   New-Item -ItemType Directory -Force -Path $trex | Out-Null
@@ -1347,7 +1788,7 @@ function Stage-Package([string]$RuntimeBuild, [hashtable]$BridgeBuilds) {
   foreach ($bad in @((Join-Path $pkg 'd3d9.dll'), (Join-Path $trex 'd3d9.dll'))) { if (Test-Path $bad) { Remove-Item -LiteralPath $bad -Force } }
 
   $readme = @"
-RTX Remix DX11 x86 Bridge Get-Going Package v51
+RTX Remix DX11 x86 Bridge Get-Going Package v57
 ================================================
 
 Layout:
@@ -1360,16 +1801,17 @@ Layout:
 
 No d3d9.dll is included.
 
-v51 fixes:
+v57 fixes:
   - launches NvRemixBridge.exe with required GUID and matching BRIDGE_VERSION arguments
   - writes .trex\bridge_version.txt from bridge server version.h
+- wires the x86 root d3d11.dll/dxgi.dll as the client bootstrap to .trex\NvRemixBridge.exe
   - strips UTF-8 BOMs from bridge Meson files before Meson setup
   - writes patched Meson files as UTF-8 without BOM
   - prints Meson/Ninja logs live and tails them on failure
   - continues if Meson exits nonzero after creating build.ninja
   - builds the x86 root d3d11.dll/dxgi.dll directly with HostX64\\x86 cl.exe, avoiding vcvarsall x64_x86 quoting failures
 "@
-  Set-Content -Path (Join-Path $pkg 'README_DX11_BRIDGE_GETGOING_V51.txt') -Value $readme -Encoding UTF8
+  Set-Content -Path (Join-Path $pkg 'README_DX11_BRIDGE_GETGOING_V57.txt') -Value $readme -Encoding UTF8
   $zip = "$pkg.zip"
   if (Test-Path $zip) { Remove-Item -LiteralPath $zip -Force }
   Add-Type -AssemblyName System.IO.Compression.FileSystem
