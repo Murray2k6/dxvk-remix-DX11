@@ -4,6 +4,7 @@
 #include <string>
 #include <mutex>
 #include <atomic>
+#include <memory>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
@@ -19,6 +20,7 @@
 #include "util_process.h"
 #include "util_semaphore.h"
 #include "util_filesys.h"
+#include "util_messagechannel.h"
 
 using namespace bridge_util;
 
@@ -66,6 +68,19 @@ void LogLine(const char* tag, const char* text) {
   if (gAttached) {
     try { Logger::info(line); } catch (...) { }
   }
+}
+
+// DX11_V122_DEFINE_SERVER_MESSAGE_CHANNEL_FOR_DX9_ACK
+// DX9 gets this helper from client/message_channels.h. The generated DX11
+// bridge client is standalone, so it defines the same server-side message
+// channel setup locally before using the DX9 Bridge_Ack sequence.
+static std::unique_ptr<MessageChannelClient> gpServerMessageChannel;
+
+static void initServerMessageChannel(const uint32_t serverThreadId) {
+  gpServerMessageChannel = std::make_unique<MessageChannelClient>(static_cast<uint32_t>(serverThreadId));
+  char msg[256] = {};
+  sprintf_s(msg, sizeof(msg), "Server message channel initialized from Bridge_Ack pHandle/thread=%u.", serverThreadId);
+  LogLine("bridge", msg);
 }
 
 void SetModule(HMODULE moduleHandle) {
@@ -159,24 +174,30 @@ bool EnsureServer() {
   }
 
   BridgeState::setServerState(BridgeState::ProcessState::Init);
-  LogLine("bridge", "Sending Bridge_Syn and waiting for Bridge_Ack from x64 server.");
+  LogLine("bridge", "Sending Bridge_Syn and waiting for Bridge_Ack from x64 server on DeviceBridge using DX9 ACK sequence. DX11_V122_USE_DX9_BRIDGE_ACK_SEQUENCE");
   {
     ClientMessage syn(Commands::Bridge_Syn, reinterpret_cast<uintptr_t>(gpServer->GetCurrentProcessHandle()));
   }
   BridgeState::setClientState(BridgeState::ProcessState::Handshaking);
 
+  // DX11_V122_USE_DX9_BRIDGE_ACK_SEQUENCE
+  // Match NVIDIA's working DX9 bridge handshake:
+  //   Bridge_Syn -> DeviceBridge::waitForCommand(Bridge_Ack)
+  //   DeviceBridge::pop_front()
+  //   initServerMessageChannel(ackResponse.pHandle)
+  //   Bridge_Continue
   const auto waitForAck = DeviceBridge::waitForCommand(Commands::Bridge_Ack, GlobalOptions::getStartupTimeout());
   if (waitForAck != Result::Success) {
-    LogLine("bridge", "Timed out or failed waiting for Bridge_Ack from x64 server.");
+    LogLine("bridge", "Timed out or failed waiting for Bridge_Ack from x64 server on DeviceBridge.");
     BridgeState::setServerState(BridgeState::ProcessState::DoneProcessing);
     gbBridgeRunning = false;
     return false;
   }
 
-  const auto ack = DeviceBridge::pop_front();
-  (void)ack;
+  const auto ackResponse = DeviceBridge::pop_front();
+  initServerMessageChannel(ackResponse.pHandle);
   BridgeState::setServerState(BridgeState::ProcessState::Handshaking);
-  LogLine("bridge", "Bridge_Ack received; sending Bridge_Continue.");
+  LogLine("bridge", "Bridge_Ack received through DX9 DeviceBridge ACK path; server message channel initialized; sending Bridge_Continue.");
   {
     ClientMessage cont(Commands::Bridge_Continue);
   }
@@ -199,6 +220,7 @@ void Detach() {
       delete gpServer;
       gpServer = nullptr;
     }
+    gpServerMessageChannel.reset();
     delete gpPresent;
     gpPresent = nullptr;
     BridgeState::setClientState(BridgeState::ProcessState::Exited);
