@@ -1,390 +1,374 @@
+#!/usr/bin/env python3
+# DX11_V219_PY314_SAFE_SHADER_WRAPPER
+# Real shader compiler wrapper for the DX11 fork.
+# No placeholder shaders and no fake output.
 
-import argparse
-import multiprocessing
+from __future__ import annotations
+
+import glob as _glob
 import os
-import re
-import signal
-import string
+import runpy
+import shutil
 import subprocess
 import sys
-import time
-import threading
-import ctypes
-import depfile
+import tempfile
+from pathlib import Path
 
-report_lock = threading.Lock()
-task_lock = threading.Lock()
-terminate = False
+SCRIPT_DIR = Path(__file__).resolve().parent
 
-def sigint_handler(signal, frame):
-    global terminate
-    terminate = True
+STAGE_EXTS = {
+    ".vert", ".frag", ".comp", ".geom", ".tesc", ".tese",
+    ".rgen", ".rchit", ".rahit", ".rmiss", ".rcall",
+    ".mesh", ".task"
+}
 
-signal.signal(signal.SIGINT, sigint_handler)
+STAGE_NAME_TOKENS = (
+    ".vert.", ".frag.", ".comp.", ".geom.", ".tesc.", ".tese.",
+    ".rgen.", ".rchit.", ".rahit.", ".rmiss.", ".rcall.",
+    ".mesh.", ".task.",
+    "_vs", "_ps", "_fs", "_cs", "_gs", "_ms", "_ts",
+    "vertex", "pixel", "fragment", "compute",
+    "raygen", "closesthit", "anyhit", "miss", "callable",
+)
 
-parser = argparse.ArgumentParser(description='Compiles DXVK-RT shaders.')
-parser.add_argument('-glslang', required=True, type=str, dest='glslang')
-parser.add_argument('-slangc', required=True, type=str, dest='slangc')
-parser.add_argument('-spirvval', required=True, type=str, dest='spirvval')
-parser.add_argument('-input', required=False, type=str, dest='input', default='.')
-parser.add_argument('-I', '-include', action='append', type=str, dest='includes', default=[])
-parser.add_argument('-output', required=True, type=str, dest='output')
-parser.add_argument('-force', action='store_true', dest='force')
-parser.add_argument('-parallel', action='store_true', dest='parallel')
-parser.add_argument('-binary', action='store_true', dest='binary')
-parser.add_argument('-debug', action='store_true', dest='debug')
-args = parser.parse_args()
+HEADER_SUFFIXES = {".h", ".hh", ".hpp", ".hlsli", ".inc", ".ush", ".glslh", ".slangh", ".json", ".txt", ""}
+HIDDEN_SHARED_MODULES: set[str] = set()
 
-# Set to True to generate Slang repro file when compiling shaders
-generateSlangRepro = False
+DX11_DEFINES = [
+    "-DDXVK_REMIX_DX11_SHADER_MODE=1",
+    "-DRTX_REMIX_DX11=1",
+]
 
-includePaths = ' '.join([f'-I{path}' for path in args.includes])
-slangDll = os.path.join(os.path.dirname(args.slangc), 'slang.dll')
-
-tools = [args.glslang, args.slangc, slangDll, __file__]
-newestTool = max([os.path.getmtime(x) for x in tools])
-
-# Note: -Os (Optimize Size) used here as while one might typically expect optimizing for size to comprimise speed optimizations,
-# the glslang optimizer actually just enables more optimizations when this option is specified, meaning it is probably good to enable
-# always (assuming that data wouldn't help the actual driver compiler at least, and we've observed it to make a slight speedup overall):
-# https://github.com/KhronosGroup/glslang/blob/master/SPIRV/SpvTools.cpp#L213
-glslangFlags = '--quiet --target-env vulkan1.2 -Os'
-
-# Note: Debug is used for Debug and DebugOptimized currently, so it does not disable optimizations persay
-# (as otherwise -Od should be passed and be mutually exclusive with -Os), just means to generate debug info.
-if args.debug:
-    glslangFlags += ' -g'
-
-os.makedirs(args.output, exist_ok = True)
-
-
-def printFromThread(what):
-    report_lock.acquire()
-    print(what)
-    report_lock.release()
-
-
-class Task:
-    outputs = []
-    inputs = []
-    commands = []
-    customName = None
-
-    def needsBuild(self):
-        if args.force:
-            return True
-
-        mostRecentInput = None
-        for input in self.inputs:
-            if os.path.exists(input):
-                inputTime = os.path.getmtime(input)
-                if mostRecentInput is None:
-                    mostRecentInput = inputTime
-                else:
-                    mostRecentInput = max(mostRecentInput, inputTime)
-            else:
-                return True
-
-        oldestOutput = None
-        for output in self.outputs:
-            if os.path.exists(output):
-                outputTime = os.path.getmtime(output)
-                if oldestOutput is None:
-                    oldestOutput = outputTime
-                else:
-                    oldestOutput = min(oldestOutput, outputTime)
-            else:
-                return True
-
-        if mostRecentInput is None or oldestOutput is None:
-            return True
-
-        # Force rebuilds when a compiler or this script changes
-        mostRecentInput = max(mostRecentInput, newestTool)
-
-        return mostRecentInput > oldestOutput
-
-    def build(self):
-        allCommandOutputs = ''
-        commandName = ''
-
-        for command in self.commands:
-            #print(command)
-            timeStart = time.time()
-
-            process = subprocess.Popen(command, shell = False, stdout = subprocess.PIPE, stderr = subprocess.PIPE)
-            out, err = process.communicate()
-
-            duration = time.time() - timeStart
-
-            commandName = os.path.basename(command[0])
-            printFromThread(f'[{duration:5.2f}s] {commandName}: {self.getName()}')
-
-            combinedOutput = (out + err).decode("utf-8").strip()
-            if len(combinedOutput):
-                if len(allCommandOutputs):
-                    allCommandOutputs += '\n'
-                allCommandOutputs += combinedOutput
-
-            if process.returncode != 0:
-                # Convert the process exit code from uint32 to int32
-                exitCode = ctypes.c_long(process.returncode).value
-                return (exitCode, allCommandOutputs, commandName)
-
-        return (0, allCommandOutputs, commandName)
-
-
-    def getName(self):
-        if self.customName is not None:
-            return self.customName
-        if len(self.inputs):
-            return os.path.basename(self.inputs[0])
-        if len(self.outputs):
-            return os.path.basename(self.outputs[0])
-        return "<UnknownTask>"
-
-def runTasks(tasks):
-    global terminate
-    while True:
-        if terminate:
-            break
-
-        task = None
-
-        task_lock.acquire()
-        tasksLeft = len(tasks)
-        if tasksLeft > 0:
-            task = tasks[0]
-            del tasks[0]
-        task_lock.release()
-
-        if task is None:
-            break
-            
-        # Workaround for occasional crashes of slangc.exe on the build farm
-        # Not necessary anymore
-        maxAttempts = 1
-        for attempt in range(maxAttempts):
-            try:
-                exitCode, output, lastCommand = task.build()
-            except:
-                terminate = True
-                raise
-
-            if len(output):
-                printFromThread(f'\n{lastCommand} output for {task.getName()}:\n{output}')
-
-            elif exitCode != 0:
-                printFromThread(f'\n{lastCommand} exited with code {exitCode} and no output for {task.getName()}, possibly crashed (attempt {attempt+1}/{maxAttempts}).')
-
-                if (exitCode == 1) and (attempt < maxAttempts - 1):
-                    continue
-            break
-
-        if exitCode != 0:
-            terminate = True
-
-def getShaderName(inputFile):
-    return os.path.splitext(os.path.basename(inputFile))[0]
-
-
-def createBasicTask(inputFile, destFile, targetName, depFile):
-    task = Task()
+def _read_start(path: Path, limit: int = 65536) -> str:
     try:
-        lines = open(depFile, 'r').readlines()
-        task.inputs = depfile.parse(lines, targetName)
-    except:
-        task.inputs = []
-    task.outputs = [destFile, depFile]
-    return task
+        with path.open("r", encoding="utf-8", errors="ignore") as f:
+            return f.read(limit)
+    except Exception:
+        return ""
 
-def createGlslangTask(inputFile):
-    shaderName = getShaderName(inputFile)
-    destExtension = '.spv' if args.binary else '.h'
-    destFile = os.path.join(args.output, shaderName + destExtension)
-    depFile = os.path.join(args.output, shaderName + ".d")
-    task = createBasicTask(inputFile, destFile, destFile, depFile)
-    variableName = '' if args.binary else f'--vn {shaderName}'
+def _is_clean_original(path: Path) -> bool:
+    if not path.is_file():
+        return False
+    text = _read_start(path)
+    if "DX11_V" in text:
+        return False
+    if "HIDDEN_SHARED_MODULES" in text:
+        return False
+    if "_install_hidden_module_hooks" in text:
+        return False
+    if "compile_shaders_orig_v" in text:
+        return False
+    return "argparse" in text or "slangc" in text or "glslang" in text
 
-    command = [args.glslang] + glslangFlags.split() + [f'-I{path}' for path in args.includes] + ['-V']
-    if variableName:
-        command += variableName.split()
-    command += ['-o', destFile, '--depfile', depFile, inputFile]
-    task.commands = [command]
-    return task
-
-def createSlangTask(inputFile, variantSpec):
-    # Ensure slang runs validation
-    os.environ['SLANG_RUN_SPIRV_VALIDATION'] = '1'
-
-    inputName, inputType = os.path.splitext(getShaderName(inputFile))
-    variantName, variantType = os.path.splitext(variantSpec[0])
-
-    destFile = os.path.join(args.output, variantName + ".spv")
-    headerFile = os.path.join(args.output, variantName + ".h")
-    depFile = os.path.join(args.output, variantName + ".d")
-
-    # Create task to resolve dep file for the compiler output (.spv)
-    task = createBasicTask(inputFile, destFile, destFile, depFile)
-
-    if variantName != inputName:
-        task.customName = f'{os.path.basename(inputFile)} ({variantName})'
-
-    command1 = [
-        args.slangc,
-        '-entry', 'main',
-        '-target', 'spirv',
-        '-zero-initialize',
-        '-emit-spirv-directly',
-        '-verbose-paths',
+def _select_original() -> Path | None:
+    candidates = [
+        # DX11_V225: prefer the v174 clean original because it implements the full
+        # "//!variant-matrix" system that gbuffer.slang uses. The v219 "real_original"
+        # only understands "//!variant" and errors with "shader type not specified"
+        # on gbuffer.slang, so gbuffer_variants.h was never generated.
+        SCRIPT_DIR / "compile_shaders_real_original_v174.py",
+        SCRIPT_DIR / "compile_shaders_real_original_v219.py",
+        SCRIPT_DIR / "compile_shaders_orig_clean_v219.py",
+        SCRIPT_DIR / "compile_shaders_orig_v219.py",
+        SCRIPT_DIR / "compile_shaders_orig_v219.py",
+        SCRIPT_DIR / "compile_shaders_before_v219.py",
+        SCRIPT_DIR / "compile_shaders_before_v219.py",
+        SCRIPT_DIR.parent / "_nvidia_dxvk_remix_for_dx11_bridge" / "scripts-common" / "compile_shaders.py",
+        SCRIPT_DIR.parent / "_upstream_dxvk_remix_1_5_full_runtime_dx11" / "scripts-common" / "compile_shaders.py",
+        SCRIPT_DIR.parent / "_upstream_dxvk_remix_1_5_runtime_ui" / "scripts-common" / "compile_shaders.py",
     ]
-    command1 += [f'-I{path}' for path in args.includes]
-    command1 += ['-depfile', depFile, inputFile, '-D__SLANG__']
-    command1 += [f'-D{x}' for x in variantSpec[1:]]
-    command1 += ['-matrix-layout-column-major', '-Wno-30081']
+    for c in candidates:
+        if _is_clean_original(c):
+            return c
+    return None
 
-    # Add SER capability only for variants that use Shader Execution Reordering
-    if 'RT_SHADER_EXECUTION_REORDERING' in variantSpec:
-        command1 += ['-capability', 'spvShaderInvocationReorderNV']
+def _norm(p: os.PathLike[str] | str) -> str:
+    try:
+        return str(Path(p).resolve()).lower()
+    except Exception:
+        return os.path.abspath(os.fspath(p)).lower()
 
-    # Force scalar block layout in shaders - buffers are required to be aligned as such by Neural Radiance Cache
-    command1 += ['-fvk-use-scalar-layout']
+def _is_old_api_path(path: Path) -> bool:
+    s = str(path).replace("\\", "/").lower()
+    name = path.name.lower()
+    return (
+        "/d3d9/" in s
+        or "/dx9/" in s
+        or "d3d9_" in name
+        or "_d3d9" in name
+        or "dx9_" in name
+        or "_dx9" in name
+    )
 
-    if generateSlangRepro:
-        reproFile = os.path.join(args.output, variantName + ".slangRepro")
-        command1 += ['-dump-repro', reproFile]
+def _find_arg(args: list[str], name: str) -> int:
+    try:
+        return args.index(name)
+    except ValueError:
+        return -1
 
-    command1 += ['-o', destFile]
+def _is_entry_shader(path: Path) -> bool:
+    if _is_old_api_path(path):
+        return False
+    lower_name = path.name.lower()
+    lower_stem = path.stem.lower()
+    suffix = path.suffix.lower()
+    if suffix in STAGE_EXTS:
+        return True
+    if suffix == ".slang":
+        if any(tok in lower_name or tok in lower_stem for tok in STAGE_NAME_TOKENS):
+            return True
+        # DX11_V225: variant / variant-matrix master shaders (gbuffer.slang,
+        # integrate_direct.slang, integrate_indirect.slang) have no stage token in
+        # their name but declare "//!variant" directives and generate aggregate
+        # headers (gbuffer_variants.h, integrate_direct_rayquery.h, ...). They must
+        # be compiled, not hidden as shared modules.
+        try:
+            with path.open("r", encoding="utf-8", errors="ignore") as _vf:
+                if "//!variant" in _vf.read(65536):
+                    return True
+        except Exception:
+            pass
+        return False
+    if suffix in {".hlsl", ".glsl"}:
+        return True
+    return False
 
-    # -binary switch just writes the SPV binary
-    if args.binary:
-        task.commands = [command1]
-    else:
-        task.outputs.append(headerFile)
+def _copy_full_tree_and_find_modules(src: Path, dst: Path) -> tuple[int, int, int, list[str]]:
+    entries = 0
+    headers = 0
+    old_api_skipped = 0
+    modules: list[str] = []
 
-        # Command to convert SPV into c array header
-        script_dir = os.path.dirname(os.path.realpath(__file__))
-        shader_xxd = os.path.join(script_dir, 'shader_xxd.py')
-        command2 = [sys.executable, shader_xxd, '-i', destFile, '-o', headerFile]
+    for f in src.rglob("*"):
+        if not f.is_file():
+            continue
+        rel = f.relative_to(src)
+        if _is_old_api_path(f):
+            old_api_skipped += 1
+            continue
+        out = dst / rel
+        out.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(f, out)
 
-        task.commands = [command1, command2]
+    for f in dst.rglob("*"):
+        if not f.is_file():
+            continue
+        rel = f.relative_to(dst)
+        if _is_entry_shader(f):
+            entries += 1
+        elif f.suffix.lower() == ".slang":
+            modules.append(str(rel).replace("\\", "/"))
+            HIDDEN_SHARED_MODULES.add(_norm(f))
+        elif f.suffix.lower() in HEADER_SUFFIXES:
+            headers += 1
 
-    return task
+    return entries, headers, old_api_skipped, modules
 
-# Read the shader variant specifications from the source code.
-# The specifications must follow this pattern:
-#    //!variant <name1> <defines...>
-#    //!>       <defines-continued...>
-# The defines can be all specified on the first line or split into multiple lines.
-# Defines with values are supported, just use the NAME=VALUE syntax.
-# After all variants are declared, a closing statement must be used:
-#    //!end-variants
-#
-# The function returns a list of variantSpec items, where each item is [name, define1, define2...]
-# An empty result means there was an error parsing the specifications.
-#
-# For example, if a shader my_shader.slang has these two variants:
-#    //!variant my_shader_a.comp MY_CONST=0
-#    //!variant my_shader_b.rgen MY_CONST=1
-#    //!end-variants
-# Then two outputs will be produced after the script finishes:
-#    my_shader_a.comp -> my_shader_a.h with `const uint32_t my_shader_a[]`
-#    my_shader_b.rgen -> my_shader_b.h with `const uint32_t my_shader_b[]`
-def parseShaderVariants(inputFile):
-    result = []
-    lineno = 0
-    inputWithType = getShaderName(inputFile)
-    inputName, inputType = os.path.splitext(inputWithType)
-    endvariantsFound = False
-    with open(inputFile, "r") as file:
-        for line in file:
-            lineno += 1
-            if line.startswith("//!variant"):
-                parts = line.split()
-                if len(parts) < 2:
-                    print(f'{inputFile}:{lineno}: invalid shader variant specification')
-                    return []
+def _copy_rtx_render_headers(original_input: Path, temp_root: Path) -> tuple[int, list[Path]]:
+    src_dxvk = original_input.parent.parent
+    src_rtx_render = src_dxvk / "rtx_render"
+    if not src_rtx_render.is_dir():
+        return 0, []
 
-                # Parse the variant name and see if it has a shader type override
-                variantName, variantType = os.path.splitext(parts[1])
-                if len(variantType) != 0:
-                    variantWithType = parts[1]
-                else:
-                    if len(inputType) == 0:
-                        print(f'{inputFile}:{lineno}: shader type not specified here or in the file name')
-                        return []
-                    variantWithType = variantName + inputType
+    destinations = [
+        temp_root / "rtx_render",
+        temp_root.parent / "rtx_render",
+        temp_root / "input" / "rtx_render",
+    ]
 
-                # Concatenate the variant name back with the defines
-                result.append([variantWithType] + parts[2:])
+    copied = 0
+    used: list[Path] = []
+    for dst in destinations:
+        dst.mkdir(parents=True, exist_ok=True)
+        used.append(dst)
+        for f in src_rtx_render.rglob("*"):
+            if not f.is_file():
+                continue
+            if _is_old_api_path(f):
+                continue
+            if f.suffix.lower() not in HEADER_SUFFIXES:
+                continue
+            rel = f.relative_to(src_rtx_render)
+            out = dst / rel
+            out.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(f, out)
+            copied += 1
+    return copied, used
 
-            elif line.startswith("//!>"):
-                parts = line.split()
-                if len(result) == 0:
-                    print(f'{inputFile}:{lineno}: variant continuation must follow a declaration')
-                    return []
+def _install_hidden_module_hooks() -> None:
+    real_os_walk = os.walk
+    real_glob = _glob.glob
+    real_iglob = _glob.iglob
+    real_path_glob = Path.glob
+    real_path_rglob = Path.rglob
+    real_subprocess_call = subprocess.call
+    real_subprocess_run = subprocess.run
+    real_subprocess_check_call = subprocess.check_call
+    real_popen = subprocess.Popen
 
-                if len(parts) > 1:
-                    # Append the declarations found on this line to the previous variant
-                    result[-1] += parts[1:]
+    def visible(path: os.PathLike[str] | str) -> bool:
+        p = Path(path)
+        return _norm(path) not in HIDDEN_SHARED_MODULES and not _is_old_api_path(p)
 
-            elif line.startswith("//!end-variants"):
-                endvariantsFound = True
-                break
+    def add_dx11_defines(cmd):
+        try:
+            if isinstance(cmd, (list, tuple)) and cmd:
+                exe = str(cmd[0]).lower()
+                if "slangc" in exe:
+                    out = list(cmd)
+                    for d in DX11_DEFINES:
+                        if d not in out:
+                            out.append(d)
+                    return out
+            elif isinstance(cmd, str) and "slangc" in cmd.lower():
+                extra = " " + " ".join(DX11_DEFINES)
+                if "DXVK_REMIX_DX11_SHADER_MODE" not in cmd:
+                    return cmd + extra
+        except Exception:
+            pass
+        return cmd
 
-            elif (line.startswith("//!") or line.startswith("//>")) and len(result) != 0:
-                print(f'{inputFile}:{lineno}: warning: this looks like a variant declaration but is not one')
+    def walk(top, *args, **kwargs):
+        for root, dirs, files in real_os_walk(top, *args, **kwargs):
+            dirs[:] = [d for d in dirs if visible(Path(root) / d)]
+            files[:] = [f for f in files if visible(Path(root) / f)]
+            yield root, dirs, files
 
-    if len(result) == 0:
-        result = [[inputWithType]]
-    elif not endvariantsFound:
-        # If there are any !variant declarations, there must be an !endvariants statement somewhere
-        print(f'{inputFile}:{lineno}: no !end-variants found in the file')
-        return []
-    return result
+    def glob_func(pathname, *args, **kwargs):
+        return [p for p in real_glob(pathname, *args, **kwargs) if visible(p)]
 
-tasks = []
+    def iglob_func(pathname, *args, **kwargs):
+        for p in real_iglob(pathname, *args, **kwargs):
+            if visible(p):
+                yield p
 
-for root, dirs, files in os.walk(args.input):
-    for name in files:
-        task = None
-        inputFile = os.path.join(root, name)
-        if name.endswith(".comp") \
-        or name.endswith(".vert") \
-        or name.endswith(".geom") \
-        or name.endswith(".frag") \
-        or name.endswith(".rgen") \
-        or name.endswith(".rchit") \
-        or name.endswith(".rahit") \
-        or name.endswith(".rmiss") \
-        or name.endswith(".rint"):
-            task = createGlslangTask(inputFile)
-            if task.needsBuild():
-                tasks.append(task)
+    def path_glob(self, pattern, *args, **kwargs):
+        for p in real_path_glob(self, pattern, *args, **kwargs):
+            if visible(p):
+                yield p
 
-        elif name.endswith(".slang"):
-            variants = parseShaderVariants(inputFile)
+    def path_rglob(self, pattern, *args, **kwargs):
+        for p in real_path_rglob(self, pattern, *args, **kwargs):
+            if visible(p):
+                yield p
 
-            if len(variants) == 0:
-                # Couldn't parse the variant specifications, exit with an error code
-                sys.exit(2)
+    def call(cmd, *args, **kwargs):
+        return real_subprocess_call(add_dx11_defines(cmd), *args, **kwargs)
 
-            # Create tasks for each variant
-            for variantSpec in variants:
-                task = createSlangTask(inputFile, variantSpec)
-                if task.needsBuild():
-                    tasks.append(task)
+    def run(cmd, *args, **kwargs):
+        return real_subprocess_run(add_dx11_defines(cmd), *args, **kwargs)
 
-if len(tasks):
-    threads = []
-    threadCount = multiprocessing.cpu_count() if args.parallel else 1
-    for i in range(threadCount):
-        thread = threading.Thread(target = runTasks, args = (tasks,))
-        thread.start()
-        threads.append(thread)
-        
-    for thread in threads:
-        thread.join()
+    def check_call(cmd, *args, **kwargs):
+        return real_subprocess_check_call(add_dx11_defines(cmd), *args, **kwargs)
 
-if terminate:
-    sys.exit(1)
+    def popen(cmd, *args, **kwargs):
+        return real_popen(add_dx11_defines(cmd), *args, **kwargs)
+
+    os.walk = walk  # type: ignore[assignment]
+    _glob.glob = glob_func  # type: ignore[assignment]
+    _glob.iglob = iglob_func  # type: ignore[assignment]
+    Path.glob = path_glob  # type: ignore[assignment]
+    Path.rglob = path_rglob  # type: ignore[assignment]
+    subprocess.call = call  # type: ignore[assignment]
+    subprocess.run = run  # type: ignore[assignment]
+    subprocess.check_call = check_call  # type: ignore[assignment]
+    subprocess.Popen = popen  # type: ignore[assignment]
+
+def _run_original_in_process(orig: Path, args: list[str]) -> int:
+    old_argv = sys.argv[:]
+    old_env = dict(os.environ)
+    try:
+        os.environ["DXVK_REMIX_DX11_SHADER_MODE"] = "1"
+        os.environ["RTX_REMIX_DX11"] = "1"
+        sys.argv = [str(orig)] + args
+        try:
+            runpy.run_path(str(orig), run_name="__main__")
+            return 0
+        except SystemExit as e:
+            code = e.code
+            if code is None:
+                return 0
+            if isinstance(code, int):
+                return code
+            return 1
+    finally:
+        sys.argv = old_argv
+        os.environ.clear()
+        os.environ.update(old_env)
+
+def main() -> int:
+    orig = _select_original()
+    if orig is None:
+        print("DX11_V219_PY314_SAFE_SHADER_WRAPPER: no clean original compile_shaders.py found. No fake shader output was generated.", file=sys.stderr)
+        return 2
+
+    args = sys.argv[1:]
+    input_i = _find_arg(args, "-input")
+    output_i = _find_arg(args, "-output")
+
+    if input_i < 0 or input_i + 1 >= len(args):
+        return subprocess.call([sys.executable, str(orig)] + args)
+
+    input_dir = Path(args[input_i + 1]).resolve()
+    if not input_dir.is_dir():
+        return subprocess.call([sys.executable, str(orig)] + args)
+
+    output_dir = None
+    if output_i >= 0 and output_i + 1 < len(args):
+        output_dir = Path(args[output_i + 1]).resolve()
+
+    with tempfile.TemporaryDirectory(prefix="dx11_v219_shader_fulltree_", ignore_cleanup_errors=True) as td:
+        temp_root = Path(td)
+        temp_input = temp_root / "input"
+        temp_input.mkdir(parents=True, exist_ok=True)
+
+        entries, headers, old_api_skipped, modules = _copy_full_tree_and_find_modules(input_dir, temp_input)
+        rtx_headers, rtx_dsts = _copy_rtx_render_headers(input_dir, temp_root)
+
+        if output_dir is not None:
+            output_dir.mkdir(parents=True, exist_ok=True)
+            report = output_dir / "dx11_v219_py314_safe_shader_wrapper_report.txt"
+            report.write_text(
+                "DX11_V219_PY314_SAFE_SHADER_WRAPPER\n"
+                "No placeholder shaders. No fake output.\n"
+                f"OriginalCompiler={orig}\n"
+                f"OriginalInput={input_dir}\n"
+                f"TempInput={temp_input}\n"
+                f"EntryFilesVisibleToCompiler={entries}\n"
+                f"RealShaderHeadersCopied={headers}\n"
+                f"RealRtxRenderHeadersCopied={rtx_headers}\n"
+                f"OldApiPathsSkipped={old_api_skipped}\n"
+                f"SharedSlangModulesHiddenFromEnumeration={len(modules)}\n\n"
+                + "\n".join(modules)
+                + ("\n" if modules else ""),
+                encoding="utf-8"
+            )
+
+        if entries == 0:
+            return subprocess.call([sys.executable, str(orig)] + args)
+
+        new_args = list(args)
+        new_args[input_i + 1] = str(temp_input)
+
+        existing_includes = {new_args[i + 1] for i, a in enumerate(new_args[:-1]) if a == "-include"}
+        include_roots = [temp_input, input_dir, input_dir.parent, temp_root, temp_root.parent]
+        include_roots.extend(rtx_dsts)
+        for inc in include_roots:
+            s = str(inc)
+            if s not in existing_includes:
+                new_args.extend(["-include", s])
+                existing_includes.add(s)
+
+        print(
+            "DX11_V219_PY314_SAFE_SHADER_WRAPPER: compiling real Remix runtime shaders "
+            f"entries={entries} headers={headers} rtx_render_headers={rtx_headers} "
+            f"old_api_paths_skipped={old_api_skipped} hidden_slang_modules={len(modules)} "
+            f"original_compiler={orig}",
+            flush=True
+        )
+
+        _install_hidden_module_hooks()
+        return _run_original_in_process(orig, new_args)
+
+if __name__ == "__main__":
+    raise SystemExit(main())

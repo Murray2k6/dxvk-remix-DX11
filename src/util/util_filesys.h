@@ -71,9 +71,8 @@ private:
 
 public:
   static void init(const std::string rootPath);
-  static inline bool isInit() { return s_bInit; }
   static inline const fspath path(const Id id) {
-    if (!s_bInit) return fspath();
+    assert(s_bInit && "[RtxFileSys] Not yet init.");
     return s_paths[id];
   }
   static void print();

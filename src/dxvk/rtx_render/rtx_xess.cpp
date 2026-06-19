@@ -88,8 +88,6 @@ namespace dxvk {
     : RtxPass(device),
       CommonDeviceObject(device),
       m_initialized(false),
-      m_supportChecked(false),
-      m_supportAvailable(false),
       m_xessContext(nullptr),
       m_targetExtent{0, 0, 0},
       m_currentPreset(XeSSPreset::Balanced),
@@ -107,11 +105,12 @@ namespace dxvk {
 
   // RtxPass interface implementations
   bool DxvkXeSS::isEnabled() const {
-    return RtxOptions::isRuntimeXeSSEnabled();
+    return RtxOptions::isXeSSEnabled();
   }
 
   bool DxvkXeSS::onActivation(Rc<DxvkContext>& ctx) {
-    if (!supportsXeSS()) {
+    // Check if XeSS is supported on this system (use stored device pointer)
+    if (!validateXeSSSupport(device())) {
       Logger::warn("XeSS: System does not support XeSS - activation failed");
       return false;
     }
@@ -119,15 +118,6 @@ namespace dxvk {
     m_recreate = true; // Force recreation of context
     Logger::info("XeSS: Activated successfully");
     return true;
-  }
-
-  bool DxvkXeSS::supportsXeSS() {
-    if (!m_supportChecked) {
-      m_supportAvailable = validateXeSSSupport(device());
-      m_supportChecked = true;
-    }
-
-    return m_supportAvailable;
   }
 
   void DxvkXeSS::onDeactivation() {
@@ -481,14 +471,12 @@ namespace dxvk {
       rtOutput.m_compositeOutput.view(Resources::AccessType::Read),
       rtOutput.m_primaryScreenSpaceMotionVector.view,
       rtOutput.m_primaryDepth.view,
-      nullptr  // Auto-exposure texture - will be set if enabled
+      nullptr // Placeholder for auto-exposure texture
     };
 
     auto& autoExposure = device()->getCommon()->metaAutoExposure();
     if (autoExposure.enabled() && autoExposure.getExposureTexture().image != nullptr) {
       inputs[3] = autoExposure.getExposureTexture().view;
-    } else {
-      inputs[3] = nullptr;  // Explicitly set to null if auto-exposure is disabled
     }
 
     std::array<Rc<DxvkImageView>, 1> outputs = {

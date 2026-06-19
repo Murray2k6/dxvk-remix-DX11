@@ -1185,7 +1185,7 @@ namespace dxvk {
     m_queryPoolDLFG = new DxvkDLFGTimestampQueryPool(m_device, kMaxFramesInFlight);
 
     if (!supportsPresentMetering()) {
-      Logger::info("NV_present_metering extension not supported");
+      Logger::warn("NV_present_metering extension not supported");
       enablePresentMetering.setDeferred(false);
     }
   }
@@ -1233,7 +1233,7 @@ namespace dxvk {
     VkExtent3D outputExtent = outputImage->imageInfo().extent;
     if (outputExtent.width != m_currentDisplaySize[0] ||
         outputExtent.height != m_currentDisplaySize[1]) {
-      // note: this is the size of the window client area, which isn't necessarily the same as the swapchain size
+      // note: this is the size of the window client area, which isn't necessarily the same as the D3D11 swapchain size
       setDisplaySize(uint2(outputExtent.width, outputExtent.height));
       m_contextDirty = true;
     }

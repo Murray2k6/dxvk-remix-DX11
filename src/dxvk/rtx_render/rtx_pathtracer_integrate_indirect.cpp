@@ -1,5 +1,5 @@
 /*
-* Copyright (c) 2023-2025, NVIDIA CORPORATION. All rights reserved.
+* Copyright (c) 2023-2026, NVIDIA CORPORATION. All rights reserved.
 *
 * Permission is hereby granted, free of charge, to any person obtaining a
 * copy of this software and associated documentation files (the "Software"),
@@ -346,7 +346,7 @@ namespace dxvk {
       const bool serEnabled = RtxOptions::isShaderExecutionReorderingInPathtracerIntegrateIndirectEnabled();
       const bool ommEnabled = OpacityMicromapManager::checkIsOpacityMicromapSupported(*m_device) && RtxOptions::OpacityMicromap::enable();
       const bool useNeeCache = NeeCachePass::enable();
-      const bool nrcEnabled = RtxOptions::getSupportedIntegrateIndirectMode(m_device, RtxOptions::integrateIndirectMode()) == IntegrateIndirectMode::NeuralRadianceCache;
+      const bool nrcEnabled = RtxOptions::integrateIndirectMode() == IntegrateIndirectMode::NeuralRadianceCache;
       const bool wboitEnabled = RtxOptions::wboitEnabled();
 
       for (int32_t includesPortals = portalsEnabled; includesPortals >= 0; includesPortals--) {
@@ -373,9 +373,8 @@ namespace dxvk {
   }
 
   void DxvkPathtracerIntegrateIndirect::logIntegrateIndirectMode() {
-    const IntegrateIndirectMode resolvedMode = RtxOptions::getSupportedIntegrateIndirectMode(m_device, RtxOptions::integrateIndirectMode());
-    if (m_integrateIndirectMode != resolvedMode) {
-      m_integrateIndirectMode = resolvedMode;
+    if (m_integrateIndirectMode != RtxOptions::integrateIndirectMode()) {
+      m_integrateIndirectMode = RtxOptions::integrateIndirectMode();
 
       switch (m_integrateIndirectMode) {
       default:
@@ -399,16 +398,8 @@ namespace dxvk {
     const Resources::RaytracingOutput& rtOutput) {
 
     const uint32_t frameIdx = ctx->getDevice()->getCurrentFrameId();
-    const bool traceRtStartupStages = frameIdx <= 3;
-    auto logRtStartupStage = [&](const char* stage) {
-      if (traceRtStartupStages) {
-        Logger::info(str::format("[RTX-Startup] frame=", frameIdx, " stage=", stage));
-      }
-    };
 
-    logRtStartupStage("indirect dispatch entry");
     logIntegrateIndirectMode();
-    logRtStartupStage("after indirect mode resolve");
 
     // Bind resources
 
@@ -505,20 +496,16 @@ namespace dxvk {
     const bool neeCacheEnabled = NeeCachePass::enable();
     const bool wboitEnabled = RtxOptions::wboitEnabled();
 
-    logRtStartupStage("after indirect resource binds");
-
     // Trace indirect ray
     {
       ScopedGpuProfileZone(ctx, "Integrate Indirect Raytracing");
       const NeeCachePass& neeCache = ctx->getCommonObjects()->metaNeeCache();
-      logRtStartupStage("before indirect ray dispatch");
+      const VkExtent3D workgroups = util::computeBlockCount(rayDims, VkExtent3D { 16, 8, 1 });
       switch (RtxOptions::renderPassIntegrateIndirectRaytraceMode()) {
-      case RaytraceMode::RayQuery: {
-        VkExtent3D workgroups = util::computeBlockCount(rayDims, VkExtent3D { 16, 8, 1 });
+      case RaytraceMode::RayQuery:
         ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, getComputeShader(neeCacheEnabled, nrcEnabled, wboitEnabled));
         ctx->dispatch(workgroups.width, workgroups.height, workgroups.depth);
         break;
-      }
       case RaytraceMode::RayQueryRayGen:
         ctx->bindRaytracingPipelineShaders(getPipelineShaders(true, serEnabled, ommEnabled, neeCacheEnabled, includePortals, pomEnabled, nrcEnabled, wboitEnabled));
         ctx->traceRays(rayDims.width, rayDims.height, rayDims.depth);
@@ -531,7 +518,6 @@ namespace dxvk {
         assert(false && "Invalid RaytraceMode in DxvkPathtracerIntegrateIndirect::dispatch");
         break;
       }
-      logRtStartupStage("after indirect ray dispatch");
     }
   }
 
@@ -539,7 +525,7 @@ namespace dxvk {
     // Sample triangles in the NEE cache and perform NEE
     // Construct restir input sample
     const auto rayDims = rtOutput.m_compositeOutputExtent;
-    VkExtent3D workgroups = util::computeBlockCount(rayDims, VkExtent3D { 16, 8, 1 });
+    VkExtent3D workgroups = util::computeBlockCount(rayDims, VkExtent3D { INTEGRATE_NEE_THREADS_DISPATCH_WIDTH, INTEGRATE_NEE_THREADS_DISPATCH_HEIGHT, 1 });
     Rc<DxvkBuffer> primitiveIDPrefixSumBuffer = ctx->getSceneManager().getCurrentFramePrimitiveIDPrefixSumBuffer();
     NeuralRadianceCache& nrc = ctx->getCommonObjects()->metaNeuralRadianceCache();
 

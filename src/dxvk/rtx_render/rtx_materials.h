@@ -20,16 +20,19 @@
 * DEALINGS IN THE SOFTWARE.
 */
 #pragma once
+#include "rtx/dx11/dx11_material_fog_state.h"
+#include <memory>
+#include <variant>
 
 #include "rtx_texture.h"
 #include "rtx_option.h"
-#include "rtx_cb_types.h"
 #include "../../util/util_color.h"
 #include "../../util/util_macro.h"
 #include "rtx/utility/shared_constants.h"
 #include "rtx/concept/surface/surface_shared.h"
 #include "rtx/pass/common_binding_indices.h"
 #include "rtx/pass/instance_definitions.h"
+#include "../../dxso/dxso_util.h"
 #include "rtx_material_data.h"
 #include "../../lssusd/mdl_helpers.h"
 #include "rtx/pass/particles/particle_system_common.h"
@@ -168,8 +171,6 @@ struct RtSurface {
     flags1 |= isMotionBlurMaskOut ?           (1 << 28) : 0;
     flags1 |= skipSurfaceInteractionSpritesheetAdjustment ? (1 << 29) : 0;
     flags1 |= ignoreTransparencyLayer ?       (1 << 30) : 0;
-    // Note: This flag is purely for debug view purpose. If we need to add more functional flags and running out of bits, we should move this flag to other place.
-    flags1 |= isInsideFrustum ?               (1 << 31) : 0;
 
     writeGPUHelper(data, offset, flags1);
 
@@ -335,7 +336,6 @@ struct RtSurface {
   bool isVertexColorBakedLighting = true;
   bool isMotionBlurMaskOut = false;
   bool skipSurfaceInteractionSpritesheetAdjustment = false;
-  bool isInsideFrustum = false;
   bool ignoreTransparencyLayer = false;
 
   RtTextureArgSource textureColorArg1Source = RtTextureArgSource::Texture;
@@ -344,7 +344,7 @@ struct RtSurface {
   RtTextureArgSource textureAlphaArg1Source = RtTextureArgSource::Texture;
   RtTextureArgSource textureAlphaArg2Source = RtTextureArgSource::None;
   DxvkRtTextureOperation textureAlphaOperation = DxvkRtTextureOperation::SelectArg1;
-  uint32_t tFactor = 0xffffffff;   // Texture blend factor; opaque white by default
+  uint32_t tFactor = 0xffffffff;   // Value for D3DRS_TEXTUREFACTOR, default value of is opaque white
   TexGenMode texgenMode = TexGenMode::None;
   std::optional<RtEyeParams> eyeParams = {};
 
@@ -404,7 +404,6 @@ struct RtSurface {
       "  isTextureFactorBlend: ", isTextureFactorBlend, "\n",
       "  isMotionBlurMaskOut: ", isMotionBlurMaskOut, "\n",
       "  skipSurfaceInteractionSpritesheetAdjustment: ", skipSurfaceInteractionSpritesheetAdjustment, "\n",
-      "  isInsideFrustum: ", isInsideFrustum, "\n",
       "  ignoreTransparencyLayer: ", ignoreTransparencyLayer));
     
     // Print alpha state
@@ -480,8 +479,10 @@ struct RtSurface {
   uint32_t objectPickingValue = 0; // NOTE: a value to fill GBUFFER_BINDING_PRIMARY_OBJECT_PICKING_OUTPUT
   uint32_t decalSortOrder = 0; // see: InstanceManager::m_decalSortOrderCounter
 
-  // PointInstancer support - this surface may represent multiple instances, one for each transform in instancesToObject
-  const std::vector<Matrix4>* instancesToObject = nullptr;
+  // PointInstancer support - this surface may represent multiple instances, one for each transform in instancesToObject.
+  // Some API-provided instance transform arrays are not owned by an AssetReplacement and may be destroyed before the
+  // next full scene clear, so surfaces retain shared ownership of the transform data they reference.
+  std::shared_ptr<const std::vector<Matrix4>> instancesToObject;
   // on the GPU, multiple copies of this surface with different transforms will exist.  They will be in a continuous block, starting at surfaceIndexOfFirstInstance.
   size_t surfaceIndexOfFirstInstance = SIZE_MAX;
 };
@@ -746,6 +747,18 @@ struct RtOpaqueSurfaceMaterial {
     return m_isRaytracedRenderTarget;
   }
 
+  template<typename Fn>
+  void forEachTextureIndex(Fn&& fn) const {
+    fn(m_albedoOpacityTextureIndex);
+    fn(m_secondaryTextureIndex);
+    fn(m_normalTextureIndex);
+    fn(m_tangentTextureIndex);
+    fn(m_heightTextureIndex);
+    fn(m_roughnessTextureIndex);
+    fn(m_metallicTextureIndex);
+    fn(m_emissiveColorTextureIndex);
+  }
+
 private:
   void updateCachedHash() {
     static_assert(
@@ -953,6 +966,14 @@ struct RtTranslucentSurfaceMaterial {
   XXH64_hash_t getHash() const {
     return m_cachedHash;
   }
+
+  template<typename Fn>
+  void forEachTextureIndex(Fn&& fn) const {
+    fn(m_normalTextureIndex);
+    fn(m_transmittanceTextureIndex);
+    fn(m_emissiveColorTextureIndex);
+  }
+
 private:
   void updateCachedHash() {
     static_assert(
@@ -1129,6 +1150,12 @@ struct RtRayPortalSurfaceMaterial {
 
   float getEmissiveIntensity() const {
     return m_emissiveIntensity;
+  }
+
+  template<typename Fn>
+  void forEachTextureIndex(Fn&& fn) const {
+    fn(m_maskTextureIndex);
+    fn(m_maskTextureIndex2);
   }
 
 private:
@@ -1308,6 +1335,13 @@ struct RtSubsurfaceMaterial {
 
   float getSubsurfaceMaxRadius() const {
     return m_subsurfaceMaxSampleRadius;
+  }
+
+  template<typename Fn>
+  void forEachTextureIndex(Fn&& fn) const {
+    fn(m_subsurfaceTransmittanceTextureIndex);
+    fn(m_subsurfaceThicknessTextureIndex);
+    fn(m_subsurfaceSingleScatteringAlbedoTextureIndex);
   }
 
 private:
@@ -1555,6 +1589,29 @@ struct RtSurfaceMaterial {
 
     return m_rayPortalSurfaceMaterial;
   }
+
+  template<typename Fn>
+  void forEachTextureIndex(Fn&& fn) const {
+    switch (m_type) {
+    default:
+      assert(false);
+
+      [[fallthrough]];
+    case RtSurfaceMaterialType::Opaque:
+      m_opaqueSurfaceMaterial.forEachTextureIndex(fn);
+      break;
+    case RtSurfaceMaterialType::Translucent:
+      m_translucentSurfaceMaterial.forEachTextureIndex(fn);
+      break;
+    case RtSurfaceMaterialType::RayPortal:
+      m_rayPortalSurfaceMaterial.forEachTextureIndex(fn);
+      break;
+    case RtSurfaceMaterialType::Subsurface:
+      m_subsurfaceMaterial.forEachTextureIndex(fn);
+      break;
+    }
+  }
+
 private:
   // Type-specific Surface Material Information
 
@@ -1615,20 +1672,20 @@ enum class MaterialDataType {
   Invalid
 };
 
-// Note: For use with legacy material information
+// Note: For use with "Legacy" D3D11 material information
 struct LegacyMaterialData {
   static OpaqueMaterialData createDefault();
 
   LegacyMaterialData()
   { }
 
-  LegacyMaterialData(const TextureRef& colorTexture, const TextureRef& colorTexture2, const RtxMaterial material)
-    : material{ material }
+  LegacyMaterialData(const TextureRef& colorTexture, const TextureRef& colorTexture2, const Dx11RuntimeMaterial material)
+    : dx11Material{ material }
   {
+    // Note: Texture required to be populated for hashing to function
     assert(!colorTexture.isImageEmpty());
-    // Hash is NOT computed here — caller must invoke updateCachedHash()
-    // after populating blend/alpha state, since the D3D11 hash includes
-    // those fields.
+
+    updateCachedHash();
   }
 
   const XXH64_hash_t getHash() const {
@@ -1651,8 +1708,8 @@ struct LegacyMaterialData {
     return samplers[1];
   }
 
-  const RtxMaterial& getLegacyMaterial() const {
-    return material;
+  const Dx11RuntimeMaterial& getLegacyMaterial() const {
+    return dx11Material;
   }
 
   inline const bool usesTexture() const {
@@ -1687,11 +1744,11 @@ struct LegacyMaterialData {
       "  textureAlphaArg2Source: ", static_cast<int>(textureAlphaArg2Source), "\n",
       "  textureAlphaOperation: ", static_cast<int>(textureAlphaOperation), "\n",
       "  tFactor: ", tFactor, "\n",
-      // "  material.Diffuse: ", material.Diffuse, "\n",
-      // "  material.Ambient: ", material.Ambient, "\n",
-      // "  material.Specular: ", material.Specular, "\n",
-      // "  material.Emissive: ", material.Emissive, "\n",
-      // "  material.Power: ", material.Power, "\n",
+      // "  m_dx11Material.Diffuse: ", m_dx11Material.Diffuse, "\n",
+      // "  m_dx11Material.Ambient: ", m_dx11Material.Ambient, "\n",
+      // "  m_dx11Material.Specular: ", m_dx11Material.Specular, "\n",
+      // "  m_dx11Material.Emissive: ", m_dx11Material.Emissive, "\n",
+      // "  m_dx11Material.Power: ", m_dx11Material.Power, "\n",
       std::hex, "  m_colorTexture: 0x", colorTextures[0].getImageHash(), "\n",
       "  m_colorTexture2: 0x", colorTextures[1].getImageHash(), "\n",
       "  m_cachedHash: 0x", m_cachedHash, std::dec));
@@ -1716,8 +1773,8 @@ struct LegacyMaterialData {
   RtTextureArgSource textureAlphaArg1Source = RtTextureArgSource::Texture;
   RtTextureArgSource textureAlphaArg2Source = RtTextureArgSource::None;
   DxvkRtTextureOperation textureAlphaOperation = DxvkRtTextureOperation::SelectArg1;
-  uint32_t tFactor = 0xffffffff;  // Default: opaque white
-  RtxMaterial material = {};
+  uint32_t tFactor = 0xffffffff;  // Value for D3DRS_TEXTUREFACTOR, default value of is opaque white
+  Dx11RuntimeMaterial dx11Material = {};
   bool isTextureFactorBlend = false;
   bool isVertexColorBakedLighting = true;
 
@@ -1727,49 +1784,17 @@ struct LegacyMaterialData {
 
 private:
   friend class RtxContext;
-  friend class D3D11Rtx;
+  friend struct D3D11Rtx;
   friend class TerrainBaker;
   friend class SceneManager;
   friend struct RemixAPIPrivateAccessor;
 
   void updateCachedHash() {
-    // D3D11 material hash — incorporates both texture hashes, blend state,
-    // and alpha test to uniquely identify materials.  In D3D11 different
-    // draw calls can bind the same albedo SRV with different blend/alpha
-    // state, producing visually distinct materials that need distinct hashes.
-    struct HashData {
-      XXH64_hash_t tex0Hash;
-      XXH64_hash_t tex1Hash;
-      uint32_t     blendEnable;
-      uint32_t     colorSrc;
-      uint32_t     colorDst;
-      uint32_t     colorOp;
-      uint32_t     alphaSrc;
-      uint32_t     alphaDst;
-      uint32_t     alphaOp;
-      uint32_t     writeMask;
-      uint32_t     alphaTestEnabled;
-      uint32_t     alphaTestRef;
-      uint32_t     alphaTestCmp;
-    };
-    static_assert(alignof(HashData) <= 8 && sizeof(HashData) % 4 == 0);
-
-    HashData hd = {
-      colorTextures[0].getImageHash(),
-      colorTextures[1].isImageEmpty() ? XXH64_hash_t(0) : colorTextures[1].getImageHash(),
-      blendMode.enableBlending,
-      static_cast<uint32_t>(blendMode.colorSrcFactor),
-      static_cast<uint32_t>(blendMode.colorDstFactor),
-      static_cast<uint32_t>(blendMode.colorBlendOp),
-      static_cast<uint32_t>(blendMode.alphaSrcFactor),
-      static_cast<uint32_t>(blendMode.alphaDstFactor),
-      static_cast<uint32_t>(blendMode.alphaBlendOp),
-      blendMode.writeMask,
-      alphaTestEnabled ? 1u : 0u,
-      static_cast<uint32_t>(alphaTestReferenceValue),
-      static_cast<uint32_t>(alphaTestCompareOp),
-    };
-    m_cachedHash = XXH3_64bits(&hd, sizeof(hd));
+    // Note: Currently only based on the color texture's data hash. This may have to be changed later to
+    // incorporate more textures used to identify a material uniquely. Note this is not the same as the
+    // plain data hash used by the RtSurfaceMaterial for storage in map-like data structures, but rather
+    // one used to identify a material and compare to user-provided hashes.
+    m_cachedHash = colorTextures[0].getImageHash();
   }
 
   const static uint32_t kMaxSupportedTextures = 2;

@@ -4,7 +4,6 @@
 #include "rtx_overlay_window.h"
 #include "../imgui/dxvk_imgui.h"
 #include "imgui/imgui_impl_win32.h"
-#include "rtx_options.h"
 
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
 
@@ -144,7 +143,7 @@ void GameOverlay::hide() {
 
   if (m_mouseInsideOverlay) {
     m_mouseInsideOverlay = false;
-    ImGui_ImplWin32_WndProcHandler(m_gameHwnd ? m_gameHwnd : m_hwnd, WM_MOUSELEAVE, 0, 0);
+    ImGui_ImplWin32_WndProcHandler(m_hwnd, WM_MOUSELEAVE, 0, 0);
   }
 
   SetWindowPos(m_hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
@@ -154,27 +153,6 @@ void GameOverlay::hide() {
 void GameOverlay::gameWndProcHandler(HWND gameHwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
   if (gameHwnd != m_gameHwnd) {
     return;
-  }
-
-  // Forward keyboard and character messages to ImGui's Win32 backend so its
-  // io.KeyAlt / io.KeysDown state stays in sync when the legacy WndProc path
-  // is the only delivery path (e.g. when a game menu captures raw input).
-  // Mouse messages are intentionally not forwarded here: the overlay's
-  // WM_INPUT path already synthesizes scaled mouse events.
-  switch (msg) {
-  case WM_KEYDOWN:
-  case WM_KEYUP:
-  case WM_SYSKEYDOWN:
-  case WM_SYSKEYUP:
-  case WM_CHAR:
-  case WM_SYSCHAR:
-    {
-      HWND overlayHwnd = m_hwnd.load();
-      ImGui_ImplWin32_WndProcHandler(overlayHwnd ? overlayHwnd : gameHwnd, msg, wParam, lParam);
-      break;
-    }
-  default:
-    break;
   }
 
   auto postShowMsg = [this] { PostMessage(hwnd(), WM_REMIX_SHOW_OVERLAY, 0, 0); };
@@ -285,8 +263,6 @@ bool GameOverlay::isOurForeground() const {
 }
 
 LRESULT GameOverlay::overlayWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
-  const HWND imguiHwnd = m_gameHwnd ? m_gameHwnd : m_hwnd;
-
   switch (msg) {
   case WM_PAINT:
   {
@@ -324,12 +300,6 @@ LRESULT GameOverlay::overlayWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
 
   case WM_NCHITTEST:
   {
-    // In legacy input mode, the overlay should always be click-through.
-    // All input goes through the game window's WndProc which forwards to ImGui.
-    if (!RtxOptions::useNewGuiInputMethod()) {
-      return HTTRANSPARENT;
-    }
-
     // Default hit-test
     LRESULT hit = DefWindowProcW(hWnd, msg, wParam, lParam);
 
@@ -344,46 +314,47 @@ LRESULT GameOverlay::overlayWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
 
   case WM_INPUT:
   {
-    // In legacy input mode, the game window's WndProc handles all input forwarding to ImGui.
-    // Only process raw input here when using the new overlay input method.
-    if (!RtxOptions::useNewGuiInputMethod()) {
-      return DefWindowProcW(m_hwnd, msg, wParam, lParam);
+    if (!isOurForeground()) {
+      if (m_mouseInsideOverlay) { 
+        m_mouseInsideOverlay = false;
+        ImGui_ImplWin32_WndProcHandler(m_hwnd, WM_MOUSELEAVE, 0, 0);
+      }
+      return 0;
+    }
+
+    // Stable scale 
+    float sx = 1.0f, sy = 1.0f;
+    if (m_w > 0 && m_h > 0) {
+      const ImVec2 disp = ImGui::GetIO().DisplaySize;
+      if (disp.x > 0.0f && disp.y > 0.0f) {
+        sx = disp.x / (float) m_w;
+        sy = disp.y / (float) m_h;
+      }
     }
 
     UINT size = 0;
-    if (GetRawInputData((HRAWINPUT) lParam, RID_INPUT, nullptr, &size, sizeof(RAWINPUTHEADER)) != 0 || size == 0)
-      return DefWindowProcW(m_hwnd, msg, wParam, lParam);
+    if (GetRawInputData((HRAWINPUT) lParam, RID_INPUT, nullptr, &size, sizeof(RAWINPUTHEADER)) != 0 || size == 0) {
+      return 0;
+    }
 
     BYTE stack_buf[256];
     std::unique_ptr<BYTE[]> heap_buf;
     BYTE* buf = size <= sizeof(stack_buf) ? stack_buf : (heap_buf.reset(new BYTE[size]), heap_buf.get());
-    if (GetRawInputData((HRAWINPUT) lParam, RID_INPUT, buf, &size, sizeof(RAWINPUTHEADER)) != size)
-      return DefWindowProcW(m_hwnd, msg, wParam, lParam);
-
-    RAWINPUT* ri = reinterpret_cast<RAWINPUT*>(buf);
-
-    // Keyboard: deliver to ImGui regardless of foreground state.
-    if (ri->header.dwType == RIM_TYPEKEYBOARD) {
-      ImGui_ImplWin32_WndProcHandler(imguiHwnd, msg, wParam, lParam);
+    if (GetRawInputData((HRAWINPUT) lParam, RID_INPUT, buf, &size, sizeof(RAWINPUTHEADER)) != size) {
       return 0;
     }
 
-    // Mouse: only process when the game/overlay is our foreground process.
-    if (!isOurForeground()) {
-      if (m_mouseInsideOverlay) {
-        m_mouseInsideOverlay = false;
-        ImGui_ImplWin32_WndProcHandler(imguiHwnd, WM_MOUSELEAVE, 0, 0);
-      }
-      return DefWindowProcW(m_hwnd, msg, wParam, lParam);
-    }
-
+    // Capture mouse events so we can modify for scaling.
+    RAWINPUT* ri = reinterpret_cast<RAWINPUT*>(buf);
     if (ri->header.dwType == RIM_TYPEMOUSE) {
+      const RAWMOUSE& m = ri->data.mouse;
+
       POINT p; 
       GetCursorPos(&p);
-      ScreenToClient(imguiHwnd, &p);
+      ScreenToClient(m_hwnd, &p);
 
       RECT cr {}; 
-      GetClientRect(imguiHwnd, &cr);
+      GetClientRect(m_hwnd, &cr);
       const int cw = cr.right - cr.left, ch = cr.bottom - cr.top;
       const bool outside = (p.x < 0 || p.y < 0 || p.x >= cw || p.y >= ch);
       if (!outside) {
@@ -391,40 +362,70 @@ LRESULT GameOverlay::overlayWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
         if (!m_mouseInsideOverlay) {
           m_mouseInsideOverlay = true;
         }
-        ImGui_ImplWin32_WndProcHandler(imguiHwnd, msg, wParam, lParam);
-        return 0;
+
+        int x = std::clamp((int) std::lround(p.x * sx), -32768, 32768);
+        int y = std::clamp((int) std::lround(p.y * sy), -32768, 32768);
+       
+        // Button mask for wParam
+        WPARAM wp = 0;
+        if (GetKeyState(VK_LBUTTON) & 0x8000) wp |= MK_LBUTTON;
+        if (GetKeyState(VK_RBUTTON) & 0x8000) wp |= MK_RBUTTON;
+        if (GetKeyState(VK_MBUTTON) & 0x8000) wp |= MK_MBUTTON;
+        if (GetKeyState(VK_XBUTTON1) & 0x8000) wp |= MK_XBUTTON1;
+        if (GetKeyState(VK_XBUTTON2) & 0x8000) wp |= MK_XBUTTON2;
+        if (GetKeyState(VK_CONTROL) & 0x8000) wp |= MK_CONTROL;
+        if (GetKeyState(VK_SHIFT) & 0x8000) wp |= MK_SHIFT;
+
+        LPARAM lp = MAKELPARAM((WORD) (SHORT) x, (WORD) (SHORT) y);
+        ImGui_ImplWin32_WndProcHandler(m_hwnd, WM_MOUSEMOVE, wp, lp);
+
+        if (m.usButtonFlags) {
+          auto send_btn = [&](UINT msg, WPARAM w) {
+            LPARAM lp = MAKELPARAM((WORD) (SHORT) x, (WORD) (SHORT) y);
+            ImGui_ImplWin32_WndProcHandler(m_hwnd, msg, w, lp);
+          };
+          if (m.usButtonFlags & RI_MOUSE_LEFT_BUTTON_DOWN)  send_btn(WM_LBUTTONDOWN, wp | MK_LBUTTON);
+          if (m.usButtonFlags & RI_MOUSE_LEFT_BUTTON_UP)    send_btn(WM_LBUTTONUP, wp & ~MK_LBUTTON);
+          if (m.usButtonFlags & RI_MOUSE_RIGHT_BUTTON_DOWN) send_btn(WM_RBUTTONDOWN, wp | MK_RBUTTON);
+          if (m.usButtonFlags & RI_MOUSE_RIGHT_BUTTON_UP)   send_btn(WM_RBUTTONUP, wp & ~MK_RBUTTON);
+          if (m.usButtonFlags & RI_MOUSE_MIDDLE_BUTTON_DOWN)send_btn(WM_MBUTTONDOWN, wp | MK_MBUTTON);
+          if (m.usButtonFlags & RI_MOUSE_MIDDLE_BUTTON_UP)  send_btn(WM_MBUTTONUP, wp & ~MK_MBUTTON);
+          if (m.usButtonFlags & RI_MOUSE_BUTTON_4_DOWN)     send_btn(WM_XBUTTONDOWN, wp | MK_XBUTTON1);
+          if (m.usButtonFlags & RI_MOUSE_BUTTON_4_UP)       send_btn(WM_XBUTTONUP, wp & ~MK_XBUTTON1);
+          if (m.usButtonFlags & RI_MOUSE_BUTTON_5_DOWN)     send_btn(WM_XBUTTONDOWN, wp | MK_XBUTTON2);
+          if (m.usButtonFlags & RI_MOUSE_BUTTON_5_UP)       send_btn(WM_XBUTTONUP, wp & ~MK_XBUTTON2);
+        }
+
+        if (m.usButtonFlags & RI_MOUSE_WHEEL) {
+          SHORT d = (SHORT) m.usButtonData;
+          WPARAM w = MAKEWPARAM(wp & 0xFFFF, (UINT16) d);
+          LPARAM l = MAKELPARAM((WORD) (SHORT) x, (WORD) (SHORT) y);
+          ImGui_ImplWin32_WndProcHandler(m_hwnd, WM_MOUSEWHEEL, w, l);
+        }
+        if (m.usButtonFlags & RI_MOUSE_HWHEEL) {
+          SHORT d = (SHORT) m.usButtonData;
+          WPARAM w = MAKEWPARAM(wp & 0xFFFF, (UINT16) d);
+          LPARAM l = MAKELPARAM((WORD) (SHORT) x, (WORD) (SHORT) y);
+          ImGui_ImplWin32_WndProcHandler(m_hwnd, WM_MOUSEHWHEEL, w, l);
+        }
       } else {
         if (m_mouseInsideOverlay) {
           m_mouseInsideOverlay = false;
-          ImGui_ImplWin32_WndProcHandler(imguiHwnd, WM_MOUSELEAVE, 0, 0);
+          ImGui_ImplWin32_WndProcHandler(m_hwnd, WM_MOUSELEAVE, 0, 0);
         }
       }
+
+      return 0;
     }
 
-    return DefWindowProcW(m_hwnd, msg, wParam, lParam);
+    // Still handle keyboard using ImGui
+    break;
   }
   }
 
-  // Only process legacy key/mouse messages when using the new overlay input method.
-  // In legacy mode, the game window's WndProc handles all input forwarding to ImGui.
-  if (RtxOptions::useNewGuiInputMethod()) {
-    const bool isKeyMsg = (msg >= WM_KEYFIRST && msg <= WM_KEYLAST)
-                       || (msg >= WM_SYSKEYDOWN && msg <= WM_SYSDEADCHAR);
-    const bool isMouseMsg = (msg >= WM_MOUSEFIRST && msg <= WM_MOUSELAST);
-
-    // When using the new overlay input method, we need to forward legacy mouse messages
-    // to ImGui for proper UI interaction (checkboxes, buttons, sliders, etc.).
-    // WM_INPUT is the authoritative source for raw input, but legacy messages are still
-    // needed for ImGui's hover and click detection.
-    if (isKeyMsg || isMouseMsg) {
-      // Forward to ImGui for proper UI interaction
-      if (ImGui_ImplWin32_WndProcHandler(imguiHwnd, msg, wParam, lParam)) {
-        return 0;
-      }
-      // If ImGui didn't handle it, pass through to the underlying window
-      return DefWindowProcW(m_hwnd, msg, wParam, lParam);
-    }
-  }
+  // Let ImGui Win32 backend handle everything else (keyboard, etc.)
+  if (ImGui_ImplWin32_WndProcHandler(hWnd, msg, wParam, lParam))
+    return 0;
 
   return DefWindowProcW(m_hwnd, msg, wParam, lParam);
 }
@@ -471,26 +472,21 @@ void GameOverlay::windowThreadMain() {
 
   show();
 
-  // Only register for raw input when using the new overlay input method.
-  // In legacy mode, the game window's WndProc handles all input forwarding to ImGui,
-  // so we should NOT receive duplicate raw input here.
-  if (RtxOptions::useNewGuiInputMethod()) {
-    RAWINPUTDEVICE rid[2] {};
-    // Mouse
-    rid[0].usUsagePage = 0x01;
-    rid[0].usUsage = 0x02;
-    rid[0].dwFlags = RIDEV_INPUTSINK;
-    rid[0].hwndTarget = m_hwnd;
-    // Keyboard
-    rid[1].usUsagePage = 0x01;
-    rid[1].usUsage = 0x06;
-    rid[1].dwFlags = RIDEV_INPUTSINK;  // no RIDEV_NOLEGACY: that flag suppresses WM_KEYDOWN for the whole process, breaking game input
-    rid[1].hwndTarget = m_hwnd;
+  RAWINPUTDEVICE rid[2] {};
+  // Mouse
+  rid[0].usUsagePage = 0x01;
+  rid[0].usUsage = 0x02;
+  rid[0].dwFlags = RIDEV_INPUTSINK;
+  rid[0].hwndTarget = m_hwnd;
+  // Keyboard
+  rid[1].usUsagePage = 0x01;
+  rid[1].usUsage = 0x06;
+  rid[1].dwFlags = RIDEV_INPUTSINK | RIDEV_NOLEGACY;
+  rid[1].hwndTarget = m_hwnd;
 
-    if (!RegisterRawInputDevices(rid, 2, sizeof(RAWINPUTDEVICE))) {
-      Logger::err(str::format("Failed to register raw input for overlay window: ", m_className));
-      return;
-    }
+  if (!RegisterRawInputDevices(rid, 2, sizeof(RAWINPUTDEVICE))) {
+    Logger::err(str::format("Failed to register raw input for overlay window: ", m_className));
+    return;
   }
 
   MSG msg {};

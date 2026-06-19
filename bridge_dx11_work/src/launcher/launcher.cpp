@@ -47,7 +47,7 @@
 #endif
 
 #define LAUNCHER_NAME "NvRemixLauncher" TARGET_SUFFIX ".exe"
-#define INJECTION_NAME "d3d9.dll"
+#define INJECTION_NAME "d3d11.dll"
 
 static void PrintUsage(void) {
   printf("Usage:\n"

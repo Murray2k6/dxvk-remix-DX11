@@ -1,5 +1,5 @@
 /*
-* Copyright (c) 2023-2025, NVIDIA CORPORATION. All rights reserved.
+* Copyright (c) 2023-2026, NVIDIA CORPORATION. All rights reserved.
 *
 * Permission is hereby granted, free of charge, to any person obtaining a
 * copy of this software and associated documentation files (the "Software"),
@@ -19,10 +19,13 @@
 * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 * DEALINGS IN THE SOFTWARE.
 */
+
 #define RAB_HAS_CURRENT_GBUFFER 1
 #define RAB_HAS_RESTIR_GI_RESERVOIRS 1
 #define OPAQUE_MATERIAL_USE_POM 1
 #define ENABLE_NRC 1
+
+#include "rtx/pass/integrate/integrate_nee_binding_indices.h"
 
 #include "rtx/pass/common_bindings.slangh"
 #include "rtx/pass/integrate/integrate_nee_bindings.slangh"
@@ -35,7 +38,7 @@
 #include "rtx/pass/nrc/nrc_utilities.slangh"
 #include "rtx/pass/nrc/nrc_debug_view_utilities.slangh"
 
-float16_t getLobeAngleFromMaterial(OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteraction)
+float getLobeAngleFromMaterial(OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteraction)
 {
   const float perceptualRoughnessSquared = opaqueSurfaceMaterialInteraction.isotropicRoughness;
   const float lobeAngleNorm = 2.0 * perceptualRoughnessSquared / (1.0 + perceptualRoughnessSquared);
@@ -46,7 +49,6 @@ float16_t getLobeAngleFromMaterial(OpaqueSurfaceMaterialInteraction opaqueSurfac
 }
 
 void addRadianceToNrcTrainingPathVertex(
-  uvec2 pixelIndex,
   uvec2 trainingPixelCoordinate,
   uint bounceIndex,
   vec3 radiance)
@@ -73,7 +75,7 @@ void addRadianceToNrcTrainingPathVertex(
 }
 
 [shader("compute")]
-[numthreads(16, 8, 1)]
+[numthreads(INTEGRATE_NEE_THREADS_DISPATCH_WIDTH, INTEGRATE_NEE_THREADS_DISPATCH_HEIGHT, 1)]
 void main(uint2 threadIndex : SV_DispatchThreadID, uint2 LocalIndex : SV_GroupThreadID)
 {
   if (any(threadIndex >= cb.camera.resolution))
@@ -81,26 +83,27 @@ void main(uint2 threadIndex : SV_DispatchThreadID, uint2 LocalIndex : SV_GroupTh
     return;
   }
 
-  const bool gBufferMiss = isGBufferMiss(threadIndex, PrimaryConeRadius);
+  uvec2 pixelCoordinate = threadIndex;
+  const bool gBufferMiss = isGBufferMiss(pixelCoordinate, PrimaryConeRadius);
 
   // Early out if the primary surface was a miss or if the indirect integrator was not selected
   // to output indirect lighting information
   if (gBufferMiss)
   {
     // Make sure to clear out pixels we're skipping over since NRC resolve pass reads from all the output pixels after this pass
-    PrimaryIndirectDiffuseLobeRadianceHitDistance[threadIndex] = vec4(vec3(0), kEmptyPixelHitDistance);
-    PrimaryIndirectSpecularLobeRadianceHitDistance[threadIndex] = vec4(vec3(0), kEmptyPixelHitDistance);
+    PrimaryIndirectDiffuseLobeRadianceHitDistance[pixelCoordinate] = vec4(vec3(0), kEmptyPixelHitDistance);
+    PrimaryIndirectSpecularLobeRadianceHitDistance[pixelCoordinate] = vec4(vec3(0), kEmptyPixelHitDistance);
 
     return;
   }
 
-  const GeometryFlags geometryFlags = geometryFlagsReadFromGBuffer(threadIndex, SharedFlags);
+  const GeometryFlags geometryFlags = geometryFlagsReadFromGBuffer(pixelCoordinate, SharedFlags);
 
   vec4 indirectDiffuseOutput = vec4(0);
   vec4 indirectSpecularOutput = vec4(0);
   if (geometryFlags.primarySelectedIntegrationSurface)
   {
-    const vec4 indirectRadianceHitDistance = IndirectRadianceHitDistance[threadIndex];   
+    const vec4 indirectRadianceHitDistance = IndirectRadianceHitDistance[pixelCoordinate];   
     if (geometryFlags.firstSampledLobeIsSpecular) 
     {
       indirectSpecularOutput = indirectRadianceHitDistance;
@@ -115,16 +118,16 @@ void main(uint2 threadIndex : SV_DispatchThreadID, uint2 LocalIndex : SV_GroupTh
   // Early out in case when NEE cache is disabled.
   if (!cb.neeCacheArgs.enable)
   {
-    PrimaryIndirectDiffuseLobeRadianceHitDistance[threadIndex] = indirectDiffuseOutput;
-    PrimaryIndirectSpecularLobeRadianceHitDistance[threadIndex] = indirectSpecularOutput;
+    PrimaryIndirectDiffuseLobeRadianceHitDistance[pixelCoordinate] = indirectDiffuseOutput;
+    PrimaryIndirectSpecularLobeRadianceHitDistance[pixelCoordinate] = indirectSpecularOutput;
     return;
   }
 
   // Note: Re-derive the original primary ray direction.
-  const Ray originalPrimaryRay = rayCreatePrimaryFromPixel(cb.camera, threadIndex);
+  const Ray originalPrimaryRay = rayCreatePrimaryFromPixel(cb.camera, pixelCoordinate);
 
-  RAB_RandomSamplerState rtxdiRNG = RAB_InitRandomSampler(threadIndex, cb.frameIdx, 7);
-  RAB_Surface surface = RAB_GetGBufferSurface(threadIndex, false);
+  RAB_RandomSamplerState rtxdiRNG = RAB_InitRandomSampler(pixelCoordinate, cb.frameIdx, 7);
+  RAB_Surface surface = RAB_GetGBufferSurface(pixelCoordinate, false);
 
   // Deserialize the Ray
   GBufferMemoryMinimalRay gBufferMemoryMinimalRay;
@@ -135,15 +138,15 @@ void main(uint2 threadIndex : SV_DispatchThreadID, uint2 LocalIndex : SV_GroupTh
 
   // Deserialize the Ray Interaction
   MinimalRayInteraction minimalRayInteraction = minimalRayInteractionReadFromGBuffer(
-    originalPrimaryRay, threadIndex, PrimaryViewDirection, PrimaryConeRadius);
+    originalPrimaryRay, pixelCoordinate, PrimaryViewDirection, PrimaryConeRadius);
 
   // Deserialize the Surface Interaction
   MinimalSurfaceInteraction minimalSurfaceInteraction = minimalSurfaceInteractionReadFromGBufferWithError(
-    threadIndex, PrimaryWorldPositionWorldTriangleNormal, PrimaryPositionError);
+    pixelCoordinate, PrimaryWorldPositionWorldTriangleNormal, PrimaryPositionError);
 
   // Deserialize the Surface Material Interaction
   PolymorphicSurfaceMaterialInteraction polymorphicSurfaceMaterialInteraction = polymorphicSurfaceMaterialInteractionReadFromGBuffer(
-    threadIndex, PrimaryWorldShadingNormal, PrimaryPerceptualRoughness, PrimaryAlbedo, PrimaryBaseReflectivity,
+    pixelCoordinate, PrimaryWorldShadingNormal, PrimaryPerceptualRoughness, PrimaryAlbedo, PrimaryBaseReflectivity,
     SharedMaterialData0, SharedMaterialData1, SharedSurfaceIndex, SharedSubsurfaceData, SharedSubsurfaceDiffusionProfileData);
 
   // Perform next event estimation on cached emissive triangle list
@@ -174,7 +177,7 @@ void main(uint2 threadIndex : SV_DispatchThreadID, uint2 LocalIndex : SV_GroupTh
         primitiveIndex = candidate.getPrimitiveID();
         vec3 uvw = vec3(RAB_GetNextRandom(rtxdiRNG), RAB_GetNextRandom(rtxdiRNG), RAB_GetNextRandom(rtxdiRNG));
         float triangleArea;
-        float16_t spreadAngle = getLobeAngleFromMaterial(opaqueSurfaceMaterialInteraction);
+        float spreadAngle = getLobeAngleFromMaterial(opaqueSurfaceMaterialInteraction);
         lightSample = NEECacheUtils.calculateLightSampleFromCandidate(
           candidate.getSurfaceID(), primitiveIndex, candidate.getRange(), PrimitiveIDPrefixSum, uvw, lightObjectPdf, minimalSurfaceInteraction.position,
           minimalRayInteraction.coneRadius, spreadAngle, triangleArea, true, kFootprintFromRayOriginClamped);
@@ -184,7 +187,7 @@ void main(uint2 threadIndex : SV_DispatchThreadID, uint2 LocalIndex : SV_GroupTh
         // Fallback: candidates lost or reshuffled (BLAS rebuild changed prim count).
         // Use cached world-space samples preserved by the update shader.
         uint triangleID;
-        float16_t spreadAngle = getLobeAngleFromMaterial(opaqueSurfaceMaterialInteraction);
+        float spreadAngle = getLobeAngleFromMaterial(opaqueSurfaceMaterialInteraction);
         lightSample = cell.getCachedLightSample(RAB_GetNextRandom(rtxdiRNG), minimalSurfaceInteraction.position,
           minimalRayInteraction.coneRadius, spreadAngle, triangleID);
         usedCachedSample = true;
@@ -216,7 +219,7 @@ void main(uint2 threadIndex : SV_DispatchThreadID, uint2 LocalIndex : SV_GroupTh
           lightSample, invalidRayPortalIndex, surface.portalSpace, rayMask, pomOpaqueSurfaceEncountered,
           surface.isViewModel, primaryRay,
           minimalRayInteraction, minimalSurfaceInteraction, opaqueSurfaceMaterialInteraction,
-          diffuseLight, specularLight, SharedSurfaceIndex[threadIndex], SharedTextureCoord[threadIndex]);
+          diffuseLight, specularLight, SharedSurfaceIndex[pixelCoordinate], SharedTextureCoord[pixelCoordinate]);
 
         // Coordinate of a training path in NRC training pixel coordinate space
         uvec2 nrcTrainingPixelCoordinate;
@@ -224,14 +227,14 @@ void main(uint2 threadIndex : SV_DispatchThreadID, uint2 LocalIndex : SV_GroupTh
 
         if (cb.enableNrc)
         {
-          hasNrcTrainingPath = Nrc::calculateIfPixelHasActiveNrcTrainingPath(threadIndex, cb.nrcArgs, nrcTrainingPixelCoordinate);
+          hasNrcTrainingPath = Nrc::calculateIfPixelHasActiveNrcTrainingPath(pixelCoordinate, cb.nrcArgs, nrcTrainingPixelCoordinate);
         }
 
         // Feed back to NEE cache hash tasks (skip when using cached samples — triangleID may be stale)
         if ((!usedCachedSample || !reshuffleResilience)
           && any(diffuseLight + specularLight) > 0
           && (hasNrcTrainingPath
-              || (threadIndex.x + threadIndex.y) % 4 == 0))
+              || (pixelCoordinate.x + pixelCoordinate.y) % 4 == 0))
         {
           int prefixTask = NEECacheUtils.convertIDToPrefixSumID(candidate.getSurfaceID(), primitiveIndex, PrimitiveIDPrefixSum);
           if (cb.neeCacheArgs.enableSpatialReuse)
@@ -250,7 +253,7 @@ void main(uint2 threadIndex : SV_DispatchThreadID, uint2 LocalIndex : SV_GroupTh
         {
           const uint bounceIndex = 0;
           const vec3 neeRadiance = diffuseLight + specularLight;
-          addRadianceToNrcTrainingPathVertex(threadIndex, nrcTrainingPixelCoordinate, bounceIndex, neeRadiance);
+          addRadianceToNrcTrainingPathVertex(nrcTrainingPixelCoordinate, bounceIndex, neeRadiance);
         }
 
         if (cb.enableReSTIRGI && isVisible)
@@ -277,9 +280,9 @@ void main(uint2 threadIndex : SV_DispatchThreadID, uint2 LocalIndex : SV_GroupTh
 
   if (cb.enableReSTIRGI)
   {
-    RAB_StoreGIReservoir(resultReservoir, threadIndex, ReSTIRGI_GetInitSamplePage());
+    RAB_StoreGIReservoir(resultReservoir, pixelCoordinate, ReSTIRGI_GetInitSamplePage());
   }
 
-  PrimaryIndirectDiffuseLobeRadianceHitDistance[threadIndex] = indirectDiffuseOutput;
-  PrimaryIndirectSpecularLobeRadianceHitDistance[threadIndex] = indirectSpecularOutput;
+  PrimaryIndirectDiffuseLobeRadianceHitDistance[pixelCoordinate] = indirectDiffuseOutput;
+  PrimaryIndirectSpecularLobeRadianceHitDistance[pixelCoordinate] = indirectSpecularOutput;
 }

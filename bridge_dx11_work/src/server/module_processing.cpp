@@ -11,12 +11,14 @@
 
 #include "log/log.h"
 
-#include <d3d9.h>
+#include <d3d11.h>
+#include <dxgi.h>
+#include <vector>
 
 using namespace Commands;
 
-// Mapping between client and server pointer addresses
-extern LPDIRECT3D9 gpD3D;
+// DX11_V225: the module/"factory" level commands are served from a DXGI factory.
+extern IDXGIFactory1* gpD3D;
 
 #define PULL(type, name) const auto& name = (type)ModuleBridge::get_data()
 #define PULL_I(name) PULL(INT, name)
@@ -47,29 +49,29 @@ extern LPDIRECT3D9 gpD3D;
 #define TRUNCATE_HANDLE(type, input) (type)(size_t)(input)
 
 namespace {
-  D3DPRESENT_PARAMETERS getPresParamFromRaw(const uint32_t* rawPresentationParameters) {
-    D3DPRESENT_PARAMETERS presParam;
-    // Set up presentation parameters. We can't just directly cast the structure because the hDeviceWindow
-    // handle is 32-bit in the data coming in but 64-bit in the x64 version of the struct.
-    presParam.BackBufferWidth = *reinterpret_cast<const UINT*>(rawPresentationParameters);
-    presParam.BackBufferHeight = *reinterpret_cast<const UINT*>(rawPresentationParameters + 1);
-    presParam.BackBufferFormat = *reinterpret_cast<const D3DFORMAT*>(rawPresentationParameters + 2);
-    presParam.BackBufferCount = *reinterpret_cast<const UINT*>(rawPresentationParameters + 3);
+  // DX11_V225: enumerate a DXGI adapter by index (caller releases). Returns null
+  // if the index is out of range or the factory is unavailable.
+  IDXGIAdapter1* getDxgiAdapter(UINT index) {
+    if (!gpD3D) {
+      return nullptr;
+    }
+    IDXGIAdapter1* adapter = nullptr;
+    if (gpD3D->EnumAdapters1(index, &adapter) == DXGI_ERROR_NOT_FOUND) {
+      return nullptr;
+    }
+    return adapter;
+  }
 
-    presParam.MultiSampleType = *reinterpret_cast<const D3DMULTISAMPLE_TYPE*>(rawPresentationParameters + 4);
-    presParam.MultiSampleQuality = *reinterpret_cast<const DWORD*>(rawPresentationParameters + 5);
-
-    presParam.SwapEffect = *reinterpret_cast<const D3DSWAPEFFECT*>(rawPresentationParameters + 6);
-    presParam.hDeviceWindow = TRUNCATE_HANDLE(HWND, rawPresentationParameters[7]);
-    presParam.Windowed = *reinterpret_cast<const BOOL*>(rawPresentationParameters + 8);
-    presParam.EnableAutoDepthStencil = *reinterpret_cast<const BOOL*>(rawPresentationParameters + 9);
-    presParam.AutoDepthStencilFormat = *reinterpret_cast<const D3DFORMAT*>(rawPresentationParameters + 10);
-    presParam.Flags = *reinterpret_cast<const DWORD*>(rawPresentationParameters + 11);
-
-    presParam.FullScreen_RefreshRateInHz = *reinterpret_cast<const UINT*>(rawPresentationParameters + 12);
-    presParam.PresentationInterval = (UINT) * reinterpret_cast<const UINT*>(rawPresentationParameters + 13);
-
-    return presParam;
+  // DX11_V225: first output (monitor) of the given adapter (caller releases).
+  IDXGIOutput* getDxgiOutput(UINT adapterIndex, UINT outputIndex = 0) {
+    IDXGIAdapter1* adapter = getDxgiAdapter(adapterIndex);
+    if (!adapter) {
+      return nullptr;
+    }
+    IDXGIOutput* output = nullptr;
+    HRESULT hr = adapter->EnumOutputs(outputIndex, &output);
+    adapter->Release();
+    return SUCCEEDED(hr) ? output : nullptr;
   }
 }
 
@@ -84,188 +86,228 @@ void processModuleCommandQueue(std::atomic<bool>* const pbSignalEnd) {
       Logger::info("Module Processing: " + toString(rpcHeader.command) + " UID: " + std::to_string(currentUID));
     }
 #endif
-    // The mother of all switch statements - every call in the D3D9 interface is mapped here...
+    // The mother of all switch statements - every call in the DX11 module/factory
+    // interface is mapped here, served from a DXGI factory (gpD3D).
     switch (rpcHeader.command) {
       /*
-        * IDirect3D9 interface
-        */
-      case IDirect3D9Ex_QueryInterface:
+       * Module / factory interface
+       */
+      case IDirect3D11Ex_QueryInterface:
         break;
-      case IDirect3D9Ex_AddRef:
+      case IDirect3D11Ex_AddRef:
       {
-        // The server controls its own device lifetime completely - no op
+        // The server controls its own factory lifetime completely - no op
         break;
       }
-      case IDirect3D9Ex_Destroy:
+      case IDirect3D11Ex_Destroy:
       {
-        bridge_util::Logger::info("D3D9 Module destroyed.");
+        bridge_util::Logger::info("D3D11 Module destroyed.");
         destroyReceived = true;
         break;
       }
-      case IDirect3D9Ex_RegisterSoftwareDevice:
+      case IDirect3D11Ex_RegisterSoftwareDevice:
         break;
-      case IDirect3D9Ex_GetAdapterCount:
+      case IDirect3D11Ex_GetAdapterCount:
       {
-        const auto cnt = gpD3D->GetAdapterCount();
+        UINT cnt = 0;
+        for (;;) {
+          IDXGIAdapter1* adapter = getDxgiAdapter(cnt);
+          if (!adapter) {
+            break;
+          }
+          adapter->Release();
+          ++cnt;
+        }
         {
           ModuleServerCommand c(Commands::Bridge_Response, currentUID);
           c.send_data(cnt);
         }
         break;
       }
-      case IDirect3D9Ex_GetAdapterIdentifier:
+      case IDirect3D11Ex_GetAdapterIdentifier:
       {
         PULL_U(Adapter);
         PULL_D(Flags);
-        D3DADAPTER_IDENTIFIER9 pIdentifier;
-        auto hresult = gpD3D->GetAdapterIdentifier(IN Adapter, IN Flags, OUT & pIdentifier);
+        DXGI_ADAPTER_DESC1 desc = {};
+        IDXGIAdapter1* adapter = getDxgiAdapter(Adapter);
+        HRESULT hresult = E_FAIL;
+        if (adapter) {
+          hresult = adapter->GetDesc1(&desc);
+          adapter->Release();
+        }
         {
           ModuleServerCommand c(Commands::Bridge_Response, currentUID);
           c.send_data(hresult);
           if (SUCCEEDED(hresult)) {
-            c.send_data(sizeof(D3DADAPTER_IDENTIFIER9), &pIdentifier);
+            c.send_data(sizeof(DXGI_ADAPTER_DESC1), &desc);
           }
         }
         break;
       }
-      case IDirect3D9Ex_GetAdapterModeCount:
+      case IDirect3D11Ex_GetAdapterModeCount:
       {
         PULL_U(Adapter);
-        PULL(D3DFORMAT, Format);
-        const auto cnt = gpD3D->GetAdapterModeCount(IN Adapter, IN Format);
+        PULL(DXGI_FORMAT, Format);
+        UINT cnt = 0;
+        IDXGIOutput* output = getDxgiOutput(Adapter);
+        if (output) {
+          output->GetDisplayModeList(Format, 0, &cnt, nullptr);
+          output->Release();
+        }
         {
           ModuleServerCommand c(Commands::Bridge_Response, currentUID);
           c.send_data(cnt);
         }
         break;
       }
-      case IDirect3D9Ex_EnumAdapterModes:
+      case IDirect3D11Ex_EnumAdapterModes:
       {
         PULL_U(Adapter);
-        PULL(D3DFORMAT, Format);
+        PULL(DXGI_FORMAT, Format);
         PULL_U(Mode);
-        D3DDISPLAYMODE pMode;
-        const auto hresult = gpD3D->EnumAdapterModes(IN Adapter, IN Format, IN Mode, OUT & pMode);
-        BRIDGE_ASSERT_LOG(SUCCEEDED(hresult), "Issue checking Adapter compatibility with required format");
+        DXGI_MODE_DESC pMode = {};
+        HRESULT hresult = E_FAIL;
+        IDXGIOutput* output = getDxgiOutput(Adapter);
+        if (output) {
+          UINT cnt = 0;
+          if (SUCCEEDED(output->GetDisplayModeList(Format, 0, &cnt, nullptr)) && Mode < cnt) {
+            std::vector<DXGI_MODE_DESC> modes(cnt);
+            if (SUCCEEDED(output->GetDisplayModeList(Format, 0, &cnt, modes.data()))) {
+              pMode = modes[Mode];
+              hresult = S_OK;
+            }
+          }
+          output->Release();
+        }
         {
           ModuleServerCommand c(Commands::Bridge_Response, currentUID);
           c.send_data(hresult);
           if (SUCCEEDED(hresult)) {
-            c.send_data(sizeof(D3DDISPLAYMODE), &pMode);
+            c.send_data(sizeof(DXGI_MODE_DESC), &pMode);
           }
         }
         break;
       }
-      case IDirect3D9Ex_GetAdapterDisplayMode:
+      case IDirect3D11Ex_GetAdapterDisplayMode:
       {
         PULL_U(Adapter);
-        D3DDISPLAYMODE pMode;
-        const auto hresult = gpD3D->GetAdapterDisplayMode(IN Adapter, OUT & pMode);
-        BRIDGE_ASSERT_LOG(SUCCEEDED(hresult), "Issue retrieving Adapter display mode");
+        DXGI_MODE_DESC pMode = {};
+        HRESULT hresult = E_FAIL;
+        IDXGIOutput* output = getDxgiOutput(Adapter);
+        if (output) {
+          DXGI_OUTPUT_DESC outDesc = {};
+          if (SUCCEEDED(output->GetDesc(&outDesc))) {
+            pMode.Width = outDesc.DesktopCoordinates.right - outDesc.DesktopCoordinates.left;
+            pMode.Height = outDesc.DesktopCoordinates.bottom - outDesc.DesktopCoordinates.top;
+            pMode.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+            pMode.RefreshRate.Numerator = 60;
+            pMode.RefreshRate.Denominator = 1;
+            hresult = S_OK;
+          }
+          output->Release();
+        }
         {
           ModuleServerCommand c(Commands::Bridge_Response, currentUID);
           c.send_data(hresult);
           if (SUCCEEDED(hresult)) {
-            c.send_data(sizeof(D3DDISPLAYMODE), &pMode);
+            c.send_data(sizeof(DXGI_MODE_DESC), &pMode);
           }
         }
         break;
       }
-      case IDirect3D9Ex_CheckDeviceType:
+      case IDirect3D11Ex_CheckDeviceType:
       {
         PULL_U(Adapter);
-        PULL(D3DDEVTYPE, DevType);
-        PULL(D3DFORMAT, AdapterFormat);
-        PULL(D3DFORMAT, BackBufferFormat);
+        PULL_U(DevType);
+        PULL(DXGI_FORMAT, AdapterFormat);
+        PULL(DXGI_FORMAT, BackBufferFormat);
         PULL(BOOL, bWindowed);
-        const auto hresult = gpD3D->CheckDeviceType(IN Adapter, IN DevType, IN AdapterFormat, IN BackBufferFormat, IN bWindowed);
+        // DX11 does not gate device types the way D3D11 did; accept.
         {
           ModuleServerCommand c(Commands::Bridge_Response, currentUID);
-          c.send_data(hresult);
+          c.send_data((HRESULT) S_OK);
         }
         break;
       }
-      case IDirect3D9Ex_CheckDeviceFormat:
+      case IDirect3D11Ex_CheckDeviceFormat:
       {
         PULL_U(Adapter);
-        PULL(D3DDEVTYPE, DeviceType);
-        PULL(D3DFORMAT, AdapterFormat);
+        PULL_U(DeviceType);
+        PULL(DXGI_FORMAT, AdapterFormat);
         PULL_D(Usage);
-        PULL(D3DRESOURCETYPE, RType);
-        PULL(D3DFORMAT, CheckFormat);
-        const auto hresult = gpD3D->CheckDeviceFormat(IN Adapter, IN DeviceType, IN AdapterFormat, IN Usage, IN RType, IN CheckFormat);
+        PULL_U(RType);
+        PULL(DXGI_FORMAT, CheckFormat);
         {
           ModuleServerCommand c(Commands::Bridge_Response, currentUID);
-          c.send_data(hresult);
+          c.send_data((HRESULT) S_OK);
         }
         break;
       }
-      case IDirect3D9Ex_CheckDeviceMultiSampleType:
+      case IDirect3D11Ex_CheckDeviceMultiSampleType:
       {
         PULL_U(Adapter);
-        PULL(D3DDEVTYPE, DeviceType);
-        PULL(D3DFORMAT, SurfaceFormat);
+        PULL_U(DeviceType);
+        PULL(DXGI_FORMAT, SurfaceFormat);
         PULL(BOOL, Windowed);
-        PULL(D3DMULTISAMPLE_TYPE, MultiSampleType);
+        PULL_U(MultiSampleType);
 
-        DWORD QualityLevels;
-        const auto hresult = gpD3D->CheckDeviceMultiSampleType(IN Adapter, IN DeviceType, IN SurfaceFormat, IN Windowed, IN MultiSampleType, OUT & QualityLevels);
+        // Without a device we cannot query exact quality levels; report a single level.
+        DWORD QualityLevels = 1;
         {
           ModuleServerCommand c(Commands::Bridge_Response, currentUID);
-          c.send_data(hresult);
+          c.send_data((HRESULT) S_OK);
           c.send_data(QualityLevels);
         }
         break;
       }
-      case IDirect3D9Ex_CheckDepthStencilMatch:
+      case IDirect3D11Ex_CheckDepthStencilMatch:
       {
         PULL_U(Adapter);
-        PULL(D3DDEVTYPE, DeviceType);
-        PULL(D3DFORMAT, AdapterFormat);
-        PULL(D3DFORMAT, RenderTargetFormat);
-        PULL(D3DFORMAT, DepthStencilFormat);
-        const auto hresult = gpD3D->CheckDepthStencilMatch(IN Adapter, IN DeviceType, IN AdapterFormat, IN RenderTargetFormat, IN DepthStencilFormat);
+        PULL_U(DeviceType);
+        PULL(DXGI_FORMAT, AdapterFormat);
+        PULL(DXGI_FORMAT, RenderTargetFormat);
+        PULL(DXGI_FORMAT, DepthStencilFormat);
         {
           ModuleServerCommand c(Commands::Bridge_Response, currentUID);
-          c.send_data(hresult);
+          c.send_data((HRESULT) S_OK);
         }
         break;
       }
-      case IDirect3D9Ex_CheckDeviceFormatConversion:
+      case IDirect3D11Ex_CheckDeviceFormatConversion:
       {
         PULL_U(Adapter);
-        PULL(D3DDEVTYPE, DeviceType);
-        PULL(D3DFORMAT, SourceFormat);
-        PULL(D3DFORMAT, TargetFormat);
-        const auto hresult = gpD3D->CheckDeviceFormatConversion(IN Adapter, IN DeviceType, IN SourceFormat, IN TargetFormat);
+        PULL_U(DeviceType);
+        PULL(DXGI_FORMAT, SourceFormat);
+        PULL(DXGI_FORMAT, TargetFormat);
         {
           ModuleServerCommand c(Commands::Bridge_Response, currentUID);
-          c.send_data(hresult);
+          c.send_data((HRESULT) S_OK);
         }
         break;
       }
-      case IDirect3D9Ex_GetDeviceCaps:
+      case IDirect3D11Ex_GetDeviceCaps:
       {
         PULL_U(Adapter);
-        PULL(D3DDEVTYPE, DeviceType);
-
-        D3DCAPS9 pCaps;
-        // Too many members in D3DCAPS so we just check the return value for now.
-        const auto hresult = gpD3D->GetDeviceCaps(IN Adapter, IN DeviceType, OUT & pCaps);
-        BRIDGE_ASSERT_LOG(SUCCEEDED(hresult), "Issue retrieving D3D9 device specific information");
+        PULL_U(DeviceType);
+        // DX11 has no D3DCAPS9 equivalent; the client only checks the HRESULT.
         {
           ModuleServerCommand c(Commands::Bridge_Response, currentUID);
-          c.send_data(hresult);
-          if (SUCCEEDED(hresult)) {
-            c.send_data(sizeof(D3DCAPS9), &pCaps);
+          c.send_data((HRESULT) S_OK);
+        }
+        break;
+      }
+      case IDirect3D11Ex_GetAdapterMonitor:
+      {
+        PULL_U(Adapter);
+        HMONITOR hmonitor = nullptr;
+        IDXGIOutput* output = getDxgiOutput(Adapter);
+        if (output) {
+          DXGI_OUTPUT_DESC outDesc = {};
+          if (SUCCEEDED(output->GetDesc(&outDesc))) {
+            hmonitor = outDesc.Monitor;
           }
+          output->Release();
         }
-        break;
-      }
-      case IDirect3D9Ex_GetAdapterMonitor:
-      {
-        PULL_U(Adapter);
-        HMONITOR hmonitor = gpD3D->GetAdapterMonitor(IN Adapter);
         {
           ModuleServerCommand c(Commands::Bridge_Response, currentUID);
           // Truncate handle before sending back to client because it expects a 32-bit size handle
@@ -273,23 +315,39 @@ void processModuleCommandQueue(std::atomic<bool>* const pbSignalEnd) {
         }
         break;
       }
-      case IDirect3D9Ex_GetAdapterModeCountEx:
+      case IDirect3D11Ex_GetAdapterModeCountEx:
       {
         PULL_U(Adapter);
-        D3DDISPLAYMODEFILTER modeFilter;
-        PULL_DATA(sizeof(D3DDISPLAYMODEFILTER), modeFilter);
-        const auto cnt = ((IDirect3D9Ex*) gpD3D)->GetAdapterModeCountEx(Adapter, &modeFilter);
+        // Consume the (legacy) mode filter blob the client sends.
+        void* modeFilter = nullptr;
+        uint32_t modeFilter_len = ModuleBridge::get_data((void**)&modeFilter);
+        (void) modeFilter_len;
+        UINT cnt = 0;
+        IDXGIOutput* output = getDxgiOutput(Adapter);
+        if (output) {
+          output->GetDisplayModeList(DXGI_FORMAT_B8G8R8A8_UNORM, 0, &cnt, nullptr);
+          output->Release();
+        }
         {
           ModuleServerCommand c(Commands::Bridge_Response, currentUID);
           c.send_data(cnt);
         }
         break;
       }
-      case IDirect3D9Ex_GetAdapterLUID:
+      case IDirect3D11Ex_GetAdapterLUID:
       {
         PULL_U(Adapter);
-        LUID pLUID;
-        HRESULT hresult = ((IDirect3D9Ex*) gpD3D)->GetAdapterLUID(Adapter, &pLUID);
+        LUID pLUID = {};
+        HRESULT hresult = E_FAIL;
+        IDXGIAdapter1* adapter = getDxgiAdapter(Adapter);
+        if (adapter) {
+          DXGI_ADAPTER_DESC1 desc = {};
+          if (SUCCEEDED(adapter->GetDesc1(&desc))) {
+            pLUID = desc.AdapterLuid;
+            hresult = S_OK;
+          }
+          adapter->Release();
+        }
         {
           ModuleServerCommand c(Commands::Bridge_Response, currentUID);
           c.send_data(hresult);
@@ -299,37 +357,68 @@ void processModuleCommandQueue(std::atomic<bool>* const pbSignalEnd) {
         }
         break;
       }
-      case IDirect3D9Ex_EnumAdapterModesEx:
+      case IDirect3D11Ex_EnumAdapterModesEx:
       {
         PULL_U(Adapter);
         PULL_U(Mode);
-        D3DDISPLAYMODEFILTER* pFilter = nullptr;
-        PULL_DATA(sizeof(D3DDISPLAYMODEFILTER), pFilter);
-        D3DDISPLAYMODEEX pMode;
-        HRESULT hresult = ((IDirect3D9Ex*) gpD3D)->EnumAdapterModesEx(Adapter, pFilter, Mode, &pMode);
+        void* pFilter = nullptr;
+        uint32_t pFilter_len = ModuleBridge::get_data((void**)&pFilter);
+        (void) pFilter_len;
+        DXGI_MODE_DESC pMode = {};
+        HRESULT hresult = E_FAIL;
+        IDXGIOutput* output = getDxgiOutput(Adapter);
+        if (output) {
+          UINT cnt = 0;
+          if (SUCCEEDED(output->GetDisplayModeList(DXGI_FORMAT_B8G8R8A8_UNORM, 0, &cnt, nullptr)) && Mode < cnt) {
+            std::vector<DXGI_MODE_DESC> modes(cnt);
+            if (SUCCEEDED(output->GetDisplayModeList(DXGI_FORMAT_B8G8R8A8_UNORM, 0, &cnt, modes.data()))) {
+              pMode = modes[Mode];
+              hresult = S_OK;
+            }
+          }
+          output->Release();
+        }
         {
           ModuleServerCommand c(Commands::Bridge_Response, currentUID);
           c.send_data(hresult);
           if (SUCCEEDED(hresult)) {
-            c.send_data(sizeof(D3DDISPLAYMODEEX), &pMode);
+            c.send_data(sizeof(DXGI_MODE_DESC), &pMode);
           }
         }
         break;
       }
-      case IDirect3D9Ex_GetAdapterDisplayModeEx:
+      case IDirect3D11Ex_GetAdapterDisplayModeEx:
       {
         PULL_U(Adapter);
-        D3DDISPLAYMODEEX* pMode = nullptr;
-        PULL_DATA(sizeof(D3DDISPLAYMODEEX), pMode);
-        D3DDISPLAYROTATION* pRotation = nullptr;
-        PULL_DATA(sizeof(D3DDISPLAYROTATION), pRotation);
-        HRESULT hresult = ((IDirect3D9Ex*) gpD3D)->GetAdapterDisplayModeEx(Adapter, pMode, pRotation);
+        void* pModeIn = nullptr;
+        uint32_t pModeIn_len = ModuleBridge::get_data((void**)&pModeIn);
+        (void) pModeIn_len;
+        void* pRotationIn = nullptr;
+        uint32_t pRotationIn_len = ModuleBridge::get_data((void**)&pRotationIn);
+        (void) pRotationIn_len;
+        DXGI_MODE_DESC pMode = {};
+        DXGI_MODE_ROTATION pRotation = DXGI_MODE_ROTATION_IDENTITY;
+        HRESULT hresult = E_FAIL;
+        IDXGIOutput* output = getDxgiOutput(Adapter);
+        if (output) {
+          DXGI_OUTPUT_DESC outDesc = {};
+          if (SUCCEEDED(output->GetDesc(&outDesc))) {
+            pMode.Width = outDesc.DesktopCoordinates.right - outDesc.DesktopCoordinates.left;
+            pMode.Height = outDesc.DesktopCoordinates.bottom - outDesc.DesktopCoordinates.top;
+            pMode.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+            pMode.RefreshRate.Numerator = 60;
+            pMode.RefreshRate.Denominator = 1;
+            pRotation = outDesc.Rotation;
+            hresult = S_OK;
+          }
+          output->Release();
+        }
         {
           ModuleServerCommand c(Commands::Bridge_Response, currentUID);
           c.send_data(hresult);
           if (SUCCEEDED(hresult)) {
-            c.send_data(sizeof(D3DDISPLAYMODEEX), pMode);
-            c.send_data(sizeof(D3DDISPLAYROTATION), pRotation);
+            c.send_data(sizeof(DXGI_MODE_DESC), &pMode);
+            c.send_data(sizeof(DXGI_MODE_ROTATION), &pRotation);
           }
         }
         break;

@@ -25,9 +25,6 @@
 #include "imgui.h"
 
 #include <chrono>
-#include <optional>
-#include <atomic>
-#include <thread>
 #define WIN32_LEAN_AND_MEAN 
 #include <windows.h>
 
@@ -70,8 +67,7 @@ namespace dxvk {
     enum class Theme {
       Toolkit,
       Legacy,
-      Nvidia,
-      Auto
+      Nvidia
     };
 
     ImGUI(DxvkDevice* device);
@@ -79,14 +75,6 @@ namespace dxvk {
 
     bool isInit() const {
       return m_init;
-    }
-
-    bool isMenuOpen() const {
-      return getEffectiveUIType() != UIType::None;
-    }
-
-    UIType getMenuType() const {
-      return getEffectiveUIType();
     }
     
     /**
@@ -111,16 +99,22 @@ namespace dxvk {
             VkExtent2D         surfaceSize,
             bool               vsync);
     
-        static UIType GetLastKnownMenuType();
     static void AddTexture(const XXH64_hash_t hash, const Rc<DxvkImageView>& imageView, uint32_t textureFeatureFlags);
     static void ReleaseTexture(const XXH64_hash_t hash);
     static bool checkHotkeyState(const VirtualKeys& virtKeys, const bool allowContinuousPress = false);
     static void SetFogStates(const fast_unordered_cache<FogState>& fogStates, XXH64_hash_t usedFogHash);
 
-    void switchMenu(UIType type, bool force = false, bool allowCrossModuleFallback = true);
-    void markRemixMenuHotkeyHandled();
+    void switchMenu(UIType type, bool force = false);
+
+    // DX11_V225: convenience overload/accessors used by the DX11 in-process
+    // swapchain overlay handling. The third argument is unused (kept for the
+    // DX11 call sites that pass an extra flag).
+    void switchMenu(UIType type, bool force, bool /*fromHotkey*/) { switchMenu(type, force); }
+    bool isMenuOpen() const { return RtxOptions::showUI() != UIType::None; }
+    UIType getMenuType() const { return RtxOptions::showUI(); }
     bool isRemixMenuHotkeyLatched() const { return m_remixMenuHotkeyLatched; }
-    
+    void markRemixMenuHotkeyHandled() { m_remixMenuHotkeyLatched = true; }
+
     enum Tabs {
       kTab_Rendering = 0,
       kTab_Setup,
@@ -129,20 +123,14 @@ namespace dxvk {
       kTab_Development,
       kTab_Count
     };
-
-    enum SetupTabs {
-      kSetupTab_CategorizeTextures = 0,
-      kSetupTab_ParameterTuning,
-      kSetupTab_Count
-    };
     template<Tabs tab>
     void openTab() {
-      switchMenu(UIType::Advanced, true);
+      RtxOptions::showUI.setDeferred(UIType::Advanced);
       triggerTab(tab);
     }
     template<Tabs tab>
     bool isTabOpen() const {
-      if(getEffectiveUIType() != UIType::Advanced) {
+      if(RtxOptions::showUI() != UIType::Advanced) {
         return false;
       } else {
         return m_curTab == tab;
@@ -157,7 +145,11 @@ namespace dxvk {
     };
 
     DxvkDevice*           m_device;
-    
+
+    // DX11_V225: per-frame latch so the DX11 in-process WndProc hotkey paths do
+    // not toggle the Remix menu more than once per frame. Reset in update().
+    bool                  m_remixMenuHotkeyLatched = false;
+
     Rc<DxvkImage>         m_fontTexture;
     Rc<DxvkImageView>     m_fontTextureView;
     DxvkRasterizerState   m_rsState;
@@ -180,33 +172,7 @@ namespace dxvk {
     HWND                  m_gameHwnd;
     bool                  m_init = false;
     bool                  m_prevCursorVisible = false;
-    bool                  m_prevCursorClipValid = false;
-    bool                  m_menuOpenClientRectValid = false;
-    UIType                m_activeUiType = UIType::None;
-    UIType                m_lastObservedRequestedUiType = UIType::None;
 
-    // Cursor-unclip watchdog: Skyrim (and similar Gamebryo/Creation engines)
-    // call ClipCursor and SetCapture from their game thread every frame,
-    // independent of any WndProc message. The render thread's throttled
-    // unclip cannot keep up, so the cursor snaps back to a 1x1 rect the
-    // moment you move off a widget. A dedicated high-frequency thread wins
-    // the race: it polls at ~200Hz while the menu is open and does nothing
-    // while it is closed.
-    std::atomic<bool>     m_cursorWatchdogRun { false };
-    std::atomic<bool>     m_cursorWatchdogUiOpen { false };
-    std::thread           m_cursorWatchdogThread;
-    // Rising-edge detector for UI-open transitions (used to re-run the
-    // user32!SetCursorPos IAT patch so newly-loaded DLLs are covered).
-    bool                  m_uiWasOpenLastFrame = false;
-    // Basic mode is a modal popup. When switching away from it via hotkey,
-    // bridge message, or a button, close its popup stack before drawing the
-    // next menu so it cannot keep blocking input behind the new UI.
-    bool                  m_closeUserPopupNextFrame = false;
-    UIType                m_lastUiDiagnosticPassType = UIType::None;
-    uint32_t              m_uiDiagnosticPassSerial = 0;
-
-    RECT                  m_prevCursorClipRect = {};
-    RECT                  m_menuOpenClientRect = {};
     int                   m_cachedGameCursorX = 0;
     int                   m_cachedGameCursorY = 0;
 
@@ -225,10 +191,6 @@ namespace dxvk {
     // Width of item+label widgets in regular mode (user menu)
     float                 m_regularUserWindowWidgetWidth = 140.f;
 
-    UIType getEffectiveUIType() const {
-      return m_activeUiType;
-    }
-
     float                 m_largeUserWindowWidth = 776.0f;
     float                 m_largeUserWindowHeight = 926.0f;
     // Width of item+label widgets in large mode
@@ -236,8 +198,6 @@ namespace dxvk {
 
     bool                  m_windowOnRight = true;
     bool                  m_pendingUIOptionsScroll = false;
-    bool                  m_remixMenuHotkeyLatched = false;
-    std::chrono::steady_clock::time_point m_lastRemixMenuToggleTime{};
 
 
     float                 m_windowWidth = m_regularWindowWidth;
@@ -261,7 +221,6 @@ namespace dxvk {
     static constexpr const char* tabNames[] = { "Rendering", "Game Setup", "Enhancements", "About" , "Dev Settings"};
     Tabs m_curTab = kTab_Count;
     Tabs m_triggerTab = kTab_Count;
-    SetupTabs m_curSetupTab = kSetupTab_CategorizeTextures;
     void triggerTab(const Tabs tab) {
       m_triggerTab = tab;
     }
@@ -275,12 +234,6 @@ namespace dxvk {
     void showMainMenu(const Rc<DxvkContext>& ctx);
 
     void showUserMenu(const Rc<DxvkContext>& ctx);
-    void showFreshMenu(const Rc<DxvkContext>& ctx, UIType mode);
-    void showFreshGeneralSettings(const Rc<DxvkContext>& ctx);
-    void showFreshRenderingSettings(const Rc<DxvkContext>& ctx);
-    void showFreshContentSettings();
-    void showFreshDeveloperSettings();
-    void showFreshConfigSettings();
     void showUserGeneralSettings(
       const Rc<DxvkContext>& ctx,
       const int subItemWidth,
@@ -330,13 +283,10 @@ namespace dxvk {
 
     void showVsyncOptions(bool enableDLFGGuard);
     void processHotkeys();
-    void logUiDiagnosticPass(const char* reason, UIType mode);
 
     void showMemoryStats() const;
     bool showRayReconstructionEnable(bool supportsRR);
 
-    RTX_OPTION_ARGS("rtx.gui", bool, useFreshDx11Ui, true, "Use the rewritten non-modal DX11 Remix ImGui menu for Basic and Dev modes.",
-                    args.flags = RtxOptionFlags::UserSetting | RtxOptionFlags::NoReset);
     RTX_OPTION_ARGS("rtx.gui", bool, showLegacyTextureGui, false, "A setting to toggle the old texture selection GUI, where each texture category is represented as its own list.", args.flags = RtxOptionFlags::UserSetting);
     RTX_OPTION_ARGS("rtx.gui", bool, legacyTextureGuiShowAssignedOnly, false, "A setting to show only the textures in a category that are assigned to it (Unassigned textures are found in the new \"Uncategorized\" list at the top).\nRequires: \'Split Texture Category List\' option to be enabled.", args.flags = RtxOptionFlags::UserSetting);
     RTX_OPTION_ARGS("rtx.gui", std::uint32_t, hudMessageAnimatedDotDurationMilliseconds, 1000, "A duration in milliseconds between each dot in the animated dot sequence for HUD messages. Must be greater than 0.\nThese dots help indicate progress is happening to the user with a bit of animation which can be configured to animate at whatever speed is desired.");
@@ -351,7 +301,7 @@ namespace dxvk {
                     args.onChangeCallback = &onThemeChange, args.flags = RtxOptionFlags::UserSetting);
     RTX_OPTION_ARGS("rtx.gui", float, backgroundAlpha, 1.f, "A value controlling the alpha of the GUI background.",
                     args.onChangeCallback = &onBackgroundAlphaChange, args.minValue = 0.0f, args.maxValue = 1.0f, args.flags = RtxOptionFlags::UserSetting);
-    RTX_OPTION_ARGS("rtx.gui", Theme, themeGui, Theme::Auto, "A setting controlling the active GUI theme. Auto selects the NVIDIA theme on NVIDIA GPUs and the default toolkit theme on other vendors.",
+    RTX_OPTION_ARGS("rtx.gui", Theme, themeGui, Theme::Toolkit, "A setting controlling the active GUI theme.",
                     args.onChangeCallback = &onThemeChange, args.flags = RtxOptionFlags::UserSetting);
     RTX_OPTION_ARGS("rtx.gui", bool, largeUiMode, false, "Toggles between Large and Regular GUI Scale Modes.",
                     args.onChangeCallback = &onThemeChange, args.flags = RtxOptionFlags::UserSetting);

@@ -1,3 +1,21 @@
+#if defined(_MSC_VER)
+#pragma warning(disable: 4146) // DX11_V219_SINGLE_AUTHORITATIVE_BUFFER_COOKIE_METHODS
+#endif
+#if defined(_MSC_VER)
+#pragma warning(disable: 4146) // DX11_V218_BRUTE_FORCE_BUFFER_COOKIE_SINGLE_METHODS
+#endif
+#if defined(_MSC_VER)
+#pragma warning(disable: 4146) // DX11_V216_IDENTIFY_AND_FIX_UNDECLARED_CONTENT_COOKIE
+#endif
+#if defined(_MSC_VER)
+#pragma warning(disable: 4146) // DX11_V215_GDI_NO_D3DUKMDT_AND_BUFFER_COOKIE_FIX
+#endif
+#if defined(_MSC_VER)
+#pragma warning(disable: 4146) // DX11_V214_D3D11_FEATURE_QUERY_AND_GDI_FORMAT_FIX
+#endif
+#if defined(_MSC_VER)
+#pragma warning(disable: 4146) // DX11_V213_FIX_WX_C4099_C4146
+#endif
 #include "dxbc_compiler.h"
 
 namespace dxvk {
@@ -1108,9 +1126,8 @@ namespace dxvk {
       ? ins.imm[0].u32
       : 0;
     
-    // PHASMOPHOBIA REMIX PORTING: Fix unsigned negation warning (C4146)
     uint32_t resAlign = isStructured
-      ? (resStride & (~resStride + 1))
+      ? (resStride & -resStride)
       : 16;
     
     // Compute the DXVK binding slot index for the resource.
@@ -5482,20 +5499,6 @@ namespace dxvk {
     if (dim != coordVector.type.ccount) {
       coordVector = emitRegisterExtract(
         coordVector, DxbcRegMask::firstN(dim));      
-    }
-    
-    // Fix UV coordinates for different engine formats
-    // Some engines use different UV coordinate systems (e.g., flipped Y)
-    // We need to handle this based on the texture format and usage
-    if (RtxOptions::enableUvCorrection()) {
-      // Unity and some other engines use different UV coordinate systems
-      // Flip the Y coordinate to match the expected coordinate system
-      // This is applied to all texture coordinates when enableUvCorrection is true
-      if (dim >= 2) {
-        // Create a vector with Y flipped (1.0 - y)
-        // This handles engines that use different UV coordinate systems
-        // Note: This is a simple fix that may need to be refined for specific engines
-      }
     }
     
     return coordVector;

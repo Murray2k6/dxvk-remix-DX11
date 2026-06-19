@@ -27,6 +27,9 @@ project(
   default_options : ['werror=true', 'b_vscrt=from_buildtype']
 )
 
+# DX11_V178_BOOST_BIND_FULL_PLACEHOLDER_COMPAT
+add_project_arguments('-DBOOST_BIND_GLOBAL_PLACEHOLDERS=1', language : 'cpp')
+
 global_src_root_norm = meson.global_source_root().replace('\\', '/')
 current_build_dir_norm = meson.current_build_dir().replace('\\', '/')
 

@@ -1,3 +1,4 @@
+#include "rtx/dx11/dx11_light_state.h"
 /*
 * Copyright (c) 2021-2023, NVIDIA CORPORATION. All rights reserved.
 *
@@ -27,16 +28,14 @@
 
 #include <remix/remix_c.h>
 
-#include <cassert>
-#include <cstdint>
+#include <d3d11.h>
 #include <regex>
+#include <cassert>
 
 #include "../../lssusd/game_exporter_common.h"
 #include "../../lssusd/game_exporter_paths.h"
 
 #include "../../lssusd/usd_include_begin.h"
-#include <pxr/base/gf/vec3d.h>
-#include <pxr/base/gf/vec3f.h>
 #include <pxr/base/vt/value.h>
 #include <pxr/usd/usd/tokens.h>
 #include <pxr/usd/usd/prim.h>
@@ -58,16 +57,11 @@
 #define WRITE_CONSTANT_DESERIALIZER(name, usd_attr, type, minVal, maxVal, defaultVal) \
       { \
         pxr::VtValue val; \
-        const pxr::UsdAttribute attr = getLightAttribute(prim, pxr::TfToken(#usd_attr), pxr::TfToken("inputs:"#usd_attr)); \
-        if(attr.Get(&val) && !val.IsEmpty()) { \
-          type parsedValue = defaultVal; \
-          if (!readUsdLightValue(val, parsedValue)) { \
-            Logger::warn(str::format("Skipping unsupported USD light attribute type for \'" #usd_attr "\' on \'", prim.GetName().GetString(), "\'")); \
-          } else { \
-            static_assert(uint32_t(DirtyFlags::k_##name) < 32); \
-            m_dirty.set(DirtyFlags::k_##name); \
-            m_##name = parsedValue; \
-          } \
+        getLightAttribute(prim, pxr::TfToken(#usd_attr), pxr::TfToken("inputs:"#usd_attr)).Get(&val); \
+        if(!val.IsEmpty()) { \
+          static_assert(uint32_t(DirtyFlags::k_##name) < 32); \
+          m_dirty.set(DirtyFlags::k_##name); \
+          m_##name = val.UncheckedGet<type>(); \
         } \
       }
 
@@ -81,7 +75,7 @@
 
 namespace dxvk {
 
-  RtLight LightData::toRtLight(const RtLight* const originalLight) const {
+  RtLight LightData::toRtLight() const {
     switch (m_lightType) {
     // Note: This default case should never be hit as an Unknown light type must be merged before it should be converted to LightData,
     // the assert is here just for debugging to assert when an unexpected light type is passed in (so this is an "unreachable"-style assert).
@@ -96,11 +90,7 @@ namespace dxvk {
       // the existing behavior.
       const auto radiusScale = std::max(std::max(m_xScale, m_yScale), m_zScale);
 
-      if (!originalLight || originalLight->getType() != RtLightType::Sphere) {
-        return RtLight(RtSphereLight(m_position, calculateRadiance(), m_Radius * radiusScale, getLightShaping(m_zAxis), m_VolumetricRadianceScale, m_cachedHash));
-      } else {
-        return RtLight(RtSphereLight(m_position, calculateRadiance(), m_Radius * radiusScale, getLightShaping(m_zAxis), m_VolumetricRadianceScale, m_cachedHash), originalLight->getSphereLight());
-      }
+      return RtLight(RtSphereLight(m_position, calculateRadiance(), m_Radius * radiusScale, getLightShaping(m_zAxis), m_VolumetricRadianceScale, m_cachedHash));
     }
     case LightType::Rect:
     {
@@ -130,7 +120,7 @@ namespace dxvk {
     }
   }
 
-  void LightData::merge(const RtxLegacyLight& light) {
+  void LightData::merge(const Dx11LightDesc& light) {
     // Special case, dont do any merging if we know we dont need to
     if (m_dirty != m_allDirty) {
       std::optional<LightData> input = tryCreate(light);
@@ -151,11 +141,11 @@ namespace dxvk {
         assert(false);
 
         [[fallthrough]];
-      case RtxLegacyLightType_Point:
-      case RtxLegacyLightType_Spot:
+      case DX11_LIGHT_POINT:
+      case DX11_LIGHT_SPOT:
         m_lightType = LightType::Sphere;
         break;
-      case RtxLegacyLightType_Directional:
+      case DX11_LIGHT_DIRECTIONAL:
         m_lightType = LightType::Distant;
         break;
       }
@@ -181,12 +171,14 @@ namespace dxvk {
     }
   }
 
-  std::optional<LightData> LightData::tryCreate(const RtxLegacyLight& light) {
-    // Ensure the legacy light is of a valid type
+  std::optional<LightData> LightData::tryCreate(const Dx11LightDesc& light) {
+    // Ensure the D3D11 Light is of a valid type
+    // Note: This is done as some games will pass invalid data to various D3D11 calls and since the RtLight
+    // requires a valid light type for construction it needs to be checked in advance to avoid issues.
 
-    if (light.Type < RtxLegacyLightType_Point || light.Type > RtxLegacyLightType_Directional) {
+    if (light.Type < DX11_LIGHT_POINT || light.Type > DX11_LIGHT_DIRECTIONAL) {
       Logger::err(str::format(
-        "Attempted to convert a legacy light with invalid light type: ",
+        "Attempted to convert a fixed function light with invalid light type: ",
         light.Type
       ));
       ONCE(assert(false));
@@ -203,10 +195,10 @@ namespace dxvk {
       assert(false);
 
       [[fallthrough]];
-    case RtxLegacyLightType_Point:
-    case RtxLegacyLightType_Spot:
+    case DX11_LIGHT_POINT:
+    case DX11_LIGHT_SPOT:
       return std::optional<LightData>(std::in_place, createFromPointSpot(light));
-    case RtxLegacyLightType_Directional:
+    case DX11_LIGHT_DIRECTIONAL:
       return std::optional<LightData>(std::in_place, createFromDirectional(light));
     }
     return {};
@@ -226,76 +218,6 @@ namespace dxvk {
     template<>           bool hasNan(const remixapi_Bool& v)    { return false; }
     template<>           bool hasNan(const Vector3& v)          { return hasNan(v.x) || hasNan(v.y) || hasNan(v.z); }
     template<>           bool hasNan(const bool& v)             { return false; }
-
-    float sanitizeUsdLightFloat(float value) {
-      return std::isnan(value) ? 0.0f : value;
-    }
-
-    bool readUsdLightValue(const pxr::VtValue& val, float& out) {
-      if (val.IsHolding<float>()) {
-        out = val.UncheckedGet<float>();
-        return !std::isnan(out);
-      }
-      if (val.IsHolding<double>()) {
-        out = static_cast<float>(val.UncheckedGet<double>());
-        return !std::isnan(out);
-      }
-      if (val.IsHolding<int>()) {
-        out = static_cast<float>(val.UncheckedGet<int>());
-        return true;
-      }
-      if (val.IsHolding<unsigned int>()) {
-        out = static_cast<float>(val.UncheckedGet<unsigned int>());
-        return true;
-      }
-      if (val.IsHolding<int64_t>()) {
-        out = static_cast<float>(val.UncheckedGet<int64_t>());
-        return true;
-      }
-      if (val.IsHolding<uint64_t>()) {
-        out = static_cast<float>(val.UncheckedGet<uint64_t>());
-        return true;
-      }
-
-      return false;
-    }
-
-    bool readUsdLightValue(const pxr::VtValue& val, bool& out) {
-      if (val.IsHolding<bool>()) {
-        out = val.UncheckedGet<bool>();
-        return true;
-      }
-
-      float numericValue = 0.0f;
-      if (readUsdLightValue(val, numericValue)) {
-        out = numericValue != 0.0f;
-        return true;
-      }
-
-      return false;
-    }
-
-    bool readUsdLightValue(const pxr::VtValue& val, Vector3& out) {
-      if (val.IsHolding<Vector3>()) {
-        out = val.UncheckedGet<Vector3>();
-        return true;
-      }
-      if (val.IsHolding<pxr::GfVec3f>()) {
-        const pxr::GfVec3f& v = val.UncheckedGet<pxr::GfVec3f>();
-        out = Vector3(sanitizeUsdLightFloat(v[0]), sanitizeUsdLightFloat(v[1]), sanitizeUsdLightFloat(v[2]));
-        return true;
-      }
-      if (val.IsHolding<pxr::GfVec3d>()) {
-        const pxr::GfVec3d& v = val.UncheckedGet<pxr::GfVec3d>();
-        out = Vector3(
-          sanitizeUsdLightFloat(static_cast<float>(v[0])),
-          sanitizeUsdLightFloat(static_cast<float>(v[1])),
-          sanitizeUsdLightFloat(static_cast<float>(v[2])));
-        return true;
-      }
-
-      return false;
-    }
 
     bool isUsdLightTransformValid(const pxr::GfMatrix4f& transform) {
       // Ignore lights with a 0 scale transform on any axis
@@ -355,7 +277,7 @@ namespace dxvk {
       Logger::warn(str::format("Failed to recognize a light type on \'", lightPrim.GetName().GetString(), "\'"));
       return {};
     }
-    // Note: LightType::Unknown is a valid case, as it's meant to be replaced by a corresponding legacy light
+    // Note: LightType::Unknown is a valid case, as it's meant to be replaced by a corresponding Dx11LightDesc
 
     auto l = LightData { lightType, isOverrideLight, absoluteTransform };
     {
@@ -423,53 +345,74 @@ namespace dxvk {
     m_isRelativeTransform { !absoluteTransform && !isOverrideLight } {
   }
 
-  LightData LightData::createFromDirectional(const RtxLegacyLight& light) {
+  LightData LightData::createFromDirectional(const Dx11LightDesc& light) {
     auto output = LightData{ Distant };
 
     const Vector3 originalDirection { light.Direction.x, light.Direction.y, light.Direction.z };
 
-    // Legacy directional lights have no requirement on normalization,
-    // so normalize here. Fall back to Z axis for zero vectors.
+    // Note: D3D11 Directional lights have no requirement on if the direction is normalized or not,
+    // so it must be normalized here for usage in the rendering (as m_direction is assumed to be normalized).
+    // Additionally, the direction may be the zero vector (even though D3D11 disallows this), so fall back to the
+    // Z axis in this case.
     output.m_zAxis = safeNormalize(originalDirection, Vector3(0.0f, 0.0f, 1.0f));
     output.m_AngleRadians = LightManager::lightConversionDistantLightFixedAngle();
-    output.m_Color = Vector3{ light.Diffuse.x, light.Diffuse.y, light.Diffuse.z };
+    output.m_Color = Vector3{ light.Diffuse.r, light.Diffuse.g, light.Diffuse.b };
     output.m_Intensity = LightManager::lightConversionDistantLightFixedIntensity();
 
-    // Stable version used for legacy light conversion path to ensure stable hashing regardless of code changes.
-    // The Rect Light type is intentionally used here instead of Distant Light due to a legacy hashing artifact.
+    // Note: Changing this code will alter "stable" light hashes from D3D11 and potentially break replacement assets.
+
+    // Note: Stable version used for D3D11 light conversion path to ensure stable hashing regardless of code changes.
+    // Also note the Rect Light type is intentionally used here instead of the Distant Light type. This is done due to
+    // a mistake originating from a refactoring on 09-26-2023. Little to no previous content was affected by this bug
+    // as directional light replacements are not common and were not used in Portal RTX, plus the lack of public usage
+    // of Remix. As such, it is left this way to not break replacements created by users after the toolkit launch
+    // (since the public launch included this bug and "fixing" it would probably be cause more harm than good).
     output.m_cachedHash = (XXH64_hash_t) RtLightType::Rect;
 
-    // A constant half angle is used due to a legacy artifact of accidentally including half angle value in the
-    // hash for lights translated to Remix.
+    // Note: A constant half angle is used due to a legacy artifact of accidentally including half angle value in the
+    // hash for lights translated from D3D11 to Remix (which always inherited a value from the
+    // lightConversionDistantLightFixedAngle option, divided by 2.
     const float legacyStableHalfAngle = 0.0349f / 2.0f;
 
-    // Stable hash: uses un-altered direction from the legacy light Direction.
+    // Note: Takes specific arguments to calculate a stable hash which does not change due to other changes in the light's code.
+    // Expects an un-altered direction directly from the Dx11LightDesc Direction (a legacy artifact caused by not normalizing this in
+    // our initial implementation).
+    // Note: Radiance not included to somewhat uniquely identify lights when constructed from D3D11 Lights.
     output.m_cachedHash = XXH64(&originalDirection[0], sizeof(originalDirection), output.m_cachedHash);
     output.m_cachedHash = XXH64(&legacyStableHalfAngle, sizeof(legacyStableHalfAngle), output.m_cachedHash);
 
     return output;
   }
 
-  LightData LightData::createFromPointSpot(const RtxLegacyLight& light) {
+  LightData LightData::createFromPointSpot(const Dx11LightDesc& light) {
     auto output = LightData{ Sphere };
 
     const Vector3 originalPosition { light.Position.x, light.Position.y, light.Position.z };
-    const float originalBrightness = std::max(light.Diffuse.x, std::max(light.Diffuse.y, light.Diffuse.z));
+    const float originalBrightness = std::max(light.Diffuse.r, std::max(light.Diffuse.g, light.Diffuse.b));
 
     output.m_position = originalPosition;
     output.m_Radius = LightManager::lightConversionSphereLightFixedRadius() * RtxOptions::sceneScale();
     output.m_Intensity = LightUtils::calculateIntensity(light, output.m_Radius);
-    output.m_Color = Vector3(light.Diffuse.x, light.Diffuse.y, light.Diffuse.z) / originalBrightness;
+    output.m_Color = Vector3(light.Diffuse.r, light.Diffuse.g, light.Diffuse.b) / originalBrightness;
 
     XXH64_hash_t shapingHash = 0;
 
-    if (light.Type == RtxLegacyLightType_Spot) {
+    if (light.Type == DX11_LIGHT_SPOT) {
       const Vector3 originalDirection { light.Direction.x, light.Direction.y, light.Direction.z };
 
-      // Legacy spot light directions may not be normalized.
-      // Fall back to Z axis for zero vectors.
+      // Set the Sphere Light's shaping
+
+      // Note: D3D11 Spot light directions have no requirement on if the direction is normalized or not,
+      // so it must be normalized here for usage in the rendering (as the m_shaping primaryAxis is assumed to be normalized).
+      // Additionally, the direction may be the zero vector (even though D3D11 disallows this), so fall back to the
+      // Z axis in this case.
       output.m_zAxis = safeNormalize(originalDirection, Vector3(0.0f, 0.0f, 1.0f));
       assert(isApproxNormalized(output.m_zAxis, 0.01f));
+
+      // Todo: The Phi and Theta values from the D3D11 Light may need to be clamped to reasonable ranges here or sanitized in the
+      // future if issues emerge from bad values being passed from games. For now though we do not as hashing relies on the shaping
+      // being constructed with the current unsanitized values (and clamping may cause slight deviations in hashing which would require
+      // duplicating the light shaping to get a variant with the "original" stable hash).
 
       // ConeAngle is the outer angle of the spotlight
       output.m_ConeAngleRadians = light.Phi / 2.0f;
@@ -477,8 +420,9 @@ namespace dxvk {
       output.m_ConeSoftness = std::cos(light.Theta / 2.0f) - std::cos(output.m_ConeAngleRadians);
       output.m_Focus = light.Falloff;
 
-      // Stable shaping hash — maintains hash stability with input values that
-      // lightShaping now rejects (specifically non-normalized direction vectors).
+      // Set the Stable Light Shaping Hash
+      // NOTE: This is broken out of the original light shaping hash code to maintain hash stability with
+      // input values that lightShaping now rejects (specifically non-normalized direction vectors).
       float cosConeAngle = cos(output.m_ConeAngleRadians);
       shapingHash = XXH64(&originalDirection[0], sizeof(originalDirection), shapingHash);
       shapingHash = XXH64(&cosConeAngle, sizeof(cosConeAngle), shapingHash);
@@ -486,13 +430,18 @@ namespace dxvk {
       shapingHash = XXH64(&output.m_Focus, sizeof(output.m_Focus), shapingHash);
     }
 
-    // Stable version used for legacy light conversion path to ensure stable hashing.
+    // Note: Stable version used for D3D11 light conversion path to ensure stable hashing regardless of code changes.
     output.m_cachedHash = (XXH64_hash_t) RtLightType::Sphere;
 
-    // A constant radius of 4.0f is used due to a legacy hashing artifact.
+    // Note: A constant radius of 4.0f is used due to a legacy artifact of accidently including radius value in the
+    // hash for lights translated from D3D11 to Remix (which always inherited a value from the
+    // lightConversionSphereLightFixedRadius option.
     const float legacyStableRadius = 4.0f;
 
-    // Stable hash: uses un-altered position from the legacy light Position.
+    // Note: Takes specific arguments to calculate a stable hash which does not change due to other changes in the light's code.
+    // Expects an un-altered position directly from the Dx11LightDesc Position, and a Stable Light Shaping structure with its primaryAxis member
+    // directly derived from the Dx11LightDesc Direction (again a legacy artifact caused by not normalizing this in our initial implementation).
+    // Note: Radiance not included to somewhat uniquely identify lights when constructed from D3D11 Lights.
     output.m_cachedHash = XXH64(&originalPosition[0], sizeof(originalPosition), output.m_cachedHash);
     output.m_cachedHash = XXH64(&legacyStableRadius, sizeof(legacyStableRadius), output.m_cachedHash);
     output.m_cachedHash = XXH64(&output.m_cachedHash, sizeof(output.m_cachedHash), shapingHash);
@@ -502,7 +451,7 @@ namespace dxvk {
 
   // When a light is being overridden in USD, we may not always get the light type.
   // For these lights we rely on the prim path (which is standardized for captured lights)
-  //  and use the light determined by the game at runtime [See: merge(RtxLegacyLight)]
+  //  and use the light determined by the game at runtime [See: merge(Dx11LightDesc)]
   // Expanded: ^/RootNode/lights/light_[0-9A-Fa-f]{16}$
   static const std::regex s_unknownLightPattern("^" + lss::gRootNodePath.GetAsString() + "/" + lss::gTokLights.GetString() + "/" + lss::prefix::light + "[0-9A-Fa-f]{16}$");
 

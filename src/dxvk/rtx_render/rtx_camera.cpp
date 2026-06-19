@@ -32,8 +32,6 @@
 #include "rtx_imgui.h"
 #include "rtx_xess.h"
 
-#include <cmath>
-
 /*
 *             Free/Debug Camera
 * 
@@ -50,34 +48,6 @@
 * Right click ----------------- Reset camera to default
 * 
 */
-
-namespace {
-  template<typename T>
-  bool isFiniteMatrix(const dxvk::Matrix4Base<T>& matrix) {
-    for (uint32_t row = 0; row < 4; ++row) {
-      for (uint32_t col = 0; col < 4; ++col) {
-        if (!std::isfinite(matrix[row][col]))
-          return false;
-      }
-    }
-
-    return true;
-  }
-
-  template<typename T>
-  bool canSafelyInvertMatrix(const dxvk::Matrix4Base<T>& matrix) {
-    if (!isFiniteMatrix(matrix))
-      return false;
-
-    const double det = dxvk::determinant(matrix);
-    return std::isfinite(det) && std::abs(det) >= 1.0e-12;
-  }
-
-  template<typename T>
-  dxvk::Matrix4Base<T> inverseOrIdentity(const dxvk::Matrix4Base<T>& matrix) {
-    return canSafelyInvertMatrix(matrix) ? dxvk::inverse(matrix) : dxvk::Matrix4Base<T>();
-  }
-}
 
 namespace dxvk
 {
@@ -543,8 +513,8 @@ namespace dxvk
       currentPosition += upSign * moveDownUp * Vector3(freeCamViewToWorld.data[1].xyz());
       currentPosition -= moveBackForward * Vector3(freeCamViewToWorld.data[2].xyz());
 
-      // Only update options when there's actual input - don't overwrite pending UI changes.
-      // Use the User edit target so camera-control edits win immediately in the UI layer.
+      // Only update options when there's actual input - don't overwrite pending UI changes
+      // Use the User edit target so these go to rtx.conf (these are UI-driven via camera controls)
       if (resetCamera) {
         RtxOptionLayerTarget layerTarget(RtxOptionEditTarget::User);
         freeCameraPosition.setDeferred(Vector3(0.f));
@@ -628,7 +598,7 @@ namespace dxvk
 
 
   bool RtCamera::updateFromSetting(uint32_t frameIdx, const RtCameraSetting& setting, uint32_t flags) {
-    // Use the User edit target so camera-setting edits win immediately in the UI layer.
+    // Use the User edit target so these go to rtx.conf (these are UI-driven via camera settings)
     RtxOptionLayerTarget layerTarget(RtxOptionEditTarget::User);
     
     enableFreeCamera.setDeferred(setting.enableFreeCamera);
@@ -676,7 +646,7 @@ namespace dxvk
     m_matCache[MatrixType::PreviousViewToWorld] = m_matCache[MatrixType::ViewToWorld];
     m_matCache[MatrixType::UncorrectedPreviousViewToWorld] = m_matCache[MatrixType::ViewToWorld];
     m_matCache[MatrixType::WorldToView] = freeCameraViewRelative() ? Matrix4d{ newWorldToView } : Matrix4d();
-    m_matCache[MatrixType::ViewToWorld] = inverseOrIdentity(m_matCache[MatrixType::WorldToView]);
+    m_matCache[MatrixType::ViewToWorld] = inverse(m_matCache[MatrixType::WorldToView]);
 
     // Setup Translated World/View Matrix Data
 
@@ -690,7 +660,7 @@ namespace dxvk
     m_matCache[MatrixType::ViewToTranslatedWorld] = freeCameraViewRelative() ? viewToTranslatedWorld : Matrix4d();
     // Note: Slightly non-ideal to have to inverse an already inverted matrix when we have the original world to view matrix,
     // but this is the safest way to ensure a proper inversion when modifying the view to world transform manually.
-    m_matCache[MatrixType::TranslatedWorldToView] = inverseOrIdentity(m_matCache[MatrixType::ViewToTranslatedWorld]);
+    m_matCache[MatrixType::TranslatedWorldToView] = inverse(m_matCache[MatrixType::ViewToTranslatedWorld]);
 
     // Setup View/Projection Matrix Data
 
@@ -699,11 +669,9 @@ namespace dxvk
 
     auto modifiedViewToProj = Matrix4d{ newViewToProjection };
 
-    // Correct only projections that still have a negative Y scale. DX11 capture
-    // paths may already canonicalize the projection before it reaches the
-    // camera; flipping an already-normalized matrix here would reintroduce the
-    // upside-down/axis-flip state we just removed.
-    if (correctProjectionYFlip() && modifiedViewToProj[1][1] < 0.0) {
+    // Correct for games that use a negative Y scale in the projection matrix
+    // (e.g., certain Unity titles) which causes the ray-traced scene to render upside-down.
+    if (correctProjectionYFlip()) {
       modifiedViewToProj[1][1] = -modifiedViewToProj[1][1];
     }
 
@@ -715,7 +683,7 @@ namespace dxvk
     }
     
     m_matCache[MatrixType::ViewToProjection] = modifiedViewToProj;
-    m_matCache[MatrixType::ProjectionToView] = inverseOrIdentity(modifiedViewToProj);
+    m_matCache[MatrixType::ProjectionToView] = inverse(modifiedViewToProj);
 
     // Apply free camera shaking
 
@@ -725,9 +693,9 @@ namespace dxvk
       newViewToTranslatedWorld[3] = Vector4d(0.0, 0.0, 0.0, newViewToTranslatedWorld[3].w);
 
       // Note: Error added here from an extra inverse operation, but should be fine as camera shaking is only used as a debugging path.
-      m_matCache[MatrixType::WorldToView] = inverseOrIdentity(newViewToWorld);
+      m_matCache[MatrixType::WorldToView] = inverse(newViewToWorld);
       m_matCache[MatrixType::ViewToWorld] = newViewToWorld;
-      m_matCache[MatrixType::TranslatedWorldToView] = inverseOrIdentity(newViewToTranslatedWorld);
+      m_matCache[MatrixType::TranslatedWorldToView] = inverse(newViewToTranslatedWorld);
       m_matCache[MatrixType::ViewToTranslatedWorld] = newViewToTranslatedWorld;
     }
 
@@ -750,7 +718,7 @@ namespace dxvk
     m_matCache[MatrixType::PreviousViewToProjectionJittered] = m_matCache[MatrixType::ViewToProjectionJittered];
     m_matCache[MatrixType::PreviousProjectionToViewJittered] = m_matCache[MatrixType::ProjectionToViewJittered];
     m_matCache[MatrixType::ViewToProjectionJittered] = newViewToProjectionJittered;
-    m_matCache[MatrixType::ProjectionToViewJittered] = inverseOrIdentity(newViewToProjectionJittered);
+    m_matCache[MatrixType::ProjectionToViewJittered] = inverse(newViewToProjectionJittered);
 
     m_frameLastTouched = frameIdx;
 
@@ -812,10 +780,9 @@ namespace dxvk
   
   Vector2 RtCamera::calcPixelJitter(uint32_t jitterFrameIdx) const {
     // Only apply jittering when DLSS/XeSS/TAA is enabled, or if forced by settings
-    if (!RtxOptions::isRuntimeDLSSOrRayReconstructionEnabled() &&
-        !RtxOptions::isRuntimeXeSSEnabled() &&
-        !RtxOptions::isRuntimeTAAEnabled() &&
-        !RtxOptions::isRuntimeFSR4Enabled() &&
+    if (!RtxOptions::isDLSSOrRayReconstructionEnabled() &&
+        !RtxOptions::isXeSSEnabled() &&
+        !RtxOptions::isTAAEnabled() &&
         !RtxOptions::forceCameraJitter()) {
       return Vector2{ 0, 0 };
     }
@@ -824,7 +791,7 @@ namespace dxvk
 #if USE_DLSS_DEMO_JITTER_PATTERN
     uint32_t jitterSequenceLength = RtxOptions::cameraJitterSequenceLength();
 
-    if (RtxOptions::isRuntimeXeSSEnabled() && DxvkXeSS::XessOptions::useRecommendedJitterSequenceLength()) {
+    if (RtxOptions::isXeSSEnabled() && DxvkXeSS::XessOptions::useRecommendedJitterSequenceLength()) {
       float upscaleFactor = static_cast<float>(m_finalResolution[1]) / m_renderResolution[1];
 
       // XeSS 2.1 formula: ceil(upscale_factor^2 * 8)
@@ -1203,7 +1170,7 @@ namespace dxvk
     }
 
     int oldFrame = m_currentFrame;
-    IMGUI_ADD_TOOLTIP(ImGui::SliderInt("Current Frame", &m_currentFrame, 0, m_settings.size() -1, "%d", ImGuiSliderFlags_AlwaysClamp), "Current Frame.");
+    IMGUI_ADD_TOOLTIP(RemixGui::SliderInt("Current Frame", &m_currentFrame, 0, m_settings.size() -1, "%d", ImGuiSliderFlags_AlwaysClamp), "Current Frame.");
     m_currentFrame = std::min(m_currentFrame, (int)m_settings.size());
 
     Mode currentMode = mode();
@@ -1219,6 +1186,7 @@ namespace dxvk
 
     // Record Button
     {
+      ImGui::BeginDisabled(isPlaying);
 
       if (isRecording) {
         ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.5, 0, 0, 1));
@@ -1232,12 +1200,14 @@ namespace dxvk
       if (isRecording) {
         ImGui::PopStyleColor(2);
       }
+      ImGui::EndDisabled();
     }
 
     ImGui::SameLine();
 
     // Play Button
     {
+      ImGui::BeginDisabled(isRecording);
 
       if (isPlaying) {
         ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0, 0.5, 0, 1));
@@ -1252,6 +1222,7 @@ namespace dxvk
         ImGui::PopStyleColor(2);
       }
 
+      ImGui::EndDisabled();
     }
 
     ImGui::SameLine();
@@ -1268,6 +1239,7 @@ namespace dxvk
 
     // Browse Button
     {
+      ImGui::BeginDisabled(isRecording || isPlaying);
 
       if (isBrowsing) {
         ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.5, 0.5, 0, 1));
@@ -1283,6 +1255,7 @@ namespace dxvk
         ImGui::PopStyleColor(2);
       }
 
+      ImGui::EndDisabled();
     }
 
     ImGui::Text("Total Frames: %d", m_settings.size());

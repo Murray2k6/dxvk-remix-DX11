@@ -297,7 +297,7 @@ void RtSphereLight::updateCachedHash() {
   XXH64_hash_t h = (XXH64_hash_t)RtLightType::Sphere;
 
   // Note: Radiance not included to somewhat uniquely identify lights when constructed
-  // from legacy lights.
+  // from D3D11 Lights.
   h = XXH64(&m_position[0], sizeof(m_position), h);
   h = XXH64(&m_radius, sizeof(m_radius), h);
   h = XXH64(&h, sizeof(h), m_shaping.getHash());
@@ -474,7 +474,7 @@ void RtRectLight::updateCachedHash() {
   XXH64_hash_t h = (XXH64_hash_t)RtLightType::Rect;
 
   // Note: Radiance not included to somewhat uniquely identify lights when constructed
-  // from legacy lights.
+  // from D3D11 Lights.
   h = XXH64(&m_position[0], sizeof(m_position), h);
   h = XXH64(&m_dimensions[0], sizeof(m_dimensions), h);
   h = XXH64(&m_xAxis[0], sizeof(m_xAxis), h);
@@ -649,7 +649,7 @@ void RtDiskLight::updateCachedHash() {
   XXH64_hash_t h = (XXH64_hash_t)RtLightType::Disk;
 
   // Note: Radiance not included to somewhat uniquely identify lights when constructed
-  // from legacy lights.
+  // from D3D11 Lights.
   h = XXH64(&m_position[0], sizeof(m_position), h);
   h = XXH64(&m_halfDimensions[0], sizeof(m_halfDimensions), h);
   h = XXH64(&m_xAxis[0], sizeof(m_xAxis), h);
@@ -789,7 +789,7 @@ void RtCylinderLight::updateCachedHash() {
   XXH64_hash_t h = (XXH64_hash_t)RtLightType::Cylinder;
 
   // Note: Radiance not included to somewhat uniquely identify lights when constructed
-  // from legacy lights.
+  // from D3D11 Lights.
   h = XXH64(&m_position[0], sizeof(m_position), h);
   h = XXH64(&m_radius, sizeof(m_radius), h);
   h = XXH64(&m_axis[0], sizeof(m_axis), h);
@@ -923,7 +923,7 @@ void RtDistantLight::updateCachedHash() {
   XXH64_hash_t h = (XXH64_hash_t)RtLightType::Distant;
 
   // Note: Radiance not included to somewhat uniquely identify lights when constructed
-  // from legacy lights.
+  // from D3D11 Lights.
   h = XXH64(&m_direction[0], sizeof(m_direction), h);
   h = XXH64(&m_halfAngle, sizeof(m_halfAngle), h);
   // Note: Volumetric radiance scale not included either for performance as it's likely not
@@ -1008,7 +1008,6 @@ void RtLight::copyFrom(const RtLight& light) {
   // Copy anti-culling union members safely based on the anti-culling type
   switch (light.m_anticullingType) {
   case RtLightAntiCullingType::GameLight:
-  case RtLightAntiCullingType::LightReplacement:
     m_originalPosition = light.m_originalPosition;
     m_originalLightRadius = light.m_originalLightRadius;
     break;

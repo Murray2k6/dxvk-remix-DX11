@@ -28,10 +28,10 @@ namespace remixapi {
   remixapi_Interface g_remix = {};
   bool g_remix_initialized = false;
   HMODULE g_remix_dll = nullptr;
-  IDirect3DDevice9Ex* g_device = nullptr;
+  ID3D11Device* g_device = nullptr;
   std::mutex g_device_mutex;
 
-  IDirect3DDevice9Ex* getDevice() {
+  ID3D11Device* getDevice() {
     std::scoped_lock device_lock(g_device_mutex);
     if (g_device) {
       bridge_util::Logger::info("[RemixApi] getDevice(): success");

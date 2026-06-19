@@ -3363,7 +3363,7 @@ namespace dxvk {
     uint32_t skinBonesPerVertex = 0;
 
     // Color0: the interleaver converts BGRA and RGBA packed-byte formats.
-    // Both B8G8R8A8_UNORM (D3D9 D3DCOLOR) and R8G8B8A8_UNORM (D3D11) are
+    // Both B8G8R8A8_UNORM (D3D11 D3DCOLOR) and R8G8B8A8_UNORM (D3D11) are
     // supported â€” the interleaver swaps R/B for RGBA.  Float vertex color
     // formats are not supported; Remix defaults to white when color0 is absent.
     RasterBuffer colBuffer;

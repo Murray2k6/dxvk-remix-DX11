@@ -63,8 +63,8 @@ opengl3_example/
     This uses more modern OpenGL calls and custom shaders. 
     Prefer using that if you are using modern OpenGL in your application (anything with shaders).
 
-directx9_example/
-    DirectX9 example, Windows only.
+directx11_example/
+    DirectX11 example, Windows only.
 	
 directx10_example/
     DirectX10 example, Windows only.

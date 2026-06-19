@@ -287,16 +287,16 @@ foreach key : copy_targets.keys()
     target_suffix = copy_targets[key]['target_suffix']
     output_path = copy_targets[key]['output_path']
     # the copy target is special
-    # if we use custom_target for the d3d9 DLL, meson generates a target that does nothing in ninja
+    # if we use custom_target for the d3d11 DLL, meson generates a target that does nothing in ninja
     # as a workaround, we do the copy as part of the test_* target itself  
     
     if cpu_family == 'x86'
         run_target('copy_' + target_suffix,
-          depends: [ d3d9_dll ],
+          depends: [ d3d11_dll ],
           command : [copy_script_path,
                     meson.current_build_dir().replace('\\', '/') + '/src/client',
                     output_path,
-                    'd3d9*'])
+                    'd3d11*'])
         run_target('copy_' + target_suffix + '_launcher',
           depends: [ launcher_exe ],
           command : [copy_script_path,

@@ -163,7 +163,7 @@ void getTriangleCandidateInfo(NEECell cell, int binIndex, out float probability,
 
   // Triangle color
   vec3 triangleCenter;
-  f16vec3 triangleNormal;
+  vec3 triangleNormal;
   NEECacheUtils.calculateTriangleLightIntensity(candidiate.getSurfaceID(), candidiate.getPrimitiveID(), triangleCenter, triangleNormal, lightIntensity);
   // Multiply 0.1 to show brighter lights
   lightIntensity = log(calcBt709Luminance(lightIntensity) + 1) * 0.1;
@@ -228,7 +228,7 @@ void getLightCandidateInfo(NEECell cell, int binIndex, RAB_Surface surface, f16v
 }
 
 [shader("compute")]
-[numthreads(16, 8, 1)]
+[numthreads(INTEGRATE_NEE_THREADS_DISPATCH_WIDTH, INTEGRATE_NEE_THREADS_DISPATCH_HEIGHT, 1)]
 void main(uint2 threadIndex : SV_DispatchThreadID, uint2 LocalIndex : SV_GroupThreadID)
 {
   if (any(threadIndex >= cb.camera.resolution))

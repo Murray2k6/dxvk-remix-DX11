@@ -1,3 +1,4 @@
+#include "rtx/dx11/dx11_material_fog_state.h"
 /*
 * Copyright (c) 2023-2026, NVIDIA CORPORATION. All rights reserved.
 *
@@ -240,6 +241,7 @@ namespace dxvk {
         RemixGui::Checkbox("Enable Reference Mode", &enableReferenceModeObject());
         RemixGui::Separator();
 
+        ImGui::BeginDisabled(enableReferenceMode());
 
         m_rebuildFroxels |= RemixGui::DragInt("Restir Grid Downsample Factor", &restirGridScaleObject(), 0.1f, 1);
         m_rebuildFroxels |= RemixGui::DragInt("Restir Froxel Depth Slices", &restirFroxelDepthSlicesObject(), 0.1f, 1, UINT16_MAX);
@@ -247,17 +249,24 @@ namespace dxvk {
 
         RemixGui::DragInt("Initial RIS Sample Count", &initialRISSampleCountObject(), 0.05f, 1, UINT8_MAX);
         RemixGui::Checkbox("Enable Initial Visibility", &enableInitialVisibilityObject());
+        ImGui::BeginDisabled(!enableInitialVisibility());
         RemixGui::Checkbox("Enable Visibility Reuse", &visibilityReuseObject());
+        ImGui::EndDisabled();
 
         RemixGui::Checkbox("Enable Temporal Resampling", &enableTemporalResamplingObject());
+        ImGui::BeginDisabled(!enableTemporalResampling());
         RemixGui::DragInt("Temporal Resampling Max Sample Count", &temporalReuseMaxSampleCountObject(), 1.0f, 1, UINT16_MAX);
+        ImGui::EndDisabled();
 
         RemixGui::Separator();
 
         RemixGui::Checkbox("Enable Spatial Resampling", &enableSpatialResamplingObject());
+        ImGui::BeginDisabled(!enableSpatialResampling());
         RemixGui::DragInt("Spatial Resampling Max Sample Count", &spatialReuseMaxSampleCountObject(), 1.0f, 1, UINT16_MAX);
         RemixGui::DragFloat("Clamped Spatial Resampling Search Radius", &spatialReuseSamplingRadiusObject(), 0.01f, 0.0f, 10.0f, "%.3f", ImGuiSliderFlags_AlwaysClamp);
+        ImGui::EndDisabled();
 
+        ImGui::EndDisabled();
       }
 
       ImGui::Unindent();
@@ -269,6 +278,7 @@ namespace dxvk {
       RemixGui::Checkbox("Enable Volumetric Lighting", &enableObject());
       {
         ImGui::Indent();
+        ImGui::BeginDisabled(!enable());
 
         const char* volumericPresetName[] = {
           "-Select Preset and Hit Apply-",
@@ -303,6 +313,7 @@ namespace dxvk {
         RemixGui::Checkbox("Show Advanced Material Options", &showAdvanced);
 
         if (showAdvanced) {
+          RemixGui::Checkbox("Enable Translucent Shadows", &enableTranslucentShadowsObject());
           RemixGui::DragFloat3("Transmittance Color", &transmittanceColorObject(), 0.01f, 0.0f, MaxTransmittanceValue, "%.3f");
           RemixGui::DragFloat("Transmittance Measurement Distance", &transmittanceMeasurementDistanceMetersObject(), 0.25f, 0.0f, FLT_MAX, "%.2f", ImGuiSliderFlags_AlwaysClamp);
           RemixGui::DragFloat3("Single Scattering Albedo", &singleScatteringAlbedoObject(), 0.01f, 0.0f, 1.0f, "%.3f");
@@ -313,6 +324,7 @@ namespace dxvk {
 
           RemixGui::Checkbox("Enable Heterogeneous Fog", &enableHeterogeneousFogObject());
 
+          ImGui::BeginDisabled(!enableHeterogeneousFog());
           RemixGui::DragFloat("Noise Field Substep Size", &noiseFieldSubStepSizeMetersObject(), 0.01f, 0.0f, FLT_MAX, "%.2f", ImGuiSliderFlags_AlwaysClamp);
           RemixGui::DragInt("Noise Field Number of Octaves", &noiseFieldOctavesObject(), 0.05f, 1, 8);
           RemixGui::DragFloat("Noise Field Time Scale", &noiseFieldTimeScaleObject(), 0.01f, 0.0f, FLT_MAX, "%.2f", ImGuiSliderFlags_AlwaysClamp);
@@ -321,16 +333,19 @@ namespace dxvk {
           RemixGui::DragFloat("Noise Field Initial Frequency", &noiseFieldInitialFrequencyPerMeterObject(), 0.01f, 0.0f, FLT_MAX, "%.3f", ImGuiSliderFlags_AlwaysClamp);
           RemixGui::DragFloat("Noise Field Lacunarity", &noiseFieldLacunarityObject(), 0.01f, 0.0f, FLT_MAX, "%.2f", ImGuiSliderFlags_AlwaysClamp);
           RemixGui::DragFloat("Noise Field Gain", &noiseFieldGainObject(), 0.01f, 0.0f, FLT_MAX, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+          ImGui::EndDisabled();
         }
 
         RemixGui::Separator();
 
         RemixGui::Checkbox("Atmosphere Enabled", &enableAtmosphereObject());
         ImGui::Indent();
+        ImGui::BeginDisabled(!enableAtmosphere());
         {
           RemixGui::DragFloat("Planet Radius", &atmospherePlanetRadiusMetersObject(), 0.1f, -FLT_MAX, FLT_MAX, "%.2f", ImGuiSliderFlags_AlwaysClamp);
           RemixGui::DragFloat("Height", &atmosphereHeightMetersObject(), 0.1f, -FLT_MAX, FLT_MAX, "%.2f", ImGuiSliderFlags_AlwaysClamp);
           RemixGui::Checkbox("Inverted", &atmosphereInvertedObject());
+          ImGui::EndDisabled();
         }
         ImGui::Unindent();
 
@@ -338,6 +353,7 @@ namespace dxvk {
         RemixGui::Checkbox("Enable Legacy Fog Remapping", &enableFogRemapObject());
         RemixGui::Separator();
 
+        ImGui::BeginDisabled(!enableFogRemap());
         {
           ImGui::Indent();
 
@@ -345,6 +361,7 @@ namespace dxvk {
 
           RemixGui::Checkbox("Enable Fog Max Distance Remapping", &enableFogMaxDistanceRemapObject());
 
+          ImGui::BeginDisabled(!enableFogMaxDistanceRemap());
           {
             // Use dynamic bounds to prevent min > max configurations
             RemixGui::DragFloat("Legacy Max Distance Min", &fogRemapMaxDistanceMinMetersObject(), 0.25f, 0.0f, fogRemapMaxDistanceMaxMeters(), "%.2f", ImGuiSliderFlags_AlwaysClamp);
@@ -352,12 +369,15 @@ namespace dxvk {
             RemixGui::DragFloat("Remapped Transmittance Measurement Distance Min", &fogRemapTransmittanceMeasurementDistanceMinMetersObject(), 0.25f, 0.0f, fogRemapTransmittanceMeasurementDistanceMaxMeters(), "%.2f", ImGuiSliderFlags_AlwaysClamp);
             RemixGui::DragFloat("Remapped Transmittance Measurement Distance Max", &fogRemapTransmittanceMeasurementDistanceMaxMetersObject(), 0.25f, fogRemapTransmittanceMeasurementDistanceMinMeters(), FLT_MAX, "%.2f", ImGuiSliderFlags_AlwaysClamp);
           }
+          ImGui::EndDisabled();
 
           RemixGui::DragFloat("Color Multiscattering Scale", &fogRemapColorMultiscatteringScaleObject(), 0.01f, 0.0f, FLT_MAX, "%.2f", ImGuiSliderFlags_AlwaysClamp);
 
           ImGui::Unindent();
         }
+        ImGui::EndDisabled();
 
+        ImGui::EndDisabled();
         ImGui::Unindent();
       }
 
@@ -421,7 +441,7 @@ namespace dxvk {
   // A typical use for this function is checking if the player is in the water, which has high density and we want to use fix function fog.
   // Note: Fogs in Portal uses linear fix fog function, so the density can only be approximated
   bool shouldConvertToPhysicalFog(const FogState& fogState, const float fogDensityThrehold) {
-    if (fogState.mode == FogMode::None || (fogState.mode == FogMode::Linear && fogState.end < 1e-7f)) {
+    if (fogState.mode == DX11_FOG_NONE || (fogState.mode == DX11_FOG_LINEAR && fogState.end < 1e-7f)) {
       return true;
     }
 
@@ -444,30 +464,30 @@ namespace dxvk {
   }
 
   VolumeArgs RtxGlobalVolumetrics::getVolumeArgs(CameraManager const& cameraManager, FogState const& fogState, bool enablePortalVolumes) const {
-    // Calculate the volumetric parameters from options and the legacy fog state
+    // Calculate the volumetric parameters from options and the fixed function fog state
 
     // Note: Volumetric transmittance color option is in gamma space, so must be converted to linear for usage in the volumetric system.
     Vector3 transmittanceColorLinear{ sRGBGammaToLinear(transmittanceColor()) };
 
-    // Fall back to default when fog mode is None, no fog remapping is specified, or invalid values in the fog mode derivation
+    // Note: Fall back to usual default in cases such as the "none" D3D fog mode, no fog remapping specified, or invalid values in the fog mode derivation
     // (such as dividing by zero).
     float transmittanceMeasurementDistance = transmittanceMeasurementDistanceMeters() * RtxOptions::getMeterToWorldUnitScale();
     Vector3 multiScatteringEstimate = Vector3();
 
     // Check if fog density is below the configurable threshold to determine if physical volumetrics should be used.
-    // This threshold was created specifically for Portal RTX's underwater legacy fog.
+    // This threshold was created specifically for Portal RTX's underwater fixed function fog.
     const bool canUsePhysicalFog = shouldConvertToPhysicalFog(fogState, waterFogDensityThreshold());
 
     if (
       enableFogRemap() &&
-      // Only consider remapping fog if any fog is actually enabled (not the None mode).
-      fogState.mode != FogMode::None &&
+      // Note: Only consider remapping fog if any fixed function fog is actually enabled (not the "none" mode).
+      fogState.mode != DX11_FOG_NONE &&
       canUsePhysicalFog
     ) {
       // Handle Fog Color remapping
       // Note: This must happen first as max distance remapping will depend on the luminance derived from the color determined here.
       if (enableFogColorRemap()) {
-        // Note: Legacy fog color is in gamma space as all the rendering in old games was typically in gamma space, same assumption we make
+        // Note: Legacy fixed function fog color is in gamma space as all the rendering in old games was typically in gamma space, same assumption we make
         // for textures/lights.
         transmittanceColorLinear = sRGBGammaToLinear(fogState.color);
       }
@@ -478,9 +498,9 @@ namespace dxvk {
       // Handle Fog Max Distance remapping
 
       if (enableFogMaxDistanceRemap()) {
-        // Switch transmittance measurement distance derivation based on which fog mode is in use
+        // Switch transmittance measurement distance derivation from D3D11 fog based on which fog mode is in use
 
-        if (fogState.mode == FogMode::Linear) {
+        if (fogState.mode == DX11_FOG_LINEAR) {
           float fogRemapMaxDistanceMin { fogRemapMaxDistanceMinMeters() * RtxOptions::getMeterToWorldUnitScale() };
           float fogRemapMaxDistanceMax { fogRemapMaxDistanceMaxMeters() * RtxOptions::getMeterToWorldUnitScale() };
           float fogRemapTransmittanceMeasurementDistanceMin { fogRemapTransmittanceMeasurementDistanceMinMeters() * RtxOptions::getMeterToWorldUnitScale() };
@@ -507,7 +527,7 @@ namespace dxvk {
           }
 
           transmittanceMeasurementDistance = normalizedRange * transmittanceMeasurementDistanceRange + fogRemapTransmittanceMeasurementDistanceMin;
-        } else if (fogState.mode == FogMode::Exp || fogState.mode == FogMode::Exp2) {
+        } else if (fogState.mode == DX11_FOG_EXP || fogState.mode == DX11_FOG_EXP2) {
           // Note: Derived using the following, doesn't take fog color into account but that is fine for a rough estimate:
           // density = -ln(color) / measurement_distance (For exp)
           // density^2 = -ln(color) / measurement_distance (For exp2)
@@ -517,8 +537,8 @@ namespace dxvk {
 
             transmittanceMeasurementDistance = -log(transmittanceColorLuminance) / fogState.density;
             // Todo: Scene scale stuff ignored for now because scene scale stuff is not actually functioning properly. Add back in if it's ever fixed.
-            // Convert transmittance measurement distance into engine units (from game-specific world units).
-            // This is the same as dividing the density by the scene scale.
+            // Note: Convert transmittance measurement distance into our engine's units (from game-specific world units due to being derived
+            // from the D3D11 side of things). This in effect is the same as dividing the density by the scene scale.
             // transmittanceMeasurementDistance *= sceneScale();
           }
         }
@@ -562,6 +582,7 @@ namespace dxvk {
     volumeArgs.froxelFireflyFilteringLuminanceThreshold = froxelFireflyFilteringLuminanceThreshold();
     volumeArgs.attenuationCoefficient = volumetricAttenuationCoefficient;
     volumeArgs.enable = enable() && canUsePhysicalFog;
+    volumeArgs.enableTranslucentShadows = volumeArgs.enable && enableTranslucentShadows();
     volumeArgs.scatteringCoefficient = volumetricScatteringCoefficient;
     volumeArgs.enableVolumeRISInitialVisibility = enableInitialVisibility();
     volumeArgs.enablevisibilityReuse = visibilityReuse();

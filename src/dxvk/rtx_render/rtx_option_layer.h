@@ -257,11 +257,11 @@ namespace dxvk {
     
     // Resolve config file paths from an environment variable
     // Returns vector of paths (may be multiple for comma-separated env var values)
-    // If env var is not set, searches common game/DLL-relative locations for defaultFileName.
+    // If env var is not set, returns the defaultFileName
     static std::vector<std::string> resolveConfigPaths(const char* envVarName, const char* defaultFileName);
 
     // Create layer(s) from paths that may come from an environment variable
-    // Handles multiple files by creating numbered layers (e.g., "zz01_rtx.conf", "zz00_rtx.conf")
+    // Handles multiple files by creating numbered layers (e.g., "00_rtx.conf", "01_rtx.conf")
     // Returns the created layers in order (first file = lowest priority within same SystemLayerPriority)
     static std::vector<RtxOptionLayer*> createLayersFromEnvVar(
         const char* envVarName,

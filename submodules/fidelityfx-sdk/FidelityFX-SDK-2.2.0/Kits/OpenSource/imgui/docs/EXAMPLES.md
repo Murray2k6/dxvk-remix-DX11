@@ -169,9 +169,9 @@ SDL3 (Win32, Mac, Linux, etc.) + Vulkan example. <BR>
 This is quite long and tedious, because: Vulkan. <BR>
 For this example, the main.cpp file exceptionally use helpers function from imgui_impl_vulkan.h/cpp.
 
-[example_win32_directx9/](https://github.com/ocornut/imgui/blob/master/examples/example_win32_directx9/) <BR>
-DirectX9 example, Windows only. <BR>
-= main.cpp + imgui_impl_win32.cpp + imgui_impl_dx9.cpp
+[example_win32_directx11/](https://github.com/ocornut/imgui/blob/master/examples/example_win32_directx11/) <BR>
+DirectX11 example, Windows only. <BR>
+= main.cpp + imgui_impl_win32.cpp + imgui_impl_dx11.cpp
 
 [example_win32_directx10/](https://github.com/ocornut/imgui/blob/master/examples/example_win32_directx10/) <BR>
 DirectX10 example, Windows only. <BR>

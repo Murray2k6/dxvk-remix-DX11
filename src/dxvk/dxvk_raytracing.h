@@ -105,10 +105,6 @@ namespace dxvk {
      */
     VkPipeline getPipelineHandle();
 
-    bool isCompiled() const {
-      return m_isCompiled.load();
-    }
-
     /**
      * \brief Compiles a pipeline
      *

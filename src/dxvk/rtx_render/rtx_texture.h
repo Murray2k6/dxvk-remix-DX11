@@ -127,31 +127,22 @@ namespace dxvk {
       return nullptr;
     }
 
+    // DX11_V225: ref-counted accessor used by the DX11 layer when it needs to keep
+    // the image view alive (e.g. storing into material color textures).
     Rc<DxvkImageView> getImageViewRc() const {
-      if (m_imageView.ptr()) {
+      if (m_imageView.ptr())
         return m_imageView;
-      }
 
-      if (m_managedTexture.ptr()) {
+      if (m_managedTexture.ptr())
         return m_managedTexture->m_currentMipView;
-      }
 
       return nullptr;
     }
 
     XXH64_hash_t getImageHash() const {
       XXH64_hash_t result = 0;
-      const DxvkImageView* resolvedImageView = getImageView();
-      if (resolvedImageView != nullptr) {
+      if (const DxvkImageView* resolvedImageView = getImageView()) {
         result = resolvedImageView->image()->getHash();
-
-        // When a view addresses a single layer of a multi-layer image (Texture2DArray),
-        // different array slices share the same image hash causing distinct game textures
-        // to collide. Mix in the layer index so each slice gets a unique hash.
-        const auto& viewInfo = resolvedImageView->info();
-        if (viewInfo.numLayers == 1 && resolvedImageView->image()->info().numLayers > 1) {
-          result = XXH64(&viewInfo.minLayer, sizeof(viewInfo.minLayer), result);
-        }
       }
 
       if (result == 0 && m_managedTexture.ptr() != nullptr) {
@@ -161,9 +152,6 @@ namespace dxvk {
         result = XXH64(&assetDataHash, sizeof(assetDataHash), result);
         // Needed to distinguish materials that load the same file different ways (i.e. raw vs sRGB)
         result = XXH64(&m_uniqueKey, sizeof(m_uniqueKey), result);
-      } else if (result == 0 && resolvedImageView != nullptr) {
-        const VkImage imageHandle = resolvedImageView->image()->handle();
-        result = XXH64(&imageHandle, sizeof(imageHandle), 0);
       }
 
       return result;

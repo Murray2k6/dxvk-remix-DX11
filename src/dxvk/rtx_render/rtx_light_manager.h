@@ -20,7 +20,7 @@
 * DEALINGS IN THE SOFTWARE.
 */
 #pragma once
-
+#include "rtx/dx11/dx11_light_state.h"
 #include <array>
 #include <vector>
 #include <unordered_map>
@@ -31,7 +31,6 @@
 #include "rtx_lights.h"
 #include "rtx_camera_manager.h"
 #include "rtx_common_object.h"
-#include "rtx_cb_types.h"
 #include "rtx/pass/common_binding_indices.h"
 #include "rtx/pass/raytrace_args.h"
 
@@ -72,6 +71,7 @@ public:
   void showImguiDebugVisualization() const;
 
   const std::unordered_map<XXH64_hash_t, RtLight>& getLightTable() const { return m_lights; }
+  const std::unordered_map<uint64_t, RtLight>& getExternallyTrackedLightTable() const { return m_externallyTrackedLights; }
   const Rc<DxvkBuffer> getLightBuffer() const { return m_lightBuffer; }
   const Rc<DxvkBuffer> getPreviousLightBuffer() const { return m_previousLightBuffer.ptr() ? m_previousLightBuffer : m_lightBuffer; }
   const Rc<DxvkBuffer> getLightMappingBuffer() const { return m_lightMappingBuffer; }
@@ -87,17 +87,15 @@ public:
 
   void prepareSceneData(Rc<DxvkContext> ctx, CameraManager const& cameraManager);
 
-  void addGameLight(uint32_t type, const RtLight& light);
+  void addGameLight(Dx11LightType type, const RtLight& light);
   RtLight* addLight(const RtLight& light, const RtLightAntiCullingType antiCullingType);
   RtLight* addLight(const RtLight& light, const DrawCallState& drawCallState, const RtLightAntiCullingType antiCullingType);
 
   // Externally tracked lights are lights whose lifecycle (creation, update, removal) is managed externally, rather than the
   // existing frame-to-frame tracking and anti-culling systems. These are kept separte to avoid any interference from anti culling
-  // and light matching.
+  // and light matching. Remove external lights by calling light->markForGarbageCollection().
   RtLight* createExternallyTrackedLight(const RtLight& light);
   void updateExternallyTrackedLight(RtLight* light, const RtLight& newLight);
-  void removeExternallyTrackedLight(RtLight* light);
-
   void addExternalLight(remixapi_LightHandle handle, const RtLight& rtlight);
   void addExternalDomeLight(remixapi_LightHandle handle, const DomeLight& domeLight);
   void removeExternalLight(remixapi_LightHandle handle);
@@ -168,7 +166,7 @@ private:
   // always creates the fallback light. Primarily a debugging feature, users should create their own lights via the Remix workflow rather than relying on this feature to provide lighting.
   // As such, this option should be set to Never for "production" builds of Remix creations to avoid the fallback light from appearing in games unintentionally in cases where no lights exist (which is
   // the default behavior when set to NoLightsPresent).
-  RTX_OPTION("rtx", FallbackLightMode, fallbackLightMode, FallbackLightMode::Always,
+  RTX_OPTION("rtx", FallbackLightMode, fallbackLightMode, FallbackLightMode::NoLightsPresent,
              "The mode to determine when to create a fallback light.\n"
              "Never (0) never creates the light, NoLightsPresent (1) creates the fallback light only when no lights are provided to Remix, and Always (2) always creates the fallback light.\n"
              "Primarily a debugging feature, users should create their own lights via the Remix workflow rather than relying on this feature to provide lighting.\n"
@@ -178,7 +176,7 @@ private:
     s_fallbackLightDirty = true;
   }
   RTX_OPTION_ARGS("rtx", FallbackLightType, fallbackLightType, FallbackLightType::Distant, "The light type to use for the fallback light. Determines which other fallback light options are used.", args.onChangeCallback = &fallbackLightOnChange);
-  RTX_OPTION_ARGS("rtx", Vector3, fallbackLightRadiance, Vector3(2.0f, 2.0f, 2.0f), "The radiance to use for the fallback light (used across all light types).", args.minValue = Vector3(0.0f, 0.0f, 0.0f), args.onChangeCallback = &fallbackLightOnChange);
+  RTX_OPTION_ARGS("rtx", Vector3, fallbackLightRadiance, Vector3(1.6f, 1.8f, 2.0f), "The radiance to use for the fallback light (used across all light types).", args.minValue = Vector3(0.0f, 0.0f, 0.0f), args.onChangeCallback = &fallbackLightOnChange);
   RTX_OPTION_ARGS("rtx", Vector3, fallbackLightDirection, Vector3(-0.2f, -1.0f, 0.4f), "The direction to use for the fallback light (used only for Distant light types)", args.onChangeCallback = &fallbackLightOnChange);
   RTX_OPTION_ARGS("rtx", float, fallbackLightAngle, 5.0f, "The angular size in degrees to use for the fallback light (used only for Distant light types). Should only be within the range [0, 180].",
                   args.onChangeCallback = &fallbackLightOnChange, args.minValue = 0.0f);
@@ -204,6 +202,15 @@ private:
                   args.minValue = 0.0f, args.maxValue = kPi);
   RTX_OPTION("rtx", float, lightConversionMaxIntensity, FLT_MAX, "The highest intensity value a converted light can have.");
   RTX_OPTION("rtx", float, lightConversionIntensityFactor, 1.f, "Scales the converted light intensities.");
+  RTX_OPTION("rtx", bool, enableLegacyRectLightConeShaping, false,
+             "If true, restores the legacy cos(angle) * aspectRatio formula for RectLight cone shaping. "
+             "Enable this only to preserve the look of existing scenes that were authored against the legacy behavior. "
+             "Note this can silently kill the light at high aspect ratios.");
+  RTX_OPTION("rtx", bool, enableRectLightConeShapingRatioScaling, false,
+             "If true, scales the RectLight cone half-angle by the light's aspect ratio in tangent space, "
+             "producing a cone that matches the rect's proportions. When false (default), the cone is uniform "
+             "and independent of the light's width/height. Ignored when enableLegacyRectLightConeShaping is true.");
 };
 
 }  // namespace dxvk
+

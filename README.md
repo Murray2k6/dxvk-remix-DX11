@@ -2,7 +2,7 @@
 
 A Direct3D 11 frontend for NVIDIA DXVK-Remix-style rendering. This project focuses on receiving D3D11 game rendering commands, translating/capturing scene data through a DXVK/Vulkan-backed path, and submitting usable geometry, materials, camera data, and frame presentation into the RTX Remix runtime pipeline.
 
-This README intentionally describes the **DX11 architecture only**. It does not document the original D3D8/D3D9 fixed-function Remix bridge path except where needed to explain what this fork replaces.
+This README intentionally describes the **DX11 architecture only**. It does not document the original D3D8/D3D11 fixed-function Remix bridge path except where needed to explain what this fork replaces.
 
 ---
 
@@ -12,7 +12,7 @@ NVIDIA RTX Remix is a runtime and tooling ecosystem for remastering older games 
 
 DXVK-Remix is the runtime-side graphics translation layer used by RTX Remix. It is based on DXVK, but it adds Remix-specific capture, material, geometry, lighting, USD, UI, and path-traced rendering systems on top of the normal Direct3D-to-Vulkan translation idea.
 
-This DX11-focused architecture replaces the traditional D3D9-facing frontend with a Direct3D 11 frontend:
+This DX11-focused architecture replaces the traditional D3D11-facing frontend with a Direct3D 11 frontend:
 
 - The game loads `d3d11.dll` and/or `dxgi.dll` from this project.
 - The frontend interposes on D3D11 device, context, swap chain, resource, shader, input-layout, and draw calls.
@@ -55,7 +55,7 @@ It does not replace:
 - The core RTX option system.
 - The ImGui/Remix user interface.
 
-It also does not guarantee that every D3D11 game will work automatically. D3D11 games are much less uniform than fixed-function-era D3D8/D3D9 games. Modern engines use custom shaders, deferred renderers, temporal effects, compute passes, dynamic buffers, engine-specific culling, skinned meshes, clustered lighting, and post-processing chains that must be handled carefully.
+It also does not guarantee that every D3D11 game will work automatically. D3D11 games are much less uniform than fixed-function-era D3D8/D3D11 games. Modern engines use custom shaders, deferred renderers, temporal effects, compute passes, dynamic buffers, engine-specific culling, skinned meshes, clustered lighting, and post-processing chains that must be handled carefully.
 
 ---
 
@@ -373,7 +373,7 @@ Best results are expected when the application uses a conventional 3D scene pipe
 
 ## Current Limitations
 
-D3D11 support is harder than classic fixed-function D3D9 support because D3D11 exposes less semantic meaning to the wrapper.
+D3D11 support is harder than classic fixed-function D3D11 support because D3D11 exposes less semantic meaning to the wrapper.
 
 Expected limitations include:
 

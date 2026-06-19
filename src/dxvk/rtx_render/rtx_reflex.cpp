@@ -93,7 +93,7 @@ namespace dxvk {
     NvLL_VK_Status status = NvLL_VK_Initialize();
 
     if (status != NVLL_VK_OK) {
-      Logger::info(str::format("Unable to initialize Reflex: ", NvLLStatusToString(status)));
+      Logger::err(str::format("Unable to initialize Reflex: ", NvLLStatusToString(status)));
 
       return;
     }

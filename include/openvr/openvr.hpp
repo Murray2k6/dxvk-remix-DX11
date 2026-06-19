@@ -1508,11 +1508,11 @@ public:
 	*   return zero for vsync time and frame counter and return false from the method. */
 	virtual bool GetTimeSinceLastVsync( float *pfSecondsSinceLastVsync, uint64_t *pulFrameCounter ) = 0;
 
-	/** [D3D9 Only]
-	* Returns the adapter index that the user should pass into CreateDevice to set up D3D9 in such
+	/** [D3D11 Only]
+	* Returns the adapter index that the user should pass into CreateDevice to set up D3D11 in such
 	* a way that it can go full screen exclusive on the HMD. Returns -1 if there was an error.
 	*/
-	virtual int32_t GetD3D9AdapterIndex() = 0;
+	virtual int32_t GetD3D11AdapterIndex() = 0;
 
 	/** [D3D10/11 Only]
 	* Returns the adapter index that the user should pass into EnumAdapters to create the device 
@@ -1525,7 +1525,7 @@ public:
 	 * compositor are creating textures and swap chains on the same GPU. If an error occurs the device
 	 * will be set to 0.
 	 * pInstance is an optional parameter that is required only when textureType is TextureType_Vulkan.
-	 * [D3D10/11/12 Only (D3D9 Not Supported)]
+	 * [D3D10/11/12 Only (D3D11 Not Supported)]
 	 *  Returns the adapter LUID that identifies the GPU attached to the HMD. The user should
 	 *  enumerate all adapters using IDXGIFactory::EnumAdapters and IDXGIAdapter::GetDesc to find
 	 *  the adapter with the matching LUID, or use IDXGIFactory4::EnumAdapterByLuid.

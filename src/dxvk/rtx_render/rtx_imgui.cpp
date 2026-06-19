@@ -1,38 +1,31 @@
+/*
+* Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+*
+* Permission is hereby granted, free of charge, to any person obtaining a
+* copy of this software and associated documentation files (the "Software"),
+* to deal in the Software without restriction, including without limitation
+* the rights to use, copy, modify, merge, publish, distribute, sublicense,
+* and/or sell copies of the Software, and to permit persons to whom the
+* Software is furnished to do so, subject to the following conditions:
+*
+* The above copyright notice and this permission notice shall be included in
+* all copies or substantial portions of the Software.
+*
+* THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+* IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+* FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+* THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+* LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+* FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+* DEALINGS IN THE SOFTWARE.
+*/
 #include "rtx_imgui.h"
-#include "../imgui/dxvk_imgui.h"
-#include "../../util/log/log.h"
-#include <functional>
+#include <algorithm>
 #include <optional>
 
 namespace RemixGui {
 
   constexpr float kFixedTooltipWidth = 540; // so the text doesn't spread too wide
-
-  bool CheckRtxOptionPopups(dxvk::RtxOptionImpl* impl,
-                            std::optional<XXH64_hash_t> hash,
-                            std::function<void()> onApplyAction) {
-    (void) onApplyAction;
-
-    if (impl == nullptr) {
-      return false;
-    }
-
-    // Always clear stronger layers so the user's edit sticks.
-    // No warning modal: the user clicked a setting, so commit that edit.
-    dxvk::RtxOptionLayerTarget userTarget(dxvk::RtxOptionEditTarget::User);
-    const dxvk::RtxOptionLayer* targetLayer = impl->getTargetLayer();
-    if (targetLayer) {
-      impl->clearFromStrongerLayers(targetLayer, hash);
-      impl->markUserOverridden(targetLayer);
-    }
-
-    return false;  // Never blocked
-  }
-
-  void RenderRtxOptionBlockedEditPopup() {
-    // Legacy no-op. Option edits now commit immediately in CheckRtxOptionPopups()
-    // and ApplyRtxOptionUserChange(), so there is no modal that can trap input.
-  }
 
   void SetTooltipUnformatted(const char* text) {
     // fixed size tooltip for readability
@@ -196,7 +189,7 @@ namespace RemixGui {
       result += "Values by layer:\n" + layerInfo;
     }
 
-    // Show higher-priority layers that will be cleared if the user edits this option.
+    // Check for blocking layers
     const dxvk::RtxOptionLayer* targetLayer = impl->getTargetLayer();
     if (targetLayer) {
       const dxvk::RtxOptionLayerKey& targetKey = targetLayer->getLayerKey();
@@ -213,7 +206,7 @@ namespace RemixGui {
       }, std::nullopt, true);
       
       if (!blockingLayers.empty()) {
-        result += "\nHigher-priority values will be cleared when edited: " + blockingLayers;
+        result += "\n[!] Editing blocked by: " + blockingLayers;
       }
     }
 
@@ -221,12 +214,7 @@ namespace RemixGui {
   }
 
   bool Checkbox(const char* label, dxvk::RtxOption<bool>* rtxOption) {
-    auto value = rtxOption->get();
-    const bool changed = Checkbox(label, &value, 0.9f);
-    if (changed) {
-      RemixGui::ApplyRtxOptionUserChange(rtxOption, value);
-    }
-    return changed;
+    IMGUI_RTXOPTION_WIDGET(Checkbox(label, &value, 0.9f))
   }
 
   static bool Items_PairGetter(void* data, int idx, const char** out_text, const char** out_tooltip) {

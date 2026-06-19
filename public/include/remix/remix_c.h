@@ -24,7 +24,11 @@
 #define REMIX_C_H_
 
 #include <stdint.h>
+
+#ifndef REMIX_WINAPI_NO_INCLUDE
 #include <windows.h>
+#endif
+
 
 #ifndef REMIX_ALLOW_X86
 #if _WIN64 != 1
@@ -54,12 +58,45 @@
 
 #define REMIXAPI_VERSION_MAJOR 0
 #define REMIXAPI_VERSION_MINOR 6
-#define REMIXAPI_VERSION_PATCH 2
+#define REMIXAPI_VERSION_PATCH 4
 
 
 // External
-typedef struct ID3D11Device      ID3D11Device;
-typedef struct ID3D11Texture2D   ID3D11Texture2D;
+// DX11_V225: the Remix DXVK interop API is DX11. Forward-declare the D3D11 COM
+// types it operates on (compatible with the real definitions in <d3d11.h>).
+typedef struct ID3D11Device    ID3D11Device;
+typedef struct ID3D11Texture2D ID3D11Texture2D;
+
+#ifndef REMIX_WINAPI_NO_INCLUDE
+  typedef HWND remixapi_HWND;
+  typedef HMODULE remixapi_HMODULE;
+  typedef FARPROC remixapi_loader_PROC;
+  #define REMIX_WINAPI_LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR
+  #define REMIX_WINAPI_LOAD_LIBRARY_SEARCH_DEFAULT_DIRS LOAD_LIBRARY_SEARCH_DEFAULT_DIRS
+  #define REMIX_WINAPI_MAX_PATH                         MAX_PATH
+#else // if there's no 'Windows.h', then declare WINAPI types/functions manually
+  typedef struct HWND__* remixapi_HWND;
+  typedef struct HINSTANCE__* remixapi_HMODULE;
+  typedef long long(__stdcall* remixapi_loader_PROC)();
+  #define REMIX_WINAPI_LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR 0x00000100
+  #define REMIX_WINAPI_LOAD_LIBRARY_SEARCH_DEFAULT_DIRS 0x00001000
+  #define REMIX_WINAPI_MAX_PATH                         260
+  #ifndef REMIX_WINAPI_NO_LIBRARY_LOADER // if loader is needed
+  #ifdef __cplusplus
+  extern "C" {
+  #endif // __cplusplus
+    __declspec(dllimport) unsigned long        __stdcall GetDllDirectoryW(unsigned long nBufferLength, wchar_t* lpBuffer);
+    __declspec(dllimport) int                  __stdcall FreeLibrary(remixapi_HMODULE hLibModule);
+    __declspec(dllimport) remixapi_HMODULE     __stdcall LoadLibraryW(const wchar_t* lpLibFileName);
+    __declspec(dllimport) remixapi_HMODULE     __stdcall LoadLibraryExW(const wchar_t* lpLibFileName, void* hFile, unsigned long dwFlags);
+    __declspec(dllimport) remixapi_loader_PROC __stdcall GetProcAddress(remixapi_HMODULE hModule, const char* lpProcName);
+    __declspec(dllimport) int                  __stdcall SetDllDirectoryW(const wchar_t* lpPathName);
+    __declspec(dllimport) unsigned long        __stdcall GetFullPathNameW(const wchar_t* lpFileName, unsigned long nBufferLength, wchar_t* lpBuffer, wchar_t** lpFilePart);
+  #ifdef __cplusplus
+  }
+  #endif // __cplusplus
+  #endif // !REMIX_WINAPI_NO_LIBRARY_LOADER
+#endif // !REMIX_WINAPI_NO_INCLUDE
 
 
 #ifdef __cplusplus
@@ -93,7 +130,8 @@ extern "C" {
     REMIXAPI_STRUCT_TYPE_PRESENT_INFO                         = 23,
     REMIXAPI_STRUCT_TYPE_DEPRECATED_LEGACY_PARTICLE_SYSTEM    = 24,
     REMIXAPI_STRUCT_TYPE_INSTANCE_INFO_PARTICLE_SYSTEM_EXT    = 25,
-    REMIXAPI_STRUCT_TYPE_INSTANCE_INFO_GPU_INSTANCING_EXT    = 26,
+    REMIXAPI_STRUCT_TYPE_INSTANCE_INFO_GPU_INSTANCING_EXT     = 26,
+    REMIXAPI_STRUCT_TYPE_CAMERA_MEDIUM_INFO                   = 27
     // NOTE: if adding a new struct, register it in 'rtx_remix_specialization.inl'
     //       and only extend this enum by appending, never adjust the order of these 
     //       as that will break backwards compatibility.
@@ -107,9 +145,9 @@ extern "C" {
     REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS                 = 3,
     // Couldn't find 'remixInitialize' function in the .dll
     REMIXAPI_ERROR_CODE_GET_PROC_ADDRESS_FAILURE          = 4,
-    // CreateD3D11Device / RegisterD3D11Device can be called only once
+    // CreateD3D11 / RegisterD3D11Device can be called only once
     REMIXAPI_ERROR_CODE_ALREADY_EXISTS                    = 5,
-    // RegisterD3D11Device requires a DXVK-created ID3D11Device
+    // RegisterD3D11Device requires the ID3D11Device that was created with / returned by CreateD3D11Device
     REMIXAPI_ERROR_CODE_REGISTERING_NON_REMIX_D3D11_DEVICE = 6,
     // RegisterD3D11Device was not called
     REMIXAPI_ERROR_CODE_REMIX_DEVICE_WAS_NOT_REGISTERED   = 7,
@@ -119,8 +157,8 @@ extern "C" {
     // WinAPI's GetFullPathName has failed
     REMIXAPI_ERROR_CODE_GET_FULL_PATH_NAME_FAILURE        = 10,
     REMIXAPI_ERROR_CODE_NOT_INITIALIZED                   = 11,
-    // Error codes that are encoded as HRESULT, i.e. returned from device creation.
-    // Custom facility code 0x896
+    // Error codes that are encoded as HRESULT, i.e. returned from D3D11 functions.
+    // Look MAKE_D3DHRESULT, but with _FACD3D=0x896, instead of D3D11's 0x876
     REMIXAPI_ERROR_CODE_HRESULT_NO_REQUIRED_GPU_FEATURES      = 0x88960001,
     REMIXAPI_ERROR_CODE_HRESULT_DRIVER_VERSION_BELOW_MINIMUM  = 0x88960002,
     REMIXAPI_ERROR_CODE_HRESULT_DXVK_INSTANCE_EXTENSION_FAIL  = 0x88960003,
@@ -167,10 +205,11 @@ extern "C" {
   typedef const wchar_t* remixapi_Path;
 
 
+
   typedef struct remixapi_StartupInfo {
     remixapi_StructType sType;
     void*               pNext;
-    HWND                hwnd;
+    remixapi_HWND       hwnd;
     remixapi_Bool       disableSrgbConversionForOutput;
     // If true, 'dxvk_GetExternalSwapchain' can be used to retrieve a raw VkImage,
     // so the application can present it, for example by using OpenGL interop:
@@ -182,6 +221,7 @@ extern "C" {
 
   typedef remixapi_ErrorCode(REMIXAPI_PTR* PFN_remixapi_Startup)(const remixapi_StartupInfo* info);
   typedef remixapi_ErrorCode(REMIXAPI_PTR* PFN_remixapi_Shutdown)(void);
+
 
 
   typedef struct remixapi_MaterialInfoOpaqueEXT {
@@ -324,6 +364,7 @@ extern "C" {
     remixapi_MeshHandle       handle);
 
 
+
   typedef enum remixapi_CameraType {
     REMIXAPI_CAMERA_TYPE_WORLD,
     REMIXAPI_CAMERA_TYPE_SKY,
@@ -353,6 +394,16 @@ extern "C" {
 
   typedef remixapi_ErrorCode(REMIXAPI_PTR* PFN_remixapi_SetupCamera)(
     const remixapi_CameraInfo* info);
+
+  typedef struct remixapi_CameraMediumInfo {
+    remixapi_StructType     sType;
+    void*                   pNext;
+    remixapi_MaterialHandle medium;
+  } remixapi_CameraMediumInfo;
+
+  typedef remixapi_ErrorCode(REMIXAPI_PTR* PFN_remixapi_SetCameraMediumMaterial)(
+    const remixapi_CameraMediumInfo* info);
+
 
 
 #define REMIXAPI_INSTANCE_INFO_MAX_BONES_COUNT 256
@@ -645,7 +696,7 @@ extern "C" {
   typedef struct remixapi_PresentInfo {
     remixapi_StructType       sType;
     void*                     pNext;
-    HWND                      hwndOverride; // Can be NULL
+    remixapi_HWND             hwndOverride; // Can be NULL
   } remixapi_PresentInfo;
 
   typedef remixapi_ErrorCode(REMIXAPI_PTR* PFN_remixapi_Present)(const remixapi_PresentInfo* info);
@@ -671,9 +722,10 @@ extern "C" {
     uint8_t                   colorB);
 
 
-  typedef remixapi_ErrorCode(REMIXAPI_PTR* PFN_remixapi_dxvk_CreateD3D11Device)(
+
+  typedef remixapi_ErrorCode(REMIXAPI_PTR* PFN_remixapi_dxvk_CreateD3D11)(
     remixapi_Bool       editorModeEnabled,
-    ID3D11Device**      out_pD3D11Device);
+    ID3D11Device**      out_pDevice);
 
   typedef remixapi_ErrorCode(REMIXAPI_PTR* PFN_remixapi_dxvk_RegisterD3D11Device)(
     ID3D11Device*       d3d11Device);
@@ -709,13 +761,9 @@ extern "C" {
     uint64_t            version;
   } remixapi_InitializeLibraryInfo;
 
-  #ifndef DX11_REMIXAPI_DX11_BRIDGE_API
-#define DX11_REMIXAPI_DX11_BRIDGE_API 1
-typedef remixapi_ErrorCode(REMIXAPI_PTR* PFN_remixapi_dxvk_CreateD3D11)(remixapi_Bool editorModeEnabled, void** out_pD3D11);
-#endif
-typedef struct remixapi_Interface {
-  PFN_remixapi_dxvk_CreateD3D11 dxvk_CreateD3D11;
-  PFN_remixapi_dxvk_RegisterD3D11Device dxvk_RegisterD3D11Device;
+  // NOTE: If adding a new function, append at the end of the struct.
+  //       Reordering breaks backwards compatibility.
+  typedef struct remixapi_Interface {
     PFN_remixapi_Shutdown           Shutdown;
     PFN_remixapi_CreateMaterial     CreateMaterial;
     PFN_remixapi_DestroyMaterial    DestroyMaterial;
@@ -729,7 +777,8 @@ typedef struct remixapi_Interface {
     PFN_remixapi_SetConfigVariable  SetConfigVariable;
 
     // DXVK interoperability
-    PFN_remixapi_dxvk_CreateD3D11Device     dxvk_CreateD3D11Device;
+    PFN_remixapi_dxvk_CreateD3D11            dxvk_CreateD3D11Device;
+    PFN_remixapi_dxvk_RegisterD3D11Device    dxvk_RegisterD3D11Device;
     PFN_remixapi_dxvk_GetExternalSwapchain  dxvk_GetExternalSwapchain;
     PFN_remixapi_dxvk_GetVkImage            dxvk_GetVkImage;
     PFN_remixapi_dxvk_CopyRenderingOutput   dxvk_CopyRenderingOutput;
@@ -740,6 +789,8 @@ typedef struct remixapi_Interface {
 
     PFN_remixapi_Startup            Startup;
     PFN_remixapi_Present            Present;
+
+    PFN_remixapi_SetCameraMediumMaterial SetCameraMediumMaterial;
   } remixapi_Interface;
 
   REMIXAPI remixapi_ErrorCode REMIXAPI_CALL remixapi_InitializeLibrary(
@@ -750,11 +801,11 @@ typedef struct remixapi_Interface {
     const remixapi_InitializeLibraryInfo* info,
     remixapi_Interface*                   out_result);
 
-
+#ifndef REMIX_WINAPI_NO_LIBRARY_LOADER
   inline remixapi_ErrorCode REMIXAPI_CALL remixapi_lib_loadRemixDllAndInitialize(
     const wchar_t*      remixD3D11DllPath,
     remixapi_Interface* out_remixInterface,
-    HMODULE*            out_remixDll
+    remixapi_HMODULE*   out_remixDll
   ) {
     if (remixD3D11DllPath == NULL || remixD3D11DllPath[0] == '\0') {
       return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
@@ -763,15 +814,15 @@ typedef struct remixapi_Interface {
       return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
     }
 
-    HMODULE remixDll = NULL;
+    remixapi_HMODULE remixDll = NULL;
     PFN_remixapi_InitializeLibrary pfn_InitializeLibrary = NULL;
     {
       // firstly, try the default method first, e.g. DLL is already loaded, 
       // DLL-s are around .exe, or an app has called SetDllDirectory
       {
-        HMODULE dll = LoadLibraryW(remixD3D11DllPath);
+        remixapi_HMODULE dll = LoadLibraryW(remixD3D11DllPath);
         if (dll) {
-          PROC func = GetProcAddress(dll, "remixapi_InitializeLibrary");
+          remixapi_loader_PROC func = GetProcAddress(dll, "remixapi_InitializeLibrary");
           if (func) {
             remixDll = dll;
             pfn_InitializeLibrary = (PFN_remixapi_InitializeLibrary) func;
@@ -784,12 +835,12 @@ typedef struct remixapi_Interface {
       // then try raw user-provided 'remixD3D11DllPath' file
       if (!pfn_InitializeLibrary) {
         // set LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR to search 
-        // dependency DLLs in the folder of 'remixD3D11DllPath'
-        HMODULE dll = LoadLibraryExW(remixD3D11DllPath, NULL,
-                                     LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR |
-                                     LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+        // dependency DLL-s in the folder of 'remixD3D11DllPath'
+        remixapi_HMODULE dll = LoadLibraryExW(remixD3D11DllPath, NULL,
+                                     REMIX_WINAPI_LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR |
+                                     REMIX_WINAPI_LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
         if (dll) {
-          PROC func = GetProcAddress(dll, "remixapi_InitializeLibrary");
+          remixapi_loader_PROC func = GetProcAddress(dll, "remixapi_InitializeLibrary");
           if (func) {
             remixDll = dll;
             pfn_InitializeLibrary = (PFN_remixapi_InitializeLibrary) func;
@@ -801,24 +852,24 @@ typedef struct remixapi_Interface {
 
       // at last, try to SetDllDirectory manually
       if (!pfn_InitializeLibrary) {
-        wchar_t absoluteDllPath[MAX_PATH];
+        wchar_t absoluteD3D11DllPath[REMIX_WINAPI_MAX_PATH];
         {
-          DWORD ret = GetFullPathNameW(remixD3D11DllPath, MAX_PATH, absoluteDllPath, NULL);
+          unsigned ret = (unsigned)GetFullPathNameW(remixD3D11DllPath, REMIX_WINAPI_MAX_PATH, absoluteD3D11DllPath, NULL);
           if (ret == 0) {
             return REMIXAPI_ERROR_CODE_GET_FULL_PATH_NAME_FAILURE;
           }
         }
-        wchar_t parentDir[MAX_PATH];
+        wchar_t parentDir[REMIX_WINAPI_MAX_PATH];
         {
           int len = 0;
-          for (int i = 0; i < MAX_PATH; i++) {
-            if (absoluteDllPath[i] == '\0') {
+          for (int i = 0; i < REMIX_WINAPI_MAX_PATH; i++) {
+            if (absoluteD3D11DllPath[i] == '\0') {
               break;
             }
-            parentDir[i] = absoluteDllPath[i] == '/' ? '\\' : absoluteDllPath[i];
+            parentDir[i] = absoluteD3D11DllPath[i] == '/' ? '\\' : absoluteD3D11DllPath[i];
             ++len;
           }
-          if (len <= 0 || len >= MAX_PATH) {
+          if (len <= 0 || len >= REMIX_WINAPI_MAX_PATH) {
             return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
           }
           parentDir[len] = '\0';
@@ -841,24 +892,24 @@ typedef struct remixapi_Interface {
         }
 
         // save the previous value that is in SetDllDirectory
-        wchar_t dirToRestore[MAX_PATH];
+        wchar_t dirToRestore[REMIX_WINAPI_MAX_PATH];
         {
-          DWORD len = GetDllDirectoryW(MAX_PATH, dirToRestore);
-          if (len > 0 && len < MAX_PATH - 1) {
-            dirToRestore[MAX_PATH - 1] = '\0';
+          unsigned len = (unsigned)GetDllDirectoryW(REMIX_WINAPI_MAX_PATH, dirToRestore);
+          if (len > 0 && len < REMIX_WINAPI_MAX_PATH - 1) {
+            dirToRestore[REMIX_WINAPI_MAX_PATH - 1] = '\0';
           }
         }
 
         {
-          BOOL s = SetDllDirectoryW(parentDir);
+          int s = SetDllDirectoryW(parentDir);
           if (!s) {
             return REMIXAPI_ERROR_CODE_SET_DLL_DIRECTORY_FAILURE;
           }
         }
 
-        HMODULE dll = LoadLibraryW(absoluteDllPath);
+        remixapi_HMODULE dll = LoadLibraryW(absoluteD3D11DllPath);
         if (dll) {
-          PROC func = GetProcAddress(dll, "remixapi_InitializeLibrary");
+          remixapi_loader_PROC func = GetProcAddress(dll, "remixapi_InitializeLibrary");
           if (func) {
             remixDll = dll;
             pfn_InitializeLibrary = (PFN_remixapi_InitializeLibrary) func;
@@ -881,7 +932,7 @@ typedef struct remixapi_Interface {
       return REMIXAPI_ERROR_CODE_GET_PROC_ADDRESS_FAILURE;
     }
 
-    remixapi_InitializeLibraryInfo info = { 0 };
+    remixapi_InitializeLibraryInfo info = { (remixapi_StructType)0 };
     {
       info.sType = REMIXAPI_STRUCT_TYPE_INITIALIZE_LIBRARY_INFO;
       info.version = REMIXAPI_VERSION_MAKE(REMIXAPI_VERSION_MAJOR,
@@ -903,7 +954,7 @@ typedef struct remixapi_Interface {
 
   inline remixapi_ErrorCode REMIXAPI_CALL remixapi_lib_shutdownAndUnloadRemixDll(
     remixapi_Interface* remixInterface,
-    HMODULE             remixDll
+    remixapi_HMODULE    remixDll
   ) {
     if (remixInterface == NULL || remixInterface->Shutdown == NULL) {
       if (remixDll != NULL) {
@@ -921,6 +972,7 @@ typedef struct remixapi_Interface {
     *remixInterface = nullInterface;
     return status;
   }
+#endif // !REMIX_WINAPI_NO_LIBRARY_LOADER
 
 #ifdef __cplusplus
 }

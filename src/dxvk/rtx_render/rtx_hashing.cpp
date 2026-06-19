@@ -92,47 +92,8 @@ namespace dxvk {
   }
 
   XXH64_hash_t hashVertexLayout(const RasterGeometry& input) {
-    struct VertexStreamLayout {
-      uint32_t defined;
-      uint32_t offset;
-      uint32_t stride;
-      uint32_t format;
-    };
-
-    struct VertexLayoutSignature {
-      uint32_t interleaved;
-      uint32_t gpuFriendly;
-      uint32_t outputStride;
-      VertexStreamLayout position;
-      VertexStreamLayout normal;
-      VertexStreamLayout texcoord;
-      VertexStreamLayout color0;
-    };
-
-    auto describe = [](const auto& buffer) {
-      VertexStreamLayout result = {};
-      result.defined = buffer.defined() ? 1u : 0u;
-      if (result.defined) {
-        result.offset = buffer.offsetFromSlice();
-        result.stride = buffer.stride();
-        result.format = static_cast<uint32_t>(buffer.vertexFormat());
-      }
-      return result;
-    };
-
-    VertexLayoutSignature signature = {};
-    signature.interleaved = input.isVertexDataInterleaved() ? 1u : 0u;
-    signature.gpuFriendly = input.areFormatsGpuFriendly() ? 1u : 0u;
-    signature.outputStride = static_cast<uint32_t>(
-      (input.isVertexDataInterleaved() && input.areFormatsGpuFriendly())
-        ? input.positionBuffer.stride()
-        : RtxGeometryUtils::computeOptimalVertexStride(input));
-    signature.position = describe(input.positionBuffer);
-    signature.normal = describe(input.normalBuffer);
-    signature.texcoord = describe(input.texcoordBuffer);
-    signature.color0 = describe(input.color0Buffer);
-
-    return XXH3_64bits(&signature, sizeof(signature));
+    const size_t vertexStride = (input.isVertexDataInterleaved() && input.areFormatsGpuFriendly()) ? input.positionBuffer.stride() : RtxGeometryUtils::computeOptimalVertexStride(input);
+    return XXH3_64bits(&vertexStride, sizeof(vertexStride));
   }
 
   XXH64_hash_t hashContiguousMemory(const void* pData, size_t byteSize) {

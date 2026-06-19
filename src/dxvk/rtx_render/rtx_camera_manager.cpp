@@ -23,90 +23,8 @@
 
 #include "dxvk_device.h"
 
-#include <cmath>
-
 namespace {
   constexpr float kFovToleranceRadians = 0.001f;
-  constexpr float kMaxProjectionShear = 0.35f; // DX11_V124_CAMERA_ARTIFACT_STABILITY: reject heavily skewed non-scene camera matrices
-  constexpr float kMinViewportFallbackMainCameraScore = 6.0f; // DX11_V124_CAMERA_ARTIFACT_STABILITY: fallback camera must be strong, not bootstrap/menu/8x8
-
-  bool isFiniteMatrix(const dxvk::Matrix4& matrix) {
-    for (uint32_t row = 0; row < 4; ++row) {
-      for (uint32_t col = 0; col < 4; ++col) {
-        if (!std::isfinite(matrix[row][col]))
-          return false;
-      }
-    }
-
-    return true;
-  }
-
-  bool isSafelyInvertibleMatrix(const dxvk::Matrix4& matrix) {
-    if (!isFiniteMatrix(matrix))
-      return false;
-
-    const double det = dxvk::determinant(matrix);
-    return std::isfinite(det) && std::abs(det) >= 1.0e-12;
-  }
-
-  float scoreMainCameraCandidate(const dxvk::DrawCallState& input, const ::DecomposeProjectionParams& projection) {
-    float score = 0.0f;
-
-    if (!input.getTransformData().usedViewportFallbackProjection) {
-      score += 6.0f;
-    } else {
-      score -= 1.0f;
-      if (input.zEnable)
-        score += 1.0f;
-      if (input.zWriteEnable)
-        score += 0.5f;
-    }
-
-    const float projectionShear = std::max(std::abs(projection.shearX), std::abs(projection.shearY));
-    if (projectionShear > 0.02f)
-      score -= std::min(projectionShear, 1.0f);
-
-    if (!dxvk::isIdentityExact(input.getTransformData().worldToView))
-      score += 3.0f;
-    else if (input.getTransformData().usedViewportFallbackProjection
-          && dxvk::isIdentityExact(input.getTransformData().objectToWorld))
-      score -= 2.0f;
-
-    if (input.zEnable)
-      score += 1.5f;
-    else
-      score -= 1.0f;
-
-    if (input.zWriteEnable)
-      score += 1.0f;
-
-    if (input.maxZ >= 0.99f)
-      score += 1.0f;
-    if (input.minZ <= 0.01f)
-      score += 0.5f;
-
-    if (input.usesVertexShader)
-      score += 0.5f;
-    if (input.usesPixelShader)
-      score += 0.5f;
-
-    if (input.isUsingRaytracedRenderTarget)
-      score -= 2.0f;
-
-    const uint32_t primitiveCount = input.getGeometryData().calculatePrimitiveCount();
-    if (primitiveCount >= 64u)
-      score += 1.0f;
-    else if (primitiveCount >= 16u)
-      score += 0.25f;
-    else if (primitiveCount <= 2u) score -= (input.getTransformData().usedViewportFallbackProjection ? 0.5f : 8.0f);
-      else if (primitiveCount <= 4u) score -= (input.getTransformData().usedViewportFallbackProjection ? 0.25f : 5.0f);
-      else if (primitiveCount <= 8u) score -= (input.getTransformData().usedViewportFallbackProjection ? 0.10f : 3.0f);
-
-    if (std::isfinite(projection.aspectRatio) && projection.aspectRatio > 0.5f && projection.aspectRatio < 4.0f)
-      score += 0.5f;
-
-    return score;
-  }
 }
 
 namespace dxvk {
@@ -124,8 +42,6 @@ namespace dxvk {
 
   void CameraManager::onFrameEnd() {
     m_lastSetCameraType = CameraType::Unknown;
-    m_mainCameraCandidateScore = -1.0e30f;
-    m_mainCameraCandidateUsedFallback = false;
     m_decompositionCache.clear();
   }
 
@@ -133,13 +49,6 @@ namespace dxvk {
     // If theres no real camera data here - bail
     if (isIdentityExact(input.getTransformData().viewToProjection)) {
       return input.testCategoryFlags(InstanceCategories::Sky) ? CameraType::Sky : CameraType::Unknown;
-    }
-
-    if (!isSafelyInvertibleMatrix(input.getTransformData().viewToProjection)
-     || (!isIdentityExact(input.getTransformData().worldToView)
-      && !isSafelyInvertibleMatrix(input.getTransformData().worldToView))) {
-      ONCE(Logger::warn("[RTX] CameraManager: rejected a camera with non-invertible matrices"));
-      return input.getCategoryFlags().test(InstanceCategories::Sky) ? CameraType::Sky : CameraType::Unknown;
     }
 
     switch (RtxOptions::fusedWorldViewMode()) {
@@ -175,8 +84,7 @@ namespace dxvk {
       return std::abs(fovA - cameraB.getFov()) < kFovToleranceRadians;
     };
 
-    const float projectionShear = std::max(std::abs(decomposeProjectionParams.shearX), std::abs(decomposeProjectionParams.shearY));
-    if (!std::isfinite(projectionShear) || projectionShear > kMaxProjectionShear || !isFovValid(decomposeProjectionParams.fov)) {
+    if (std::abs(decomposeProjectionParams.shearX) > 0.01f || !isFovValid(decomposeProjectionParams.fov)) {
       ONCE(Logger::warn("[RTX] CameraManager: rejected an invalid camera"));
       return input.getCategoryFlags().test(InstanceCategories::Sky) ? CameraType::Sky : CameraType::Unknown;
     }
@@ -208,121 +116,22 @@ namespace dxvk {
     } else if (isViewModel(decomposeProjectionParams.fov, input.maxZ, frameId)) {
       cameraType = CameraType::ViewModel;
     }
-
-    // Suppress viewport-fallback candidates for Main once a real camera has
-    // ever been accepted. The fallback is only a bootstrap for games that
-    // never expose a usable projection cbuffer; after a real camera exists,
-    // letting a synthesized projection overwrite Main can path trace a
-    // post-process/menu viewport and destabilize temporal resources.
-    if (cameraType == CameraType::Main
-        && input.getTransformData().usedViewportFallbackProjection
-        && m_hasSeenRealMainCamera
-        && !RtxOptions::allowViewportFallbackAfterRealCamera()) {
-      m_lastSetCameraType = CameraType::Unknown;
-
-      static uint32_t sPostRealViewportFallbackLogCount = 0;
-      if (sPostRealViewportFallbackLogCount < 12) {
-        ++sPostRealViewportFallbackLogCount;
-        Logger::info(str::format(
-          "[RTX] CameraManager: rejected viewport-fallback main-camera candidate after a real main camera was seen (drawCallID=",
-          input.drawCallID,
-          ")"));
-      }
-
-      return CameraType::Unknown;
-    }
-
+    
     // Check fov consistency across frames
     if (frameId > 0) {
       if (getCamera(cameraType).isValid(frameId - 1) && !areFovsClose(decomposeProjectionParams.fov, getCamera(cameraType))) {
-        ONCE(Logger::info("[RTX] CameraManager: FOV of a camera changed between frames"));
+        ONCE(Logger::warn("[RTX] CameraManager: FOV of a camera changed between frames"));
       }
     }
 
     auto& camera = getCamera(cameraType);
     auto cameraSequence = RtCameraSequence::getInstance();
-    const uint32_t primitiveCount = input.getGeometryData().calculatePrimitiveCount();
-    const float candidateScore = cameraType == CameraType::Main
-      ? scoreMainCameraCandidate(input, decomposeProjectionParams)
-      : 0.0f;
     bool shouldUpdateMainCamera = cameraType == CameraType::Main && camera.getLastUpdateFrame() != frameId;
-
-    const bool suspiciousTinyCbufferMainCandidate =
-      cameraType == CameraType::Main &&
-      !input.getTransformData().usedViewportFallbackProjection &&
-      !input.isDrawingToRaytracedRenderTarget &&
-      primitiveCount <= 2u;
-
-    if (suspiciousTinyCbufferMainCandidate
-        && (m_hasSeenRealMainCamera || camera.getLastUpdateFrame() == frameId)) {
-      m_lastSetCameraType = CameraType::Unknown;
-
-      static uint32_t sTinyCbufferMainCameraLogCount = 0;
-      if (sTinyCbufferMainCameraLogCount < 16) {
-        ++sTinyCbufferMainCameraLogCount;
-        Logger::info(str::format(
-          "[RTX] CameraManager: rejected tiny cbuffer main-camera candidate (primitives=",
-          primitiveCount,
-          " score=",
-          candidateScore,
-          " drawCallID=",
-          input.drawCallID,
-          ")"));
-      }
-
-      return input.getCategoryFlags().test(InstanceCategories::Sky) ? CameraType::Sky : CameraType::Unknown;
-    }
     bool isPlaying = RtCameraSequence::mode() == RtCameraSequence::Mode::Playback;
     bool isBrowsing = RtCameraSequence::mode() == RtCameraSequence::Mode::Browse;
     bool isCameraCut = false;
     Matrix4 worldToView = input.getTransformData().worldToView;
     Matrix4 viewToProjection = input.getTransformData().viewToProjection;
-    const bool candidateUsesFallbackProjection = input.getTransformData().usedViewportFallbackProjection;
-
-    if (cameraType == CameraType::Main
-        && candidateUsesFallbackProjection
-        && candidateScore < kMinViewportFallbackMainCameraScore) {
-      m_lastSetCameraType = CameraType::Unknown;
-
-      static uint32_t sWeakViewportFallbackCameraLogCount = 0;
-      if (sWeakViewportFallbackCameraLogCount < 12) {
-        ++sWeakViewportFallbackCameraLogCount;
-        Logger::info(str::format(
-          "[RTX] CameraManager: rejected weak viewport-fallback main-camera candidate (score=",
-          candidateScore,
-          " drawCallID=",
-          input.drawCallID,
-          ")"));
-      }
-
-      return input.getCategoryFlags().test(InstanceCategories::Sky) ? CameraType::Sky : CameraType::Unknown;
-    }
-
-    if (cameraType == CameraType::Main && camera.getLastUpdateFrame() == frameId && !isPlaying && !isBrowsing) {
-      const bool shouldReplaceCurrentMain = (m_mainCameraCandidateUsedFallback != candidateUsesFallbackProjection)
-        ? (m_mainCameraCandidateUsedFallback && !candidateUsesFallbackProjection)
-        : (candidateScore > m_mainCameraCandidateScore + 3.0f);
-      if (!shouldReplaceCurrentMain) {
-        m_lastSetCameraType = cameraType;
-        return cameraType;
-      }
-
-      shouldUpdateMainCamera = true;
-
-      static uint32_t sMainCameraReplacementLogCount = 0;
-      if (sMainCameraReplacementLogCount < 12) {
-        ++sMainCameraReplacementLogCount;
-        Logger::info(str::format(
-          "[RTX] CameraManager: replacing weaker main-camera candidate in-frame (oldScore=",
-          m_mainCameraCandidateScore,
-          " newScore=",
-          candidateScore,
-          " drawCallID=",
-          input.drawCallID,
-          input.getTransformData().usedViewportFallbackProjection ? " viewportFallback" : " cbufferProjection",
-          ")"));
-      }
-    }
     if (isPlaying || isBrowsing) {
       if (shouldUpdateMainCamera) {
         RtCamera::RtCameraSetting setting;
@@ -352,30 +161,20 @@ namespace dxvk {
       cameraSequence->addRecord(setting);
     }
 
-    if (cameraType == CameraType::Main && camera.getLastUpdateFrame() == frameId) {
-      m_mainCameraCandidateScore = candidateScore;
-      const bool usedFallback = input.getTransformData().usedViewportFallbackProjection;
-      m_mainCameraCandidateUsedFallback = usedFallback;
-      if (!usedFallback) {
-        m_lastMainCbufferProjFrameId = frameId;
-        m_hasSeenRealMainCamera = true;
-      }
-      // Force a camera cut when the projection source flips between
-      // fallback and real cbuffer. Without this the denoiser keeps
-      // temporal history from the wrong projection for ~10 frames,
-      // which is exactly the "flicker after Remix loads" the user sees
-      // when the splash/fallback phase ends and gameplay begins.
-      if (m_hasLastMainUpdate && usedFallback != m_lastMainUsedFallbackProj) {
-        isCameraCut = true;
-      }
-      m_lastMainUsedFallbackProj = usedFallback;
-      m_hasLastMainUpdate = true;
-    }
-
     // Register camera cut when there are significant interruptions to the view (like changing level, or opening a menu)
     if (isCameraCut && cameraType == CameraType::Main) {
       m_lastCameraCutFrameId = m_device->getCurrentFrameId();
     }
+
+    // DX11_V225: track real vs viewport-fallback main cameras for the DX11 layer.
+    if (cameraType == CameraType::Main) {
+      const bool usedViewportFallback = input.getTransformData().usedViewportFallbackProjection;
+      m_mainCameraLastUpdateUsedViewportFallback = usedViewportFallback;
+      if (!usedViewportFallback) {
+        m_hasSeenRealMainCamera = true;
+      }
+    }
+
     m_lastSetCameraType = cameraType;
 
     return cameraType;
@@ -388,26 +187,9 @@ namespace dxvk {
   void CameraManager::processExternalCamera(CameraType::Enum type,
                                             const Matrix4& worldToView,
                                             const Matrix4& viewToProjection) {
-    if (type >= CameraType::Count || type == CameraType::Unknown) {
-      ONCE(Logger::warn("[RTX] CameraManager: ignored an external camera with an invalid type"));
-      return;
-    }
-
-    if (!isSafelyInvertibleMatrix(viewToProjection)
-     || (!isIdentityExact(worldToView) && !isSafelyInvertibleMatrix(worldToView))) {
-      ONCE(Logger::warn("[RTX] CameraManager: rejected an external camera with non-invertible matrices"));
-      return;
-    }
-
     DecomposeProjectionParams decomposeProjectionParams = getOrDecomposeProjection(viewToProjection);
 
-    const float projectionShear = std::max(std::abs(decomposeProjectionParams.shearX), std::abs(decomposeProjectionParams.shearY));
-    if (!std::isfinite(projectionShear) || projectionShear > kMaxProjectionShear || decomposeProjectionParams.fov < kFovToleranceRadians) {
-      ONCE(Logger::warn("[RTX] CameraManager: rejected an invalid external camera"));
-      return;
-    }
-
-    const bool isCameraCut = getCamera(type).update(
+    getCamera(type).update(
       m_device->getCurrentFrameId(),
       worldToView,
       viewToProjection,
@@ -416,20 +198,6 @@ namespace dxvk {
       decomposeProjectionParams.nearPlane,
       decomposeProjectionParams.farPlane,
       decomposeProjectionParams.isLHS);
-
-    if (type == CameraType::Main) {
-      if (isCameraCut) {
-        m_lastCameraCutFrameId = m_device->getCurrentFrameId();
-      }
-      m_mainCameraCandidateScore = std::max(m_mainCameraCandidateScore, 0.0f);
-      m_mainCameraCandidateUsedFallback = false;
-      m_lastMainCbufferProjFrameId = m_device->getCurrentFrameId();
-      m_lastMainUsedFallbackProj = false;
-      m_hasLastMainUpdate = true;
-      m_hasSeenRealMainCamera = true;
-    }
-
-    m_lastSetCameraType = type;
   }
 
     DecomposeProjectionParams CameraManager::getOrDecomposeProjection(const Matrix4& viewToProjection) {

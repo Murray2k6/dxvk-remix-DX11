@@ -29,10 +29,10 @@
 #include "gen_tri_list_index_buffer.h"
 
 layout(binding = GEN_TRILIST_BINDING_OUTPUT)
-RWStructuredBuffer<uint32_t> dst;
+RWStructuredBuffer<uint16_t> dst;
 
-layout(binding = GEN_TRILIST_BINDING_INPUT) 
-StructuredBuffer<uint32_t> src;
+layout(binding = GEN_TRILIST_BINDING_INPUT)
+StructuredBuffer<uint16_t> src;
 
 layout(push_constant)
 ConstantBuffer<GenTriListArgs> cb;

@@ -20,8 +20,7 @@
 * DEALINGS IN THE SOFTWARE.
 */
 #pragma once
-
-#include <deque>
+#include "rtx/dx11/dx11_light_state.h"
 #include <mutex>
 #include <vector>
 #include <set>
@@ -40,6 +39,7 @@
 #include "rtx_common_object.h"
 #include "rtx_camera_manager.h"
 #include "rtx_draw_call_cache.h"
+#include "rtx_draw_call_tracker.h"
 #include "rtx_sparse_unique_cache.h"
 #include "rtx_light_manager.h"
 #include "rtx_instance_manager.h"
@@ -50,7 +50,7 @@
 #include "rtx_mod_manager.h"
 #include "graph/rtx_graph_manager.h"
 #include "rtx_particle_system.h"
-#include "rtx_cb_types.h"
+#include <d3d11.h>
 
 namespace dxvk 
 {
@@ -110,6 +110,10 @@ struct ExternalDrawState {
   bool doubleSided {};
   const std::optional<RtxParticleSystemDesc> optionalParticleDesc {};
   std::vector<Matrix4> gpuInstancingTransforms {};
+
+  // Draw-instance identity for ReplacementInstance lookup. Excludes per-frame camera matrices
+  // (worldToView / viewToProjection / objectToView) filled in submitExternalDraw after hashing.
+  XXH64_hash_t computeExternalDrawIdentityHash() const;
 };
 
 // Scene manager is a super manager, it's the interface between rendering and world state
@@ -131,6 +135,13 @@ public:
 
   void submitDrawState(Rc<DxvkContext> ctx, const DrawCallState& input, const MaterialData* overrideMaterialData);
   void submitExternalDraw(Rc<DxvkContext> ctx, ExternalDrawState&& state);
+
+  // Remove an externally created mesh and all associated replacement instances.
+  void destroyExternalMesh(remixapi_MeshHandle handle);
+  void removeInstancesWithExternalMesh(remixapi_MeshHandle handle);
+  
+  void setExternalStartInMediumMaterial(const MaterialData& translucentMaterial);
+  void clearExternalStartInMediumMaterial();
   
   bool areAllReplacementsLoaded() const;
   std::vector<Mod::State> getReplacementStates() const;
@@ -173,7 +184,7 @@ public:
 
   static Vector3 sceneToWorldOrientedVector(const Vector3& sceneVector);
 
-  void addLight(const RtxLegacyLight& light);
+  void addLight(const Dx11LightDesc& light);
 
   const CameraManager& getCameraManager() const { return m_cameraManager; }
   CameraManager& getCameraManager() { return m_cameraManager; }
@@ -213,7 +224,6 @@ public:
 
   std::optional<XXH64_hash_t> findLegacyTextureHashByObjectPickingValue(uint32_t objectPickingValue);
   std::vector<ObjectPickingValue> gatherObjectPickingValuesByTextureHash(XXH64_hash_t texHash);
-  std::string describeObjectPickingValue(uint32_t objectPickingValue);
 
   // Replacement material hash tracking
   void trackReplacementMaterialHash(XXH64_hash_t materialHash);
@@ -264,6 +274,10 @@ private:
   const RtSurfaceMaterial& createSurfaceMaterial(const MaterialData& renderMaterialData,
                                                  const DrawCallState& drawCallState,
                                                  uint32_t* out_indexInCache = nullptr);
+  RtTranslucentSurfaceMaterial createTranslucentSurfaceMaterial(const TranslucentMaterialData& translucentMaterialData,
+                                                                uint32_t samplerIndex,
+                                                                bool hasTexcoords);
+  Rc<DxvkSampler> getOrCreateExternalSampler();
 
   // Updates ref counts for new buffers
   void updateBufferCache(RaytraceGeometry& newGeoData);
@@ -272,9 +286,6 @@ private:
   ObjectCacheState onSceneObjectAdded(Rc<DxvkContext> ctx, const DrawCallState& drawCallState, BlasEntry* pBlas);
   // Called whenever a BLAS scene object is updated
   ObjectCacheState onSceneObjectUpdated(Rc<DxvkContext> ctx, const DrawCallState& drawCallState, BlasEntry* pBlas);
-  // Called whenever a BLAS scene object is destroyed
-  void onSceneObjectDestroyed(const BlasEntry& pBlas);
-
   // Called whenever a new instance has been added to the database
   void onInstanceAdded(RtInstance& instance);
   // Called whenever instance metadata is updated
@@ -282,12 +293,12 @@ private:
   // Called whenever an instance has been removed from the database
   void onInstanceDestroyed(RtInstance& instance);
 
-  // Called to destroy a ReplacementInstance.
-  // This is used to clear up all references to the ReplacementInstance.
-  // Also responsible for removing any graphs from graphManager.
-  void destroyReplacementInstance(ReplacementInstance* replacementInstance);
+  void drawReplacements(Rc<DxvkContext> ctx, const DrawCallState* input, const std::vector<AssetReplacement>* pReplacements, MaterialData& renderMaterialData, ReplacementInstance* replacementInstance);
 
-  void drawReplacements(Rc<DxvkContext> ctx, const DrawCallState* input, const std::vector<AssetReplacement>* pReplacements, MaterialData& renderMaterialData);
+  // Re-register an existing instance's buffers, textures, and materials in the
+  // current frame's per-frame tables without running the full draw call pipeline.
+  // Called for anti-culled instances whose game draw call was not submitted this frame.
+  void keepInstanceAlive(RtInstance& instance);
 
   void createEffectLight(Rc<DxvkContext> ctx, const DrawCallState& input, const RtInstance* instance);
 
@@ -296,6 +307,7 @@ private:
   
   MaterialData determineMaterialData(const MaterialData* overrideMaterialData, const DrawCallState& input);
   
+  const uint32_t kInvalidMaterialCacheIndex = UINT32_MAX;
   uint32_t m_beginUsdExportFrameNum = -1;
   bool m_enqueueDelayedClear = false;
   bool m_previousFrameSceneAvailable = false;
@@ -322,7 +334,9 @@ private:
   FogState m_fog;
   fast_unordered_cache<FogState> m_fogStates;
   uint32_t m_startInMediumMaterialIndex = SURFACE_INDEX_INVALID;
-  uint32_t m_startInMediumMaterialIndex_inCache = UINT32_MAX;
+  uint32_t m_fogStartInMediumMaterialIndex_inCache = kInvalidMaterialCacheIndex;
+  uint32_t m_externalStartInMediumMaterialIndex_inCache = kInvalidMaterialCacheIndex;
+  uint32_t m_startInMediumMaterialIndex_inCache = kInvalidMaterialCacheIndex;
 
   // TODO: Move the following resources and getters to RtResources class
   Rc<DxvkBuffer> m_surfaceMaterialBuffer;
@@ -334,76 +348,8 @@ private:
   float m_uniqueObjectSearchDistance = 1.f;
 
   struct DrawCallMetaInfo {
-    std::vector<XXH64_hash_t> legacyTextureHashes {};
-    std::vector<XXH64_hash_t> geometryHashes {};
-    std::vector<XXH64_hash_t> materialHashes {};
-    uint32_t drawCallCount { 0 };
-
-    static void addUniqueHash(std::vector<XXH64_hash_t>& hashes, XXH64_hash_t hash) {
-      if (hash == kEmptyHash) {
-        return;
-      }
-
-      for (XXH64_hash_t existingHash : hashes) {
-        if (existingHash == hash) {
-          return;
-        }
-      }
-
-      hashes.push_back(hash);
-    }
-
-    void addLegacyTextureHash(XXH64_hash_t hash) {
-      addUniqueHash(legacyTextureHashes, hash);
-    }
-
-    void addGeometryHash(XXH64_hash_t hash) {
-      addUniqueHash(geometryHashes, hash);
-    }
-
-    void addMaterialHash(XXH64_hash_t hash) {
-      addUniqueHash(materialHashes, hash);
-    }
-
-    void mergeFrom(const DrawCallMetaInfo& other) {
-      for (XXH64_hash_t hash : other.legacyTextureHashes) {
-        addLegacyTextureHash(hash);
-      }
-      for (XXH64_hash_t hash : other.geometryHashes) {
-        addGeometryHash(hash);
-      }
-      for (XXH64_hash_t hash : other.materialHashes) {
-        addMaterialHash(hash);
-      }
-    }
-
-    std::optional<XXH64_hash_t> getPrimaryLegacyTextureHash() const {
-      for (XXH64_hash_t hash : legacyTextureHashes) {
-        if (hash != kEmptyHash) {
-          return hash;
-        }
-      }
-
-      return std::nullopt;
-    }
-
-    bool containsLegacyTextureHash(XXH64_hash_t hash) const {
-      if (hash == kEmptyHash) {
-        return false;
-      }
-
-      for (XXH64_hash_t existingHash : legacyTextureHashes) {
-        if (existingHash == hash) {
-          return true;
-        }
-      }
-
-      return false;
-    }
-
-    bool hasMetadata() const {
-      return !legacyTextureHashes.empty() || !geometryHashes.empty() || !materialHashes.empty();
-    }
+    XXH64_hash_t legacyTextureHash { kEmptyHash };
+    XXH64_hash_t legacyTextureHash2 { kEmptyHash };
   };
   struct DrawCallMeta {
     constexpr static inline uint8_t MaxTicks = 2;
@@ -430,8 +376,7 @@ private:
   // Mesh hash tracking for current frame (hash -> count)
   std::unordered_map<XXH64_hash_t, uint32_t> m_currentFrameMeshHashes;
 
-  // Using std::deque for pointer stability: push_back doesn't invalidate existing pointers
-  std::deque<std::vector<Matrix4>> m_externalGpuInstancingTransforms;
+  DrawCallTracker m_drawCallTracker;
 };
 
 }  // namespace nvvk

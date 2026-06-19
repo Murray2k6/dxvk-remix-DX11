@@ -45,8 +45,8 @@ namespace ReplacementMaterialTextureCategory {
 }
 
 #ifdef __cplusplus
-// Texture slot used for secondary texture during terrain baking.
+// Texture stage used for secondary texture during terrain baking.
 // This could be made bound to a dynamic slot or to a different resource should it 
 // conflict in any game in the future.
-static const unsigned int kTerrainBakerSecondaryTextureSlot = 7;
+static const unsigned int kTerrainBakerSecondaryTextureStage = 7;
 #endif

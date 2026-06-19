@@ -165,20 +165,15 @@ namespace dxvk {
   
   std::string Logger::getFilePath(const std::string& fileName) {
     // NV-DXVK start: Use std::filesystem::path helpers + RtxFileSys
-    // Defer file creation until RtxFileSys is initialized.  During DLL
-    // static init the filesystem paths aren't known yet — returning empty
-    // keeps the Logger in stderr/OutputDebugString-only mode until
-    // initRtxLog() re-opens at the correct location.
-    if (!util::RtxFileSys::isInit()) {
-      return {};
-    }
-
     auto path = util::RtxFileSys::path(util::RtxFileSys::Logs);
 
+    // Note: If no path is specified to store log files in, simply use the current directory by returning
+    // the specified log file name directly.
     if (path.empty()) {
       return fileName;
     }
 
+    // Append the specified log file name to the logging directory.
     path /= fileName;
 
     return path.string();

@@ -96,7 +96,7 @@ namespace dxvk {
   }
 
   bool DxvkDLSS::isEnabled() const {
-      return RtxOptions::isRuntimeDLSSOrRayReconstructionEnabled();
+      return RtxOptions::isDLSSOrRayReconstructionEnabled();
   }
 
   DLSSProfile DxvkDLSS::getAutoProfile(uint32_t displayWidth, uint32_t displayHeight) {

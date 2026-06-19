@@ -125,7 +125,7 @@
 #define AO_MODE_STRING                             L"Ambient Occlusion"
 #define AO_MODE_ACTIVE_STRING                      L"NVIDIA Predefined Ambient Occlusion Usage"
 #define AUTO_LODBIASADJUST_STRING                  L"Texture filtering - Driver Controlled LOD Bias"
-#define EXPORT_PERF_COUNTERS_DX9_ONLY_STRING       L"Export Performance Counters for DX9 only"
+#define EXPORT_PERF_COUNTERS_DX11_ONLY_STRING       L"Export Performance Counters for DX11 only"
 #define ICAFE_LOGO_CONFIG_STRING                   L"ICafe Settings"
 #define LODBIASADJUST_STRING                       L"Texture filtering - LOD Bias"
 #define MAXWELL_B_SAMPLE_INTERLEAVE_STRING         L"Enable sample interleaving (MFAA)"
@@ -244,7 +244,7 @@ enum ESetting {
     AO_MODE_ID                                    = 0x00667329,
     AO_MODE_ACTIVE_ID                             = 0x00664339,
     AUTO_LODBIASADJUST_ID                         = 0x00638E8F,
-    EXPORT_PERF_COUNTERS_DX9_ONLY_ID              = 0x00B65E72,
+    EXPORT_PERF_COUNTERS_DX11_ONLY_ID              = 0x00B65E72,
     ICAFE_LOGO_CONFIG_ID                          = 0x00DB1337,
     LODBIASADJUST_ID                              = 0x00738E8F,
     MAXWELL_B_SAMPLE_INTERLEAVE_ID                = 0x0098C1AC,
@@ -1167,11 +1167,11 @@ enum EValues_AUTO_LODBIASADJUST {
     AUTO_LODBIASADJUST_DEFAULT = AUTO_LODBIASADJUST_ON
 };
 
-enum EValues_EXPORT_PERF_COUNTERS_DX9_ONLY {
-    EXPORT_PERF_COUNTERS_DX9_ONLY_OFF                    = 0x00000000,
-    EXPORT_PERF_COUNTERS_DX9_ONLY_ON                     = 0x00000001,
-    EXPORT_PERF_COUNTERS_DX9_ONLY_NUM_VALUES = 2,
-    EXPORT_PERF_COUNTERS_DX9_ONLY_DEFAULT = EXPORT_PERF_COUNTERS_DX9_ONLY_OFF
+enum EValues_EXPORT_PERF_COUNTERS_DX11_ONLY {
+    EXPORT_PERF_COUNTERS_DX11_ONLY_OFF                    = 0x00000000,
+    EXPORT_PERF_COUNTERS_DX11_ONLY_ON                     = 0x00000001,
+    EXPORT_PERF_COUNTERS_DX11_ONLY_NUM_VALUES = 2,
+    EXPORT_PERF_COUNTERS_DX11_ONLY_DEFAULT = EXPORT_PERF_COUNTERS_DX11_ONLY_OFF
 };
 
 enum EValues_LODBIASADJUST {

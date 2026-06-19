@@ -255,7 +255,7 @@ namespace dxvk {
     case OptionType::Bool: return "bool";
     case OptionType::Int: return "int";
     case OptionType::Float: return "float";
-    case OptionType::HashSet: return "hash set"; 
+    case OptionType::HashSet: return "hash set";
     case OptionType::HashVector: return "hash vector";
     case OptionType::VirtualKeys: return "virtual keys";
     case OptionType::Vector2: return "float2";
@@ -580,13 +580,6 @@ namespace dxvk {
   }
 
   void RtxOptionImpl::readOptionLayer(const RtxOptionLayer& optionLayer) {
-    // If the user has explicitly overridden this option via the UI, skip
-    // re-population from layers stronger than the edited layer.
-    if (m_userOverridden && optionLayer.getLayerKey() < m_userOverrideLayerKey) {
-        // This layer is stronger than the User layer — skip to preserve the user's UI change
-        return;
-    }
-
     GenericValueWrapper value(m_type);
     const std::string fullName = getFullName();
     // Only insert into queue when the option can be found in the config of option layer
@@ -667,12 +660,6 @@ namespace dxvk {
     
     bool anyModified = false;
     
-    // If clearing stronger layers for the User layer, mark this option as user-overridden
-    // so that layer re-population from config files will skip this option.
-    if (targetLayer == RtxOptionLayer::getUserLayer()) {
-      markUserOverridden(targetLayer);
-    }
-    
     // Iterate through layers stronger than target (keys < targetKey)
     // Map is sorted by RtxOptionLayerKey, strongest (lowest key) first
     auto it = m_optionLayerValueQueue.begin();
@@ -718,8 +705,7 @@ namespace dxvk {
     }
   }
 
-  void RtxOptionImpl::moveLayerValue(const RtxOptionLayer* sourceLayer, const RtxOptionLayer* destLayer,
-                                     bool preserveDestinationValue) {
+  void RtxOptionImpl::moveLayerValue(const RtxOptionLayer* sourceLayer, const RtxOptionLayer* destLayer) {
     if (!sourceLayer || !destLayer) {
       return;
     }
@@ -730,12 +716,6 @@ namespace dxvk {
     // Get source layer value
     auto sourceIt = m_optionLayerValueQueue.find(sourceLayer->getLayerKey());
     if (sourceIt == m_optionLayerValueQueue.end()) {
-      return;
-    }
-
-    if (preserveDestinationValue && hasValueInLayer(destLayer)) {
-      disableLayerValue(sourceLayer);
-      sourceLayer->onLayerValueChanged();
       return;
     }
 
@@ -776,7 +756,7 @@ namespace dxvk {
   bool RtxOptionImpl::migrateValuesTo(RtxOptionImpl* destOption, std::function<bool(const GenericValue& src, GenericValue& dest, bool destHasExistingValue)> transform) {
     std::lock_guard<std::mutex> lock(getUpdateMutex());
 
-    Logger::info(str::format("[Migration] Migrating from ", getFullName(), " to ", destOption->getFullName()));
+    bool migrated = false;
 
     for (auto& [layerKey, sourcePrioritizedValue] : m_optionLayerValueQueue) {
       if (layerKey == kRtxOptionLayerDefaultKey) {
@@ -796,10 +776,20 @@ namespace dxvk {
 
       if (transform(sourcePrioritizedValue.value, *destValue, !destIsNew)) {
         destOption->markDirty();
+        migrated = true;
       }
     }
 
-    return true;
+    // Only announce the migration when at least one non-default layer actually
+    // moved. Callers (decal-texture / particle maxSpeed) gate their own
+    // `[Deprecated Config]` "please re-save your rtx config" log on this
+    // return value, so emitting true when nothing moved spams users who have
+    // no deprecated keys in any of their configs.
+    if (migrated) {
+      Logger::info(str::format("[Migration] Migrating from ", getFullName(), " to ", destOption->getFullName()));
+    }
+
+    return migrated;
   }
 
   void RtxOptionImpl::updateLayerBlendStrength(const RtxOptionLayer& optionLayer) {
@@ -831,26 +821,18 @@ namespace dxvk {
     if (explicitLayer) {
       return explicitLayer;
     }
-
-    // graphicsPreset controls the Quality layer and must never be routed into it.
-    // If it lands in Quality, it can override the user's own preset selection and lock the UI in Auto.
-    // Fall back to the Default layer when the User layer is not yet initialized (early device creation).
-    if (this == &RtxOptions::graphicsPresetObject()) {
-      const RtxOptionLayer* ul = RtxOptionLayer::getUserLayer();
-      return ul ? ul : RtxOptionLayer::getDefaultLayer();
-    }
     
     const RtxOptionEditTarget editTarget = RtxOptionLayerTarget::getEditTarget();
     const bool hasUserSettingsFlag = (m_flags & RtxOptionFlags::UserSetting) != 0;
     
     // User-driven changes (UI edit target)
     if (editTarget == RtxOptionEditTarget::User) {
-      // UI edits must win immediately in both the Basic and Dev menus.  Older
-      // routing sent non-UserSetting options to rtx.conf, which sits below
-      // Derived/User/Quality layers and made many controls appear to accept a
-      // click before snapping back to their default or preset value.
-      const RtxOptionLayer* userLayer = RtxOptionLayer::getUserLayer();
-      return userLayer ? userLayer : RtxOptionLayer::getRtxConfLayer();
+      // Options with UserSettings flag go to User Settings layer
+      if (hasUserSettingsFlag) {
+        return RtxOptionLayer::getUserLayer();
+      }
+      // Options without UserSettings flag go to Remix Config layer
+      return RtxOptionLayer::getRtxConfLayer();
     }
     
     // Code-driven changes (Derived edit target)

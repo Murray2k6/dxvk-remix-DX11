@@ -79,7 +79,6 @@ namespace dxvk {
     // Public methods needed by RTX context
     void setSetting(const uint32_t displaySize[2], const XeSSPreset preset, uint32_t outRenderSize[2]);
     void getInputSize(uint32_t& width, uint32_t& height) const;
-    bool supportsXeSS();
     
     // XeSS 2.1 public helper methods
     uint32_t calcRecommendedJitterSequenceLength() const;
@@ -109,8 +108,6 @@ namespace dxvk {
 
     // Member variables - organized after methods per style guide
     bool m_initialized;
-    bool m_supportChecked;
-    bool m_supportAvailable;
     xess_context_handle_t m_xessContext;
     VkExtent3D m_targetExtent;
     XeSSPreset m_currentPreset;

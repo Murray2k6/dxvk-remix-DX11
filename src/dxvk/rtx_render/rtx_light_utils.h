@@ -21,8 +21,10 @@
 */
 #pragma once
 
-#include "rtx_cb_types.h"
+#include <d3d11.h>
 #include "../util/util_vector.h"
+// DX11_V225: DX11-native light descriptor (replaces the legacy D3DLIGHT9).
+#include "rtx/dx11/dx11_light_state.h"
 
 namespace dxvk {
   struct LightUtils {
@@ -30,12 +32,12 @@ namespace dxvk {
     // This function will determine the distance from `light` that the brightness would fall below kLegacyLightEndValue, based on the attenuation function.
     // If the light would never attenuate to less than kLegacyLightEndValue, light.Range will be used instead.
     // It will then determine how bright the replacement light needs to be to have a brightness of kNewLightEndValue at the same distance.
-    static float calculateIntensity(const RtxLegacyLight& light, const float radius);
+    static float calculateIntensity(const Dx11LightDesc& light, const float radius);
 
     // Variant of calculateIntensity but also combine that intensity with the original light's diffuse color to determine the radiance.
-    static Vector3 calculateRadiance(const RtxLegacyLight& light, const float radius);
+    static Vector3 calculateRadiance(const Dx11LightDesc& light, const float radius);
 
     // Best fit light transform for a given legacy light
-    static Matrix4 getLightTransform(const RtxLegacyLight& light);
+    static Matrix4 getLightTransform(const Dx11LightDesc& light);
   };
 } // namespace dxvk

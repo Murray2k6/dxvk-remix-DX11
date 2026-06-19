@@ -53,7 +53,7 @@ namespace dxvk {
     RTX_OPTION("rtx.neeCache", bool, enableMIS, true, "Enable MIS.");
     RTX_OPTION("rtx.neeCache", bool, enableUpdate, true, "Enable Update.");
     RTX_OPTION("rtx.neeCache", bool, enableOnFirstBounce, true, "Enable NEE Cache on a first bounce.");
-    RTX_OPTION_ARGS("rtx.neeCache", NeeEnableMode, enableModeAfterFirstBounce, NeeEnableMode::All, "NEE Cache enable mode on a second and higher bounces. 0 means off, 1 means enabled for specular rays only, 2 means always enabled.",
+    RTX_OPTION_ARGS("rtx.neeCache", NeeEnableMode, enableModeAfterFirstBounce, NeeEnableMode::SpecularOnly, "NEE Cache enable mode on a second and higher bounces. 0 means off, 1 means enabled for specular rays only, 2 means always enabled.",
                     args.flags = RtxOptionFlags::UserSetting);
     RTX_OPTION("rtx.neeCache", bool, enableAnalyticalLight, true, "Enable NEE Cache on analytical light.");
     RTX_OPTION("rtx.neeCache", float, specularFactor, 1.0, "Specular component factor.");

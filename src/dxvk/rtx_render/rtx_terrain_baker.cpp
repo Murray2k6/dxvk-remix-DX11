@@ -1,3 +1,4 @@
+#include "rtx/dx11/dx11_material_fog_state.h"
 /*
 * Copyright (c) 2023-2024, NVIDIA CORPORATION. All rights reserved.
 *
@@ -21,6 +22,8 @@
 */
 
 #include "rtx_terrain_baker.h"
+// DX11_V225: complete type for the fixed-function-equivalent VS constant block.
+#include "../../d3d11/d3d11_fixed_function.h"
 
 #include "dxvk_device.h"
 #include "../tracy/Tracy.hpp"
@@ -30,9 +33,12 @@
 #include "rtx_texture.h"
 #include "rtx_texture_manager.h"
 
-#include "rtx_cb_types.h"
-#include "rtx_spec_constants.h"
-#include "rtx_options.h"
+#include "../d3d11/d3d11_state.h"
+#include "../d3d11/d3d11_spec_constants.h"
+#include "../dxso/dxso_util.h"
+#include "../../d3d11/d3d11_rtx.h"
+#include "../../dxso/dxso_util.h"
+#include "../../d3d11/d3d11_caps.h"
 
 namespace {
   // By default, a value of 1.f will have 0 displacement.
@@ -100,9 +106,9 @@ namespace dxvk {
     if (drawCallState.usesPixelShader) {
       return Material::replacementSupportInPS() && 
              Material::replacementSupportInPS_programmableShaders() &&
-             drawCallState.pixelShaderInfo.majorVersion() <= 1;
+             drawCallState.programmablePixelShaderInfo.majorVersion() <= 1;
     } else {
-      return Material::replacementSupportInPS() && Material::replacementSupportInPS_legacyPipeline();
+      return Material::replacementSupportInPS() && Material::replacementSupportInPS_fixedFunction();
     }
   }
 
@@ -281,7 +287,7 @@ namespace dxvk {
     RtxTextureManager& textureManger = ctx->getCommonObjects()->getTextureManager();
     const RtCamera& camera = sceneManager.getCamera();
 
-    if (drawCallState.usesVertexShader && !RtxOptions::useVertexCapture()) {
+    if (drawCallState.usesVertexShader && !D3D11Rtx::useVertexCapture()) {
       ONCE(Logger::warn(str::format("[RTX Terrain Baker] Terrain texture corresponds to a draw call with programmable Vertex Shader usage. Vertex capture must be enabled to support baking of such draw calls. Ignoring the draw call.")));
       return false;
     }
@@ -335,8 +341,8 @@ namespace dxvk {
 
     // The constants buffers are fairly large, and their use is mutually exclusive, so use a union to save memory.
     union UnifiedCB {
-      RtxVertexCaptureData programmablePipeline;
-      RtxVSConstants vsConstants;
+      D3D11RtxVertexCaptureData programmablePipeline;
+      D3D11FixedFunctionVS fixedFunction;
 
       UnifiedCB() { }
     };
@@ -344,11 +350,11 @@ namespace dxvk {
     UnifiedCB prevCB;
 
     if (drawCallState.usesVertexShader) {
-      prevCB.programmablePipeline = *static_cast<RtxVertexCaptureData*>(rtState.vertexCaptureCB->mapPtr(0));
+      prevCB.programmablePipeline = *static_cast<D3D11RtxVertexCaptureData*>(rtState.vertexCaptureCB->mapPtr(0));
     } else {
-      prevCB.vsConstants = *static_cast<RtxVSConstants*>(rtState.vsConstantsCB->mapPtr(0));
+      prevCB.fixedFunction = *static_cast<D3D11FixedFunctionVS*>(rtState.vsFixedFunctionCB->mapPtr(0));
     }
-    RtxSharedPS prevSharedState = *static_cast<RtxSharedPS*>(rtState.psSharedStateCB->mapPtr(0));
+    D3D11SharedPS prevSharedState = *static_cast<D3D11SharedPS*>(rtState.psSharedStateCB->mapPtr(0));
 
     const float2 float2CascadeLevelResolution = float2 {
       static_cast<float>(m_bakingParams.cascadeLevelResolution.width),
@@ -377,12 +383,12 @@ namespace dxvk {
       colorTextureSlot = drawCallState.getMaterialData().getColorTextureSlot(0);
 
       // Check that the slot for secondary textures is available
-      const uint32_t textureSlot = drawCallState.getMaterialData().getColorTextureSlot(kTerrainBakerSecondaryTextureSlot);
+      const uint32_t textureSlot = drawCallState.getMaterialData().getColorTextureSlot(kTerrainBakerSecondaryTextureStage);
 
       if (textureSlot == kInvalidResourceSlot) {
-        // In D3D11 texture slots are SRV indices set by the bridge. Use the
-        // secondary stage index directly as a fallback slot.
-        secondaryTextureSlot = kTerrainBakerSecondaryTextureSlot;
+        auto shaderSampler = RemapStateSamplerShader(static_cast<uint8_t>(kTerrainBakerSecondaryTextureStage));
+        const uint32_t bindingIndex = shaderSampler.second;
+        secondaryTextureSlot = computeResourceSlotId(DxsoProgramType::PixelShader, DxsoBindingType::Image, bindingIndex);
       }
     }
 
@@ -391,18 +397,18 @@ namespace dxvk {
     {
       // Disable fog
 
-      ctx->setSpecConstant(VK_PIPELINE_BIND_POINT_GRAPHICS, RtxSpecConstantId::FogEnabled, false);
-      ctx->setSpecConstant(VK_PIPELINE_BIND_POINT_GRAPHICS, RtxSpecConstantId::VertexFogMode, static_cast<uint32_t>(FogMode::None));
-      ctx->setSpecConstant(VK_PIPELINE_BIND_POINT_GRAPHICS, RtxSpecConstantId::PixelFogMode, static_cast<uint32_t>(FogMode::None));
+      ctx->setSpecConstant(VK_PIPELINE_BIND_POINT_GRAPHICS, D3D11SpecConstantId::FogEnabled, false);
+      ctx->setSpecConstant(VK_PIPELINE_BIND_POINT_GRAPHICS, D3D11SpecConstantId::VertexFogMode, DX11_FOG_NONE);
+      ctx->setSpecConstant(VK_PIPELINE_BIND_POINT_GRAPHICS, D3D11SpecConstantId::PixelFogMode, DX11_FOG_NONE);
 
       if (drawCallState.usesVertexShader) {
-        ctx->setSpecConstant(VK_PIPELINE_BIND_POINT_GRAPHICS, RtxSpecConstantId::CustomVertexTransformEnabled, true);
+        ctx->setSpecConstant(VK_PIPELINE_BIND_POINT_GRAPHICS, D3D11SpecConstantId::CustomVertexTransformEnabled, true);
       }
     }
 
     bool bakingResult = false;
 
-    ctx->setSpecConstant(VK_PIPELINE_BIND_POINT_GRAPHICS, RtxSpecConstantId::ReplacementTextureCategory, static_cast<uint32_t>(ReplacementMaterialTextureCategory::AlbedoOpacity));
+    ctx->setSpecConstant(VK_PIPELINE_BIND_POINT_GRAPHICS, D3D11SpecConstantId::ReplacementTextureCategory, static_cast<uint32_t>(ReplacementMaterialTextureCategory::AlbedoOpacity));
     
     // The height value that corresponds to the original surface height.
     const float prevFrameTotalHeight = m_prevFrameMaxDisplaceIn + m_prevFrameMaxDisplaceOut;
@@ -430,7 +436,7 @@ namespace dxvk {
 
           if (drawCallState.usesPixelShader) {
             if (textureType != ReplacementMaterialTextureType::Enum::AlbedoOpacity &&
-                drawCallState.pixelShaderInfo.majorVersion() >= 2) {
+                drawCallState.programmablePixelShaderInfo.majorVersion() >= 2) {
               // Unsupported right now - REMIX-2223 
               ONCE(Logger::err("[RTX Terrain Baker] Draw call associated with a terrain texture uses a shader model version 2 or higher. This is currently not supported when baking replacement PBR material textures other than albedoOpacity. Skipping baking of the replacement texture of all but albedoOpacity."));
               continue;
@@ -441,21 +447,21 @@ namespace dxvk {
           switch (textureType) {
           case ReplacementMaterialTextureType::Enum::AlbedoOpacity:
           default:
-            ctx->setSpecConstant(VK_PIPELINE_BIND_POINT_GRAPHICS, RtxSpecConstantId::ReplacementTextureCategory, static_cast<uint32_t>(ReplacementMaterialTextureCategory::AlbedoOpacity));
+            ctx->setSpecConstant(VK_PIPELINE_BIND_POINT_GRAPHICS, D3D11SpecConstantId::ReplacementTextureCategory, static_cast<uint32_t>(ReplacementMaterialTextureCategory::AlbedoOpacity));
             break;
 
           case ReplacementMaterialTextureType::Enum::Normal:
           case ReplacementMaterialTextureType::Enum::Tangent:
-            ctx->setSpecConstant(VK_PIPELINE_BIND_POINT_GRAPHICS, RtxSpecConstantId::ReplacementTextureCategory, static_cast<uint32_t>(ReplacementMaterialTextureCategory::SecondaryOctahedralEncoded));
+            ctx->setSpecConstant(VK_PIPELINE_BIND_POINT_GRAPHICS, D3D11SpecConstantId::ReplacementTextureCategory, static_cast<uint32_t>(ReplacementMaterialTextureCategory::SecondaryOctahedralEncoded));
             break;
 
           case ReplacementMaterialTextureType::Enum::Roughness:
           case ReplacementMaterialTextureType::Enum::Metallic:
           case ReplacementMaterialTextureType::Enum::Emissive:
-            ctx->setSpecConstant(VK_PIPELINE_BIND_POINT_GRAPHICS, RtxSpecConstantId::ReplacementTextureCategory, static_cast<uint32_t>(ReplacementMaterialTextureCategory::SecondaryRaw));
+            ctx->setSpecConstant(VK_PIPELINE_BIND_POINT_GRAPHICS, D3D11SpecConstantId::ReplacementTextureCategory, static_cast<uint32_t>(ReplacementMaterialTextureCategory::SecondaryRaw));
             break;
           case ReplacementMaterialTextureType::Enum::Height:
-            ctx->setSpecConstant(VK_PIPELINE_BIND_POINT_GRAPHICS, RtxSpecConstantId::ReplacementTextureCategory, static_cast<uint32_t>(ReplacementMaterialTextureCategory::SecondaryScaled));
+            ctx->setSpecConstant(VK_PIPELINE_BIND_POINT_GRAPHICS, D3D11SpecConstantId::ReplacementTextureCategory, static_cast<uint32_t>(ReplacementMaterialTextureCategory::SecondaryScaled));
             break;
           }
 
@@ -503,7 +509,7 @@ namespace dxvk {
         m_materialTextures[textureType].markAsBaked();
       }
 
-      const Matrix4& world = drawCallState.usesVertexShader ? prevCB.programmablePipeline.normalTransform : prevCB.vsConstants.World;
+      const Matrix4& world = drawCallState.usesVertexShader ? prevCB.programmablePipeline.normalTransform : prevCB.fixedFunction.World;
       Matrix4 worldSceneView = m_bakingParams.sceneView * world;
 
       // Render into all cascade levels. 
@@ -531,10 +537,6 @@ namespace dxvk {
         // Set scissor window which clips the screen space
         VkRect2D scissor = { cascadeOffset, m_bakingParams.cascadeLevelResolution };
 
-        // Save current viewport state before setting new one
-        const uint32_t currentViewportCount = ctx->getCurrentViewportCount();
-        const DxvkViewportState currentViewportState = ctx->getCurrentViewportState();
-        
         ctx->setViewports(1, &viewport, &scissor);
 
         // Account for the difference in UV density between the input terrain material and the baked terrain.
@@ -543,26 +545,26 @@ namespace dxvk {
 
         // Update constant buffers
         // 
-        RtxSharedPS& sharedState = ctx->allocAndMapPSSharedStateConstantBuffer();
-        for (int i = 0; i < kRtxMaxTextureSlots; ++i) {
+        D3D11SharedPS& sharedState = ctx->allocAndMapPSSharedStateConstantBuffer();
+        for (int i = 0; i < caps::TextureStageCount; ++i) {
           sharedState.Stages[i] = prevSharedState.Stages[i];
         }
         // The neutral height value of the input image and the output map don't match.
         // To account, first subtract the input's neutral value from the pixel,
         // then apply all scale operations, then add the output neutral value.
-sharedState.Stages[kTerrainBakerSecondaryTextureSlot].texturePreOffset = texturePreOffset;
-      sharedState.Stages[kTerrainBakerSecondaryTextureSlot].textureScale = textureScale * cascadeUvDensity;
-      sharedState.Stages[kTerrainBakerSecondaryTextureSlot].texturePostOffset = neutralDisplacement;
+        sharedState.Stages[kTerrainBakerSecondaryTextureStage].texturePreOffset = texturePreOffset;
+        sharedState.Stages[kTerrainBakerSecondaryTextureStage].textureScale = textureScale * cascadeUvDensity;
+        sharedState.Stages[kTerrainBakerSecondaryTextureStage].texturePostOffset = neutralDisplacement;
         
         // Programmable VS path
         if (drawCallState.usesVertexShader) {
-          RtxVertexCaptureData& cbData = ctx->allocAndMapVertexCaptureConstantBuffer();
+          D3D11RtxVertexCaptureData& cbData = ctx->allocAndMapVertexCaptureConstantBuffer();
           cbData = prevCB.programmablePipeline;
           cbData.customWorldToProjection = m_bakingParams.bakingCameraOrthoProjection[iCascade] * worldSceneView;
         } 
-        else { // Legacy pipeline path
-          RtxVSConstants& cbData = ctx->allocAndMapVSConstantBuffer();
-          cbData = prevCB.vsConstants;
+        else { // Fixed function path
+          D3D11FixedFunctionVS& cbData = ctx->allocAndMapFixedFunctionVSConstantBuffer();
+          cbData = prevCB.fixedFunction;
 
           cbData.InverseView = m_bakingParams.inverseSceneView;
           cbData.View = m_bakingParams.sceneView;
@@ -591,24 +593,17 @@ sharedState.Stages[kTerrainBakerSecondaryTextureSlot].texturePreOffset = texture
 
     // Restore prev state
     {
-      // Restore viewport state
       ctx->setViewports(prevViewportCount, prevViewportState.viewports.data(), prevViewportState.scissorRects.data());
-      
-      // Restore render targets
       ctx->bindRenderTargets(prevRenderTargets);
-      
-      // Restore spec constants
       ctx->setSpecConstantsInfo(VK_PIPELINE_BIND_POINT_GRAPHICS, prevSpecConstantsInfo);
 
-      // Restore constant buffers
       ctx->allocAndMapPSSharedStateConstantBuffer() = prevSharedState;
       if (drawCallState.usesVertexShader) {
         ctx->allocAndMapVertexCaptureConstantBuffer() = prevCB.programmablePipeline;
       } else {
-        ctx->allocAndMapVSConstantBuffer() = prevCB.vsConstants;
+        ctx->allocAndMapFixedFunctionVSConstantBuffer() = prevCB.fixedFunction;
       }
 
-      // Restore secondary texture slot if needed
       if (secondaryTextureSlot != kInvalidResourceSlot) {
         // Secondary texture slot wasn't used prior to baking, so set it to a null view
         ctx->bindResourceView(secondaryTextureSlot, nullptr, nullptr);
@@ -776,8 +771,10 @@ sharedState.Stages[kTerrainBakerSecondaryTextureSlot].texturePreOffset = texture
       if (RemixGui::CollapsingHeader("Material")) {
         ImGui::Indent();
 
-        const bool isPSReplacementSupportEnabled = Material::replacementSupportInPS_legacyPipeline() || Material::replacementSupportInPS_programmableShaders();
+        const bool isPSReplacementSupportEnabled = Material::replacementSupportInPS_fixedFunction() || Material::replacementSupportInPS_programmableShaders();
+        ImGui::BeginDisabled(!isPSReplacementSupportEnabled);
         RemixGui::Checkbox("Replacements Support in PS", &Material::replacementSupportInPSObject());
+        ImGui::EndDisabled();
 
         RemixGui::Checkbox("Bake Replacement Materials", &Material::bakeReplacementMaterialsObject());
         RemixGui::Checkbox("Bake Secondary PBR Textures", &Material::bakeSecondaryPBRTexturesObject());
@@ -1063,8 +1060,8 @@ sharedState.Stages[kTerrainBakerSecondaryTextureSlot].texturePreOffset = texture
     // Compute the relative half width of the cascade map around the camera
     float cascadeMapHalfWidth = metersToWorldUnitScale * cascadeMap.defaultHalfWidth();
     if (terrainBBOXIsValid) {
-      // Calculate an exact half-texel offset based on the cascade map resolution
-      const float halfTexelOffset = 0.5f / m_bakingParams.cascadeMapResolution.width;
+      // Add offset for all terrain samples to be within the baked terrain texture
+      const float halfTexelOffset = 10;       // ToDo: calculate an exact value
 
       // Compute bbox relative to the camera
       AxisAlignedBoundingBox cameraRelativeTerrainBBOX = {

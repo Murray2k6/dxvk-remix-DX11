@@ -20,7 +20,6 @@
 * DEALINGS IN THE SOFTWARE.
 */
 #include "rtx_tone_mapping.h"
-#include "rtx_fork_tonemap.h"
 #include "dxvk_device.h"
 #include "dxvk_scoped_annotation.h"
 #include "rtx_render/rtx_shader_manager.h"
@@ -111,9 +110,6 @@ namespace dxvk {
     if (tonemappingEnabled()) {
       ImGui::Indent();
       RemixGui::Checkbox("Finalize With ACES", &finalizeWithACESObject());
-
-      // Tonemap operator selection (Hable Filmic, AgX, Lottes, etc.)
-      fork_tonemap::showTonemapOperatorUI();
 
       RemixGui::Combo("Dither Mode", &ditherModeObject(), "Disabled\0Spatial\0Spatial + Temporal\0");
 
@@ -282,9 +278,6 @@ namespace dxvk {
     }
     pushArgs.frameIndex = ctx->getDevice()->getCurrentFrameId();
 
-    // Populate tonemap operator fields (Hable, AgX, Lottes, Direct mode).
-    fork_tonemap::populateTonemapOperatorArgs(pushArgs);
-
     ctx->bindResourceView(TONEMAPPING_APPLY_BLUE_NOISE_TEXTURE_INPUT, ctx->getResourceManager().getBlueNoiseTexture(ctx), nullptr);
     ctx->bindResourceView(TONEMAPPING_APPLY_TONEMAPPING_COLOR_INPUT, inputBuffer.view, nullptr);
     ctx->bindResourceView(TONEMAPPING_APPLY_TONEMAPPING_TONE_CURVE_INPUT, m_toneCurve.view, nullptr);
@@ -313,14 +306,14 @@ namespace dxvk {
 
     ctx->setPushConstantBank(DxvkPushConstantBank::RTX);
 
-    // Reset tone mapping resources if not initialized
+    // TODO : set reset on significant camera changes as well
     if (m_toneHistogram.image.ptr() == nullptr) {
       createResources(ctx);
       m_resetState = true;
     }
 
     const Resources::Resource& inputColorBuffer = rtOutput.m_finalOutput.resource(Resources::AccessType::Read);
-    if (tonemappingEnabled() && !fork_tonemap::shouldSkipToneCurve()) {
+    if (tonemappingEnabled()) {
       dispatchHistogram(ctx, exposureView, inputColorBuffer, autoExposureEnabled);
       dispatchToneCurve(ctx);
     }

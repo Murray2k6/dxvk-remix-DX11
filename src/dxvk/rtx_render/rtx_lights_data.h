@@ -20,11 +20,10 @@
 * DEALINGS IN THE SOFTWARE.
 */
 #pragma once
-
+#include "rtx/dx11/dx11_light_state.h"
 #include <type_traits>
 
 #include "rtx_lights.h"
-#include "rtx_cb_types.h"
 
 #define LIST_LIGHT_CONSTANTS(X) \
   /*Parameter Name,   USD Token String,       Type,    Min Value,    Max Value,    Default Value */ \
@@ -53,13 +52,13 @@ struct remixapi_LightInfoUSDEXT;
 
 namespace dxvk {
   struct LightData {
-    static std::optional<LightData> tryCreate(const RtxLegacyLight& light);
+    static std::optional<LightData> tryCreate(const Dx11LightDesc& light);
     static std::optional<LightData> tryCreate(const pxr::UsdPrim& lightPrim, const pxr::GfMatrix4f* pLocalToRoot, const bool isOverrideLight, const bool absoluteTransform);
     static std::optional<LightData> tryCreate(const remixapi_LightInfoUSDEXT& src);
 
-    RtLight toRtLight(const RtLight* const originalLight = nullptr) const;
+    RtLight toRtLight() const;
 
-    void merge(const RtxLegacyLight& light);
+    void merge(const Dx11LightDesc& light);
 
     static bool isSupportedUsdLight(const pxr::UsdPrim& lightPrim);
 
@@ -86,8 +85,8 @@ namespace dxvk {
 
     explicit LightData(LightType lightType, bool isOverrideLight = false, bool absoluteTransform = true);
 
-    static LightData createFromDirectional(const RtxLegacyLight& light);
-    static LightData createFromPointSpot(const RtxLegacyLight& light);
+    static LightData createFromDirectional(const Dx11LightDesc& light);
+    static LightData createFromPointSpot(const Dx11LightDesc& light);
 
     void merge(const LightData& input);
 

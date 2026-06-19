@@ -1656,15 +1656,7 @@ namespace dxvk {
         info->TileBasedDeferredRenderer = FALSE;
       } return S_OK;
 
-      case D3D11_FEATURE_D3D9_OPTIONS: {
-        auto info = static_cast<D3D11_FEATURE_DATA_D3D9_OPTIONS*>(pFeatureSupportData);
-
-        if (FeatureSupportDataSize != sizeof(*info))
-          return E_INVALIDARG;
-
-        info->FullNonPow2TextureSupport = TRUE;
-      } return S_OK;
-      
+      // DX11_V214: removed invalid/non-SDK D3D11 feature-query compatibility block.
       case D3D11_FEATURE_SHADER_MIN_PRECISION_SUPPORT: {
         auto info = static_cast<D3D11_FEATURE_DATA_SHADER_MIN_PRECISION_SUPPORT*>(pFeatureSupportData);
 
@@ -1676,15 +1668,7 @@ namespace dxvk {
         info->AllOtherShaderStagesMinPrecision = 0;
       } return S_OK;
       
-      case D3D11_FEATURE_D3D9_SHADOW_SUPPORT: {
-        auto info = static_cast<D3D11_FEATURE_DATA_D3D9_SHADOW_SUPPORT*>(pFeatureSupportData);
-
-        if (FeatureSupportDataSize != sizeof(*info))
-          return E_INVALIDARG;
-        
-        info->SupportsDepthAsTextureWithLessEqualComparisonFilter = TRUE;
-      } return S_OK;
-
+      // DX11_V214: removed invalid/non-SDK D3D11 feature-query compatibility block.
       case D3D11_FEATURE_D3D11_OPTIONS1: {
         auto info = static_cast<D3D11_FEATURE_DATA_D3D11_OPTIONS1*>(pFeatureSupportData);
 
@@ -1699,15 +1683,7 @@ namespace dxvk {
         info->MapOnDefaultBuffers                   = TRUE;
       } return S_OK;
 
-      case D3D11_FEATURE_D3D9_SIMPLE_INSTANCING_SUPPORT: {
-        auto info = static_cast<D3D11_FEATURE_DATA_D3D9_SIMPLE_INSTANCING_SUPPORT*>(pFeatureSupportData);
-
-        if (FeatureSupportDataSize != sizeof(*info))
-          return E_INVALIDARG;
-
-        info->SimpleInstancingSupported = TRUE;
-      } return S_OK;
-
+      // DX11_V214: removed invalid/non-SDK D3D11 feature-query compatibility block.
       case D3D11_FEATURE_MARKER_SUPPORT: {
         auto info = static_cast<D3D11_FEATURE_DATA_MARKER_SUPPORT*>(pFeatureSupportData);
 
@@ -1717,18 +1693,7 @@ namespace dxvk {
         info->Profile = FALSE;
       } return S_OK;
 
-      case D3D11_FEATURE_D3D9_OPTIONS1: {
-        auto info = static_cast<D3D11_FEATURE_DATA_D3D9_OPTIONS1*>(pFeatureSupportData);
-
-        if (FeatureSupportDataSize != sizeof(*info))
-          return E_INVALIDARG;
-
-        info->FullNonPow2TextureSupported                                 = TRUE;
-        info->DepthAsTextureWithLessEqualComparisonFilterSupported        = TRUE;
-        info->SimpleInstancingSupported                                   = TRUE;
-        info->TextureCubeFaceRenderTargetWithNonCubeDepthStencilSupported = TRUE;
-      } return S_OK;
-
+      // DX11_V214: removed invalid/non-SDK D3D11 feature-query compatibility block.
       case D3D11_FEATURE_D3D11_OPTIONS2: {
         auto info = static_cast<D3D11_FEATURE_DATA_D3D11_OPTIONS2*>(pFeatureSupportData);
 

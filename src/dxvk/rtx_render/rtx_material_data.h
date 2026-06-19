@@ -24,20 +24,10 @@
 #include "../../lssusd/mdl_helpers.h"
 
 #include "../../lssusd/usd_include_begin.h"
-#include <pxr/base/gf/vec3d.h>
-#include <pxr/base/gf/vec3f.h>
-#include <pxr/base/gf/vec4d.h>
-#include <pxr/base/gf/vec4f.h>
 #include <pxr/base/vt/value.h>
 #include <pxr/usd/usd/tokens.h>
 #include <pxr/usd/usd/prim.h>
 #include "../../lssusd/usd_include_end.h"
-
-#include <algorithm>
-#include <cmath>
-#include <cstdint>
-#include <limits>
-#include <type_traits>
 
 // Note: These material ranges and defaults should be kept in sync with the MDL ranges to prevent mismatching between how data is clamped.
 
@@ -187,16 +177,12 @@
 
 #define WRITE_CONSTANT_DESERIALIZER(name, usd_attr, type, minVal, maxVal, defaultVal) \
       if(shader.HasAttribute(get##name##Token())) { \
+        static_assert(uint64_t(DirtyFlags::k_##name) < 64); \
+        target.m_dirty.set(DirtyFlags::k_##name); \
         pxr::VtValue val; \
         shader.GetAttribute(get##name##Token()).Get(&val); \
-        if(!val.IsEmpty()) { \
-          type parsedValue = defaultVal; \
-          if(detail::readUsdMaterialValue(val, parsedValue)) { \
-            static_assert(uint64_t(DirtyFlags::k_##name) < 64); \
-            target.m_dirty.set(DirtyFlags::k_##name); \
-            target.m_##name = parsedValue; \
-          } \
-        } \
+        if(!val.IsEmpty()) \
+          target.m_##name = val.UncheckedGet<type>(); \
       }
 
 #define WRITE_TEXTURE_DESERIALIZER(name, usd_attr, type, minVal, maxVal, defaultVal) \
@@ -324,131 +310,6 @@ private:                                                                        
 };
 
 namespace dxvk {
-  namespace detail {
-    inline bool readUsdNumber(const pxr::VtValue& value, double& out) {
-      if (value.IsHolding<float>()) {
-        out = static_cast<double>(value.UncheckedGet<float>());
-        return true;
-      }
-      if (value.IsHolding<double>()) {
-        out = value.UncheckedGet<double>();
-        return true;
-      }
-      if (value.IsHolding<int>()) {
-        out = static_cast<double>(value.UncheckedGet<int>());
-        return true;
-      }
-      if (value.IsHolding<unsigned int>()) {
-        out = static_cast<double>(value.UncheckedGet<unsigned int>());
-        return true;
-      }
-      if (value.IsHolding<int64_t>()) {
-        out = static_cast<double>(value.UncheckedGet<int64_t>());
-        return true;
-      }
-      if (value.IsHolding<uint64_t>()) {
-        out = static_cast<double>(value.UncheckedGet<uint64_t>());
-        return true;
-      }
-      if (value.IsHolding<uint8_t>()) {
-        out = static_cast<double>(value.UncheckedGet<uint8_t>());
-        return true;
-      }
-
-      return false;
-    }
-
-    inline float sanitizeUsdFloat(const double value) {
-      return std::isfinite(value) ? static_cast<float>(value) : 0.0f;
-    }
-
-    inline bool readUsdMaterialValue(const pxr::VtValue& value, float& out) {
-      double numericValue = 0.0;
-      if (!readUsdNumber(value, numericValue)) {
-        return false;
-      }
-
-      out = sanitizeUsdFloat(numericValue);
-      return true;
-    }
-
-    inline bool readUsdMaterialValue(const pxr::VtValue& value, bool& out) {
-      if (value.IsHolding<bool>()) {
-        out = value.UncheckedGet<bool>();
-        return true;
-      }
-
-      double numericValue = 0.0;
-      if (!readUsdNumber(value, numericValue) || !std::isfinite(numericValue)) {
-        return false;
-      }
-
-      out = numericValue != 0.0;
-      return true;
-    }
-
-    inline bool readUsdMaterialValue(const pxr::VtValue& value, uint8_t& out) {
-      double numericValue = 0.0;
-      if (!readUsdNumber(value, numericValue) || !std::isfinite(numericValue)) {
-        return false;
-      }
-
-      numericValue = std::clamp(numericValue, 0.0, static_cast<double>(std::numeric_limits<uint8_t>::max()));
-      out = static_cast<uint8_t>(numericValue);
-      return true;
-    }
-
-    template<typename T, typename std::enable_if_t<std::is_enum<T>::value, int> = 0>
-    inline bool readUsdMaterialValue(const pxr::VtValue& value, T& out) {
-      if (value.IsHolding<T>()) {
-        out = value.UncheckedGet<T>();
-        return true;
-      }
-
-      double numericValue = 0.0;
-      if (!readUsdNumber(value, numericValue) || !std::isfinite(numericValue)) {
-        return false;
-      }
-
-      using UnderlyingType = std::underlying_type_t<T>;
-      numericValue = std::clamp(
-        numericValue,
-        static_cast<double>(std::numeric_limits<UnderlyingType>::min()),
-        static_cast<double>(std::numeric_limits<UnderlyingType>::max()));
-      out = static_cast<T>(static_cast<UnderlyingType>(numericValue));
-      return true;
-    }
-
-    inline bool readUsdMaterialValue(const pxr::VtValue& value, Vector3& out) {
-      if (value.IsHolding<Vector3>()) {
-        out = value.UncheckedGet<Vector3>();
-        return true;
-      }
-      if (value.IsHolding<pxr::GfVec3f>()) {
-        const pxr::GfVec3f& v = value.UncheckedGet<pxr::GfVec3f>();
-        out = Vector3(sanitizeUsdFloat(v[0]), sanitizeUsdFloat(v[1]), sanitizeUsdFloat(v[2]));
-        return true;
-      }
-      if (value.IsHolding<pxr::GfVec3d>()) {
-        const pxr::GfVec3d& v = value.UncheckedGet<pxr::GfVec3d>();
-        out = Vector3(sanitizeUsdFloat(v[0]), sanitizeUsdFloat(v[1]), sanitizeUsdFloat(v[2]));
-        return true;
-      }
-      if (value.IsHolding<pxr::GfVec4f>()) {
-        const pxr::GfVec4f& v = value.UncheckedGet<pxr::GfVec4f>();
-        out = Vector3(sanitizeUsdFloat(v[0]), sanitizeUsdFloat(v[1]), sanitizeUsdFloat(v[2]));
-        return true;
-      }
-      if (value.IsHolding<pxr::GfVec4d>()) {
-        const pxr::GfVec4d& v = value.UncheckedGet<pxr::GfVec4d>();
-        out = Vector3(sanitizeUsdFloat(v[0]), sanitizeUsdFloat(v[1]), sanitizeUsdFloat(v[2]));
-        return true;
-      }
-
-      return false;
-    }
-  }
-
   REMIX_MATERIAL(OpaqueMaterial, LIST_OPAQUE_MATERIAL_CONSTANTS, LIST_OPAQUE_MATERIAL_TEXTURES, LIST_OPAQUE_MATERIAL_PARAMS)
   REMIX_MATERIAL(TranslucentMaterial, LIST_TRANSLUCENT_MATERIAL_CONSTANTS, LIST_TRANSLUCENT_MATERIAL_TEXTURES, LIST_TRANSLUCENT_MATERIAL_PARAMS)
   REMIX_MATERIAL(RayPortalMaterial, LIST_PORTAL_MATERIAL_CONSTANTS, LIST_PORTAL_MATERIAL_TEXTURES, LIST_PORTAL_MATERIAL_PARAMS)

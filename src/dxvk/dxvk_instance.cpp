@@ -65,14 +65,6 @@
 // NV-DXVK end
 namespace dxvk {
 
-  namespace {
-
-    bool isRenderDocAttached() {
-      return ::GetModuleHandleW(L"renderdoc.dll") != nullptr;
-    }
-
-  }
-
   // NV-DXVK start: debug callback context (stack trace + duplicate filtering)
   struct DxvkDebugUtilsContext {
     struct StackTrace {
@@ -460,15 +452,6 @@ namespace dxvk {
     for (const auto& provider : m_extProviders)
       provider->initInstanceExtensions();
 
-    // Leave Vulkan implicit layers enabled by default. Some systems rely on
-    // driver/utility layers for device routing, overlays, capture, or frame
-    // pacing; disabling them globally can hurt performance or adapter choice.
-    // Keep the old blacklist available as an explicit escape hatch.
-    if (m_config.getOption<bool>("dxvk.disableKnownBadImplicitLayers", false, "DXVK_DISABLE_KNOWN_BAD_IMPLICIT_LAYERS")
-     && !env::getEnvVar("VK_LOADER_LAYERS_DISABLE").size())
-      _putenv_s("VK_LOADER_LAYERS_DISABLE",
-                "*RTSS*,*RivaTuner*,*GOG*,*Epic*,*EOS*");
-
     m_vkl = new vk::LibraryFn();
     m_vki = new vk::InstanceFn(true, this->createInstance());
 
@@ -592,7 +575,7 @@ namespace dxvk {
 
     // Hide VK_EXT_debug_utils behind an environment variable. This extension
     // adds additional overhead to winevulkan
-    if (areValidationLayersEnabled || (env::getEnvVar("DXVK_PERF_EVENTS") == "1" && !isRenderDocAttached())) {
+    if (areValidationLayersEnabled || env::getEnvVar("DXVK_PERF_EVENTS") == "1") {
       insExtensionList.push_back(&insExtensions.extDebugUtils);
     }
 

@@ -64,7 +64,7 @@
 #ifdef WIN32 
 #ifdef _DEBUG
 // Enable our hack to get D3D error messages from the runtime.
-// Note: Only tested on Windows 10 [d3d9.dll version: 10.0.19041.1387 (WinBuild.160101.0800)],
+// Note: Only tested on Windows 10 [d3d11.dll version: 10.0.19041.1387 (WinBuild.160101.0800)],
 //       may require changes to work on a newer Windows 10 or Windows 11 build.
 // #define HACK_D3D_DEBUG_MSG
 #endif

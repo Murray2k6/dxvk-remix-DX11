@@ -21,6 +21,12 @@
 */
 #pragma once
 
+// DX11_V162_REAL_ENV_BYPASS_FUNCTION
+#ifdef _WIN32
+#include <windows.h>
+#include <cstring>
+#endif
+
 // NV-DXVK start: Fix some circular inclusion stuff
 #include <string>
 // NV-DXVK end
@@ -123,16 +129,6 @@ namespace dxvk::env {
    */
   std::string getExePath();
 
-  /**
-   * \brief Checks whether current process should bypass Remix
-   *
-   * Used for obvious helper executables such as crash handlers,
-   * launchers, reporters, installers, and similar side processes
-   * that may load D3D11/DXGI but should not run the Remix frontend.
-   * \returns True if the current process should use native system DLLs
-   */
-  bool shouldBypassRemixForCurrentProcess();
-
   // NV-DXVK start
 
   /**
@@ -185,4 +181,52 @@ namespace dxvk::env {
  * \brief Kills the current process via system
  */
   void killProcess();
+}
+
+namespace dxvk::env {
+
+  inline bool shouldBypassRemixForCurrentProcess() {
+#ifdef _WIN32
+    auto readFlag = [](const char* name, bool fallback) -> bool {
+      char value[32] = {};
+      const DWORD len = ::GetEnvironmentVariableA(name, value, DWORD(sizeof(value)));
+      if (len == 0 || len >= DWORD(sizeof(value)))
+        return fallback;
+
+      if (!_stricmp(value, "1") || !_stricmp(value, "true") || !_stricmp(value, "yes") || !_stricmp(value, "on"))
+        return true;
+
+      if (!_stricmp(value, "0") || !_stricmp(value, "false") || !_stricmp(value, "no") || !_stricmp(value, "off"))
+        return false;
+
+      return fallback;
+    };
+
+    if (readFlag("DXVK_REMIX_FORCE_CURRENT_PROCESS", false))
+      return false;
+
+    if (readFlag("DXVK_REMIX_ALLOW_CURRENT_PROCESS", false))
+      return false;
+
+    if (readFlag("DXVK_REMIX_BYPASS_CURRENT_PROCESS", false))
+      return true;
+
+    char modulePath[MAX_PATH] = {};
+    const DWORD pathLen = ::GetModuleFileNameA(nullptr, modulePath, DWORD(sizeof(modulePath)));
+    if (pathLen != 0 && pathLen < DWORD(sizeof(modulePath))) {
+      const char* fileName = std::strrchr(modulePath, '\\');
+      fileName = fileName ? fileName + 1 : modulePath;
+
+      // Keep the bridge/runtime path active. These helpers are part of the DX11
+      // Remix chain and must not be auto-bypassed.
+      if (!_stricmp(fileName, "NvRemixBridge.exe") || !_stricmp(fileName, "NvRemixLauncher32.exe"))
+        return false;
+    }
+
+    return false;
+#else
+    return false;
+#endif
+  }
+
 }

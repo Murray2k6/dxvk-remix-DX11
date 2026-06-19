@@ -2,8 +2,8 @@
 // If you are new to ImGui, see examples/README.txt and documentation at the top of imgui.cpp.
 
 #include "imgui.h"
-#include "imgui_impl_dx9.h"
-#include <d3d9.h>
+#include "imgui_impl_dx11.h"
+#include <d3d11.h>
 #define DIRECTINPUT_VERSION 0x0800
 #include <dinput.h>
 #include <tchar.h>
@@ -23,13 +23,13 @@ LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
     case WM_SIZE:
         if (g_pd3dDevice != NULL && wParam != SIZE_MINIMIZED)
         {
-            ImGui_ImplDX9_InvalidateDeviceObjects();
+            ImGui_ImplDX11_InvalidateDeviceObjects();
             g_d3dpp.BackBufferWidth  = LOWORD(lParam);
             g_d3dpp.BackBufferHeight = HIWORD(lParam);
             HRESULT hr = g_pd3dDevice->Reset(&g_d3dpp);
             if (hr == D3DERR_INVALIDCALL)
                 IM_ASSERT(0);
-            ImGui_ImplDX9_CreateDeviceObjects();
+            ImGui_ImplDX11_CreateDeviceObjects();
         }
         return 0;
     case WM_SYSCOMMAND:
@@ -48,7 +48,7 @@ int main(int, char**)
     // Create application window
     WNDCLASSEX wc = { sizeof(WNDCLASSEX), CS_CLASSDC, WndProc, 0L, 0L, GetModuleHandle(NULL), NULL, NULL, NULL, NULL, _T("ImGui Example"), NULL };
     RegisterClassEx(&wc);
-    HWND hwnd = CreateWindow(_T("ImGui Example"), _T("ImGui DirectX9 Example"), WS_OVERLAPPEDWINDOW, 100, 100, 1280, 800, NULL, NULL, wc.hInstance, NULL);
+    HWND hwnd = CreateWindow(_T("ImGui Example"), _T("ImGui DirectX11 Example"), WS_OVERLAPPEDWINDOW, 100, 100, 1280, 800, NULL, NULL, wc.hInstance, NULL);
 
     // Initialize Direct3D
     LPDIRECT3D9 pD3D;
@@ -79,7 +79,7 @@ int main(int, char**)
     ImGui::CreateContext();
     ImGuiIO& io = ImGui::GetIO(); (void)io;
     //io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;  // Enable Keyboard Controls
-    ImGui_ImplDX9_Init(hwnd, g_pd3dDevice);
+    ImGui_ImplDX11_Init(hwnd, g_pd3dDevice);
 
     // Setup style
     ImGui::StyleColorsDark();
@@ -121,7 +121,7 @@ int main(int, char**)
             DispatchMessage(&msg);
             continue;
         }
-        ImGui_ImplDX9_NewFrame();
+        ImGui_ImplDX11_NewFrame();
 
         // 1. Show a simple window.
         // Tip: if we don't call ImGui::Begin()/ImGui::End() the widgets automatically appears in a window called "Debug".
@@ -170,21 +170,21 @@ int main(int, char**)
         if (g_pd3dDevice->BeginScene() >= 0)
         {
             ImGui::Render();
-            ImGui_ImplDX9_RenderDrawData(ImGui::GetDrawData());
+            ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
             g_pd3dDevice->EndScene();
         }
         HRESULT result = g_pd3dDevice->Present(NULL, NULL, NULL, NULL);
 
-        // Handle loss of D3D9 device
+        // Handle loss of D3D11 device
         if (result == D3DERR_DEVICELOST && g_pd3dDevice->TestCooperativeLevel() == D3DERR_DEVICENOTRESET)
         {
-            ImGui_ImplDX9_InvalidateDeviceObjects();
+            ImGui_ImplDX11_InvalidateDeviceObjects();
             g_pd3dDevice->Reset(&g_d3dpp);
-            ImGui_ImplDX9_CreateDeviceObjects();
+            ImGui_ImplDX11_CreateDeviceObjects();
         }
     }
 
-    ImGui_ImplDX9_Shutdown();
+    ImGui_ImplDX11_Shutdown();
     ImGui::DestroyContext();
 
     if (g_pd3dDevice) g_pd3dDevice->Release();

@@ -302,7 +302,7 @@ void my_stbtt_print(float x, float y, char *text)
    while (*text) {
       if (*text >= 32 && *text < 128) {
          stbtt_aligned_quad q;
-         stbtt_GetBakedQuad(cdata, 512,512, *text-32, &x,&y,&q,1);//1=opengl & d3d10+,0=d3d9
+         stbtt_GetBakedQuad(cdata, 512,512, *text-32, &x,&y,&q,1);//1=opengl & d3d10+,0=d3d11
          glTexCoord2f(q.s0,q.t1); glVertex2f(q.x0,q.y0);
          glTexCoord2f(q.s1,q.t1); glVertex2f(q.x1,q.y0);
          glTexCoord2f(q.s1,q.t0); glVertex2f(q.x1,q.y1);
@@ -545,7 +545,7 @@ STBTT_DEF void stbtt_GetBakedQuad(const stbtt_bakedchar *chardata, int pw, int p
                                int char_index,             // character to display
                                float *xpos, float *ypos,   // pointers to current position in screen pixel space
                                stbtt_aligned_quad *q,      // output: quad to draw
-                               int opengl_fillrule);       // true if opengl fill rule; false if DX9 or earlier
+                               int opengl_fillrule);       // true if opengl fill rule; false if DX11 or earlier
 // Call GetBakedQuad with char_index = 'character - first_char', and it
 // creates the quad you need to draw and advances the current position.
 //

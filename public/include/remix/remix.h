@@ -171,7 +171,7 @@ namespace remix {
   }
 
   struct Interface {
-    HMODULE            m_RemixDLL { nullptr };
+    remixapi_HMODULE   m_RemixDLL { nullptr };
     remixapi_Interface m_CInterface {};
 
     // Functions
@@ -183,6 +183,7 @@ namespace remix {
     Result< remixapi_MeshHandle >     CreateMesh(const remixapi_MeshInfo& info);
     Result< void >                    DestroyMesh(remixapi_MeshHandle handle);
     Result< void >                    SetupCamera(const remixapi_CameraInfo& info);
+    Result< void >                    SetCameraMediumMaterial(remixapi_MaterialHandle medium);
     Result< void >                    DrawInstance(const remixapi_InstanceInfo& info);
     Result< remixapi_LightHandle >    CreateLight(const remixapi_LightInfo& info);
     Result< void >                    DestroyLight(remixapi_LightHandle handle);
@@ -190,11 +191,11 @@ namespace remix {
     Result< void >                    SetConfigVariable(const char* key, const char* value);
 
     // DXVK interoperability
-    Result< ID3D11Device* >                  dxvk_CreateD3D11Device(bool editorModeEnabled = false);
-    Result< void >                           dxvk_RegisterD3D11Device(ID3D11Device* d3d11Device);
+    Result< IDirect3D11Ex* >                  dxvk_CreateD3D11(bool editorModeEnabled = false);
+    Result< void >                           dxvk_RegisterD3D11Device(IDirect3DDevice9Ex* d3d11Device);
     Result< detail::dxvk_ExternalSwapchain > dxvk_GetExternalSwapchain();
-    Result< detail::dxvk_VkImage >           dxvk_GetVkImage(ID3D11Texture2D* source);
-    Result< void >                           dxvk_CopyRenderingOutput(ID3D11Texture2D* destination,
+    Result< detail::dxvk_VkImage >           dxvk_GetVkImage(IDirect3DSurface9* source);
+    Result< void >                           dxvk_CopyRenderingOutput(IDirect3DSurface9* destination,
                                                                       remixapi_dxvk_CopyRenderingOutputType type);
     Result< void >                           dxvk_SetDefaultOutput(remixapi_dxvk_CopyRenderingOutputType type,
                                                                    const remixapi_Float4D& color);
@@ -206,13 +207,14 @@ namespace remix {
                                                                    uint8_t colorR, uint8_t colorG, uint8_t colorB);
   };
 
+#ifndef REMIX_WINAPI_NO_LIBRARY_LOADER
   namespace lib {
     // Helper function to load a .dll of Remix, and initialize it.
-    // remixD3D11DllPath is a path to .dll file, e.g. "C:\dxvk-remix-nv\public\bin\d3d11.dll"
+    // pRemixD3D11DllPath is a path to .dll file, e.g. "C:\dxvk-remix-nv\public\bin\d3d11.dll"
     [[nodiscard]] inline Result< Interface > loadRemixDllAndInitialize(const std::filesystem::path& remixD3D11DllPath) {
 
       remixapi_Interface interfaceInC = {};
-      HMODULE remixDll = nullptr;
+      remixapi_HMODULE remixDll = nullptr;
 
       remixapi_ErrorCode status =
         remixapi_lib_loadRemixDllAndInitialize(remixD3D11DllPath.c_str(),
@@ -223,7 +225,7 @@ namespace remix {
         return status;
       }
 
-      static_assert(sizeof(remixapi_Interface) == 168,
+      static_assert(sizeof(remixapi_Interface) == 176,
                     "Change version, update C++ wrapper when adding new functions");
 
       remix::Interface interfaceInCpp = {};
@@ -242,6 +244,7 @@ namespace remix {
       return remixapi_lib_shutdownAndUnloadRemixDll(&interfaceInCpp.m_CInterface, interfaceInCpp.m_RemixDLL);
     }
   }
+#endif // !REMIX_WINAPI_NO_LIBRARY_LOADER
 
 
 
@@ -702,6 +705,18 @@ namespace remix {
     return m_CInterface.SetupCamera(&info);
   }
 
+  inline Result< void > Interface::SetCameraMediumMaterial(remixapi_MaterialHandle medium) {
+    if (!m_CInterface.SetCameraMediumMaterial) {
+      return REMIXAPI_ERROR_CODE_NOT_INITIALIZED;
+    }
+
+    remixapi_CameraMediumInfo info {};
+    info.sType = REMIXAPI_STRUCT_TYPE_CAMERA_MEDIUM_INFO;
+    info.pNext = nullptr;
+    info.medium = medium;
+    return m_CInterface.SetCameraMediumMaterial(&info);
+  }
+
 
 
   struct InstanceInfoBoneTransformsEXT : remixapi_InstanceInfoBoneTransformsEXT {
@@ -1016,16 +1031,16 @@ namespace remix {
     };
   }
 
-  inline Result< ID3D11Device* > Interface::dxvk_CreateD3D11Device(bool editorModeEnabled) {
-    ID3D11Device* d3d11 { nullptr };
-    remixapi_ErrorCode status = m_CInterface.dxvk_CreateD3D11Device(editorModeEnabled, &d3d11);
+  inline Result< IDirect3D11Ex* > Interface::dxvk_CreateD3D11(bool editorModeEnabled) {
+    IDirect3D11Ex* d3d11 { nullptr };
+    remixapi_ErrorCode status = m_CInterface.dxvk_CreateD3D11(editorModeEnabled, &d3d11);
     if (status != REMIXAPI_ERROR_CODE_SUCCESS) {
       return status;
     }
     return d3d11;
   }
 
-  inline Result< void > Interface::dxvk_RegisterD3D11Device(ID3D11Device* d3d11Device) {
+  inline Result< void > Interface::dxvk_RegisterD3D11Device(IDirect3DDevice9Ex* d3d11Device) {
     return m_CInterface.dxvk_RegisterD3D11Device(d3d11Device);
   }
 
@@ -1041,7 +1056,7 @@ namespace remix {
     return externalSwapchain;
   }
 
-  inline Result< detail::dxvk_VkImage > Interface::dxvk_GetVkImage(ID3D11Texture2D* source) {
+  inline Result< detail::dxvk_VkImage > Interface::dxvk_GetVkImage(IDirect3DSurface9* source) {
     detail::dxvk_VkImage externalImage {};
     remixapi_ErrorCode status = m_CInterface.dxvk_GetVkImage(source, &externalImage.vkImage);
     if (status != REMIXAPI_ERROR_CODE_SUCCESS) {
@@ -1051,7 +1066,7 @@ namespace remix {
   }
 
   inline Result< void > Interface::dxvk_CopyRenderingOutput(
-      ID3D11Texture2D* destination, remixapi_dxvk_CopyRenderingOutputType type) {
+      IDirect3DSurface9* destination, remixapi_dxvk_CopyRenderingOutputType type) {
     return m_CInterface.dxvk_CopyRenderingOutput(destination, type);
   }
 

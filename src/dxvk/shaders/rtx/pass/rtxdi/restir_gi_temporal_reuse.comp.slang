@@ -200,7 +200,7 @@ void main(int2 thread_id : SV_DispatchThreadID)
   vec4 prevNDC = mul(camera.prevWorldToProjection, vec4(prevVirtualWorldPosition, 1.0f));
   prevNDC.xyz /= prevNDC.w;
   float2 prevPixelCenter = cameraNDCToScreenUV(camera, prevNDC.xy) * vec2(camera.resolution);
-  float2 expectedPrevHitDistance = length(prevVirtualWorldPosition - cameraGetPreviousWorldPosition(camera).xyz);
+  float2 expectedPrevHitDistance = calculateExpectedPreviousHitDistance(camera, prevVirtualWorldPosition);
   float viewDirectionDotTriangleNormal = abs(dot(surface.minimalRayInteraction.viewDirection, surface.minimalSurfaceInteraction.triangleNormal));
   float2 depthThreshold = 0.01 / max(viewDirectionDotTriangleNormal, 0.01);
   float normalThreshold = lerp(0.995, 0.5, surface.opaqueSurfaceMaterialInteraction.isotropicRoughness);
@@ -210,10 +210,10 @@ void main(int2 thread_id : SV_DispatchThreadID)
   if (cb.enableReSTIRGIReflectionReprojection > 0 && surface.portalSpace == PORTAL_SPACE_NONE)
   {
     float roughWeight = 1.0 - surface.opaqueSurfaceMaterialInteraction.isotropicRoughness;
-    const float16_t normalDotOutputDirection = dot(surface.opaqueSurfaceMaterialInteraction.shadingNormal, surface.minimalRayInteraction.viewDirection);
-    const float16_t albedoLuminance = calcBt709Luminance(surface.opaqueSurfaceMaterialInteraction.albedo);
-    const f16vec3 fresnel = evalOpaqueSchlickFresnel(surface.opaqueSurfaceMaterialInteraction.baseReflectivity, normalDotOutputDirection);
-    const float16_t fresnelLuminance = calcBt709Luminance(fresnel);
+    const float normalDotOutputDirection = dot(surface.opaqueSurfaceMaterialInteraction.shadingNormal, surface.minimalRayInteraction.viewDirection);
+    const float albedoLuminance = calcBt709Luminance(surface.opaqueSurfaceMaterialInteraction.albedo);
+    const vec3 fresnel = evalOpaqueSchlickFresnel(surface.opaqueSurfaceMaterialInteraction.baseReflectivity, normalDotOutputDirection);
+    const float fresnelLuminance = calcBt709Luminance(fresnel);
     float specularWeight = fresnelLuminance / (fresnelLuminance + albedoLuminance);
     reflectionWeight = specularWeight * roughWeight;
   }
@@ -228,7 +228,7 @@ void main(int2 thread_id : SV_DispatchThreadID)
   {
     float3 worldPos = surface.minimalSurfaceInteraction.position;
     float3 viewVector = -surface.minimalRayInteraction.viewDirection;
-    f16vec3 surfaceNormal = surface.opaqueSurfaceMaterialInteraction.shadingNormal;
+    vec3 surfaceNormal = surface.opaqueSurfaceMaterialInteraction.shadingNormal;
     float3 reflectionVector = reflect(viewVector, surfaceNormal);
 
     // Calculate reflection hit T
@@ -303,7 +303,7 @@ void main(int2 thread_id : SV_DispatchThreadID)
   tparams.prevPixelCenter = prevPixelCenter;
   tparams.prevBackupPixelCenter = prevBackupPixelCenter;
   tparams.resolution = cb.camera.resolution;
-  tparams.expectedPrevHitDistance = vec2(expectedPrevHitDistance);
+  tparams.expectedPrevHitDistance = expectedPrevHitDistance;
   tparams.normalThreshold = normalThreshold;
   tparams.depthThreshold = depthThreshold;
   tparams.virtualMotionVector = virtualMotionVector;

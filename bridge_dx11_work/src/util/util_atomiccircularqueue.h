@@ -179,8 +179,8 @@ namespace bridge_util {
       return currentWrite == m_read->load(std::memory_order_acquire);
     }
 
-    std::vector<Commands::D3D9Command> buildQueueData(int maxQueueElements, int currentIndex) {
-      std::vector<Commands::D3D9Command> commandHistory;
+    std::vector<Commands::D3D11Command> buildQueueData(int maxQueueElements, int currentIndex) {
+      std::vector<Commands::D3D11Command> commandHistory;
       int itemCount = 0;
       while (itemCount < m_queueSize && itemCount < maxQueueElements) {
         // To prevent adding default commands in the Queue to the command list
@@ -193,13 +193,13 @@ namespace bridge_util {
       return commandHistory;
     }
 
-    std::vector<Commands::D3D9Command> getWriterQueueData(int maxQueueElements=10) {
+    std::vector<Commands::D3D11Command> getWriterQueueData(int maxQueueElements=10) {
       const auto currentRead = m_read->load(std::memory_order_relaxed);
       int currentIndex = queueIdxDec(currentRead);
       return buildQueueData(maxQueueElements, currentIndex);
     }
 
-    std::vector<Commands::D3D9Command> getReaderQueueData(int maxQueueElements = 10) {
+    std::vector<Commands::D3D11Command> getReaderQueueData(int maxQueueElements = 10) {
       const auto currentWrite = m_write->load(std::memory_order_relaxed);
       int currentIndex = queueIdxDec(currentWrite);
       return buildQueueData(maxQueueElements, currentIndex);

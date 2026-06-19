@@ -20,7 +20,7 @@
 * DEALINGS IN THE SOFTWARE.
 */
 #include "rtx_draw_call_cache.h"
-#include "rtx_cb_types.h"
+#include "../d3d11/d3d11_state.h"
 
 namespace dxvk 
 {

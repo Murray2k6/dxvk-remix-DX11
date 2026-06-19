@@ -77,7 +77,7 @@ namespace dxvk {
       uint64_t offset;
       size_t size;
       assetData->placement(layer, 0, mipLevels_begin, offset, size);
-      // Calculate total size for all mips in the range
+      // TODO: optimize
       for (uint32_t n = mipLevels_begin + 1; n < mipLevels_end; n++) {
         uint64_t levelOffset;
         size_t levelSize;

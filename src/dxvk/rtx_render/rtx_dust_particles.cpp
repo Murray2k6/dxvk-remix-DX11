@@ -1,5 +1,5 @@
 /*
-* Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+* Copyright (c) 2025-2026, NVIDIA CORPORATION. All rights reserved.
 *
 * Permission is hereby granted, free of charge, to any person obtaining a
 * copy of this software and associated documentation files (the "Software"),
@@ -32,7 +32,7 @@
 #include <rtx_shaders/dust_particles_vertex.h>
 #include <rtx_shaders/dust_particles_fragment.h>
 #include "dxvk_context_state.h"
-#include "../util/util_globaltime.h"
+#include "../util/util_global_time.h"
 
 namespace dxvk {
 
@@ -84,6 +84,7 @@ namespace dxvk {
       ImGui::Indent();
 
       RemixGui::Checkbox("Enable", &enableObject());
+      ImGui::BeginDisabled(!enable());
 
       RemixGui::DragInt("Number of Particles", &numberOfParticlesObject(), 0.1f, 1, 100000000, "%d", ImGuiSliderFlags_AlwaysClamp);
 
@@ -108,10 +109,13 @@ namespace dxvk {
         RemixGui::DragFloat("Max Speed", &maxSpeedObject(), 0.01f, 0.f, 100.f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
 
         RemixGui::Checkbox("Simulate Turbulence", &useTurbulenceObject());
+        ImGui::BeginDisabled(!useTurbulence());
         RemixGui::DragFloat("Turbulence Amplitude", &turbulenceAmplitudeObject(), 0.01f, 0.f, 10.f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
         RemixGui::DragFloat("Turbulence Frequency", &turbulenceFrequencyObject(), 0.01f, 0.f, 10.f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+        ImGui::EndDisabled();
       }
       ImGui::Unindent();
+      ImGui::EndDisabled();
       ImGui::PopID();
     }
   }
@@ -199,9 +203,6 @@ namespace dxvk {
     ctx->bindShader(VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT, nullptr);
     ctx->bindShader(VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT, nullptr);
     ctx->bindShader(VK_SHADER_STAGE_GEOMETRY_BIT, nullptr);
-
-    // Note: Viewport and render target state will be restored by the caller
-    // via dxvkCtxState = stateCopy in simulateAndDraw
   }
 
 
@@ -281,10 +282,7 @@ namespace dxvk {
 
     ctx->bindCommonRayTracingResources(rtOutput);
 
-    // Save current viewport and render target state before setting up dust particle rendering
-    const uint32_t prevViewportCount = ctx->getCurrentViewportCount();
-    const DxvkViewportState prevViewportState = ctx->getCurrentViewportState();
-    const DxvkRenderTargets prevRenderTargets = ctx->getCurrentRenderTargets();
+    DxvkContextState stateCopy = dxvkCtxState;
 
     Resources& resourceManager = ctx->getResourceManager();
     Rc<DxvkSampler> linearSampler = resourceManager.getSampler(VK_FILTER_LINEAR, VK_SAMPLER_MIPMAP_MODE_NEAREST, VK_SAMPLER_ADDRESS_MODE_REPEAT);
@@ -311,8 +309,6 @@ namespace dxvk {
 
     ctx->draw(numberOfParticles(), 1, 0, 0);
 
-    // Restore viewport and render target state
-    ctx->setViewports(prevViewportCount, prevViewportState.viewports.data(), prevViewportState.scissorRects.data());
-    ctx->bindRenderTargets(prevRenderTargets);
+    dxvkCtxState = stateCopy;
   }
 }

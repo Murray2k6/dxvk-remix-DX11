@@ -1,18 +1,15 @@
 #pragma once
-
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-
-#include <windows.h>
-#include <winternl.h>
-#include <d3dkmthk.h>
+#include <dxgiformat.h>
+#include <dxgi.h>
+#include <d3d11.h>
 
 namespace dxvk {
+  using NTSTATUS = LONG;
+
   // Slightly modified definitions...
   struct D3DKMT_CREATEDCFROMMEMORY {
     void*         pMemory;
-    D3DDDIFORMAT  Format;
+    DXGI_FORMAT Format;
     UINT          Width;
     UINT          Height;
     UINT          Pitch;

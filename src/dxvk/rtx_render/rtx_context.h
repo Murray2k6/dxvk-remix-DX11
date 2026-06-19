@@ -20,7 +20,7 @@
 * DEALINGS IN THE SOFTWARE.
 */
 #pragma once
-
+#include "rtx/dx11/dx11_light_state.h"
 #include "../dxvk_context.h"
 #include "rtx_resources.h"
 #include "rtx_asset_exporter.h"
@@ -41,11 +41,8 @@ namespace dxvk {
   class TerrainBaker;
   struct ExternalDrawState;
 
-  struct RtxVertexCaptureData;
-  struct RtxVSConstants;
-  struct RtxPSConstants;
-  struct RtxSharedPS;
-  struct RtxLegacyLight;
+  struct D3D11RtxVertexCaptureData;
+  struct D3D11SharedPS;
   
   struct DrawParameters {
     uint32_t vertexCount = 0;
@@ -65,20 +62,6 @@ namespace dxvk {
   class RtxContext : public DxvkContext {
 
   public:
-        // Getter for current viewport state
-        const DxvkViewportState& getCurrentViewportState() const {
-          return m_state.vp;
-        }
-
-        // Getter for current render targets
-        const DxvkRenderTargets& getCurrentRenderTargets() const {
-          return m_state.om.renderTargets;
-        }
-
-        // Getter for viewport count (returns active viewport count from rasterizer state)
-        uint32_t getCurrentViewportCount() const {
-          return m_state.gp.state.rs.viewportCount();
-        }
     
     RtxContext(const Rc<DxvkDevice>& device);
     ~RtxContext();
@@ -108,13 +91,13 @@ namespace dxvk {
     void onPresent(Rc<DxvkImage> targetImage = nullptr);
 
     /**
-      * \brief Set VS/PS constant buffers for the RT pipeline.
+      * \brief Set D3D11 specific constant buffers
       *
-      * \param [in] vsConstantsSlot: resource idx of the VS constant buffer
-      * \param [in] psSharedStateSlot: resource idx of the PS shared state CB
+      * \param [in] vsFixedFunctionConstants: resource idx of the constant buffer for FF vertex shaders
+      * \param [in] psFixedFunctionConstants: resource idx of the constant buffer for FF pixel shaders
       * \param [in] vertexCaptureCB: constant buffer for vertex capture
       */
-    void setConstantBuffers(const uint32_t vsConstantsSlot, const uint32_t psSharedStateSlot, Rc<DxvkBuffer> vertexCaptureCB);
+    void setConstantBuffers(const uint32_t vsFixedFunctionConstants, const uint32_t psFixedFunctionConstants, Rc<DxvkBuffer> vertexCaptureCB);
 
     /**
       * \brief Adds a batch of lights to the scene context
@@ -122,7 +105,7 @@ namespace dxvk {
       * \param [in] pLights: array of light structures
       * \param [in] numLights: number of lights
       */
-    void addLights(const RtxLegacyLight* pLights, const uint32_t numLights);
+    void addLights(const Dx11LightDesc* pLights, const uint32_t numLights);
 
     void clearRenderTarget(const Rc<DxvkImageView>& imageView, VkImageAspectFlags clearAspects, VkClearValue clearValue);
     void clearImageView(const Rc<DxvkImageView>& imageView, VkOffset3D offset, VkExtent3D extent, VkImageAspectFlags aspect, VkClearValue value);
@@ -147,9 +130,9 @@ namespace dxvk {
     void getDenoiseArgs(NrdArgs& outPrimaryDirectNrdArgs, NrdArgs& outPrimaryIndirectNrdArgs, NrdArgs& outSecondaryNrdArgs);
     void updateRaytraceArgsConstantBuffer(Resources::RaytracingOutput& rtOutput, const VkExtent3D& downscaledExtent, const VkExtent3D& targetExtent);
 
-    RtxVertexCaptureData& allocAndMapVertexCaptureConstantBuffer();
-    RtxVSConstants& allocAndMapVSConstantBuffer();
-    RtxSharedPS& allocAndMapPSSharedStateConstantBuffer();
+    D3D11RtxVertexCaptureData& allocAndMapVertexCaptureConstantBuffer();
+    D3D11FixedFunctionVS& allocAndMapFixedFunctionVSConstantBuffer();
+    D3D11SharedPS& allocAndMapPSSharedStateConstantBuffer();
 
     static bool checkIsShaderExecutionReorderingSupported(DxvkDevice& device);
 
@@ -184,7 +167,6 @@ namespace dxvk {
       NIS,
       TAAU,
       XeSS,
-      FSR4,
       DLSS_RR,
     };
 
@@ -198,7 +180,8 @@ namespace dxvk {
 
     VkExtent3D setDownscaleExtent(const VkExtent3D& upscaleExtent);
 
-    VkExtent3D onFrameBegin(const VkExtent3D& upscaleExtent);
+    VkExtent3D onInjectRtxFrameBegin(const VkExtent3D& upscaleExtent);
+    void onInjectRtxFrameEnd(bool raytracedThisFrame);
 
     void dispatchVolumetrics(const Resources::RaytracingOutput& rtOutput);
     void dispatchIntegrate(const Resources::RaytracingOutput& rtOutput);
@@ -220,7 +203,6 @@ namespace dxvk {
     void dispatchObjectPicking(Resources::RaytracingOutput& rtOutput, const VkExtent3D& srcExtent, const VkExtent3D& targetExtent);
     void dispatchDLFG();
     void updateMetrics(const float gpuIdleTimeMilliseconds) const;
-
     void rasterizeToSkyMatte(const DrawParameters& params, const DrawCallState& drawCallState);
     void initSkyProbe();
     void rasterizeToSkyProbe(const DrawParameters& params, const DrawCallState& drawCallState);
@@ -253,13 +235,7 @@ namespace dxvk {
     bool shouldUseNIS() const;
     bool shouldUseTAA() const;
     bool shouldUseXeSS() const;
-    bool shouldUseFSR4() const;
-    bool shouldUseUpscaler() const { return shouldUseDLSS() || shouldUseNIS() || shouldUseTAA() || shouldUseXeSS() || shouldUseFSR4(); }
-    void updateAdaptivePathTracingPerformanceState() const;
-    bool isAdaptivePathTracingPerformanceActive() const;
-    bool isAdaptivePathTracingPerformanceSevere() const;
-    float getAdaptivePathTracingResolutionScaleLimit() const;
-    void logAdaptivePathTracingPerformanceState(bool active, bool severe, float resolutionScaleLimit) const;
+    bool shouldUseUpscaler() const { return shouldUseDLSS() || shouldUseNIS() || shouldUseTAA() || shouldUseXeSS(); }
 
     inline static bool s_triggerScreenshot = false;
     inline static bool s_triggerUsdCapture = false;
@@ -273,19 +249,14 @@ namespace dxvk {
     bool m_resetHistory = true;    // Discards use of temporal data in passes
 
     std::chrono::time_point<std::chrono::steady_clock> m_prevRunningTime;
-    uint64_t m_prevGpuIdleTicks;
+    uint64_t m_prevGpuIdleTicks = 0;
+    bool m_prevGpuIdleTicksInitialized = false;
 
     bool m_screenshotFrameEnabled = false;
     bool m_triggerDelayedTerminate = false;
     uint32_t m_screenshotFrameNum = -1;
     uint32_t m_terminateAppFrameNum = -1;
     uint32_t m_framesWithoutValidScene = 0;
-    uint32_t m_lastRaytracedSurfaceCount = 0;
-    mutable uint32_t m_adaptivePerformanceStateFrame = kInvalidFrameIndex;
-    mutable uint32_t m_adaptivePerformanceHoldFrames = 0;
-    mutable uint32_t m_adaptivePerformanceSevereHoldFrames = 0;
-    mutable bool m_adaptivePerformanceActiveCached = false;
-    mutable bool m_adaptivePerformanceSevereCached = false;
     IntegrateIndirectMode m_prevIntegrateIndirectMode = IntegrateIndirectMode::Count;
 
     DxvkRaytracingInstanceState m_rtState;

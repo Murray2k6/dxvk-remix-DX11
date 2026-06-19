@@ -200,12 +200,12 @@ public:
   // Waits for a command to appear in the command queue. Upon success the command will NOT be removed from queue
   // and client MUST pull the command header manually by using pop_front() or pull() methods. The queue will enter
   // into an unrecoverable state otherwise.
-  static bridge_util::Result waitForCommand(const Commands::D3D9Command& command = Commands::Bridge_Any,
+  static bridge_util::Result waitForCommand(const Commands::D3D11Command& command = Commands::Bridge_Any,
                                             DWORD overrideTimeoutMS = 0,
                                             std::atomic<bool>* const pbEarlyOutSignal = nullptr, bool verifyUID = false, UID uidToVerify=0);
   // Waits for a command to appear in the command queue. Upon success the command will be removed from the queue
   // and discarded.
-  static bridge_util::Result waitForCommandAndDiscard(const Commands::D3D9Command& command = Commands::Bridge_Any,
+  static bridge_util::Result waitForCommandAndDiscard(const Commands::D3D11Command& command = Commands::Bridge_Any,
                                                       DWORD overrideTimeoutMS = 0,
                                                       std::atomic<bool>* const pbEarlyOutSignal = nullptr, bool verifyUID = false, UID uidToVerify = 0) {
     auto result = waitForCommand(command, overrideTimeoutMS, pbEarlyOutSignal, verifyUID, uidToVerify);
@@ -217,13 +217,13 @@ public:
   
   class Command {
   public:
-    Command(const Commands::D3D9Command command) :
+    Command(const Commands::D3D11Command command) :
       Command(command, NULL) {
     }
-    Command(const Commands::D3D9Command command, uintptr_t pHandle) :
+    Command(const Commands::D3D11Command command, uintptr_t pHandle) :
       Command(command, pHandle, 0) {
     }
-    Command(const Commands::D3D9Command command,
+    Command(const Commands::D3D11Command command,
             uintptr_t pHandle,
             const Commands::Flags commandFlags);
     ~Command();
@@ -301,34 +301,34 @@ public:
       s_cmdCounter = 0;
     }
     
-    static inline void print_data(std::string prefix, std::vector<Commands::D3D9Command>& commandList)       {
+    static inline void print_data(std::string prefix, std::vector<Commands::D3D11Command>& commandList)       {
       for (const auto& currentCommand : commandList) {
         Logger::info(prefix + toString(currentCommand));
       }
     }
 
     static inline void print_writer_data_sent() {
-      std::vector<Commands::D3D9Command> resultCommands = s_pWriterChannel->commands->getWriterQueueData();
+      std::vector<Commands::D3D11Command> resultCommands = s_pWriterChannel->commands->getWriterQueueData();
       print_data("Command sent: ", resultCommands);
     }
 
     static inline void print_writer_data_received() {
-      std::vector<Commands::D3D9Command> resultCommands = s_pWriterChannel->commands->getReaderQueueData();
+      std::vector<Commands::D3D11Command> resultCommands = s_pWriterChannel->commands->getReaderQueueData();
       print_data("Command received: ", resultCommands);
     }
 
     static inline void print_reader_data_sent() {
-      std::vector<Commands::D3D9Command> resultCommands = s_pReaderChannel->commands->getWriterQueueData();
+      std::vector<Commands::D3D11Command> resultCommands = s_pReaderChannel->commands->getWriterQueueData();
       print_data("Command sent: ", resultCommands);
     }
 
     static inline void print_reader_data_received() {
-      std::vector<Commands::D3D9Command> resultCommands = s_pReaderChannel->commands->getReaderQueueData();
+      std::vector<Commands::D3D11Command> resultCommands = s_pReaderChannel->commands->getReaderQueueData();
       print_data("Command received: ", resultCommands);
     }
 
   private:
-    const Commands::D3D9Command m_command;
+    const Commands::D3D11Command m_command;
     const uint32_t m_handle;
     const Commands::Flags m_commandFlags;
   };

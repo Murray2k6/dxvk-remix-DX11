@@ -26,12 +26,11 @@
 #include "../../util/thread.h"
 #include "dxvk_context.h"
 #include "dxvk_device.h"
-#include "rtx_render/rtx_shader_manager.h"
-#include "rtx_render/rtx_texture_manager.h"
+#include "rtx_shader_manager.h"
+#include "rtx_texture_manager.h"
 #include "rtx_io.h"
 #include "dxvk_raytracing.h"
 #include "rtx_debug_view.h"
-#include <chrono>
 
 namespace dxvk {
   RtxInitializer::RtxInitializer(DxvkDevice* device)
@@ -63,12 +62,9 @@ namespace dxvk {
         env::getEnvVar("DXVK_GRAPHICS_PRESET_TYPE") != "0") {
       const DxvkDeviceInfo& deviceInfo = m_device->adapter()->devicePropertiesExt();
 
-      RtxOptions::updateUpscalerFromDlssPreset(m_device);
+      RtxOptions::updateUpscalerFromDlssPreset();
       RtxOptions::updateGraphicsPresets(m_device);
       RtxOptions::updateRaytraceModePresets(deviceInfo.core.properties.vendorID, deviceInfo.khrDeviceDriverProperties.driverID);
-      
-      // Detect game engine and apply engine-specific settings
-      RtxOptions::detectEngineAndApplySettings(m_device);
     } else {
       // Default, init to custom unless otherwise specified
       if (RtxOptions::graphicsPreset() == GraphicsPreset::Auto) {
@@ -83,27 +79,17 @@ namespace dxvk {
     }
 
     // Configure shader manager to understand bindless layouts
-    Logger::info("[RTX-Init] phase: configuring bindless layouts");
     ShaderManager::getInstance()->addGlobalExtraLayout(pCommon->getSceneManager().getBindlessResourceManager().getGlobalBindlessTableLayout(BindlessResourceManager::Buffers));
     ShaderManager::getInstance()->addGlobalExtraLayout(pCommon->getSceneManager().getBindlessResourceManager().getGlobalBindlessTableLayout(BindlessResourceManager::Textures));
     ShaderManager::getInstance()->addGlobalExtraLayout(pCommon->getSceneManager().getBindlessResourceManager().getGlobalBindlessTableLayout(BindlessResourceManager::Samplers));
 
     // Need to promote all of the hardware support Options before prewarming shaders.
-    Logger::info("[RTX-Init] phase: applying pending option values");
     RtxOptionManager::applyPendingValues(m_device, /* forceOnChange */ true);
 
-    // The earlier updateGraphicsPresets call was a no-op because RtxOptions was not yet
-    // constructed (isInitialized()==false). Now that applyPendingValues has fully initialized
-    // the options system with the real device, run it explicitly so GPU-based preset detection
-    // (Intel, AMD, NVIDIA, or any other vendor) fires correctly on first launch.
-    RtxOptions::updateGraphicsPresets(m_device);
-
     // Kick off shader prewarming
-    Logger::info("[RTX-Init] phase: starting shader prewarm");
     startPrewarmShaders();
 
     // Load assets (if any) as early as possible
-    Logger::info("[RTX-Init] phase: loading assets");
     if (RtxOptions::asyncAssetLoading()) {
       // Async asset loading (USD)
       m_asyncAssetLoadThread = dxvk::thread([this] {
@@ -113,16 +99,13 @@ namespace dxvk {
     } else {
       loadAssets();
     }
-    Logger::info("[RTX-Init] phase: initializing DLSS/DLFG meta objects");
     pCommon->metaDLSS(); // Lazy allocator triggers init in ctor
     pCommon->metaDLFG();
 
     if (!asyncShaderFinalizing()) {
       // Wait for all prewarming to complete before calling "RTX initialized"
-      Logger::info("[RTX-Init] phase: waiting for shader prewarm to finish");
       waitForShaderPrewarm();
     }
-    Logger::info("[RTX-Init] phase: initialize() complete");
   }
 
   void RtxInitializer::release() {
@@ -155,17 +138,15 @@ namespace dxvk {
   void RtxInitializer::startPrewarmShaders() {
     // If we want to run without shader prewarming, then pipelines will be built inline with other GPU work on first use (typically means
     // long stutters whenever a yet to be compiled pipeline comes into use).
-    if (!asyncShaderPrewarming()) {
+    if (!asyncShaderPrewarming()
+        // WAR: Shader prewarming caused a deadlock on AMD in the past so it is forcibly disabled, should re-evaluate this at some point.
+        || m_device->properties().core.properties.vendorID == static_cast<uint32_t>(DxvkGpuVendor::Amd)) {
       return;
     }
 
     DxvkObjects* pCommon = m_device->getCommon();
 
-    Logger::info("[ShaderPrewarm] Scheduling explicit Remix path-tracing prewarm passes.");
-
-    // Prewarm the exact path-tracing passes Remix can hit on the first real scene frame.
-    // RayQuery modes are compute pipelines too, but relying only on the automatic compute
-    // registry can miss current pass variants and move the compile stall into Present.
+    // Prewarm all the shaders we'll need for RT by registering them (per-pass) with the driver
     pCommon->metaPathtracerGbuffer().prewarmShaders(pCommon->pipelineManager());
     pCommon->metaPathtracerIntegrateDirect().prewarmShaders(pCommon->pipelineManager());
     pCommon->metaPathtracerIntegrateIndirect().prewarmShaders(pCommon->pipelineManager());
@@ -181,31 +162,9 @@ namespace dxvk {
       return;
     }
 
-    // Wait for all shader prewarming to complete.  Log progress every
-    // second so we can diagnose hangs in the "Compiling shaders..."
-    // state, and bail out with a clear log after 120s instead of
-    // deadlocking the caller (which, with asyncShaderFinalizing=false,
-    // is the device-init thread invoked from the game's splash-screen
-    // present path).
-    auto& pm = m_device->getCommon()->pipelineManager();
-    const auto start = std::chrono::steady_clock::now();
-    uint32_t lastLogSec = 0;
-    while (pm.isCompilingShaders()) {
+    // Wait for all shader prewarming to complete
+    while (m_device->getCommon()->pipelineManager().isCompilingShaders()) {
       Sleep(1);
-      const auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
-        std::chrono::steady_clock::now() - start).count();
-      if (elapsed >= 120) {
-        Logger::err(str::format(
-          "[ShaderPrewarm] timed out after 120s; remix shaders still in flight=",
-          pm.remixShaderCompilationCount(), " — giving up to avoid splash deadlock"));
-        break;
-      }
-      if (static_cast<uint32_t>(elapsed) != lastLogSec) {
-        lastLogSec = static_cast<uint32_t>(elapsed);
-        Logger::info(str::format(
-          "[ShaderPrewarm] still compiling... t=", lastLogSec,
-          "s remixInFlight=", pm.remixShaderCompilationCount()));
-      }
     }
 
     DxvkRaytracingPipeline::releaseFinalizer();

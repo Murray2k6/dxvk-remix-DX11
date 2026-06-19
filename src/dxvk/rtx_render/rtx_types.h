@@ -20,7 +20,7 @@
 * DEALINGS IN THE SOFTWARE.
 */
 #pragma once
-
+#include "rtx/dx11/dx11_material_fog_state.h"
 #include "rtx_constants.h"
 #include "rtx_utils.h"
 #include "rtx_materials.h"
@@ -32,6 +32,7 @@
 #include "../../util/util_spatial_map.h"
 
 #include <inttypes.h>
+#include <memory>
 #include <vector>
 #include <future>
 
@@ -44,21 +45,11 @@ class RtCamera;
 class RtInstance;
 struct RtLight;
 class GraphInstance;
-struct RtxVSConstants;
-struct RtxPSConstants;
+struct D3D11FixedFunctionVS;
+struct D3D11FixedFunctionPS;
+struct DrawCallState;
+struct AssetReplacement;
 struct ReplacementInstance;
-
-struct ShaderProgramInfo {
-  uint32_t m_majorVersion = 0;
-  uint32_t m_minorVersion = 0;
-
-  ShaderProgramInfo() = default;
-  ShaderProgramInfo(uint32_t major, uint32_t minor)
-    : m_majorVersion{major}, m_minorVersion{minor} {}
-
-  uint32_t majorVersion() const { return m_majorVersion; }
-  uint32_t minorVersion() const { return m_minorVersion; }
-};
 
 using RasterBuffer = GeometryBuffer<Raster>;
 using RaytraceBuffer = GeometryBuffer<Raytrace>;
@@ -118,29 +109,120 @@ std::ostream& operator << (std::ostream& os, PrimInstance::Type type);
 
 struct ReplacementInstance {
   // Lifecycle note:
-  // Currently, ReplacementInstances are created the first time a given replaced draw call
-  // is rendered.  A single entity (a light or instance) is designated as the 'root'.
-  // When that entity is destroyed, the ReplacementInstance is destroyed.
-  // Unfortunately, lights and instances aren't always destroyed at the same time, or
-  // in the same order they were created.  To accomodate that, when non-root entities
-  // are deleted, they remove themselves from the `entities` vector.  Similarly, when
-  // the root is deleted, all entities remaining in the vector will have their pointer
-  // to the ReplacementInstance set to nullptr.
-  // TODO(REMIX-4226): In the future, draw calls should be tracked and destroyed based
-  // on the pre-replacement draw call, so that everything in a ReplacementInstance gets
-  // destroyed at the same time.  When that change is made, the original tracked draw
-  // call should own this ReplacementInstance.
+  // All ReplacementInstances are owned by DrawCallTracker and tracked via two-level hash
+  // lookup (identity hash + tracking hash + proximity). PrimInstanceOwner stores a non-owning
+  // pointer; DrawCallTracker::destroyReplacementInstance() handles destruction.
 
   static constexpr uint32_t kInvalidReplacementIndex = UINT32_MAX;
 
+  // Bundled hash/position/transform parameters used to look up or create a
+  // ReplacementInstance. Constructed by callers from whatever source they have
+  // (DrawCallState, D3DLIGHT9, ExternalDrawState).
+  struct LookupKey {
+    XXH64_hash_t identityHash;
+    // The hash to identify which spatial map to search for the replacementInstance.
+    XXH64_hash_t spatialMapHash;
+    XXH64_hash_t materialHash;
+    XXH64_hash_t vertexPositionHash;
+    Vector3 worldPos;
+    Matrix4 transform;
+  };
+
+  ReplacementInstance() = delete;
+
+  ReplacementInstance(const LookupKey& key, uint32_t newId, uint32_t frameId);
+
+  // Bit indices describing which fields of this RI changed in the most recent
+  // submission relative to the previously cached data. Computed immediately
+  // after a drawcall is matched to a ReplacementInstance.
+  //
+  // Note: distinct from boundingBoxDirty. That flag is a "pending work" signal
+  // set externally and cleared by the consumer (recalculateBoundingBox).
+  // dirtyFlags is a snapshot of "what changed in the last update", overwritten
+  // on the next submission. Different semantics, different lifetimes.
+  enum class DirtyFlag : uint32_t {
+    Transform,
+    VertexPosHash,
+    MaterialHash,
+    Any,           // Catch-all bit that is set if anything at all has changed
+  };
+  using DirtyFlags = Flags<DirtyFlag>;
+
   ~ReplacementInstance();
 
+  // Mark all prim entities for GC, drop the prim/root slots, reset cached
+  // aggregate bounding boxes, and clear activeReplacements. Returns the RI to
+  // the same shape it had immediately after construction.
   void clear();
 
   std::vector<PrimInstance> prims;
   PrimInstance root;
 
-  void setup(PrimInstance newRoot, size_t numPrims);
+  // Reset the RI and re-initialize it with the given root, prim count, and
+  // tracking pointer to the replacement vector that owns those prims (pass
+  // nullptr for non-replacement contexts -- e.g. standalone draws or external
+  // mesh submissions). The stored pointer is used by drawReplacements to
+  // detect when the underlying replacement data has changed across frames.
+  void setup(PrimInstance newRoot, size_t numPrims,
+             const std::vector<AssetReplacement>* replacements);
+
+  // Frame-to-frame tracking fields (used by SceneManager two-level lookup)
+  uint32_t id = 0;
+  XXH64_hash_t identityHash = kEmptyHash;
+  XXH64_hash_t spatialMapHash = kEmptyHash;
+  XXH64_hash_t materialHash = kEmptyHash;
+  XXH64_hash_t vertexPositionHash = kEmptyHash;
+  Vector3 centroid = Vector3(0.f);
+  uint32_t frameCreated = 0;
+  uint32_t frameLastSeen = 0;
+  XXH64_hash_t spatialCacheTransformHash = kEmptyHash;
+  XXH64_hash_t materialSpatialCacheTransformHash = kEmptyHash;
+
+  // Pointer to the replacement data this RI was set up with. Used to detect when
+  // replacements change (async load, hot reload) and the RI needs reinitialization.
+  const std::vector<AssetReplacement>* activeReplacements = nullptr;
+
+  // Draw call properties that affect anti-culling GC decisions.
+  // Set from the original DrawCallState each time the RI is matched.
+  // Stored as raw bits because CategoryFlags is defined later in this file.
+  uint32_t categoryFlags = 0;
+  bool isSkinned = false;
+
+  // When true, the aggregate object-space bounding boxes (geometryBoundingBox,
+  // lightBoundingBox) will be recomputed from the replacement mesh/light data
+  // on the next drawReplacements call. Defaults to true so the initial frame
+  // computes the AABB. Set back to true by clear() or dirtyBoundingBox().
+  bool boundingBoxDirty = true;
+
+  void dirtyBoundingBox() { boundingBoxDirty = true; }
+
+  // Recompute the aggregate object-space bounding boxes from the replacement data,
+  // if boundingBoxDirty is set. Always updates objectToWorld (the game object may
+  // move each frame). Clears boundingBoxDirty after computation.
+  // originalGeometryBBox is the original draw call's geometry bbox, used for
+  // includeOriginal replacements (pass nullptr when there is no original geometry,
+  // e.g. light-only replacements in addLight).
+  void recalculateBoundingBox(const Matrix4& newObjectToWorld,
+                              const std::vector<AssetReplacement>& replacements,
+                              const AxisAlignedBoundingBox* originalGeometryBBox = nullptr);
+
+  // Anti-culling bounding boxes, both in the space defined by objectToWorld.
+  // For mesh draw calls, this is the original draw call's object space.
+  // For light replacements, this is the D3D11 light's local space.
+  // objectToWorld transforms these to world space for the frustum check.
+  // geometryBoundingBox covers mesh geometry (checked against main camera frustum).
+  // lightBoundingBox covers light positions expanded by radius (checked against
+  // the wider light anti-culling frustum). If either check passes, the RI is kept alive.
+  AxisAlignedBoundingBox geometryBoundingBox;
+  AxisAlignedBoundingBox lightBoundingBox;
+  Matrix4 objectToWorld;
+
+  // Snapshot of which fields of this RI changed in the most recent submission.
+  // Initialized by setup() (all bits set, so the first frame's update runs every
+  // step) and updated by findOrCreateReplacementInstance on each subsequent
+  // match. Used downstream to gate update work and to identify animated
+  // entities for anti-culling.
+  DirtyFlags dirtyFlags;
 };
 
 // Wrapper utility to share the code for handling replacementInstance ownership.
@@ -162,7 +244,6 @@ public:
 
   bool isRoot(const void* owner) const;
   void setReplacementInstance(ReplacementInstance* replacementInstance, size_t replacementIndex, void* owner, PrimInstance::Type type);
-  ReplacementInstance* getOrCreateReplacementInstance(void* owner, PrimInstance::Type type, size_t index, size_t numPrims);
   ReplacementInstance* getReplacementInstance() const { return m_replacementInstance; }
   size_t getReplacementIndex() const { return m_replacementIndex; }
   bool isSubPrim() const {
@@ -479,11 +560,14 @@ struct DrawCallTransforms {
   Matrix4 worldToView = Matrix4();
   Matrix4 viewToProjection = Matrix4();
   Matrix4 textureTransform = Matrix4();
-  bool usedViewportFallbackProjection = false;
   bool enableClipPlane = false;
+  // DX11_V225: set by the DX11 layer when the projection came from a synthesized
+  // viewport fallback (no real game projection yet). Read by d3d11_rtx heuristics
+  // and CameraManager so fallback frames are not treated as a stable scene camera.
+  bool usedViewportFallbackProjection = false;
   Vector4 clipPlane{ 0.f };
   TexGenMode texgenMode = TexGenMode::None;
-  const std::vector<Matrix4>* instancesToObject = nullptr;
+  std::shared_ptr<const std::vector<Matrix4>> instancesToObject;
 
   void sanitize() {
     if (objectToWorld[3][3] == 0.f) objectToWorld[3][3] = 1.f;
@@ -500,18 +584,8 @@ struct DrawCallTransforms {
   }
 };
 
-// API-agnostic fog mode — D3D11 has no fog API; this is used by the
-// shared RTX backend to represent legacy fog state passed via constant buffers.
-enum class FogMode : uint32_t {
-  None   = 0,
-  Exp    = 1,
-  Exp2   = 2,
-  Linear = 3,
-};
-std::ostream& operator << (std::ostream& os, FogMode mode);
-
 struct FogState {
-  FogMode mode = FogMode::None;
+  uint32_t mode = DX11_FOG_NONE;
   Vector3 color = Vector3();
   float scale = 0.f;
   float end = 0.f;
@@ -555,6 +629,14 @@ enum class InstanceCategories : uint32_t {
 using CategoryFlags = Flags<InstanceCategories>;
 
 #define DECAL_CATEGORY_FLAGS InstanceCategories::DecalStatic, InstanceCategories::DecalDynamic, InstanceCategories::DecalSingleOffset, InstanceCategories::DecalNoOffset
+
+// DX11_V225: lightweight shader-model version (major.minor) recorded by the DX11
+// layer. D3D11 shaders are always SM 4.0+. Separate from the D3D11 DxsoProgramInfo
+// since the DX11 bridge does not have DXSO bytecode info.
+struct ShaderProgramInfo {
+  uint32_t majorVersion = 0;
+  uint32_t minorVersion = 0;
+};
 
 struct DrawCallState {
   DrawCallState() = default;
@@ -607,11 +689,14 @@ struct DrawCallState {
   // Camera type associated with the draw call
   CameraType::Enum cameraType = CameraType::Unknown;
 
-  // Uses programmable VS/PS
+  // Uses programmamble VS/PS
   bool usesVertexShader = false, usesPixelShader = false;
 
-  // Shader model version — valid only when usesVertex/PixelShader is set.
-  // D3D11 shaders are SM 4.0+; legacy games via Remix API may report SM 1-3.
+  // Contains valid values only if usesVertex/PixelShader is set
+  DxsoProgramInfo programmableVertexShaderInfo;
+  DxsoProgramInfo programmablePixelShaderInfo;
+
+  // DX11_V225: D3D11/DXGI shader-model version recorded by the DX11 layer.
   ShaderProgramInfo vertexShaderInfo;
   ShaderProgramInfo pixelShaderInfo;
 
@@ -704,7 +789,7 @@ struct DrawCallState {
 private:
   friend class RtxContext;
   friend class SceneManager;
-  friend class D3D11Rtx;
+  friend struct D3D11Rtx;
   friend class TerrainBaker;
   friend struct RemixAPIPrivateAccessor;
   friend class RtxParticleSystemManager;
@@ -719,7 +804,7 @@ private:
 
   RasterGeometry geometryData;
 
-  // Note: This represents the original material from the game frontend, which will always be a LegacyMaterialData
+  // Note: This represents the original material from the D3D11 side, which will always be a LegacyMaterialData
   // whereas the replacement material data used for rendering will be a full MaterialData.
   LegacyMaterialData materialData;
 
@@ -750,6 +835,11 @@ struct PooledBlas : public RcObject {
   VkAccelerationStructureBuildGeometryInfoKHR buildInfo = {};
   std::vector<uint32_t> primitiveCounts {};
 
+  // Content hash of the geometry data that was last built into this BLAS.
+  // When the merged BLAS content (geometry addresses + primitive counts) is
+  // unchanged, the GPU build can be skipped entirely.
+  XXH64_hash_t contentHash = kEmptyHash;
+
   explicit PooledBlas();
   ~PooledBlas();
 };
@@ -761,7 +851,7 @@ struct BlasEntry {
   //  - Data can be made alive on CPU for longer with an explicit ref hold on it
   //  - For shader based games the data may contain various unsupported formats a game might deliver the data in. 
   //    That is converted and optimized in RtxGeometryUtils::interleaveGeometry. 
-  //    Legacy pipeline games always use supported buffer formats/encodings etc...
+  //    Fixed function games always use supported buffer formats/encodings etc...
   DrawCallState input; 
   // modifiedGeometryData contains the same geometry as "input" but it (may) have been transformed (i.e.interleaved vertex data, 
   // converted to optimal vertex formats [we prefer float32], will always be a triangle list and could be skinned)
@@ -777,8 +867,6 @@ struct BlasEntry {
 
   // Frame when the vertex data of this geometry was last updated, used to detect static geometries
   uint32_t frameLastUpdated = kInvalidFrameIndex;
-
-  using InstanceMap = SpatialMap<RtInstance>;
 
   Rc<PooledBlas> dynamicBlas = nullptr;
 
@@ -818,10 +906,6 @@ struct BlasEntry {
   void unlinkInstance(RtInstance* instance);
 
   const std::vector<RtInstance*>& getLinkedInstances() const { return m_linkedInstances; }
-  InstanceMap& getSpatialMap() { return m_spatialMap; }
-  const InstanceMap& getSpatialMap() const { return m_spatialMap; }
-
-  void rebuildSpatialMap();
 
   void printDebugInfo(const char* name = "") const {
 #ifdef REMIX_DEVELOPMENT
@@ -856,7 +940,6 @@ struct BlasEntry {
 
 private:
   std::vector<RtInstance*> m_linkedInstances;
-  InstanceMap m_spatialMap;
   std::unordered_map<XXH64_hash_t, LegacyMaterialData> m_materials;
 };
 
@@ -882,7 +965,7 @@ enum class RtxGeometryStatus {
 };
 
 struct DxvkRaytracingInstanceState {
-  Rc<DxvkBuffer> vsConstantsCB;
+  Rc<DxvkBuffer> vsFixedFunctionCB;
   Rc<DxvkBuffer> psSharedStateCB;
   Rc<DxvkBuffer> vertexCaptureCB;
 };

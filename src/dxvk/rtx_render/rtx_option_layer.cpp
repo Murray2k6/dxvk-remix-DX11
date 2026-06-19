@@ -25,12 +25,8 @@
 #include "../util/util_env.h"
 #include "../util/log/log.h"
 
-#include <algorithm>
-#include <cctype>
-#include <filesystem>
 #include <iomanip>
 #include <sstream>
-#include <system_error>
 
 namespace {
   // Helper to split comma-separated paths into a vector
@@ -49,141 +45,17 @@ namespace {
     return result;
   }
 
-  std::string comparablePath(std::string path) {
-    std::replace(path.begin(), path.end(), '/', '\\');
-    std::transform(path.begin(), path.end(), path.begin(), [](unsigned char c) {
-      return static_cast<char>(std::tolower(c));
-    });
-    return path;
-  }
-
-  std::string normalizePath(const std::filesystem::path& path) {
-    std::error_code ec;
-    std::filesystem::path normalized = path;
-    if (normalized.is_relative()) {
-      normalized = std::filesystem::absolute(normalized, ec);
-      if (ec) {
-        normalized = path;
-        ec.clear();
-      }
-    }
-    return normalized.lexically_normal().string();
-  }
-
-  void addUniquePath(std::vector<std::string>& paths, const std::filesystem::path& path) {
-    if (path.empty()) {
-      return;
-    }
-
-    const std::string normalized = normalizePath(path);
-    const std::string comparable = comparablePath(normalized);
-    for (const std::string& existing : paths) {
-      if (comparablePath(existing) == comparable) {
-        return;
-      }
-    }
-
-    paths.push_back(normalized);
-  }
-
-  bool isExistingConfigFile(const std::string& path) {
-    std::error_code ec;
-    return std::filesystem::is_regular_file(std::filesystem::path(path), ec);
-  }
-
-  bool isExistingDirectory(const std::filesystem::path& path) {
-    std::error_code ec;
-    return !path.empty() && std::filesystem::is_directory(path, ec);
-  }
-
-  bool isRtxRemixDirectory(const std::filesystem::path& path) {
-    return comparablePath(path.filename().string()) == "rtx-remix";
-  }
-
-  void addConfigInDirectory(std::vector<std::string>& candidates, const std::filesystem::path& directory, const char* defaultFileName) {
-    if (isExistingDirectory(directory)) {
-      addUniquePath(candidates, directory / defaultFileName);
-    }
-  }
-
-  std::vector<std::string> defaultConfigCandidates(const char* defaultFileName) {
-    std::vector<std::string> candidates;
-    const std::filesystem::path defaultPath(defaultFileName);
-
-    if (defaultPath.is_absolute() || defaultPath.has_parent_path()) {
-      addUniquePath(candidates, defaultPath);
-      return candidates;
-    }
-
-    std::error_code ec;
-    const std::filesystem::path cwd = std::filesystem::current_path(ec);
-    if (!ec && !cwd.empty()) {
-      addConfigInDirectory(candidates, cwd, defaultFileName);
-    } else {
-      addUniquePath(candidates, defaultPath);
-    }
-
-    const std::string exePath = dxvk::env::getExePath();
-    if (!exePath.empty()) {
-      const std::filesystem::path exeDir = std::filesystem::path(exePath).parent_path();
-      if (!exeDir.empty()) {
-        addConfigInDirectory(candidates, exeDir, defaultFileName);
-        addConfigInDirectory(candidates, exeDir / "rtx-remix", defaultFileName);
-      }
-    }
-
-    const std::string dllDirString = dxvk::env::getDllDirectory();
-    if (!dllDirString.empty()) {
-      const std::filesystem::path dllDir(dllDirString);
-      const std::filesystem::path dllParent = dllDir.parent_path();
-      if (isRtxRemixDirectory(dllDir)) {
-        addConfigInDirectory(candidates, dllParent, defaultFileName);
-      }
-      addConfigInDirectory(candidates, dllDir, defaultFileName);
-    }
-
-    return candidates;
-  }
-
-  std::vector<std::string> existingDefaultConfigPaths(const char* defaultFileName) {
-    const std::vector<std::string> candidates = defaultConfigCandidates(defaultFileName);
-    std::vector<std::string> existingPaths;
-
-    for (const std::string& candidate : candidates) {
-      if (isExistingConfigFile(candidate)) {
-        existingPaths.push_back(candidate);
-      }
-    }
-
-    if (!existingPaths.empty()) {
-      return existingPaths;
-    }
-
-    if (!candidates.empty()) {
-      return { candidates.back() };
-    }
-
-    return { defaultFileName };
-  }
-
-  std::string preferredDefaultConfigPath(const char* defaultFileName) {
-    const std::vector<std::string> paths = existingDefaultConfigPaths(defaultFileName);
-    return paths.empty() ? std::string(defaultFileName) : paths.back();
-  }
-
-  // Helper to create a zero-padded index prefix for layer names when multiple files share a priority.
-  // The LAST entry gets no prefix (so layer key lookups still work), earlier entries get a suffix-sorting
-  // prefix so they are weaker than the unprefixed final layer in RtxOptionLayerKey ordering.
+  // Helper to create a zero-padded index prefix for layer names when multiple files share a priority
+  // The LAST entry gets no prefix (so layer key lookups still work), earlier entries get prefixed
   std::string makeLayerName(size_t index, size_t total, const std::string& baseName) {
     if (total <= 1 || index == total - 1) {
       // Single entry or last entry - use base name with no prefix
       return baseName;
     }
-    // Earlier entries get a prefix that sorts after the base name alphabetically.
-    // e.g., for 3 files: "zz01_rtx.conf", "zz00_rtx.conf", "rtx.conf"
+    // Earlier entries get 2-digit zero-padded prefix for alphabetical ordering
+    // e.g., for 3 files: "00_rtx.conf", "01_rtx.conf", "rtx.conf"
     std::ostringstream oss;
-    const size_t orderedIndex = total - index - 2;
-    oss << "zz" << std::setfill('0') << std::setw(2) << orderedIndex << "_" << baseName;
+    oss << std::setfill('0') << std::setw(2) << index << "_" << baseName;
     return oss.str();
   }
 }
@@ -707,7 +579,8 @@ namespace dxvk {
       return splitPaths(envVarPath);
     }
     
-    return existingDefaultConfigPaths(defaultFileName);
+    // Default: use the file name in current directory
+    return { defaultFileName };
   }
 
   std::vector<RtxOptionLayer*> RtxOptionLayer::createLayersFromEnvVar(
@@ -816,7 +689,7 @@ namespace dxvk {
 
     // 6. user.conf (user settings layer) - highest priority for end-user changes (not included in merged config)
     // User layer is designated for UserSetting options only; other options are miscategorized here.
-    s_userLayer = RtxOptionManager::acquireLayer(preferredDefaultConfigPath(kRtxOptionUserConfFileName), kRtxOptionLayerUserKey, 1.0f, 0.1f, true, nullptr);
+    s_userLayer = RtxOptionManager::acquireLayer(kRtxOptionUserConfFileName, kRtxOptionLayerUserKey, 1.0f, 0.1f, true, nullptr);
     if (s_userLayer) {
       s_userLayer->setCategoryFlags(RtxOptionFlags::UserSetting);
     }

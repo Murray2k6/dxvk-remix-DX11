@@ -38,10 +38,14 @@ namespace fast {
     int result[4];
     __cpuid(result, 7);
 
-    // Check for AVX512 support
+    // TODO(REMIX-1112): AVX512 seems to have issues, disable while we get more HW to test
+  #if 0
     if ((result[1] & (1 << 16)) != 0) {
       simdSupport = SIMD::AVX512; // Foundation only
-    } else if ((result[1] & (1 << 5)) != 0) {
+    } else 
+  #endif
+
+    if ((result[1] & (1 << 5)) != 0) {
       simdSupport = SIMD::AVX2;
     } else {
       // Query CPUID info with EAX = 1
