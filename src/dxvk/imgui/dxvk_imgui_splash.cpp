@@ -50,15 +50,14 @@ namespace dxvk {
       m_hasStarted = true;
 
       // Record the start time
-      m_startTime = steady_clock::now();
+      m_startTime = system_clock::now();
     }
 
-    const auto elapsedDuration = steady_clock::now() - m_startTime;
+    const auto elapsedDuration = system_clock::now() - m_startTime;
     const auto elapsedMilliseconds = duration_cast<milliseconds>(elapsedDuration).count();
     const auto elapsedSeconds = duration_cast<seconds>(elapsedDuration).count();
 
-    if (elapsedSeconds < 0)
-      return;
+    assert(elapsedSeconds >= 0);
 
     if (static_cast<std::uint32_t>(elapsedSeconds) <= SplashSettings::splashMessageDisplayTimeSeconds()) {
       // Show the user the time remaining
@@ -71,9 +70,7 @@ namespace dxvk {
       // Note: If largeFont is NULL (as it may be if the font has not loaded yet) this will default to the default font.
       // Large font used to make this more visible as it is important users understand how to access the rendering settings
       // to adjust performance/quality to their desires.
-      const bool pushedFont = largeFont != nullptr;
-      if (pushedFont)
-        ImGui::PushFont(largeFont);
+      ImGui::PushFont(largeFont);
 
       // Note: pi-based scalar used to align cycles with seconds countdown nicely.
       const float pulseInterpolationFactor = (std::cos(elapsedMilliseconds / 1000.0f * kPi / 2.0f) + 1.0f) / 2.0f;
@@ -89,24 +86,20 @@ namespace dxvk {
       if (ImGui::Begin("Splash Message", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoMove)) {
         const auto keyBindDescriptor = buildKeyBindDescriptorString(RtxOptions::remixMenuKeyBinds());
         std::string message = str::format("Welcome to RTX Remix. Use ", keyBindDescriptor, " to access the RTX Remix Menu and change settings. Closing in ", clampedSecondsRemaining);
-        ImGui::TextUnformatted(message.c_str());
+        ImGui::Text(message.c_str());
       }
       ImGui::End();
 
       ImGui::PopStyleColor();
-      if (pushedFont)
-        ImGui::PopFont();
+      ImGui::PopFont();
 
       if (!SplashSettings::welcomeMessage().empty()) {
         const ImGuiViewport* viewport = ImGui::GetMainViewport();
-        if (viewport == nullptr || viewport->Size.x <= 0.0f || viewport->Size.y <= 0.0f)
-          return;
-
         ImGui::SetNextWindowSize(ImVec2(340.f, 120.f), ImGuiCond_Always);
         ImGui::SetNextWindowPos(ImVec2(viewport->Size.x / 2 - 170, viewport->Size.y / 2 - 60), ImGuiCond_Always);
         if (ImGui::Begin("Welcome Message", nullptr, ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoResize)) {
           std::string message = str::format(SplashSettings::welcomeMessage(), " -- Closing in ", clampedSecondsRemaining);
-          ImGui::TextWrapped("%s", message.c_str());
+          ImGui::TextWrapped(message.c_str());
         }
         ImGui::End();
       }

@@ -34,7 +34,6 @@
 #include <tlhelp32.h>
 #include <Psapi.h>
 #include <Shlwapi.h>
-#include <cwctype>
 // NV-DXVK start
 #include <set>
 #include <filesystem>
@@ -201,55 +200,6 @@ namespace dxvk::env {
     }
 
     return fullPath;
-  }
-
-  bool shouldBypassRemixForCurrentProcess() {
-    static const std::array<const wchar_t*, 23> kHelperProcessTokens = {{
-      L"crashhandler",
-      L"crashhandler32",
-      L"crashhandler64",
-      L"crashreport",
-      L"crashpad",
-      L"crashclient",
-      L"reporter",
-      L"bugreport",
-      L"launcher",
-      L"bootstrapper",
-      L"bootstrap",
-      L"updater",
-      L"installer",
-      L"patcher",
-      L"helper",
-      L"steamwebhelper",
-      L"epicwebhelper",
-      L"webhelper",
-      L"webview",
-      L"cef",
-      L"prereq",
-      L"setup",
-      L"redlauncher"
-    }};
-
-    std::vector<WCHAR> exePath;
-    exePath.resize(MAX_PATH + 1);
-
-    DWORD len = ::GetModuleFileNameW(NULL, exePath.data(), MAX_PATH);
-    exePath.resize(len);
-
-    std::wstring exeName = exePath.data();
-    const size_t slash = exeName.find_last_of(L"\\/");
-    if (slash != std::wstring::npos)
-      exeName.erase(0, slash + 1);
-
-    for (wchar_t& ch : exeName)
-      ch = static_cast<wchar_t>(std::towlower(ch));
-
-    for (const wchar_t* token : kHelperProcessTokens) {
-      if (exeName.find(token) != std::wstring::npos)
-        return true;
-    }
-
-    return false;
   }
   
   // NV-DXVK start

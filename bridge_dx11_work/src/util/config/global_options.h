@@ -25,7 +25,7 @@
 #include "log/log.h"
 #include "util_bridgecommand.h"
 
-#include <d3d9.h>
+#include <d3d11.h>
 #include <debugapi.h>
 #include <vector>
 
@@ -319,17 +319,17 @@ private:
     sendCreateFunctionServerResponses = bridge_util::Config::getOption<bool>("sendCreateFunctionServerResponses", true);
 
     // In a Debug or DebugOptimized build of the bridge, setting LogApiCalls
-    // to True will write each call to a D3D9 API function through the bridge
+    // to True will write each call to a D3D11 API function through the bridge
     // client to the the client log file("bridge32.log").
     logApiCalls = bridge_util::Config::getOption<bool>("logApiCalls", false);
 
     // Like logApiCalls, setting LogAllCalls to True while running a
     // Debug or Debugoptimized build of the bridge will write each call
-    // to a D3D9 API function through the bridge client to to the the
+    // to a D3D11 API function through the bridge client to to the the
     // client log file("bridge32.log"), except both the entry and exit of
     // the call will be logged.This includes clientside internal calls to
-    // D3D9API functions.Additionally, each nested internal call to a
-    // public D3D9 API function will be offset by an additional tab.
+    // D3D11API functions.Additionally, each nested internal call to a
+    // public D3D11 API function will be offset by an additional tab.
     logAllCalls = bridge_util::Config::getOption<bool>("logAllCalls", false);
 
     // In a Debug or DebugOptimized build of the bridge, setting LogAllCommands

@@ -55,14 +55,14 @@ private:
     }
 
     // Check if Command sent to the queue is consistent
-    vector<D3D9Command> commandSent;
+    vector<D3D11Command> commandSent;
     commandSent = commandQueueObject.getWriterQueueData(3);
     if (commandSent[0] != IDirect3DDevice9Ex_GetDeviceCaps || commandSent[1] != Bridge_Ack || commandSent[2] != Bridge_Syn) {
       throw string("Commands sent do not match");
     }
 
     // Check if Command recieved from the queue is consistent
-    vector<D3D9Command> commandReceived;
+    vector<D3D11Command> commandReceived;
     commandReceived = commandQueueObject.getReaderQueueData(1);
     if (commandReceived[0] != Bridge_Syn) {
       throw string("Commands received do not match");

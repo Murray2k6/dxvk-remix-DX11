@@ -1,9 +1,5 @@
 #include <thread>
 
-#ifdef _MSC_VER
-#pragma comment(lib, "synchronization")
-#endif
-
 #include "thread.h"
 #include "util_env.h"
 #include "util_fps_limiter.h"

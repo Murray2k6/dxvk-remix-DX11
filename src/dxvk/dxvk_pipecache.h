@@ -3,8 +3,6 @@
 #include <atomic>
 #include <condition_variable>
 #include <fstream>
-#include <string>
-#include <vector>
 
 #include "dxvk_include.h"
 
@@ -39,12 +37,6 @@ namespace dxvk {
     
     Rc<vk::DeviceFn>        m_vkd;
     VkPipelineCache         m_handle;
-    std::string             m_cacheFileName;
-
-    std::vector<char> readCacheFile() const;
-    void writeCacheFile() const;
-    std::string getCacheFileName() const;
-    std::string getCacheDir() const;
     
   };
   

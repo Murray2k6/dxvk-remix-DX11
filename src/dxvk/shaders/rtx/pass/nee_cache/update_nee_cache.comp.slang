@@ -149,10 +149,10 @@ void clearTask(uint2 localIndex)
 // Put a new task to shared memory.
 void insertTask(uint2 value, uint batchIndex)
 {
-  int oldCount = 0;
-  InterlockedAdd(s_candidateCount[batchIndex], 1, oldCount);
-  oldCount = min(oldCount, CANDIDATE_LENGTH - 1);
-  s_candidateList[oldCount][batchIndex] = value;
+  int oldCounterIndex = 0;
+  InterlockedAdd(s_candidateCount[batchIndex], 1, oldCounterIndex);
+  oldCounterIndex = min(oldCounterIndex, CANDIDATE_LENGTH - 1);
+  s_candidateList[oldCounterIndex][batchIndex] = value;
 }
 
 // Insert this frame's new tasks, merge them if there is an existing one.
@@ -180,7 +180,9 @@ int finalizeTask(uint batchIndex)
 {
   // Calculate total light contribution
   float totalLight = 0;
-  int count = s_candidateCount[batchIndex];
+  // Note: insertTask() atomically increments s_candidateCount past CANDIDATE_LENGTH
+  // (writes are clamped but the counter is not), so clamp here to stay in bounds.
+  int count = min(s_candidateCount[batchIndex], CANDIDATE_LENGTH);
   for (int i = 0; i < count; ++i)
   {
     totalLight += float(s_candidateList[i][batchIndex].y);
@@ -229,7 +231,7 @@ void updateTriangleTask(NEECell cell, uint2 localIndex)
     if (cb.neeCacheArgs.enableReshuffleResilience && value.x != NEE_CACHE_INVALID_ID)
     {
       vec3 triangleCenter, lightIntensity;
-      f16vec3 triangleNormal;
+      vec3 triangleNormal;
       NEECacheUtils.calculateTriangleLightIntensity(surfaceID, primitiveID, triangleCenter, triangleNormal, lightIntensity);
       if (all(lightIntensity == 0))
       {
@@ -266,7 +268,7 @@ void updateTriangleTask(NEECell cell, uint2 localIndex)
     if (value.x != NEE_CACHE_INVALID_ID)
     {
       vec3 triangleCenter, lightIntensity;
-      f16vec3 triangleNormal;
+      vec3 triangleNormal;
       NEECacheUtils.calculateTriangleLightIntensity(surfaceID, primitiveID, triangleCenter, triangleNormal, lightIntensity);
       if (all(lightIntensity == 0))
       {

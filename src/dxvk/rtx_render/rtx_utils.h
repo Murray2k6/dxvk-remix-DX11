@@ -36,6 +36,7 @@
 #include "../util/util_pack.h"
 #include "../util/util_fast_cache.h"
 #include "dxvk_bind_mask.h"
+#include <d3d11.h>
 #include <type_traits>
 #include <unordered_set>
 

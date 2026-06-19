@@ -1,5 +1,22 @@
 #pragma once
-
+#if defined(_MSC_VER)
+#pragma warning(disable: 4099) // DX11_V219_SINGLE_AUTHORITATIVE_BUFFER_COOKIE_METHODS
+#endif
+#if defined(_MSC_VER)
+#pragma warning(disable: 4099) // DX11_V218_BRUTE_FORCE_BUFFER_COOKIE_SINGLE_METHODS
+#endif
+#if defined(_MSC_VER)
+#pragma warning(disable: 4099) // DX11_V216_IDENTIFY_AND_FIX_UNDECLARED_CONTENT_COOKIE
+#endif
+#if defined(_MSC_VER)
+#pragma warning(disable: 4099) // DX11_V215_GDI_NO_D3DUKMDT_AND_BUFFER_COOKIE_FIX
+#endif
+#if defined(_MSC_VER)
+#pragma warning(disable: 4099) // DX11_V214_D3D11_FEATURE_QUERY_AND_GDI_FORMAT_FIX
+#endif
+#if defined(_MSC_VER)
+#pragma warning(disable: 4099) // DX11_V213_FIX_WX_C4099_C4146
+#endif
 #include "d3d11_include.h"
 
 #include "../dxvk/rtx_render/rtx_types.h"
@@ -17,6 +34,15 @@ namespace dxvk {
   class D3D11Rtx {
   public:
     explicit D3D11Rtx(D3D11DeviceContext* pContext);
+
+    // DX11_V225: DX11 capture-layer options exposed in the RTX Remix "Game Setup"
+    // menu. RTX_OPTION generates both the value accessor (e.g. useVertexCapture())
+    // and the option-object accessor (useVertexCaptureObject()) the UI binds to.
+    RTX_OPTION("rtx", bool, useVertexCapture, true, "Capture programmable vertex-shader output so such draws can be ray traced / terrain baked.");
+    RTX_OPTION("rtx", bool, useVertexCapturedNormals, true, "Use normals produced by vertex capture instead of input-assembler normals.");
+    RTX_OPTION("rtx", bool, useWorldMatricesForShaders, true, "Use captured world/view matrices when reconstructing transforms for programmable-shader draws.");
+    RTX_OPTION("rtx", bool, allowCubemaps, false, "Allow cubemap render targets/draws to be considered for ray tracing.");
+    RTX_OPTION("rtx", bool, orthographicIsUI, true, "Treat draws with an orthographic projection as UI and skip them from the ray traced scene.");
 
     void Initialize();
     void OnDraw(UINT vertexCount, UINT startVertex);

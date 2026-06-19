@@ -386,9 +386,9 @@ namespace dxvk {
 
     m_submissionQueue.present(presentInfo, status);
 
-    // NV-DXVK end: incrementPresentCount() moved to callers (D3D11
-    // swap chain) so that non-primary chains can present without
-    // bumping the Remix frame counter.
+    incrementPresentCount();
+
+    // NV-DXVK end
 
     // NV-DXVK start: DLFG integration
     if (m_presenterInFlight.ptr() != presenter.ptr()) {
@@ -550,7 +550,6 @@ namespace dxvk {
     m_nis(device),
     m_taa(device),
     m_xess(device),
-    m_fsr(device),
     m_composite(device),
     m_debug_view(device),
     m_autoExposure(device),

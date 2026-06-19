@@ -1,28 +1,210 @@
+/*
+* Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+*
+* Permission is hereby granted, free of charge, to any person obtaining a
+* copy of this software and associated documentation files (the "Software"),
+* to deal in the Software without restriction, including without limitation
+* the rights to use, copy, modify, merge, publish, distribute, sublicense,
+* and/or sell copies of the Software, and to permit persons to whom the
+* Software is furnished to do so, subject to the following conditions:
+*
+* The above copyright notice and this permission notice shall be included in
+* all copies or substantial portions of the Software.
+*
+* THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+* IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+* FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+* THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+* LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+* FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+* DEALINGS IN THE SOFTWARE.
+*/
 #pragma once
 
 #include <imgui\imgui.h>
 #include <imgui\imgui_internal.h>
 #include "..\rtx_render\rtx_option.h"
+#include "..\rtx_render\rtx_option_blocking_popup.h"
 #include "..\util\util_string.h"
 #include "..\util\util_vector.h"
-#include <functional>
-#include <optional>
 #include <type_traits>
 #include <utility>
 
 namespace RemixGui {
-  IMGUI_API bool CheckRtxOptionPopups(dxvk::RtxOptionImpl* impl,
-                                      std::optional<XXH64_hash_t> hash,
-                                      std::function<void()> onApplyAction);
-
-  // Compatibility shim for older option widgets.
-  // The reset/status row decorator used to rewrite ImGui work rects, clip rects,
-  // draw channels, and item hitboxes around every option. That made some
-  // settings visually present but unable to receive or commit clicks.
+  // RAII wrapper for per-row UX around an RtxOption<T>.
+  // Reserves a right-side button lane so wrapped widgets never overlap it.
   template <typename T>
   struct RtxOptionUxWrapper {
-    explicit RtxOptionUxWrapper(dxvk::RtxOption<T>*) {}
-    ~RtxOptionUxWrapper() = default;
+    dxvk::RtxOption<T>* option = nullptr;
+    ImGuiWindow* window = nullptr;
+    const ImGuiStyle* style = nullptr;
+
+    ImRect rowBb {};
+    bool isNonDefault = false;
+    float circleRadius = 0.0f;
+    ImGuiID id = 0;
+    float lineHeight = 0.0f;
+    ImVec2 startCursorPos {};
+
+    // right-side lane reservation
+    float reservedRightW = 0.0f;
+    float prevWorkRectMaxX = 0.0f;
+    bool clipPushed = false;
+    bool channelsSplit = false;
+
+    explicit RtxOptionUxWrapper(dxvk::RtxOption<T>* rtxOption)
+      : option(rtxOption) {
+      window = ImGui::GetCurrentWindow();
+      if (!window || window->SkipItems) {
+        return;
+      } else {
+        ImGuiContext& g = *ImGui::GetCurrentContext();
+        style = &g.Style;
+
+        const float fontSize = g.FontSize;
+        const ImVec2& padding = style->FramePadding;
+
+        startCursorPos = window->DC.CursorPos;
+        lineHeight = ImMax(ImMin(window->DC.CurrLineSize.y, fontSize + padding.y * 2.0f), fontSize + padding.y * 2.0f);
+
+        circleRadius = fontSize * 0.40f;
+        const float touch = style->TouchExtraPadding.x;
+        reservedRightW = padding.x + fontSize + circleRadius + touch + 1.0f;
+
+        prevWorkRectMaxX = window->WorkRect.Max.x;
+        window->WorkRect.Max.x = ImMax(window->WorkRect.Min.x, prevWorkRectMaxX - reservedRightW);
+
+        ImVec2 clipMin = ImVec2(window->ClipRect.Min.x, window->ClipRect.Min.y);
+        ImVec2 clipMax = ImVec2(window->WorkRect.Max.x, window->ClipRect.Max.y);
+        window->DrawList->PushClipRect(clipMin, clipMax, true);
+        clipPushed = true;
+
+        isNonDefault = (option->get() != option->getDefaultValue());
+
+        // Split channels so we can paint the background under content and the button later.
+        window->DrawList->ChannelsSplit(2);
+        window->DrawList->ChannelsSetCurrent(1);
+        channelsSplit = true;
+
+        ImGui::PushID((void*) option);
+        ImGui::BeginGroup();
+      }
+    }
+
+    ~RtxOptionUxWrapper() {
+      if (!window || window->SkipItems) {
+        return;
+      } else {
+        ImGui::EndGroup();
+
+        // Bounds of children inside the group
+        ImVec2 groupMin = ImGui::GetItemRectMin();
+        ImVec2 groupMax = ImGui::GetItemRectMax();
+
+        ImGui::PopID();
+
+        // We want the background to include the right reset button lane.
+        // Restore clip and layout BEFORE drawing the background so the right lane is included.
+        if (clipPushed) {
+          window->DrawList->PopClipRect();
+          clipPushed = false;
+        }
+        window->WorkRect.Max.x = prevWorkRectMaxX;
+
+        // Switch to background channel to draw under content.
+        if (channelsSplit) {
+          window->DrawList->ChannelsSetCurrent(0);
+        }
+
+        {
+          const float y0 = startCursorPos.y;
+          const float y1 = startCursorPos.y + lineHeight;
+
+          const float padX = style->ItemInnerSpacing.x * 0.5f;
+
+          // Left bound hugs the group content with a small inset.
+          const float x0 = ImMax(window->WorkRect.Min.x, groupMin.x - padX);
+
+          // Right bound extends to cover the reserved button lane but not beyond the row work area.
+          const float x1 = prevWorkRectMaxX;
+
+          if (ImGui::IsMouseHoveringRect(ImVec2(x0, y0), ImVec2(x1, y1))) {
+            const ImU32 bg = ImGui::GetColorU32(ImGuiCol_HeaderHovered);
+            window->DrawList->AddRectFilled(ImVec2(x0, y0), ImVec2(x1, y1), bg, 0.0f);
+          } else if (isNonDefault) {
+            const ImU32 bg = ImGui::GetColorU32(ImGuiCol_ChildBg);
+            window->DrawList->AddRectFilled(ImVec2(x0, y0), ImVec2(x1, y1), bg, 0.0f);
+          }
+        }
+
+        // Merge channels so subsequent draws are normal.
+        if (channelsSplit) {
+          window->DrawList->ChannelsMerge();
+          channelsSplit = false;
+        }
+
+        // Draw the reset button on top.
+        ImGuiContext& g = *ImGui::GetCurrentContext();
+        const float fontSize = g.FontSize;
+        const ImVec2& padding = style->FramePadding;
+
+        const float yCenter = startCursorPos.y + lineHeight * 0.5f;
+        const ImVec2 circleCenter(prevWorkRectMaxX - padding.x - fontSize, yCenter);
+
+        ImRect hitBb(ImVec2(circleCenter.x - circleRadius, circleCenter.y - circleRadius),
+                     ImVec2(circleCenter.x + circleRadius, circleCenter.y + circleRadius));
+        hitBb.Expand(style->TouchExtraPadding);
+
+        id = window->GetID((void*) option);
+
+        bool resetButtonHovered = false;
+        if (ImGui::ItemAdd(hitBb, id)) {
+          bool held = false;
+          bool pressed = ImGui::ButtonBehavior(hitBb, id, &resetButtonHovered, &held, ImGuiButtonFlags_PressedOnClick);
+          if (pressed) {
+            CheckRtxOptionPopups(option);
+            option->resetToDefault();
+          }
+
+          const ImU32 fill = isNonDefault ? ImGui::GetColorU32((ImU32) 0xFFffc734) : ImGui::GetColorU32((ImU32) 0xFF464646);
+          const ImU32 outline = ImGui::GetColorU32(resetButtonHovered ? ImGuiCol_Text : ImGuiCol_Border);
+
+          window->DrawList->AddCircleFilled(circleCenter, circleRadius, fill);
+          window->DrawList->AddCircle(circleCenter, circleRadius, outline, 0, 1.0f);
+
+          if (resetButtonHovered) {
+            ImGui::SetTooltip("Reset to default (%s)", option->getName());
+          }
+        }
+
+        // Show RtxOption tooltip when hovering over label/widget area (but not if another tooltip is already shown)
+        const float x0 = window->WorkRect.Min.x;
+        const float x1 = prevWorkRectMaxX - reservedRightW;
+        const float y0 = startCursorPos.y;
+        const float y1 = startCursorPos.y + lineHeight;
+        
+        if (!resetButtonHovered && ImGui::IsMouseHoveringRect(ImVec2(x0, y0), ImVec2(x1, y1))) {
+          // Check if any tooltip window was created (by code between the construction and destruction of this wrapper)
+          bool tooltipAlreadyShown = false;
+          for (int i = 0; i <= g.TooltipOverrideCount; i++) {
+            char window_name[16];
+            ImFormatString(window_name, 16, "##Tooltip_%02d", i);
+            ImGuiWindow* tooltip_window = ImGui::FindWindowByName(window_name);
+            if (tooltip_window && tooltip_window->Active && !tooltip_window->Hidden) {
+              tooltipAlreadyShown = true;
+              break;
+            }
+          }
+
+          if (!tooltipAlreadyShown) {
+            // Only build the tooltip when actually hovering (BuildRtxOptionTooltip is expensive)
+            std::string tooltipText = RemixGui::BuildRtxOptionTooltip(option);
+            RemixGui::SetTooltipUnformatted(tooltipText.c_str());
+          }
+        }
+      }
+    }
+
     RtxOptionUxWrapper(const RtxOptionUxWrapper&) = delete;
     RtxOptionUxWrapper& operator=(const RtxOptionUxWrapper&) = delete;
   };
@@ -38,6 +220,10 @@ namespace RemixGui {
   bool SliderInt4(const char* label, int v[4], int v_min, int v_max, const char* format = "%d", ImGuiSliderFlags flags = 0, float overlayAlpha = 0.8f);
   
   bool Checkbox(const char* label, bool* v, float boxScale = .9f);
+
+  // Labeled rows are laid out as [label text | control]. This fixes the pixel width of the left column where the label string is drawn (and clipped); it does not set the width of the checkbox, slider, or other control, which uses the rest of the row. Without a push, that label column defaults to ~50% of the row.
+  void PushLabelColumnFixedWidth(float labelColumnWidthPixels);
+  void PopLabelColumnFixedWidth();
 
   bool InputFloat(const char* label, float* v, float step = 0.0f, float step_fast = 0.0f, const char* format = "%.3f", ImGuiInputTextFlags flags = 0);
   bool InputFloat2(const char* label, float v[2], const char* format = "%.3f", ImGuiInputTextFlags flags = 0);

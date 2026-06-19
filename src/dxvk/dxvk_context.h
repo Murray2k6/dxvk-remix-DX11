@@ -1460,7 +1460,6 @@ namespace dxvk {
 
     void unbindRaytracingPipeline();
     bool updateRaytracingPipeline();
-    bool shouldDeferRaytracingPipelineCompilation();
     bool updateRaytracingPipelineState();
 
     void unbindGraphicsPipeline();

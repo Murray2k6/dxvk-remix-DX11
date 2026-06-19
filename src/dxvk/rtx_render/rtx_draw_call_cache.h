@@ -30,6 +30,7 @@
 
 #include "rtx_types.h"
 #include "rtx_common_object.h"
+#include <d3d11.h>
 
 namespace dxvk 
 {
@@ -61,12 +62,6 @@ public:
     m_entries.clear();
   }
   
-  void rebuildSpatialMaps() {
-    for (auto iter = m_entries.begin(); iter != m_entries.end(); ++iter) {
-      iter->second.rebuildSpatialMap();
-    }
-  }
-
 private:
   MultimapType m_entries;
 

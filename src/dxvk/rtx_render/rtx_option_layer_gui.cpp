@@ -298,6 +298,7 @@ namespace dxvk {
     }
     
     // Save button (disabled if no unsaved changes)
+    ImGui::BeginDisabled(!hasUnsaved);
     const std::string saveId = std::string("Save##") + idSuffix;
     if (ImGui::Button(saveId.c_str(), ImVec2(buttonWidth, 0))) {
       layer->save();
@@ -306,11 +307,12 @@ namespace dxvk {
     if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
       ImGui::SetTooltip("Save unsaved changes to %s.", layer->getFilePath().c_str());
     }
+    ImGui::EndDisabled();
     
     ImGui::SameLine();
     
     // Reload button
-    const std::string reloadId = std::string("Reload##") + idSuffix;
+    const std::string reloadId = std::string("Discard Changes##") + idSuffix;
     if (ImGui::Button(reloadId.c_str(), ImVec2(buttonWidth, 0))) {
       layer->reload();
       anyClicked = true;
@@ -322,7 +324,7 @@ namespace dxvk {
     ImGui::SameLine();
     
     // Reset button
-    const std::string resetId = std::string("Reset##") + idSuffix;
+    const std::string resetId = std::string("Delete All##") + idSuffix;
     if (ImGui::Button(resetId.c_str(), ImVec2(buttonWidth, 0))) {
       layer->removeFromAllOptions();
       anyClicked = true;
@@ -334,7 +336,7 @@ namespace dxvk {
     ImGui::SameLine();
     
     // Clean button (remove redundant)
-    const std::string cleanId = std::string("Clean##") + idSuffix;
+    const std::string cleanId = std::string("Remove Dupes##") + idSuffix;
     if (ImGui::Button(cleanId.c_str(), ImVec2(buttonWidth, 0))) {
       RtxOptionManager::removeRedundantLayerValues(layer);
       anyClicked = true;

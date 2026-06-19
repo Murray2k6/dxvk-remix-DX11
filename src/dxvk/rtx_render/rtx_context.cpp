@@ -22,16 +22,14 @@
 #include <cstring>
 #include <cmath>
 #include <cassert>
-#include <algorithm>
-#include <array>
-#include <chrono>
-#include <mutex>
 
 #include "dxvk_device.h"
 #include "dxvk_scoped_annotation.h"
 #include "rtx_shader_manager.h"
 #include "dxvk_adapter.h"
 #include "rtx_context.h"
+// DX11_V225: complete type for the fixed-function-equivalent VS constant block.
+#include "../../d3d11/d3d11_fixed_function.h"
 #include "rtx_asset_exporter.h"
 #include "rtx_options.h"
 #include "rtx_bindless_resource_manager.h"
@@ -42,13 +40,10 @@
 #include "rtx_neural_radiance_cache.h"
 #include "rtx_ray_reconstruction.h"
 #include "rtx_xess.h"
-#include "rtx_fsr.h"
 #include "rtx_rtxdi_rayquery.h"
 #include "rtx_restir_gi_rayquery.h"
 #include "rtx_composite.h"
 #include "rtx_debug_view.h"
-
-#include "../imgui/dxvk_imgui.h"
 
 #include "rtx/pass/common_binding_indices.h"
 #include "rtx/pass/raytrace_args.h"
@@ -58,12 +53,12 @@
 #include "rtx_nrd_settings.h"
 #include "rtx_scene_manager.h"
 
-#include "rtx_cb_types.h"
-#include "rtx_spec_constants.h"
+#include "../d3d11/d3d11_state.h"
+#include "../d3d11/d3d11_spec_constants.h"
 
 #include "../util/log/metrics.h"
 #include "../util/util_defer.h"
-#include "../util/util_globaltime.h"
+#include "../util/util_global_time.h"
 
 #include "rtx_imgui.h"
 #include "dxvk_scoped_annotation.h"
@@ -82,22 +77,6 @@
 #include "rtx_sky.h"
 
 namespace dxvk {
-
-  namespace {
-
-    bool isRenderDocAttached() {
-      return ::GetModuleHandleW(L"renderdoc.dll") != nullptr;
-    }
-
-    bool isValid2DExtent(const VkExtent3D& extent) {
-      return extent.width > 0 && extent.height > 0 && extent.depth > 0;
-    }
-
-    bool matching2DExtents(const VkExtent3D& a, const VkExtent3D& b) {
-      return a.width == b.width && a.height == b.height && a.depth == b.depth;
-    }
-
-  }
 
   Metrics Metrics::s_instance;
 
@@ -165,7 +144,7 @@ namespace dxvk {
   RtxContext::RtxContext(const Rc<DxvkDevice>& device)
     : DxvkContext(device) {
     // Note: This may not be the best place to check for these features/properties, they ideally would be specified as
-    // required upfront, but there's no good place to do that for this RTX extension (the D3D11 frontend does it before device
+    // required upfront, but there's no good place to do that for this RTX extension (the D3D11 stuff does it before device
     // creation), so instead we just check for what is needed.
     // Note: When adding new extensions update DxvkAdapter::createDevice as it is what brings these features over.
     m_rayTracingSupported = (m_device->features().core.features.shaderInt16 &&
@@ -204,52 +183,22 @@ namespace dxvk {
       m_triggerDelayedTerminate = true;
     }
 
+    Metrics::TestTraceConfig testTraceConfig;
+    testTraceConfig.enabled = RtxOptions::Automation::enableTestTrace();
+    testTraceConfig.screenshotFrameEnabled = m_screenshotFrameEnabled;
+    testTraceConfig.screenshotFrameNum = m_screenshotFrameNum;
+    testTraceConfig.terminateAppFrameNum = m_terminateAppFrameNum;
+    Metrics::configureTestTrace(testTraceConfig);
+
     m_prevRunningTime = std::chrono::steady_clock::now();
 
-    // Feature-support checks only need to run once per DxvkDevice.  Multi-device
-    // games (UE4, emulators) create multiple D3D11 devices backed by the same
-    // shared DxvkDevice — each creates its own RtxContext, but the hardware
-    // capabilities are identical.  Running checks once avoids duplicate log spam
-    // ("not supported" messages appearing 2–3 times).
-    static std::once_flag s_featureCheckOnce;
-    std::call_once(s_featureCheckOnce, [this]() {
-      checkOpacityMicromapSupport();
-      checkShaderExecutionReorderingSupport();
-      checkNeuralRadianceCacheSupport();
-      reportCpuSimdSupport();
-    });
+    checkOpacityMicromapSupport();
+    checkShaderExecutionReorderingSupport();
+    checkNeuralRadianceCacheSupport();
+    reportCpuSimdSupport();
 
-    GlobalTime::get().init(RtxOptions::timeDeltaBetweenFrames());
-
-    // Create the three RTX constant buffers used by sky matte/probe rasterization
-    // and terrain baking.  In D3D9 mode the bridge called setConstantBuffers() to
-    // supply externally-created buffers; D3D11 mode bypasses that path, so we
-    // create them here to avoid null-pointer crashes in downstream code.
-    {
-      auto makeCB = [this](VkDeviceSize size, const char* name) -> Rc<DxvkBuffer> {
-        DxvkBufferCreateInfo info = {};
-        info.size   = size;
-        info.usage  = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT
-                    | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-        info.stages = VK_PIPELINE_STAGE_VERTEX_SHADER_BIT
-                    | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT
-                    | VK_PIPELINE_STAGE_TRANSFER_BIT;
-        info.access = VK_ACCESS_UNIFORM_READ_BIT
-                    | VK_ACCESS_TRANSFER_WRITE_BIT;
-        return m_device->createBuffer(info,
-          VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-          DxvkMemoryStats::Category::RTXBuffer, name);
-      };
-
-      m_rtState.vertexCaptureCB = makeCB(sizeof(RtxVertexCaptureData), "RTX Vertex Capture CB");
-      m_rtState.vsConstantsCB   = makeCB(sizeof(RtxVSConstants),       "RTX VS Constants CB");
-      m_rtState.psSharedStateCB = makeCB(sizeof(RtxSharedPS),          "RTX PS Shared State CB");
-
-      // Zero-initialize to identity-safe defaults.
-      std::memset(m_rtState.vertexCaptureCB->mapPtr(0), 0, sizeof(RtxVertexCaptureData));
-      std::memset(m_rtState.vsConstantsCB->mapPtr(0),   0, sizeof(RtxVSConstants));
-      std::memset(m_rtState.psSharedStateCB->mapPtr(0),  0, sizeof(RtxSharedPS));
-    }
+    GlobalTime::get().init(RtxOptions::timeDeltaBetweenFrames() * 0.001f);
+    GlobalTime::get().setAdvanceTime(RtxOptions::advanceTime());
   }
 
   RtxContext::~RtxContext() {
@@ -258,6 +207,7 @@ namespace dxvk {
     if (m_screenshotFrameNum != -1 || m_terminateAppFrameNum != -1) {
       Metrics::serialize();
     }
+
   }
 
   SceneManager& RtxContext::getSceneManager() {
@@ -270,124 +220,22 @@ namespace dxvk {
   // Returns GPU idle time between calls to this in milliseconds
   float RtxContext::getGpuIdleTimeSinceLastCall() {
     uint64_t currGpuIdleTicks = m_device->getStatCounters().getCtr(DxvkStatCounter::GpuIdleTicks);
+    if (!m_prevGpuIdleTicksInitialized) {
+      // DxvkSubmissionQueue::gpuIdleTicks() is a monotonic accumulator, so the
+      // only invalid sample here is the first one before we've established a baseline.
+      m_prevGpuIdleTicks = currGpuIdleTicks;
+      m_prevGpuIdleTicksInitialized = true;
+      return 0.0f;
+    }
+
     uint64_t delta = currGpuIdleTicks - m_prevGpuIdleTicks;
     m_prevGpuIdleTicks = currGpuIdleTicks;
 
     return static_cast<float>(delta) * 0.001f; // to milliseconds
   }
 
-  void RtxContext::updateAdaptivePathTracingPerformanceState() const {
-    const uint32_t frameId = m_device != nullptr ? m_device->getCurrentFrameId() : kInvalidFrameIndex;
-    if (m_adaptivePerformanceStateFrame == frameId) {
-      return;
-    }
-    m_adaptivePerformanceStateFrame = frameId;
-
-    if (!RtxOptions::adaptivePathTracingPerformance()) {
-      m_adaptivePerformanceHoldFrames = 0;
-      m_adaptivePerformanceSevereHoldFrames = 0;
-      m_adaptivePerformanceActiveCached = false;
-      m_adaptivePerformanceSevereCached = false;
-      return;
-    }
-
-    const float frameTimeMs = GlobalTime::get().deltaTimeMs();
-    const bool activeNow = std::isfinite(frameTimeMs)
-      && frameTimeMs >= RtxOptions::adaptivePathTracingFrameTimeMs();
-    const bool severeNow = std::isfinite(frameTimeMs)
-      && frameTimeMs >= RtxOptions::adaptivePathTracingSevereFrameTimeMs();
-
-    if (severeNow) {
-      m_adaptivePerformanceSevereHoldFrames = 12;
-      m_adaptivePerformanceHoldFrames = 24;
-    } else if (activeNow) {
-      m_adaptivePerformanceHoldFrames = std::max(m_adaptivePerformanceHoldFrames, 12u);
-      if (m_adaptivePerformanceSevereHoldFrames > 0) {
-        --m_adaptivePerformanceSevereHoldFrames;
-      }
-    } else {
-      if (m_adaptivePerformanceHoldFrames > 0) {
-        --m_adaptivePerformanceHoldFrames;
-      }
-      if (m_adaptivePerformanceSevereHoldFrames > 0) {
-        --m_adaptivePerformanceSevereHoldFrames;
-      }
-    }
-
-    m_adaptivePerformanceSevereCached = severeNow || m_adaptivePerformanceSevereHoldFrames > 0;
-    m_adaptivePerformanceActiveCached = activeNow || m_adaptivePerformanceHoldFrames > 0 || m_adaptivePerformanceSevereCached;
-  }
-
-  bool RtxContext::isAdaptivePathTracingPerformanceActive() const {
-    updateAdaptivePathTracingPerformanceState();
-    return m_adaptivePerformanceActiveCached;
-  }
-
-  bool RtxContext::isAdaptivePathTracingPerformanceSevere() const {
-    updateAdaptivePathTracingPerformanceState();
-    return m_adaptivePerformanceSevereCached;
-  }
-
-  float RtxContext::getAdaptivePathTracingResolutionScaleLimit() const {
-    if (!isAdaptivePathTracingPerformanceActive()) {
-      return 1.0f;
-    }
-
-    const float emergencyScale = std::clamp(RtxOptions::adaptivePathTracingEmergencyResolutionScale(), 0.25f, 1.0f);
-    if (isAdaptivePathTracingPerformanceSevere()) {
-      return emergencyScale;
-    }
-
-    const float frameTimeMs = std::max(GlobalTime::get().deltaTimeMs(), 1.0f);
-    const float targetFrameTimeMs = std::max(RtxOptions::adaptivePathTracingFrameTimeMs(), 1.0f);
-    return std::clamp(std::sqrt(targetFrameTimeMs / frameTimeMs), emergencyScale, 1.0f);
-  }
-
-  void RtxContext::logAdaptivePathTracingPerformanceState(bool active, bool severe, float resolutionScaleLimit) const {
-    static bool s_prevActive = false;
-    static bool s_prevSevere = false;
-    static int s_prevResolutionScalePercent = 100;
-
-    const int resolutionScalePercent = static_cast<int>(std::round(resolutionScaleLimit * 100.0f));
-    if (active == s_prevActive && severe == s_prevSevere && resolutionScalePercent == s_prevResolutionScalePercent) {
-      return;
-    }
-
-    s_prevActive = active;
-    s_prevSevere = severe;
-    s_prevResolutionScalePercent = resolutionScalePercent;
-
-    if (active) {
-      // Only warn when adaptive mode is actually constraining the renderer -
-      // i.e. it is severe, or it has dropped internal resolution below 100%.
-      // An "active" state at full resolution with a fast frame time (e.g.
-      // 3.6 ms) is not degrading anything and was producing noisy warnings;
-      // log that case at info level instead.
-      if (severe || resolutionScalePercent < 100) {
-        Logger::warn(str::format(
-          "[RTX-Performance] Adaptive path tracing performance mode active: frameTimeMs=",
-          GlobalTime::get().deltaTimeMs(),
-          " severe=",
-          severe ? 1 : 0,
-          " maxInternalResolutionScale=",
-          resolutionScalePercent,
-          "%"));
-      } else {
-        Logger::info(str::format(
-          "[RTX-Performance] Adaptive path tracing monitoring active (no quality reduction): frameTimeMs=",
-          GlobalTime::get().deltaTimeMs(),
-          " scale=", resolutionScalePercent, "%"));
-      }
-    } else {
-      Logger::info("[RTX-Performance] Adaptive path tracing performance mode inactive; restoring selected render workload.");
-    }
-  }
-
   VkExtent3D RtxContext::setDownscaleExtent(const VkExtent3D& upscaleExtent) {
     ScopedCpuProfileZone();
-    RtxOptions::setRuntimeUpscalerType(
-      RtxOptions::getSupportedUpscalerForDevice(m_device.ptr(), RtxOptions::upscalerType()));
-
     VkExtent3D downscaleExtent;
     if (shouldUseDLSS()) {
       DxvkDLSS& dlss = m_common->metaDLSS();
@@ -419,7 +267,7 @@ namespace dxvk {
         uint32_t recommendedJitterLength = xess.calcRecommendedJitterSequenceLength();
         uint32_t currentJitterLength = RtxOptions::cameraJitterSequenceLength();
       }
-    } else if (shouldUseNIS() || shouldUseTAA() || shouldUseFSR4()) {
+    } else if (shouldUseNIS() || shouldUseTAA()) {
       auto resolutionScale = RtxOptions::resolutionScale();
       downscaleExtent.width = uint32_t(std::roundf(upscaleExtent.width * resolutionScale));
       downscaleExtent.height = uint32_t(std::roundf(upscaleExtent.height * resolutionScale));
@@ -427,16 +275,6 @@ namespace dxvk {
     } else {
       downscaleExtent = upscaleExtent;
     }
-
-    const float adaptiveResolutionScaleLimit = getAdaptivePathTracingResolutionScaleLimit();
-    if (adaptiveResolutionScaleLimit < 1.0f && shouldUseUpscaler()) {
-      const uint32_t maxAdaptiveWidth = std::max(1u, static_cast<uint32_t>(std::round(upscaleExtent.width * adaptiveResolutionScaleLimit)));
-      const uint32_t maxAdaptiveHeight = std::max(1u, static_cast<uint32_t>(std::round(upscaleExtent.height * adaptiveResolutionScaleLimit)));
-      downscaleExtent.width = std::min(downscaleExtent.width, maxAdaptiveWidth);
-      downscaleExtent.height = std::min(downscaleExtent.height, maxAdaptiveHeight);
-      downscaleExtent.depth = 1;
-    }
-
     downscaleExtent.width = std::max(downscaleExtent.width, 1u);
     downscaleExtent.height = std::max(downscaleExtent.height, 1u);
 
@@ -476,8 +314,7 @@ namespace dxvk {
   }
 
   bool RtxContext::useRayReconstruction() const {
-    return RtxOptions::isRuntimeDLSSOrRayReconstructionEnabled()
-      && m_common->metaRayReconstruction().useRayReconstruction();
+    return m_common->metaRayReconstruction().useRayReconstruction();
   }
 
   RtxContext::InternalUpscaler RtxContext::getCurrentFrameUpscaler() {
@@ -487,8 +324,6 @@ namespace dxvk {
       return InternalUpscaler::DLSS_RR;
     } else if (shouldUseXeSS() && m_common->metaXeSS().isActive()) {
       return InternalUpscaler::XeSS;
-    } else if (shouldUseFSR4()) {
-      return InternalUpscaler::FSR4;
     } else if (shouldUseNIS()) {
       return InternalUpscaler::NIS;
     } else if (shouldUseTAA()) {
@@ -498,7 +333,7 @@ namespace dxvk {
     }
   }
 
-  VkExtent3D RtxContext::onFrameBegin(const VkExtent3D& upscaledExtent) {
+  VkExtent3D RtxContext::onInjectRtxFrameBegin(const VkExtent3D& upscaledExtent) {
     auto logRenderPassRaytraceModeRayQuery = [=](const char* renderPassName, auto mode) {
       switch (mode) {
       case decltype(mode)::RayQuery:
@@ -532,33 +367,21 @@ namespace dxvk {
     static RenderPassGBufferRaytraceMode sPrevRenderPassGBufferRaytraceMode = RenderPassGBufferRaytraceMode::Count;
     static RenderPassIntegrateDirectRaytraceMode sPrevRenderPassIntegrateDirectRaytraceMode = RenderPassIntegrateDirectRaytraceMode::Count;
     static RenderPassIntegrateIndirectRaytraceMode sPrevRenderPassIntegrateIndirectRaytraceMode = RenderPassIntegrateIndirectRaytraceMode::Count;
-    static UpscalerType sPrevRequestedUpscalerType = UpscalerType::None;
-    static UpscalerType sPrevRuntimeUpscalerType = UpscalerType::None;
-
-    const UpscalerType requestedUpscalerType = RtxOptions::upscalerType();
-    const UpscalerType runtimeUpscalerType = RtxOptions::getSupportedUpscalerForDevice(m_device.ptr(), requestedUpscalerType);
-    RtxOptions::setRuntimeUpscalerType(runtimeUpscalerType);
+    static UpscalerType sPrevUpscalerType = UpscalerType::None;
 
     if (sPrevRenderPassGBufferRaytraceMode != RtxOptions::renderPassGBufferRaytraceMode() ||
         sPrevRenderPassIntegrateDirectRaytraceMode != RtxOptions::renderPassIntegrateDirectRaytraceMode() ||
         sPrevRenderPassIntegrateIndirectRaytraceMode != RtxOptions::renderPassIntegrateIndirectRaytraceMode() ||
-        sPrevRequestedUpscalerType != requestedUpscalerType ||
-        sPrevRuntimeUpscalerType != runtimeUpscalerType) {
+        sPrevUpscalerType != RtxOptions::upscalerType()) {
 
       sPrevRenderPassGBufferRaytraceMode = RtxOptions::renderPassGBufferRaytraceMode();
       sPrevRenderPassIntegrateDirectRaytraceMode = RtxOptions::renderPassIntegrateDirectRaytraceMode();
       sPrevRenderPassIntegrateIndirectRaytraceMode = RtxOptions::renderPassIntegrateIndirectRaytraceMode();
-      sPrevRequestedUpscalerType = requestedUpscalerType;
-      sPrevRuntimeUpscalerType = runtimeUpscalerType;
+      sPrevUpscalerType = RtxOptions::upscalerType();
 
       logRenderPassRaytraceMode("GBuffer", RtxOptions::renderPassGBufferRaytraceMode());
       logRenderPassRaytraceModeRayQuery("Integrate Direct", RtxOptions::renderPassIntegrateDirectRaytraceMode());
       logRenderPassRaytraceMode("Integrate Indirect", RtxOptions::renderPassIntegrateIndirectRaytraceMode());
-      if (requestedUpscalerType != runtimeUpscalerType) {
-        Logger::info(str::format("RTX: requested upscaler ", getUpscalerTypeName(requestedUpscalerType),
-                                 " will dispatch through runtime backend ", getUpscalerTypeName(runtimeUpscalerType),
-                                 " on this Vulkan device."));
-      }
 
       m_resetHistory = true;
     }
@@ -580,16 +403,13 @@ namespace dxvk {
     getResourceManager().onFrameBegin(this, getCommonObjects()->getTextureManager(), getSceneManager(), downscaledExtent,
                                       upscaledExtent, m_resetHistory, mainCamera.isCameraCut());
 
-    const IntegrateIndirectMode resolvedIntegrateIndirectMode =
-      RtxOptions::getSupportedIntegrateIndirectMode(m_device.ptr(), RtxOptions::integrateIndirectMode());
-
-    // Force history reset on integrate indirect mode change to discard incompatible history.
-    if (resolvedIntegrateIndirectMode != m_prevIntegrateIndirectMode) {
+    // Force history reset on integrate indirect mode change to discard incompatible history 
+    if (RtxOptions::integrateIndirectMode() != m_prevIntegrateIndirectMode) {
       m_resetHistory = true;
-      m_prevIntegrateIndirectMode = resolvedIntegrateIndirectMode;
+      m_prevIntegrateIndirectMode = RtxOptions::integrateIndirectMode();
     }
 
-    if (resolvedIntegrateIndirectMode == IntegrateIndirectMode::NeuralRadianceCache &&
+    if (RtxOptions::integrateIndirectMode() == IntegrateIndirectMode::NeuralRadianceCache &&
         m_common->metaNeuralRadianceCache().isResettingHistory()) {
       m_resetHistory = true;
     }
@@ -613,7 +433,18 @@ namespace dxvk {
     return downscaledExtent;
   }
 
-  // Hooked into presentImage (same place HUD rendering is)
+  void RtxContext::onInjectRtxFrameEnd(bool rayTracedThisFrame) {
+    if (rayTracedThisFrame) {
+      Resources::RaytracingOutput& rtOutput = getResourceManager().getRaytracingOutput();
+
+      m_common->metaNeuralRadianceCache().onFrameEnd(rtOutput);
+      rtOutput.onFrameEnd();
+    }
+
+    getSceneManager().onFrameEnd(this, rayTracedThisFrame);
+  }
+
+  // Hooked into D3D11 presentImage (same place HUD rendering is)
   void RtxContext::injectRTX(std::uint64_t cachedReflexFrameId, Rc<DxvkImage> targetImage) {
     ScopedCpuProfileZone();
 #ifdef REMIX_DEVELOPMENT
@@ -652,7 +483,6 @@ namespace dxvk {
     commitGraphicsState<true, false>();
 
     auto common = getCommonObjects();
-    const uint32_t currentFrameId = m_device->getCurrentFrameId();
     const auto isRaytracingEnabled = RtxOptions::enableRaytracing();
     const auto asyncShaderCompilationActive = RtxOptions::Shader::enableAsyncCompilation() && common->pipelineManager().remixShaderCompilationCount() > 0;
 
@@ -663,20 +493,10 @@ namespace dxvk {
     const auto requestedPresentThrottleDelay = RtxOptions::enablePresentThrottle() ? RtxOptions::presentThrottleDelay() : 0;
     std::uint32_t requestedAsyncShaderCompilationDelay = 0U;
 
-    // Startup and launcher frames should yield enough CPU time for Remix shader
-    // prewarm to finish, but once a scene is live we cap the delay so gameplay
-    // frames do not inherit the heavier loading-screen throttle.
-    if (m_rayTracingSupported && asyncShaderCompilationActive) {
+    // Note: Only use the async shader compilation throttle delay when rendering which uses Remix shaders would actually take place. As such this delay is not
+    // needed when ray tracing is not supported or enabled as Remix shaders will not be used in that case.
+    if (m_rayTracingSupported && isRaytracingEnabled && asyncShaderCompilationActive) {
       requestedAsyncShaderCompilationDelay = RtxOptions::Shader::asyncCompilationThrottleMilliseconds();
-
-      const bool hasRecentlyInjectedScene = m_frameLastInjected != kInvalidFrameIndex
-        && currentFrameId >= m_frameLastInjected
-        && currentFrameId - m_frameLastInjected <= 4u;
-      if (isRaytracingEnabled && hasRecentlyInjectedScene) {
-        requestedAsyncShaderCompilationDelay = std::min(
-          requestedAsyncShaderCompilationDelay,
-          RtxOptions::Shader::activeSceneCompilationThrottleMilliseconds());
-      }
     }
 
     // Note: Determine the throttle delay to use based on the larger of the two requested delay values as the larger should satisfy the requests of both.
@@ -693,62 +513,23 @@ namespace dxvk {
       return;
     }
 
-    if (m_frameLastInjected == currentFrameId) {
+    if (m_frameLastInjected == m_device->getCurrentFrameId()) {
       return;
     }
 
-    const bool uiOpen = ImGUI::GetLastKnownMenuType() != UIType::None;
-    // Hold the last good scene/camera across short DX11 cbuffer or shader
-    // extraction gaps. Clearing after the configured default of two missed
-    // frames is too aggressive for several games and shows up as a black
-    // frame followed by temporal-resource churn or a device loss.
-    const uint32_t sceneKeepAliveFrames = std::max(RtxOptions::sceneKeepAliveFrames(), uiOpen ? 120u : 16u);
-    bool isCameraValid = getSceneManager().getCamera().isValid(currentFrameId);
+    const bool isCameraValid = getSceneManager().getCamera().isValid(m_device->getCurrentFrameId());
     if (!isCameraValid) {
-      auto& cameraManager = getSceneManager().getCameraManager();
-      auto& mainCamera = cameraManager.getCamera(CameraType::Main);
-      const uint32_t lastCameraFrame = mainCamera.getLastUpdateFrame();
-      const bool lastCameraWasViewportFallback = cameraManager.mainCameraLastUpdateUsedViewportFallback();
-      const uint32_t cameraKeepAliveFrames = sceneKeepAliveFrames + 1 > 16
-        ? sceneKeepAliveFrames + 1
-        : 16;
-
-      if (lastCameraFrame != kInvalidFrameIndex
-       && !lastCameraWasViewportFallback
-       && currentFrameId > lastCameraFrame
-       && currentFrameId - lastCameraFrame <= cameraKeepAliveFrames) {
-        cameraManager.processExternalCamera(
-          CameraType::Main,
-          Matrix4 { mainCamera.getWorldToView(false) },
-          Matrix4 { mainCamera.getViewToProjection() });
-        isCameraValid = true;
-
-        static uint32_t sCameraKeepAliveLogCount = 0;
-        if (sCameraKeepAliveLogCount < 12) {
-          ++sCameraKeepAliveLogCount;
-          Logger::info(str::format(
-            "[RTX] Reusing last valid camera to keep path tracing stable across a short camera gap: frameId=",
-            currentFrameId,
-            " lastCameraFrame=",
-            lastCameraFrame,
-            " keepAliveFrames=",
-            cameraKeepAliveFrames));
-        }
-      }
-    }
-
-    if (!isCameraValid
-      && (!getSceneManager().isPreviousFrameSceneAvailable() || m_framesWithoutValidScene >= sceneKeepAliveFrames)
-      && !uiOpen) {
       ONCE(Logger::info(str::format("[RTX-Compatibility-Info] Trying to raytrace but not detecting a valid camera.")));
     }
 
     // Update frame counter only after actual rendering
     if (isCameraValid) {
-      m_frameLastInjected = currentFrameId;
+      m_frameLastInjected = m_device->getCurrentFrameId();
     }
 
-    RtxOptions::setRuntimeUpscalerType(RtxOptions::getSupportedUpscalerForDevice(m_device.ptr(), RtxOptions::upscalerType()));
+    if (RtxOptions::upscalerType() == UpscalerType::DLSS && !common->metaDLSS().supportsDLSS()) {
+      RtxOptions::upscalerType.setDeferred(UpscalerType::TAAU);
+    }
 
     if (DxvkDLFG::enable() && !common->metaDLFG().supportsDLFG()) {
       DxvkDLFG::enable.setDeferred(false);
@@ -763,89 +544,32 @@ namespace dxvk {
     common->getTextureManager().processAllHotReloadRequests();
 
     const float gpuIdleTimeMilliseconds = getGpuIdleTimeSinceLastCall();
+    Metrics::TestTraceSample testTraceSample;
+    testTraceSample.frameId = m_device->getCurrentFrameId();
+    testTraceSample.effectiveDeltaMs = GlobalTime::get().deltaTimeMs();
+    testTraceSample.realWallDeltaMs = GlobalTime::get().realDeltaTimeMs();
+    testTraceSample.gpuIdleTimeMs = gpuIdleTimeMilliseconds;
+    testTraceSample.surfaceCount = getSceneManager().getAccelManager().getSurfaceCount();
+    testTraceSample.shaderCompileInflightCount = getCommonObjects()->pipelineManager().remixShaderCompilationCount();
+    testTraceSample.debugViewMode = m_common->metaDebugView().getDebugViewIndex();
+    testTraceSample.compositeDebugViewMode = m_common->metaDebugView().getCompositeDebugViewIndex();
+    testTraceSample.raytracingEnabled = isRaytracingEnabled;
+    testTraceSample.cameraValid = isCameraValid;
+    testTraceSample.asyncShaderPrewarming = RtxInitializer::asyncShaderPrewarming();
+    testTraceSample.asyncCompilationEnabled = RtxOptions::Shader::enableAsyncCompilation();
+    testTraceSample.asyncCompilationActive = asyncShaderCompilationActive;
+    testTraceSample.surfaceBufferAvailable = getSceneManager().getSurfaceBuffer() != nullptr;
+    Metrics::recordTestTrace(testTraceSample);
 
     bool raytracedThisFrame = false;
-    bool missingTargetImage = false;
-    auto resolveTargetImage = [&]() {
-      if (targetImage != nullptr) {
-        const VkExtent3D targetExtent = targetImage->info().extent;
-        if (isValid2DExtent(targetExtent)) {
-          return true;
-        }
-
-        missingTargetImage = true;
-
-        static uint32_t sInvalidProvidedTargetLogCount = 0;
-        if (sInvalidProvidedTargetLogCount < 12) {
-          ++sInvalidProvidedTargetLogCount;
-          Logger::warn(str::format(
-            "[RTX] Skipping RTX injection because the provided target image has an invalid extent: ",
-            targetExtent.width,
-            "x",
-            targetExtent.height,
-            "x",
-            targetExtent.depth));
-        }
-
-        return false;
-      }
-
-      const auto& colorTarget = m_state.om.renderTargets.color[0];
-      if (colorTarget.view == nullptr || colorTarget.view->image() == nullptr) {
-        missingTargetImage = true;
-
-        static uint32_t sMissingTargetImageLogCount = 0;
-        if (sMissingTargetImageLogCount < 12) {
-          ++sMissingTargetImageLogCount;
-          Logger::warn("[RTX] Skipping RTX injection because no present target or color render target is currently bound.");
-        }
-
-        return false;
-      }
-
-      targetImage = colorTarget.view->image();
-      const VkExtent3D targetExtent = targetImage->info().extent;
-      if (!isValid2DExtent(targetExtent)) {
-        missingTargetImage = true;
-
-        static uint32_t sInvalidBoundTargetLogCount = 0;
-        if (sInvalidBoundTargetLogCount < 12) {
-          ++sInvalidBoundTargetLogCount;
-          Logger::warn(str::format(
-            "[RTX] Skipping RTX injection because the bound color target has an invalid extent: ",
-            targetExtent.width,
-            "x",
-            targetExtent.height,
-            "x",
-            targetExtent.depth));
-        }
-
-        return false;
-      }
-
-      return true;
-    };
-
-    auto finishFrameWithoutValidRtScene = [&](bool preserveLastGoodSurfaceCount) {
-      m_framesWithoutValidScene++;
-      if (m_framesWithoutValidScene > sceneKeepAliveFrames) {
-        const bool needWfi = !preserveLastGoodSurfaceCount
-          && (m_framesWithoutValidScene == sceneKeepAliveFrames + 1);
-        getSceneManager().clear(this, needWfi);
-        if (!preserveLastGoodSurfaceCount) {
-          m_lastRaytracedSurfaceCount = 0;
-        }
-      }
-
-      getSceneManager().onFrameEnd(this, false);
-      RtxOptionManager::applyPendingValues(m_device.ptr(), /* forceOnChange */ false);
-      updateMetrics(gpuIdleTimeMilliseconds);
-      m_resetHistory = false;
-    };
 
     // Note: Only engage ray tracing when it is enabled, the camera is valid and when no shaders are currently being compiled asynchronously (as
     // trying to render before shaders are done compiling will cause Remix to block).
-    if (isRaytracingEnabled && isCameraValid && !asyncShaderCompilationActive && resolveTargetImage()) {
+    if (isRaytracingEnabled && isCameraValid && !asyncShaderCompilationActive) {
+      if (targetImage == nullptr) {
+        targetImage = m_state.om.renderTargets.color[0].view->image();  
+      }
+
       const bool captureTestScreenshot = (m_screenshotFrameEnabled && m_device->getCurrentFrameId() == m_screenshotFrameNum);
       const bool captureScreenImage = s_triggerScreenshot || (captureTestScreenshot && !s_capturePrePresentTestScreenshot);
       const bool captureDebugImage = RtxOptions::captureDebugImage();
@@ -859,62 +583,17 @@ namespace dxvk {
         Logger::info(str::format("RTX: Test screenshot capture triggered"));
         Logger::info(str::format("RTX: Use separate denoiser ", RtxOptions::denoiseDirectAndIndirectLightingSeparately()));
         Logger::info(str::format("RTX: Use rtxdi ", RtxOptions::useRTXDI()));
-        Logger::info(str::format("RTX: Requested upscaler ", getUpscalerTypeName(RtxOptions::upscalerType())));
-        Logger::info(str::format("RTX: Runtime upscaler ", getUpscalerTypeName(RtxOptions::runtimeUpscalerType())));
-        Logger::info(str::format("RTX: Use dlss ", RtxOptions::isRuntimeDLSSOrRayReconstructionEnabled()));
-        Logger::info(str::format("RTX: Use ray reconstruction ", RtxOptions::isRuntimeRayReconstructionEnabled()));
-        Logger::info(str::format("RTX: Use nis ", RtxOptions::isRuntimeNISEnabled()));
+        Logger::info(str::format("RTX: Use dlss ", RtxOptions::isDLSSOrRayReconstructionEnabled()));
+        Logger::info(str::format("RTX: Use ray reconstruction ", RtxOptions::isRayReconstructionEnabled()));
+        Logger::info(str::format("RTX: Use nis ", RtxOptions::isNISEnabled()));
         if (!s_capturePrePresentTestScreenshot) {
           m_screenshotFrameEnabled = false;
+          Metrics::setTestTraceScreenshotFrameEnabled(false);
         }
       }
 
       if (captureScreenImage && captureDebugImage) {
         takeScreenshot("orgImage", targetImage);
-      }
-
-      {
-        const auto& sceneManager = getSceneManager();
-        const uint32_t pendingInstanceCount = sceneManager.getInstanceManager().getActiveCount();
-        const auto& cameraManager = sceneManager.getCameraManager();
-        const bool currentCameraCameFromViewportFallback =
-          cameraManager.getLastSetCameraType() == CameraType::Main
-          && cameraManager.lastMainCameraCandidateUsedViewportFallback();
-        const bool hasRealSceneCamera = cameraManager.getLastSetCameraType() != CameraType::Unknown
-          && !currentCameraCameFromViewportFallback;
-        const bool hasStableSceneCamera = hasRealSceneCamera || (isCameraValid && !currentCameraCameFromViewportFallback);
-        const bool preBuildSparseStartupScene = !isRenderDocAttached()
-          && m_lastRaytracedSurfaceCount == 0
-          && m_device->getCurrentFrameId() <= 40
-          && pendingInstanceCount <= 4
-          && !hasStableSceneCamera;
-        const bool preBuildSceneCollapsed =
-          m_lastRaytracedSurfaceCount >= 16
-          && pendingInstanceCount > 0
-          && uint64_t(pendingInstanceCount) * 4ull < uint64_t(m_lastRaytracedSurfaceCount);
-        const bool preBuildTinyUnclassifiedScene =
-          pendingInstanceCount < 4
-          && !hasStableSceneCamera
-          && m_lastRaytracedSurfaceCount == 0;
-        const bool preBuildEmptyScene = pendingInstanceCount == 0;
-
-        if (preBuildEmptyScene || preBuildSceneCollapsed || preBuildTinyUnclassifiedScene || preBuildSparseStartupScene) {
-          static uint32_t sPreBuildInvalidSceneLogCount = 0;
-          if (sPreBuildInvalidSceneLogCount < 16) {
-            ++sPreBuildInvalidSceneLogCount;
-            Logger::info(str::format(
-              "[RTX] Skipping RTX scene prepare before viewport injection: pendingInstances=", pendingInstanceCount,
-              " lastGoodSurfaces=", m_lastRaytracedSurfaceCount,
-              " realCamera=", hasRealSceneCamera ? 1 : 0,
-              preBuildEmptyScene ? " [empty]" : "",
-              preBuildSparseStartupScene ? " [startup-sparse]" : "",
-              preBuildSceneCollapsed ? " [collapsed]" : "",
-              preBuildTinyUnclassifiedScene ? " [tiny-unclassified]" : ""));
-          }
-
-          finishFrameWithoutValidRtScene(preBuildSceneCollapsed);
-          return;
-        }
       }
 
       RtxParticleSystemManager& particles = m_device->getCommon()->metaParticleSystem();
@@ -940,40 +619,11 @@ namespace dxvk {
 
       // Update all the GPU buffers needed to describe the scene
       getSceneManager().prepareSceneData(this, m_execBarriers);
+      
+      // If we really don't have any RT to do, just bail early (could be UI/menus rendering)
+      if (getSceneManager().getSurfaceBuffer() != nullptr) {
 
-      const uint32_t surfaceCount = getSceneManager().getAccelManager().getSurfaceCount();
-      const bool hasSurfaceBuffer = getSceneManager().getSurfaceBuffer() != nullptr;
-      const auto& cameraManager = getSceneManager().getCameraManager();
-      const bool currentCameraCameFromViewportFallback =
-        cameraManager.getLastSetCameraType() == CameraType::Main
-        && cameraManager.lastMainCameraCandidateUsedViewportFallback();
-      const bool hasRealSceneCamera = cameraManager.getLastSetCameraType() != CameraType::Unknown
-        && !currentCameraCameFromViewportFallback;
-      const bool hasStableSceneCamera = hasRealSceneCamera || (isCameraValid && !currentCameraCameFromViewportFallback);
-      const bool sparseStartupScene = !isRenderDocAttached()
-        && m_lastRaytracedSurfaceCount == 0
-        && m_device->getCurrentFrameId() <= 40
-        && surfaceCount <= 4
-        && !hasStableSceneCamera;
-      const bool sceneCollapsed = m_lastRaytracedSurfaceCount >= 16 && surfaceCount * 4 < m_lastRaytracedSurfaceCount;
-      const bool tinyUnclassifiedScene = surfaceCount < 4 && !hasStableSceneCamera && m_lastRaytracedSurfaceCount == 0;
-      const bool hasValidRtScene = hasSurfaceBuffer && surfaceCount > 0 && !sceneCollapsed && !tinyUnclassifiedScene && !sparseStartupScene;
-
-      // If we really don't have any RT to do, or the scene collapsed to a tiny
-      // helper/post-process subset, bail early and let the previous scene stay alive.
-      if (hasValidRtScene) {
-        // Trace only the first few frames so a one-time startup issue is
-        // visible in the log without drowning it on longer runs.
-        const bool traceRtStartupStages = m_device->getCurrentFrameId() <= 3;
-        auto logRtStartupStage = [&](const char* stage) {
-          if (traceRtStartupStages) {
-            Logger::info(str::format("[RTX-Startup] frame=", m_device->getCurrentFrameId(), " stage=", stage));
-          }
-        };
-
-        logRtStartupStage("before onFrameBegin");
-        VkExtent3D downscaledExtent = onFrameBegin(targetImage->info().extent);
-        logRtStartupStage("after onFrameBegin");
+        VkExtent3D downscaledExtent = onInjectRtxFrameBegin(targetImage->info().extent);
 
         Resources::RaytracingOutput& rtOutput = getResourceManager().getRaytracingOutput();
 
@@ -988,48 +638,22 @@ namespace dxvk {
         getCommonObjects()->getTextureManager().prepareSamplerFeedback(this);
 
         // Generate ray tracing constant buffer
-        logRtStartupStage("before updateRaytraceArgsConstantBuffer");
         updateRaytraceArgsConstantBuffer(rtOutput, downscaledExtent, targetImage->info().extent);
-        logRtStartupStage("after updateRaytraceArgsConstantBuffer");
-
-        const bool adaptivePerformanceActive = isAdaptivePathTracingPerformanceActive();
-        const bool adaptivePerformanceSevere = isAdaptivePathTracingPerformanceSevere();
-        const bool adaptiveSkipOptionalPasses = adaptivePerformanceActive && RtxOptions::adaptivePathTracingSkipOptionalPasses();
-        logAdaptivePathTracingPerformanceState(
-          adaptivePerformanceActive,
-          adaptivePerformanceSevere,
-          getAdaptivePathTracingResolutionScaleLimit());
 
         // Volumetric Lighting
-        logRtStartupStage("before dispatchVolumetrics");
-        if (!adaptiveSkipOptionalPasses) {
-          dispatchVolumetrics(rtOutput);
-        }
-        logRtStartupStage("after dispatchVolumetrics");
+        dispatchVolumetrics(rtOutput);
         
         // Path Tracing
-        logRtStartupStage("before dispatchPathTracing");
         dispatchPathTracing(rtOutput);
-        logRtStartupStage("after dispatchPathTracing");
 
         // Neural Radiance Cache
-        logRtStartupStage("before dispatchTrainingAndResolve");
         m_common->metaNeuralRadianceCache().dispatchTrainingAndResolve(*this, rtOutput);
-        logRtStartupStage("after dispatchTrainingAndResolve");
 
         // RTXDI confidence
-        logRtStartupStage("before dispatchConfidence");
-        if (!adaptiveSkipOptionalPasses) {
-          m_common->metaRtxdiRayQuery().dispatchConfidence(this, rtOutput);
-        }
-        logRtStartupStage("after dispatchConfidence");
+        m_common->metaRtxdiRayQuery().dispatchConfidence(this, rtOutput);
 
         // ReSTIR GI
-        logRtStartupStage("before dispatchReSTIRGI");
-        if (!adaptiveSkipOptionalPasses) {
-          m_common->metaReSTIRGIRayQuery().dispatch(this, rtOutput);
-        }
-        logRtStartupStage("after dispatchReSTIRGI");
+        m_common->metaReSTIRGIRayQuery().dispatch(this, rtOutput);
         
         if (captureScreenImage && captureDebugImage) {
           takeScreenshot("baseReflectivity", rtOutput.m_primaryBaseReflectivity.image(Resources::AccessType::Read));
@@ -1038,9 +662,7 @@ namespace dxvk {
         }
 
         // Demodulation
-        logRtStartupStage("before dispatchDemodulate");
         dispatchDemodulate(rtOutput);
-        logRtStartupStage("after dispatchDemodulate");
 
         // Note: Primary direct diffuse/specular radiance textures noisy and in a demodulated state after demodulation step.
         if (captureScreenImage && captureDebugImage) {
@@ -1049,9 +671,7 @@ namespace dxvk {
         }
 
         // Denoising
-        logRtStartupStage("before dispatchDenoise");
         dispatchDenoise(rtOutput);
-        logRtStartupStage("after dispatchDenoise");
 
         // Note: Primary direct diffuse/specular radiance textures denoised but in a still demodulated state after denoising step.
         if (captureScreenImage && captureDebugImage) {
@@ -1060,9 +680,7 @@ namespace dxvk {
         }
 
         // Composition
-        logRtStartupStage("before dispatchComposite");
         dispatchComposite(rtOutput);
-        logRtStartupStage("after dispatchComposite");
 
         // Post composite Debug View that may overwrite Composite output
         dispatchReplaceCompositeWithDebugView(rtOutput);
@@ -1072,9 +690,7 @@ namespace dxvk {
         }
 
         getCommonObjects()->getTextureManager().copySamplerFeedbackToHost(this);
-        if (!adaptiveSkipOptionalPasses) {
-          dispatchObjectPicking(rtOutput, downscaledExtent, targetImage->info().extent);
-        }
+        dispatchObjectPicking(rtOutput, downscaledExtent, targetImage->info().extent);
 
         // Upscaling if DLSS/NIS enabled, or the Composition Pass will do upscaling
         if (m_currentUpscaler == InternalUpscaler::DLSS) {
@@ -1088,13 +704,6 @@ namespace dxvk {
         } else if (m_currentUpscaler == InternalUpscaler::XeSS) {
           m_common->metaAutoExposure().createResources(this);
           dispatchXeSS(rtOutput);
-        } else if (m_currentUpscaler == InternalUpscaler::FSR4) {
-          static bool sLoggedFsr4CompatibilityBackend = false;
-          if (!sLoggedFsr4CompatibilityBackend) {
-            sLoggedFsr4CompatibilityBackend = true;
-            Logger::warn("AMD FSR4 is selected and the SDK provider is present, but native Vulkan dispatch is not implemented in this DX11 renderer yet. Using the temporal AA compatibility backend instead of disabling the selected manufacturer mode.");
-          }
-          dispatchTemporalAA(rtOutput);
         } else if (m_currentUpscaler == InternalUpscaler::NIS) {
           dispatchNIS(rtOutput);
         } else if (m_currentUpscaler == InternalUpscaler::TAAU){
@@ -1147,36 +756,11 @@ namespace dxvk {
         // Blit to the game target
         {
           ScopedGpuProfileZone(this, "Blit to Game");
-
-          const VkExtent3D srcExtent = srcImage != nullptr ? srcImage->info().extent : VkExtent3D { 0u, 0u, 0u };
-          const VkExtent3D dstExtent = targetImage != nullptr ? targetImage->info().extent : VkExtent3D { 0u, 0u, 0u };
-          const bool canBlitToTarget = srcImage != nullptr
-            && targetImage != nullptr
-            && isValid2DExtent(srcExtent)
-            && isValid2DExtent(dstExtent)
-            && matching2DExtents(srcExtent, dstExtent);
-
-          if (canBlitToTarget) {
-            blitImageHelper(this, srcImage, targetImage, VkFilter::VK_FILTER_NEAREST);
-          } else {
-            static uint32_t sSkipViewportBlitLogCount = 0;
-            if (sSkipViewportBlitLogCount < 12) {
-              ++sSkipViewportBlitLogCount;
-              Logger::warn(str::format(
-                "[RTX] Skipping final viewport blit because the RT output and game target are not compatible: src=",
-                srcExtent.width,
-                "x",
-                srcExtent.height,
-                "x",
-                srcExtent.depth,
-                " dst=",
-                dstExtent.width,
-                "x",
-                dstExtent.height,
-                "x",
-                dstExtent.depth));
-            }
-          }
+          
+          // Note: the resolution between srcImage and dstImage always matches
+          // so we can use the same blit with nearest neighbor filtering
+          assert(srcImage->info().extent == targetImage->info().extent);
+          blitImageHelper(this, srcImage, targetImage, VkFilter::VK_FILTER_NEAREST);
         }
 
         // Log stats when an image is taken
@@ -1184,38 +768,11 @@ namespace dxvk {
           getSceneManager().logStatistics();
         }
 
-        m_common->metaNeuralRadianceCache().onFrameEnd(rtOutput);
-
-        rtOutput.onFrameEnd();
         raytracedThisFrame = true;
-        m_lastRaytracedSurfaceCount = surfaceCount;
-        m_framesWithoutValidScene = 0;
-      } else {
-        if ((hasSurfaceBuffer && surfaceCount > 0) && (sceneCollapsed || tinyUnclassifiedScene || sparseStartupScene)) {
-          static uint32_t sInvalidSceneLogCount = 0;
-          if (sInvalidSceneLogCount < 12) {
-            ++sInvalidSceneLogCount;
-            Logger::info(str::format(
-              "[RTX] Skipping collapsed RT scene update: surfaces=", surfaceCount,
-              " lastGoodSurfaces=", m_lastRaytracedSurfaceCount,
-              " realCamera=", hasRealSceneCamera ? 1 : 0,
-              sparseStartupScene ? " [startup-sparse]" : "",
-              sceneCollapsed ? " [collapsed]" : "",
-              tinyUnclassifiedScene ? " [tiny-unclassified]" : ""));
-          }
-        }
-
-        m_framesWithoutValidScene++;
-        if (m_framesWithoutValidScene > sceneKeepAliveFrames) {
-          const bool needWfi = !sceneCollapsed
-            && (m_framesWithoutValidScene == sceneKeepAliveFrames + 1);
-          getSceneManager().clear(this, needWfi);
-          if (!sceneCollapsed) {
-            m_lastRaytracedSurfaceCount = 0;
-          }
-        }
       }
-    } else if (!missingTargetImage) {
+
+      m_framesWithoutValidScene = 0;
+    } else {
       // If raytracing is only disabled because we don't have shaders available, we don't want to clear the scene.
       // This frequently happens for a single frame when a cached shader is being fetched, and causes the Logic 
       // graph state to be reset - which is problematic since Logic graphs often trigger shader fetches.
@@ -1225,22 +782,17 @@ namespace dxvk {
         m_framesWithoutValidScene++;
         // Some games may have invalid cameras for a brief period during camera cuts, but clearing the scene
         // during these cuts causes all textures to need to be reloaded, which is slow.
-        if (m_framesWithoutValidScene > sceneKeepAliveFrames) {
+        if (m_framesWithoutValidScene > RtxOptions::sceneKeepAliveFrames()) {
           // Only perform Wait For Idle on the first clear to avoid expensive GPU sync on every frame
-          const bool needWfi = (m_framesWithoutValidScene == sceneKeepAliveFrames + 1);
+          const bool needWfi = (m_framesWithoutValidScene == RtxOptions::sceneKeepAliveFrames() + 1);
           getSceneManager().clear(this, needWfi);
-          m_lastRaytracedSurfaceCount = 0;
         }
       } else {
         m_framesWithoutValidScene = 0;
       }
-    } else {
-      // Keep the previous scene alive across transient swapchain/render-target
-      // gaps during startup or game/menu transitions.
-      m_framesWithoutValidScene = 0;
     }
 
-    getSceneManager().onFrameEnd(this, raytracedThisFrame);
+    onInjectRtxFrameEnd(raytracedThisFrame);
 
     // apply changes to RtxOptions after the frame has ended
     RtxOptionManager::applyPendingValues(m_device.ptr(), /* forceOnChange */ false);
@@ -1256,30 +808,6 @@ namespace dxvk {
     if (callInjectRtx) {
       // Fallback inject (is a no-op if already injected this frame, or no valid RT scene)
       injectRTX(cachedReflexFrameId, targetImage);
-    } else {
-      // Even when D3D11 correctly decides to pass a startup/loading/menu frame
-      // through without RTX, accepted draw calls may already have reached the
-      // scene manager. Finalize the frame so those transient objects, camera
-      // candidates, fog states, and buffer refs cannot accumulate indefinitely.
-      const bool uiOpen = ImGUI::GetLastKnownMenuType() != UIType::None;
-      const uint32_t sceneKeepAliveFrames = std::max(RtxOptions::sceneKeepAliveFrames(), uiOpen ? 120u : 16u);
-      const bool hasRtSceneState =
-        getSceneManager().getInstanceManager().getActiveCount() > 0
-        || getSceneManager().getSurfaceBuffer().ptr() != nullptr
-        || getSceneManager().isPreviousFrameSceneAvailable();
-
-      if (hasRtSceneState) {
-        m_framesWithoutValidScene++;
-        if (m_framesWithoutValidScene > sceneKeepAliveFrames) {
-          const bool needWfi = (m_framesWithoutValidScene == sceneKeepAliveFrames + 1);
-          getSceneManager().clear(this, needWfi);
-          m_lastRaytracedSurfaceCount = 0;
-        }
-      } else {
-        m_framesWithoutValidScene = 0;
-      }
-
-      getSceneManager().onFrameEnd(this, false);
     }
 
 #ifdef REMIX_DEVELOPMENT
@@ -1292,7 +820,7 @@ namespace dxvk {
     GlobalTime::get().update();
   }
 
-  // Called right before present
+  // Called right before D3D11 present
   void RtxContext::onPresent(Rc<DxvkImage> targetImage) {
     // If injectRTX couldn't screenshot a final image or a pre-present screenshot is requested,
     // take a screenshot of a present image (with UI and others)
@@ -1305,16 +833,9 @@ namespace dxvk {
         const bool captureDxvkScreenImage = s_triggerScreenshot || captureTestScreenshot;
         if (captureDxvkScreenImage) {
           if (targetImage == nullptr) {
-            const auto& colorTarget = m_state.om.renderTargets.color[0];
-            if (colorTarget.view != nullptr) {
-              targetImage = colorTarget.view->image();
-            }
+            targetImage = m_state.om.renderTargets.color[0].view->image();
           }
-          if (targetImage == nullptr) {
-            Logger::warn("[RTX] Skipping DXVK-view screenshot because no present target or color render target is currently bound.");
-          } else {
-            takeScreenshot("rtxImageDxvkView", targetImage);
-          }
+          takeScreenshot("rtxImageDxvkView", targetImage);
         }
       }
     }
@@ -1337,7 +858,7 @@ namespace dxvk {
 
   void RtxContext::updateMetrics(const float gpuIdleTimeMilliseconds) const {
     ScopedCpuProfileZone();
-    Metrics::logRollingAverage(Metric::dxvk_average_frame_time_ms, GlobalTime::get().deltaTimeMs()); // In milliseconds
+    Metrics::logRollingAverage(Metric::dxvk_average_frame_time_ms, GlobalTime::get().realDeltaTimeMs()); // In milliseconds
     Metrics::logRollingAverage(Metric::dxvk_gpu_idle_time_ms, gpuIdleTimeMilliseconds); // In milliseconds
     uint64_t vidUsageMib = 0;
     uint64_t sysUsageMib = 0;
@@ -1359,13 +880,13 @@ namespace dxvk {
     Metrics::logFloat(Metric::dxvk_frame_count, static_cast<float>(m_device->getCurrentFrameId()));
   }
 
-  void RtxContext::setConstantBuffers(const uint32_t vsConstantsSlot, const uint32_t psSharedStateConstants, Rc<DxvkBuffer> vertexCaptureCB) {
-    m_rtState.vsConstantsCB    = m_rc[vsConstantsSlot].bufferSlice.buffer();
-    m_rtState.psSharedStateCB  = m_rc[psSharedStateConstants].bufferSlice.buffer();
-    m_rtState.vertexCaptureCB  = vertexCaptureCB;
+  void RtxContext::setConstantBuffers(const uint32_t vsFixedFunctionConstants, const uint32_t psSharedStateConstants, Rc<DxvkBuffer> vertexCaptureCB) {
+    m_rtState.vsFixedFunctionCB = m_rc[vsFixedFunctionConstants].bufferSlice.buffer();
+    m_rtState.psSharedStateCB = m_rc[psSharedStateConstants].bufferSlice.buffer();
+    m_rtState.vertexCaptureCB = vertexCaptureCB;
   }
 
-  void RtxContext::addLights(const RtxLegacyLight* pLights, const uint32_t numLights) {
+  void RtxContext::addLights(const Dx11LightDesc* pLights, const uint32_t numLights) {
     for (uint32_t i = 0; i < numLights; i++) {
       getSceneManager().addLight(pLights[i]);
     }
@@ -1373,11 +894,6 @@ namespace dxvk {
 
   void RtxContext::commitGeometryToRT(const DrawParameters& params, DrawCallState& drawCallState){
     ScopedCpuProfileZone();
-
-    using Clock = std::chrono::steady_clock;
-    static uint32_t sCommitTimingLogCount = 0;
-    const bool logCommitTiming = sCommitTimingLogCount < 24;
-    const auto commitStart = logCommitTiming ? Clock::now() : Clock::time_point {};
 
     RasterGeometry& geoData = drawCallState.geometryData;
     DrawCallTransforms& transformData = drawCallState.transformData;
@@ -1409,44 +925,9 @@ namespace dxvk {
 
     // Sync any pending work with geometry processing threads
     if (drawCallState.finalizePendingFutures(lastCamera)) {
-      const auto afterFinalize = logCommitTiming ? Clock::now() : Clock::time_point {};
       drawCallState.cameraType = cameraManager.processCameraData(drawCallState);
-      const auto afterCamera = logCommitTiming ? Clock::now() : Clock::time_point {};
 
       if (drawCallState.cameraType == CameraType::Unknown) {
-        if (drawCallState.getTransformData().usedViewportFallbackProjection) {
-          const bool hasStableMainCamera = cameraManager.isCameraValid(CameraType::Main)
-            || cameraManager.getLastSetCameraType() == CameraType::Main;
-          const bool fallbackBootstrapAllowed = !cameraManager.hasSeenRealMainCamera();
-          const bool hasCameraTransformSignal = !isIdentityExact(drawCallState.getTransformData().worldToView);
-          const bool hasFusedCameraTransformSignal = !isIdentityExact(drawCallState.getTransformData().objectToView)
-            && drawCallState.getTransformData().objectToView != drawCallState.getTransformData().objectToWorld;
-          const uint32_t primitiveCount = drawCallState.getGeometryData().calculatePrimitiveCount();
-          const bool hasSceneDepthSignal = drawCallState.zEnable
-            && (drawCallState.zWriteEnable || drawCallState.maxZ >= 0.99f);
-          const bool canBootstrapFromFallback = hasCameraTransformSignal
-            || hasFusedCameraTransformSignal
-            || (hasSceneDepthSignal && primitiveCount >= 32u);
-
-          if (fallbackBootstrapAllowed && !hasStableMainCamera && canBootstrapFromFallback) {
-            static uint32_t sViewportFallbackBootstrapLogCount = 0;
-            if (sViewportFallbackBootstrapLogCount < 8) {
-              ++sViewportFallbackBootstrapLogCount;
-              Logger::info("[RTX] Promoting synthesized viewport-fallback draw to main camera while no stable real scene camera exists yet.");
-            }
-            drawCallState.cameraType = CameraType::Main;
-          } else {
-            static uint32_t sViewportFallbackUnknownCameraSkipLogCount = 0;
-            if (sViewportFallbackUnknownCameraSkipLogCount < 8) {
-              ++sViewportFallbackUnknownCameraSkipLogCount;
-              Logger::info(str::format(
-                "[RTX] Skipping draw with synthesized viewport-fallback camera that could not be classified as a real scene camera",
-                fallbackBootstrapAllowed ? "." : " after a real main camera was seen."));
-            }
-            return;
-          }
-        }
-
         if (RtxOptions::skipObjectsWithUnknownCamera()) {
           return;
         }
@@ -1457,12 +938,10 @@ namespace dxvk {
       if (tryHandleSky(&params, &drawCallState) == TryHandleSkyResult::SkipSubmit) {
         return;
       }
-      const auto afterSky = logCommitTiming ? Clock::now() : Clock::time_point {};
 
       // Bake the terrain
       const MaterialData* overrideMaterialData = nullptr;
       bakeTerrain(params, drawCallState, &overrideMaterialData);
-      const auto afterTerrain = logCommitTiming ? Clock::now() : Clock::time_point {};
 
     
       // An attempt to resolve cases where games pre-combine view and world matrices
@@ -1495,36 +974,6 @@ namespace dxvk {
       }
 
       getSceneManager().submitDrawState(this, drawCallState, overrideMaterialData);
-      if (logCommitTiming) {
-        const auto afterSubmit = Clock::now();
-        ++sCommitTimingLogCount;
-
-        const auto toUs = [](Clock::duration d) {
-          return std::chrono::duration_cast<std::chrono::microseconds>(d).count();
-        };
-
-        Logger::info(str::format(
-          "[RTX-DX11] commitGeometryToRT timings us: finalize=",
-          toUs(afterFinalize - commitStart),
-          " camera=",
-          toUs(afterCamera - afterFinalize),
-          " sky=",
-          toUs(afterSky - afterCamera),
-          " terrain=",
-          toUs(afterTerrain - afterSky),
-          " submit=",
-          toUs(afterSubmit - afterTerrain),
-          " drawId=",
-          drawCallState.drawCallID,
-          " indexed=",
-          params.indexCount > 0 ? 1 : 0,
-          " vertices=",
-          drawCallState.getGeometryData().vertexCount,
-          " indices=",
-          drawCallState.getGeometryData().indexCount,
-          " skinned=",
-          drawCallState.futureSkinningData.valid() ? 1 : 0));
-      }
     }
   }
 
@@ -1610,26 +1059,6 @@ namespace dxvk {
     constants.russianRoulette1stBounceMaxContinueProbability = RtxOptions::russianRoulette1stBounceMaxContinueProbability();
     constants.pathMinBounces = RtxOptions::pathMinBounces();
     constants.pathMaxBounces = RtxOptions::pathMaxBounces();
-
-    const bool adaptivePerformanceActive = isAdaptivePathTracingPerformanceActive();
-    const bool adaptivePerformanceSevere = isAdaptivePathTracingPerformanceSevere();
-    if (adaptivePerformanceActive && RtxOptions::adaptivePathTracingClampBounces()) {
-      const uint8_t maxAdaptivePathBounces = adaptivePerformanceSevere
-        ? RtxOptions::adaptivePathTracingSevereMaxBounces()
-        : RtxOptions::adaptivePathTracingLowFpsMaxBounces();
-
-      constants.pathMaxBounces = std::min(constants.pathMaxBounces, maxAdaptivePathBounces);
-      constants.pathMinBounces = std::min(constants.pathMinBounces, constants.pathMaxBounces);
-      constants.secondaryRayMaxInteractions = std::min(
-        constants.secondaryRayMaxInteractions,
-        RtxOptions::adaptivePathTracingSecondaryRayMaxInteractions());
-      constants.psrrMaxBounces = std::min(
-        RtxOptions::psrrMaxBounces(),
-        static_cast<uint8_t>(adaptivePerformanceSevere ? 2 : 4));
-      constants.pstrMaxBounces = std::min(
-        RtxOptions::pstrMaxBounces(),
-        static_cast<uint8_t>(adaptivePerformanceSevere ? 2 : 4));
-    }
     // Note: Probability adjustments always in the 0-1 range and therefore less than FLOAT16_MAX.
     constants.opaqueDiffuseLobeSamplingProbabilityZeroThreshold =
       glm::packHalf1x16(RtxOptions::opaqueDiffuseLobeSamplingProbabilityZeroThreshold());
@@ -1662,10 +1091,8 @@ namespace dxvk {
     constants.emissiveIntensity = glm::packHalf1x16(RtxOptions::emissiveIntensity());
     constants.particleSoftnessFactor = glm::packHalf1x16(RtxOptions::particleSoftnessFactor());
 
-    if (!adaptivePerformanceActive || !RtxOptions::adaptivePathTracingClampBounces()) {
-      constants.psrrMaxBounces = RtxOptions::psrrMaxBounces();
-      constants.pstrMaxBounces = RtxOptions::pstrMaxBounces();
-    }
+    constants.psrrMaxBounces = RtxOptions::psrrMaxBounces();
+    constants.pstrMaxBounces = RtxOptions::pstrMaxBounces();
 
     auto& rayReconstruction = m_common->metaRayReconstruction();
     constants.outputParticleLayer = useRR && rayReconstruction.useParticleBuffer();
@@ -1707,6 +1134,8 @@ namespace dxvk {
     constants.enableTransmissionApproximationInIndirectRays = RtxOptions::enableTransmissionApproximationInIndirectRays();
     constants.enableUnorderedEmissiveParticlesInIndirectRays = RtxOptions::enableUnorderedEmissiveParticlesInIndirectRays();
     constants.enableDecalMaterialBlending = RtxOptions::enableDecalMaterialBlending();
+    constants.enableLegacyRectLightConeShaping = LightManager::enableLegacyRectLightConeShaping();
+    constants.enableRectLightConeShapingRatioScaling = LightManager::enableRectLightConeShapingRatioScaling();
     constants.enableBillboardOrientationCorrection = RtxOptions::enableBillboardOrientationCorrection() && RtxOptions::enableSeparateUnorderedApproximations();
     constants.useIntersectionBillboardsOnPrimaryRays = RtxOptions::useIntersectionBillboardsOnPrimaryRays() && constants.enableBillboardOrientationCorrection;
     constants.enableDirectLightBoilingFilter = m_common->metaDemodulate().enableDirectLightBoilingFilter() && RtxOptions::useRTXDI();
@@ -1796,7 +1225,7 @@ namespace dxvk {
     constants.reSTIRGIMISRoughness = restirGI.misRoughness();
     constants.reSTIRGIMISParallaxAmount = restirGI.parallaxAmount();
     constants.enableReSTIRGIDemodulatedTargetFunction = restirGI.useDemodulatedTargetFunction();
-    constants.enableReSTIRGILightingValidation = RtxOptions::useRTXDI() && rtxdi.enableDenoiserGradient() && restirGI.validateLightingChange();
+    constants.enableReSTIRGILightingValidation = RtxOptions::useRTXDI() && rtxdi.getEnableDenoiserGradient(*this) && restirGI.validateLightingChange();
     constants.reSTIRGISampleValidationThreshold = restirGI.lightingValidationThreshold();
     constants.enableReSTIRGIVisibilityValidation = restirGI.validateVisibilityChange();
     constants.reSTIRGIVisibilityValidationRange = 1.0f + restirGI.visibilityValidationRange();
@@ -1991,7 +1420,9 @@ namespace dxvk {
 
   void RtxContext::checkOpacityMicromapSupport() {
     bool isOpacityMicromapSupported = OpacityMicromapManager::checkIsOpacityMicromapSupported(*m_device);
+
     RtxOptions::setIsOpacityMicromapSupported(isOpacityMicromapSupported);
+
     Logger::info(str::format("[RTX info] Opacity Micromap: ", isOpacityMicromapSupported ? "supported" : "not supported"));
   }
 
@@ -2025,25 +1456,16 @@ namespace dxvk {
   }
 
   void RtxContext::checkNeuralRadianceCacheSupport() {
-    const IntegrateIndirectMode requestedMode = RtxOptions::integrateIndirectMode();
-    const IntegrateIndirectMode resolvedMode = RtxOptions::getSupportedIntegrateIndirectMode(m_device.ptr(), requestedMode);
+    // Update RtxOption selection if Neural Radiance Cache was selected but it's not supported
+    if (RtxOptions::integrateIndirectMode() == IntegrateIndirectMode::NeuralRadianceCache &&
+        !NeuralRadianceCache::checkIsSupported(m_device.ptr())) {
 
-    if (requestedMode != resolvedMode) {
-      Logger::info(str::format("[RTX] Neural Radiance Cache is not supported on this hardware. Using the supported indirect illumination mode selected by the active preset/configuration."));
-
-      // Enforce the fallback, do not merely log it. NRC is an NVIDIA-only
-      // path (it needs VK_NVX_binary_import / VK_NVX_image_view_handle, absent
-      // on AMD and Intel). Per REMIX-4105, dispatching a frame with NRC active
-      // when it is unsupported hangs/crashes the GPU - which is exactly the
-      // first-frame freeze seen on every non-NVIDIA GPU when a user.conf pins
-      // rtx.integrateIndirectMode to NeuralRadianceCache. Force the resolved
-      // mode immediately AND clear NRC from any stronger (user/config) layer so
-      // it cannot resolve back to NRC on the frame that follows.
-      RtxOptions::integrateIndirectMode.setImmediately(resolvedMode, RtxOptionLayer::getQualityLayer());
-      if (RtxOptions::integrateIndirectMode() != resolvedMode) {
-        RtxOptions::integrateIndirectMode.clearFromStrongerLayers(RtxOptionLayer::getQualityLayer());
-        RtxOptions::integrateIndirectMode.setImmediately(resolvedMode, RtxOptionLayer::getQualityLayer());
-      }
+      // Fallback to ReSTIRGI
+      Logger::warn(str::format("[RTX] Neural Radiance Cache is not supported. Switching indirect illumination mode to ReSTIR GI."));
+      // TODO[REMIX-4105] trying to use NRC for a frame when it isn't supported will cause a crash, so this needs to be setImmediately.
+      // Should refactor this to use a separate global for the final state, and indicate user preference with the option.
+      // Use Quality layer to ensure this overrides the Environment layer (where env vars are stored).
+      RtxOptions::integrateIndirectMode.setImmediately(IntegrateIndirectMode::ReSTIRGI, RtxOptionLayer::getQualityLayer());
     }
   }
 
@@ -2060,75 +1482,37 @@ namespace dxvk {
   void RtxContext::dispatchIntegrate(const Resources::RaytracingOutput& rtOutput) {
     ScopedGpuProfileZone(this, "Integrate Raytracing");
 
-    const bool traceRtStartupStages = m_device->getCurrentFrameId() <= 3;
-    auto logRtStartupStage = [&](const char* stage) {
-      if (traceRtStartupStages) {
-        Logger::info(str::format("[RTX-Startup] frame=", m_device->getCurrentFrameId(), " stage=", stage));
-      }
-    };
-
     // Integrate direct
-    logRtStartupStage("before dispatchIntegrateDirect");
     m_common->metaPathtracerIntegrateDirect().dispatch(this, rtOutput);
-    logRtStartupStage("after dispatchIntegrateDirect");
 
     // RTXDI Gradient pass
-    logRtStartupStage("before dispatchRtxdiGradient");
-    if (!isAdaptivePathTracingPerformanceActive() || !RtxOptions::adaptivePathTracingSkipOptionalPasses()) {
-      m_common->metaRtxdiRayQuery().dispatchGradient(this, rtOutput);
-    }
-    logRtStartupStage("after dispatchRtxdiGradient");
+    m_common->metaRtxdiRayQuery().dispatchGradient(this, rtOutput);
 
     // Integrate indirect
-    if (!isAdaptivePathTracingPerformanceSevere() || !RtxOptions::adaptivePathTracingSkipOptionalPasses()) {
+    {
       ScopedGpuProfileZone(this, "Integrate Indirect Raytracing");
       setFramePassStage(RtxFramePassStage::IndirectIntegration);
-
-      logRtStartupStage("before dispatchIntegrateIndirect");
+      
       m_common->metaPathtracerIntegrateIndirect().dispatch(this, rtOutput);
-      logRtStartupStage("after dispatchIntegrateIndirect");
-    } else {
-      logRtStartupStage("skip dispatchIntegrateIndirect severe adaptive performance");
     }
 
     // Integrate indirect - NEE Cache pass
-    logRtStartupStage("before dispatchIntegrateNEE");
-    if (!isAdaptivePathTracingPerformanceActive() || !RtxOptions::adaptivePathTracingSkipOptionalPasses()) {
-      m_common->metaPathtracerIntegrateIndirect().dispatchNEE(this, rtOutput);
-    }
-    logRtStartupStage("after dispatchIntegrateNEE");
+    m_common->metaPathtracerIntegrateIndirect().dispatchNEE(this, rtOutput);
   }
 
   void RtxContext::dispatchPathTracing(const Resources::RaytracingOutput& rtOutput) {
 
-    const bool traceRtStartupStages = m_device->getCurrentFrameId() <= 3;
-    auto logRtStartupStage = [&](const char* stage) {
-      if (traceRtStartupStages) {
-        Logger::info(str::format("[RTX-Startup] frame=", m_device->getCurrentFrameId(), " stage=", stage));
-      }
-    };
-
     // Gbuffer Raytracing
-    logRtStartupStage("before dispatchPathtracerGbuffer");
     m_common->metaPathtracerGbuffer().dispatch(this, rtOutput);
-    logRtStartupStage("after dispatchPathtracerGbuffer");
 
     // RTXDI
-    logRtStartupStage("before dispatchRtxdiPrimary");
     m_common->metaRtxdiRayQuery().dispatch(this, rtOutput);
-    logRtStartupStage("after dispatchRtxdiPrimary");
 
     // NEE Cache
-    logRtStartupStage("before dispatchNeeCache");
-    if (!isAdaptivePathTracingPerformanceActive() || !RtxOptions::adaptivePathTracingSkipOptionalPasses()) {
-      dispatchNeeCache(rtOutput);
-    }
-    logRtStartupStage("after dispatchNeeCache");
+    dispatchNeeCache(rtOutput);
 
     // Integration Raytracing
-    logRtStartupStage("before dispatchIntegrate");
     dispatchIntegrate(rtOutput);
-    logRtStartupStage("after dispatchIntegrate");
   }
   
   void RtxContext::dispatchDemodulate(const Resources::RaytracingOutput& rtOutput) {
@@ -2202,11 +1586,7 @@ namespace dxvk {
         denoiser.dispatch(this, m_execBarriers, rtOutput, denoiseInput, denoiseOutput);
     };
 
-    bool isSecondaryOnly = useRayReconstruction() && !rayReconstruction.enableNRDForTraining() && rayReconstruction.preprocessSecondarySignal();
-    const bool skipSecondaryDenoiseForPerformance =
-      isAdaptivePathTracingPerformanceActive()
-      && RtxOptions::adaptivePathTracingSkipOptionalPasses()
-      && !isSecondaryOnly;
+    const bool isSecondaryOnly = rayReconstruction.denoiseSecondarySignalWithExternalDenoiser();
 
     // Primary Direct light denoiser
     if (!isSecondaryOnly)
@@ -2261,7 +1641,7 @@ namespace dxvk {
     }
 
     // Secondary Combined light denoiser
-    if (!skipSecondaryDenoiseForPerformance) {
+    {
       ScopedGpuProfileZone(this, "Secondary Combined Denoising");
 
       DxvkDenoise::Input denoiseInput = {};
@@ -2277,9 +1657,6 @@ namespace dxvk {
       denoiseOutput.specular_hitT = &rtOutput.m_secondaryCombinedSpecularRadiance.resource(Resources::AccessType::Write);
 
       runDenoising(denoiser2, referenceDenoiserSecondLobe2, denoiseInput, denoiseOutput);
-    } else {
-      denoiser2.releaseResources();
-      referenceDenoiserSecondLobe2.releaseResources();
     }
   }
 
@@ -2371,7 +1748,7 @@ namespace dxvk {
     // but the reset of denoised buffers causes wide tone curve differences
     // until it converges and thus making comparison of raytracing mode outputs more difficult
     setFramePassStage(RtxFramePassStage::ToneMapping);
-    if (RtxOptions::tonemappingMode() == TonemappingMode::Global || RtxOptions::tonemappingMode() == TonemappingMode::Direct) {
+    if (RtxOptions::tonemappingMode() == TonemappingMode::Global) {
       DxvkToneMapping& toneMapper = m_common->metaToneMapping();
       toneMapper.dispatch(this, 
         getResourceManager().getSampler(VK_FILTER_LINEAR, VK_SAMPLER_MIPMAP_MODE_NEAREST, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER),
@@ -2389,10 +1766,6 @@ namespace dxvk {
 
   void RtxContext::dispatchBloom(const Resources::RaytracingOutput& rtOutput) {
     ScopedCpuProfileZone();
-    if (isAdaptivePathTracingPerformanceActive() && RtxOptions::adaptivePathTracingSkipPostFx()) {
-      return;
-    }
-
     DxvkBloom& bloom = m_common->metaBloom();
     if (!bloom.isActive()) {
       return;
@@ -2409,10 +1782,6 @@ namespace dxvk {
 
   void RtxContext::dispatchPostFx(Resources::RaytracingOutput& rtOutput) {
     ScopedCpuProfileZone();
-    if (isAdaptivePathTracingPerformanceActive() && RtxOptions::adaptivePathTracingSkipPostFx()) {
-      return;
-    }
-
     DxvkPostFx& postFx = m_common->metaPostFx();
     RtCamera& mainCamera = getSceneManager().getCamera();
     if (!postFx.enable()) {
@@ -2831,7 +2200,7 @@ namespace dxvk {
     // Note: m_dlssSupported only checks for the presence of some basic extensions, the actual DLSS context needs to be queried to see
     // if a given platform supports DLSS (as this will depend on if it was actually initialized successfully or not). Cases where m_dlssSupported
     // is true but supportsDLSS() is not are for example when the DLSS DLL is missing.
-    return RtxOptions::isRuntimeDLSSEnabled() && m_dlssSupported && m_common->metaDLSS().supportsDLSS();
+    return RtxOptions::isDLSSEnabled() && m_dlssSupported && m_common->metaDLSS().supportsDLSS();
   }
 
   bool RtxContext::shouldUseRayReconstruction() const {
@@ -2839,41 +2208,35 @@ namespace dxvk {
   }
 
   bool RtxContext::shouldUseNIS() const {
-    return RtxOptions::isRuntimeNISEnabled();
+    return RtxOptions::isNISEnabled();
   }
 
   bool RtxContext::shouldUseTAA() const {
-    return RtxOptions::isRuntimeTAAEnabled();
+    return RtxOptions::isTAAEnabled();
   }
 
   bool RtxContext::shouldUseXeSS() const {
-    return RtxOptions::isRuntimeXeSSEnabled()
-      && m_common->metaXeSS().supportsXeSS();
+    return RtxOptions::upscalerType() == UpscalerType::XeSS;
   }
 
-  bool RtxContext::shouldUseFSR4() const {
-    return RtxOptions::isRuntimeFSR4Enabled()
-      && m_common->metaFSR().supportsFSR4();
-  }
-
-  RtxVertexCaptureData& RtxContext::allocAndMapVertexCaptureConstantBuffer() {
+  D3D11RtxVertexCaptureData& RtxContext::allocAndMapVertexCaptureConstantBuffer() {
     DxvkBufferSliceHandle slice = m_rtState.vertexCaptureCB->allocSlice();
     invalidateBuffer(m_rtState.vertexCaptureCB, slice);
 
-    return *static_cast<RtxVertexCaptureData*>(slice.mapPtr);
+    return *static_cast<D3D11RtxVertexCaptureData*>(slice.mapPtr);
   }
 
-  RtxVSConstants& RtxContext::allocAndMapVSConstantBuffer() {
-    DxvkBufferSliceHandle slice = m_rtState.vsConstantsCB->allocSlice();
-    invalidateBuffer(m_rtState.vsConstantsCB, slice);
+  D3D11FixedFunctionVS& RtxContext::allocAndMapFixedFunctionVSConstantBuffer() {
+    DxvkBufferSliceHandle slice = m_rtState.vsFixedFunctionCB->allocSlice();
+    invalidateBuffer(m_rtState.vsFixedFunctionCB, slice);
 
-    return *static_cast<RtxVSConstants*>(slice.mapPtr);
+    return *static_cast<D3D11FixedFunctionVS*>(slice.mapPtr);
   }
-  RtxSharedPS& RtxContext::allocAndMapPSSharedStateConstantBuffer() {
+  D3D11SharedPS& RtxContext::allocAndMapPSSharedStateConstantBuffer() {
     DxvkBufferSliceHandle slice = m_rtState.psSharedStateCB->allocSlice();
     invalidateBuffer(m_rtState.psSharedStateCB, slice);
 
-    return *static_cast<RtxSharedPS*>(slice.mapPtr);
+    return *static_cast<D3D11SharedPS*>(slice.mapPtr);
   }
 
   void RtxContext::rasterizeToSkyMatte(const DrawParameters& params, const DrawCallState& drawCallState) {
@@ -2883,8 +2246,8 @@ namespace dxvk {
     const uint32_t* renderResolution = camera.m_renderResolution;
 
     union UnifiedCB {
-      RtxVertexCaptureData programmablePipeline;
-      RtxVSConstants vsConstants;
+      D3D11RtxVertexCaptureData programmablePipeline;
+      D3D11FixedFunctionVS fixedFunction;
 
       UnifiedCB() { }
     };
@@ -2892,9 +2255,9 @@ namespace dxvk {
     UnifiedCB prevCB;
 
     if (drawCallState.usesVertexShader) {
-      prevCB.programmablePipeline = *static_cast<RtxVertexCaptureData*>(m_rtState.vertexCaptureCB->mapPtr(0));
+      prevCB.programmablePipeline = *static_cast<D3D11RtxVertexCaptureData*>(m_rtState.vertexCaptureCB->mapPtr(0));
     } else {
-      prevCB.vsConstants = *static_cast<RtxVSConstants*>(m_rtState.vsConstantsCB->mapPtr(0));
+      prevCB.fixedFunction = *static_cast<D3D11FixedFunctionVS*>(m_rtState.vsFixedFunctionCB->mapPtr(0));
     }
 
     auto skyMatteView = getResourceManager().getSkyMatte(this, m_skyColorFormat).view;
@@ -2905,18 +2268,13 @@ namespace dxvk {
     {
       if (drawCallState.usesVertexShader) {
         prevClipSpaceJitterEnabled = getSpecConstantsInfo(VK_PIPELINE_BIND_POINT_GRAPHICS)
-          .specConstants[RtxSpecConstantId::ClipSpaceJitterEnabled]
+          .specConstants[D3D11SpecConstantId::ClipSpaceJitterEnabled]
             ? 1
             : 0;
         // Enable, to use clipSpaceJitter, see notes below
-        setSpecConstant(VK_PIPELINE_BIND_POINT_GRAPHICS, RtxSpecConstantId::ClipSpaceJitterEnabled, true);
+        setSpecConstant(VK_PIPELINE_BIND_POINT_GRAPHICS, D3D11SpecConstantId::ClipSpaceJitterEnabled, true);
       }
     }
-
-    // Save current viewport and render target state
-    const uint32_t prevViewportCount = m_state.gp.state.rs.viewportCount();
-    const DxvkViewportState prevViewportState = m_state.vp;
-    const DxvkRenderTargets prevRenderTargets = m_state.om.renderTargets;
 
     {
       VkViewport viewport { 0.5f, static_cast<float>(skyMatteExt.height) + 0.5f,
@@ -2933,7 +2291,7 @@ namespace dxvk {
     }
 
     if (drawCallState.usesVertexShader) {
-      RtxVertexCaptureData modified = prevCB.programmablePipeline;
+      D3D11RtxVertexCaptureData modified = prevCB.programmablePipeline;
       {
         // Jittered clip space for DLSS
         // Note: we can't jitter the projection matrix, as a game might calculate
@@ -2947,18 +2305,18 @@ namespace dxvk {
       }
 
       // Ensure that memcpy can be used for fewer memory interactions
-      static_assert(std::is_trivially_copyable_v<RtxVertexCaptureData>);
+      static_assert(std::is_trivially_copyable_v<D3D11RtxVertexCaptureData>);
       allocAndMapVertexCaptureConstantBuffer() = modified;
     } else {
-      RtxVSConstants modified = prevCB.vsConstants;
+      D3D11FixedFunctionVS modified = prevCB.fixedFunction;
       {
         // Jittered projection for DLSS
         camera.applyJitterTo(modified.Projection,
                              m_device->getCurrentFrameId());
       }
       // Ensure that memcpy can be used for fewer memory interactions
-      static_assert(std::is_trivially_copyable_v<RtxVSConstants>);
-      allocAndMapVSConstantBuffer() = modified;
+      static_assert(std::is_trivially_copyable_v<D3D11FixedFunctionVS>);
+      allocAndMapFixedFunctionVSConstantBuffer() = modified;
     }
 
     DxvkRenderTargets skyRt;
@@ -2979,17 +2337,13 @@ namespace dxvk {
     // Restore state
     if (prevClipSpaceJitterEnabled >= 0) {
       assert(prevClipSpaceJitterEnabled == 0 || prevClipSpaceJitterEnabled == 1);
-      setSpecConstant(VK_PIPELINE_BIND_POINT_GRAPHICS, RtxSpecConstantId::ClipSpaceJitterEnabled, prevClipSpaceJitterEnabled);
+      setSpecConstant(VK_PIPELINE_BIND_POINT_GRAPHICS, D3D11SpecConstantId::ClipSpaceJitterEnabled, prevClipSpaceJitterEnabled);
     }
     if (drawCallState.usesVertexShader) {
       allocAndMapVertexCaptureConstantBuffer() = prevCB.programmablePipeline;
     } else {
-      allocAndMapVSConstantBuffer() = prevCB.vsConstants;
+      allocAndMapFixedFunctionVSConstantBuffer() = prevCB.fixedFunction;
     }
-
-    // Restore viewport and render target state
-    setViewports(prevViewportCount, prevViewportState.viewports.data(), prevViewportState.scissorRects.data());
-    bindRenderTargets(prevRenderTargets);
   }
 
   void RtxContext::initSkyProbe() {
@@ -3025,8 +2379,8 @@ namespace dxvk {
     // Grab transforms
     
     union UnifiedCB {
-      RtxVertexCaptureData programmablePipeline;
-      RtxVSConstants vsConstants;
+      D3D11RtxVertexCaptureData programmablePipeline;
+      D3D11FixedFunctionVS fixedFunction;
 
       UnifiedCB() { }
     };
@@ -3034,13 +2388,13 @@ namespace dxvk {
     UnifiedCB prevCB;
 
     if (drawCallState.usesVertexShader) {
-      prevCB.programmablePipeline = *static_cast<RtxVertexCaptureData*>(m_rtState.vertexCaptureCB->mapPtr(0));
+      prevCB.programmablePipeline = *static_cast<D3D11RtxVertexCaptureData*>(m_rtState.vertexCaptureCB->mapPtr(0));
     } else {
-      prevCB.vsConstants = *static_cast<RtxVSConstants*>(m_rtState.vsConstantsCB->mapPtr(0));
+      prevCB.fixedFunction = *static_cast<D3D11FixedFunctionVS*>(m_rtState.vsFixedFunctionCB->mapPtr(0));
     }
 
-    const Matrix4& worldToView = drawCallState.usesVertexShader ? drawCallState.getTransformData().worldToView : prevCB.vsConstants.View;
-    const Matrix4& viewToProj  = drawCallState.usesVertexShader ? drawCallState.getTransformData().viewToProjection : prevCB.vsConstants.Projection;
+    const Matrix4& worldToView = drawCallState.usesVertexShader ? drawCallState.getTransformData().worldToView : prevCB.fixedFunction.View;
+    const Matrix4& viewToProj  = drawCallState.usesVertexShader ? drawCallState.getTransformData().viewToProjection : prevCB.fixedFunction.Projection;
 
     // Figure out camera position
     const Vector3 camPos = inverse(worldToView).data[3].xyz();
@@ -3072,10 +2426,10 @@ namespace dxvk {
     {
       if (drawCallState.usesVertexShader) {
         prevCustomVertexTransformEnabled = getSpecConstantsInfo(VK_PIPELINE_BIND_POINT_GRAPHICS)
-          .specConstants[RtxSpecConstantId::CustomVertexTransformEnabled]
+          .specConstants[D3D11SpecConstantId::CustomVertexTransformEnabled]
             ? 1
             : 0;
-        setSpecConstant(VK_PIPELINE_BIND_POINT_GRAPHICS, RtxSpecConstantId::CustomVertexTransformEnabled, true);
+        setSpecConstant(VK_PIPELINE_BIND_POINT_GRAPHICS, D3D11SpecConstantId::CustomVertexTransformEnabled, true);
       }
     }
 
@@ -3103,7 +2457,7 @@ namespace dxvk {
       Rc<DxvkImageView>* skyRenderTarget = &m_skyProbeCubePlanes[plane];
 
       if (drawCallState.usesVertexShader) {
-        RtxVertexCaptureData& newState = allocAndMapVertexCaptureConstantBuffer();
+        D3D11RtxVertexCaptureData& newState = allocAndMapVertexCaptureConstantBuffer();
         newState = prevCB.programmablePipeline;
 
         // Create cube plane projection
@@ -3115,14 +2469,14 @@ namespace dxvk {
 
         newState.customWorldToProjection = proj * makeViewMatrixForCubePlane(plane, camPos);
       } else {
-        // Push new state to the VS constants
-        RtxVSConstants& newState = allocAndMapVSConstantBuffer();
-        newState = prevCB.vsConstants;
+        // Push new state to the fixed function constants
+        D3D11FixedFunctionVS& newState = allocAndMapFixedFunctionVSConstantBuffer();
+        newState = prevCB.fixedFunction;
         const Matrix4 view = makeViewMatrixForCubePlane(plane, camPos);
 
         // Set to identity, as we use custom matrices that transform from world to cube side projection
         newState.View      = view;
-        newState.WorldView = view * prevCB.vsConstants.World;
+        newState.WorldView = view * prevCB.fixedFunction.World;
         // And cube plane projection
         newState.Projection[0][0] = 1.f;
         newState.Projection[1][1] = 1.f;
@@ -3151,12 +2505,12 @@ namespace dxvk {
     setRasterizerState(prevRasterizerState);
     if (prevCustomVertexTransformEnabled >= 0) {
       assert(prevCustomVertexTransformEnabled == 0 || prevCustomVertexTransformEnabled == 1);
-      setSpecConstant(VK_PIPELINE_BIND_POINT_GRAPHICS, RtxSpecConstantId::CustomVertexTransformEnabled, prevCustomVertexTransformEnabled);
+      setSpecConstant(VK_PIPELINE_BIND_POINT_GRAPHICS, D3D11SpecConstantId::CustomVertexTransformEnabled, prevCustomVertexTransformEnabled);
     }
     if (drawCallState.usesVertexShader) {
       allocAndMapVertexCaptureConstantBuffer() = prevCB.programmablePipeline;
     } else {
-      allocAndMapVSConstantBuffer() = prevCB.vsConstants;
+      allocAndMapFixedFunctionVSConstantBuffer() = prevCB.fixedFunction;
     }
   }
 

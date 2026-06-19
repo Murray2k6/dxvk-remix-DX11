@@ -50,7 +50,7 @@
 #include "rtx_matrix_helpers.h"
 #include "rtx_lights.h"
 
-#include "../util/util_globaltime.h"
+#include "../util/util_global_time.h"
 
 #include <filesystem>
 
@@ -309,8 +309,7 @@ namespace dxvk {
   }
 
   void GameCapturer::captureLights() {
-    for (auto&& pair : m_sceneManager.getLightManager().getLightTable()) {
-      const RtLight& rtLight = pair.second;
+    auto captureLight = [&](const RtLight& rtLight) {
       assert(rtLight.getInitialHash() != 0);
       switch (rtLight.getType()) {
       default:
@@ -336,6 +335,13 @@ namespace dxvk {
         captureDistantLight(rtLight.getDistantLight());
         break;
       }
+    };
+
+    for (auto&& pair : m_sceneManager.getLightManager().getLightTable()) {
+      captureLight(pair.second);
+    }
+    for (auto&& pair : m_sceneManager.getLightManager().getExternallyTrackedLightTable()) {
+      captureLight(pair.second);
     }
   }
 
@@ -809,8 +815,7 @@ namespace dxvk {
                                       std::shared_ptr<Mesh> pMesh) {
 
     AssetExporter::BufferCallback captureMeshColorAsync = [ctx, geomData, currentFrameNum, pMesh](Rc<DxvkBuffer> colBuf) {
-      assert(geomData.color0Buffer.vertexFormat() == VK_FORMAT_B8G8R8A8_UNORM
-          || geomData.color0Buffer.vertexFormat() == VK_FORMAT_R8G8B8A8_UNORM);
+      assert(geomData.color0Buffer.vertexFormat() == VK_FORMAT_B8G8R8A8_UNORM);
       // Prep helper vars
       const size_t numVertices = geomData.vertexCount;
       constexpr size_t colorSubElementSize = sizeof(uint8_t);
@@ -879,7 +884,7 @@ namespace dxvk {
           lastWeight -= thisWeight;
           targetBuffer.push_back(thisWeight);
         }
-        // Only bonesPerVertex - 1 weights are stored. The last weight is 1 minus the other weights.
+        // D3D11 only stores bonesPerVertex - 1 weights. The last weight is 1 minus the other weights.
         targetBuffer.push_back(lastWeight);
       }
       assert(targetBuffer.size() > 0);

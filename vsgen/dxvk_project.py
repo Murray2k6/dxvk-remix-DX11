@@ -121,7 +121,7 @@ def generate_dxvk_project(output_root_path, dxvk_cpp_defines):
 
     # list of locations in the build directory where headers show up
     # this might change over time...
-    build_output_search_paths = [ ".", "src/d3d9/d3d9.dll.p", "src/dxvk/libdxvk.a.p", "src/dxvk/rtx_shaders", "src/dxvk" ]
+    build_output_search_paths = [ ".", "src/d3d11/d3d11.dll.p", "src/dxvk/libdxvk.a.p", "src/dxvk/rtx_shaders", "src/dxvk" ]
 
     def build_search_path(build_dir):
         # list of build directory paths with headers in them

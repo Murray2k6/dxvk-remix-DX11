@@ -65,12 +65,12 @@ namespace dxvk {
             return;
           }
 
-          // Internal Remix singletons outlive atexit — not real leaks.
-          Logger::debug(str::format("[", s_checkValue.load(),
+          // Hopefully logger is still alive
+          Logger::err(str::format("[", s_checkValue.load(),
             "] common device objects were not disposed of."));
 #ifdef REMIX_DEVELOPMENT
           for (auto& obj : s_checkSet) {
-            Logger::debug(str::format("\tObject ", typeid(*obj).name(),
+            Logger::err(str::format("\tObject ", typeid(*obj).name(),
               " [", obj, "] is alive at exit."));
           }
 #endif

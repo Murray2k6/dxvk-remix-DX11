@@ -69,7 +69,7 @@ STBDDEF void stb_compress_bc5_block(unsigned char *dest, const unsigned char *sr
 //     implicitly had this turned on. 
 //
 //     in case you're targeting a specific type of hardware (e.g. console programmers):
-//     NVidia and Intel GPUs (as of 2010) as well as DX9 ref use DXT decoders that are closer
+//     NVidia and Intel GPUs (as of 2010) as well as DX11 ref use DXT decoders that are closer
 //     to STB_DXT_USE_ROUNDING_BIAS. AMD/ATI, S3 and DX10 ref are closer to rounding with no bias.
 //     you also see "(a*5 + b*3) / 8" on some old GPU designs.
 // #define STB_DXT_USE_ROUNDING_BIAS

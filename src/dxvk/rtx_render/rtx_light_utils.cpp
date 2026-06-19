@@ -119,11 +119,11 @@ float solveQuadraticEndDistance(float originalBrightness, float attenuation2, fl
   return endDistance;
 }
 
-float LightUtils::calculateIntensity(const RtxLegacyLight& light, const float radius) {
+float LightUtils::calculateIntensity(const Dx11LightDesc& light, const float radius) {
   constexpr float kEpsilon = 0.000001f;
 
   // Calculate max distance based on attenuation.  We're looking to find when the light's attenuation is kLegacyLightEndValue.
-  // Attenuation for legacy lights is calculated as 1/(light.Attenuation2*d*d + light.Attenuation1*d + light.Attenuation).
+  // Attenuation in D3D11 for lights is calculated as 1/(light.Attenuation2*d*d + light.Attenuation1*d + light.Attenuation).
   // This is calculated with respect to the max component of the light's 3 color components, and then is translated to RGB with the normalized color later.
   // Note that the calculated max distance may be greater than the Light's original "Range" value. This is because often times in older games the
   // Range was merely used in conjunction with a custom large color value and attenuation curve as an optimization to keep very bright lights from extending
@@ -132,7 +132,7 @@ float LightUtils::calculateIntensity(const RtxLegacyLight& light, const float ra
   const float b = light.Attenuation1;
   const float c = light.Attenuation0;
 
-  const float originalBrightness = std::max(light.Diffuse.x, std::max(light.Diffuse.y, light.Diffuse.z));
+  const float originalBrightness = std::max(light.Diffuse.r, std::max(light.Diffuse.g, light.Diffuse.b));
 
   float endDistance = light.Range;
 
@@ -165,39 +165,55 @@ float LightUtils::calculateIntensity(const RtxLegacyLight& light, const float ra
   const float endDistanceSq = endDistance * endDistance;
 
   // Conversion factor from a desired distance squared to a radiance value based on a desired fixed light radius and the desired ending radiance value.
+  // Derivation:
+  // t = Threshold (ending) radiance value
+  // i = Point Light Intensity
+  // d = Distance
+  // p = Power
+  // r = Radiance
+  // 
+  // i / d^2 = t (Inverse square law for intensity, solving for d to find the intensity of a point light to reach this radiance threshold)
+  // p = i * 4 * pi (Point Light Intensity to Power)
+  // r = p / ((4 * pi * r^2) * pi) (Power to Sphere Light Radiance)
+  // r = (d^2 * t) / (pi * r^2) (Solve and Substitute)
   const float kDistanceSqToRadiance = kNewLightEndValue / (kPi * radius * radius);
 
   return std::min(kDistanceSqToRadiance * endDistanceSq * LightManager::lightConversionIntensityFactor(), LightManager::lightConversionMaxIntensity());
 }
 
 
-Vector3 LightUtils::calculateRadiance(const RtxLegacyLight& light, const float radius) {
+Vector3 LightUtils::calculateRadiance(const Dx11LightDesc& light, const float radius) {
   const float intensity = calculateIntensity(light, radius);
-  const float originalBrightness = std::max(light.Diffuse.x, std::max(light.Diffuse.y, light.Diffuse.z));
+  const float originalBrightness = std::max(light.Diffuse.r, std::max(light.Diffuse.g, light.Diffuse.b));
 
   // Convert the max component radiance to RGB using the normalized color of the light.
+  // Note: Many old games did their lighting entierly in gamma space (when sRGB textures and framebuffers were absent),
+  // meaning while the normalized light color value should be converted from gamma to linear space to have the lighting look more
+  // physically correct, this changes the look of lighting too much (which makes artists unhappy), so it is left unchanged.
+  // In the future a conversion may be needed if gamma corrected framebuffers were used in the original game, but for now this is fine.
   Vector3 result;
-  result[0] = light.Diffuse.x / originalBrightness * intensity;
-  result[1] = light.Diffuse.y / originalBrightness * intensity;
-  result[2] = light.Diffuse.z / originalBrightness * intensity;
+  result[0] = light.Diffuse.r / originalBrightness * intensity;
+  result[1] = light.Diffuse.g / originalBrightness * intensity;
+  result[2] = light.Diffuse.b / originalBrightness * intensity;
 
   return result;
 }
 
 
-Matrix4 LightUtils::getLightTransform(const RtxLegacyLight& light) {
+Matrix4 LightUtils::getLightTransform(const Dx11LightDesc& light) {
 
+  // Determine the optimal light transform from light
   switch (light.Type) {
-  case RtxLegacyLightType_Spot:
+  case DX11_LIGHT_SPOT:
   {
     const Vector3 zAxis = safeNormalize(Vector3{ light.Direction.x, light.Direction.y, light.Direction.z }, Vector3(0.0f, 0.0f, 1.0f));
     return Matrix4(getOrientation(Vector3(0.f, 0.f, -1.f), zAxis), Vector3{ light.Position.x, light.Position.y, light.Position.z });
   }
-  case RtxLegacyLightType_Point:
+  case DX11_LIGHT_POINT:
   {
     return Matrix4(Vector3(light.Position.x, light.Position.y, light.Position.z));
   }
-  case RtxLegacyLightType_Directional:
+  case DX11_LIGHT_DIRECTIONAL:
   {
     const Vector3 zAxis = safeNormalize(Vector3{ light.Direction.x, light.Direction.y, light.Direction.z }, Vector3(0.0f, 0.0f, 1.0f));
     return Matrix4(getOrientation(Vector3(0.f, 0.f, -1.f), zAxis), Vector3{ 0.0f });

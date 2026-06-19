@@ -1,5 +1,5 @@
 /*
-* Copyright (c) 2021-2025, NVIDIA CORPORATION. All rights reserved.
+* Copyright (c) 2021-2026, NVIDIA CORPORATION. All rights reserved.
 *
 * Permission is hereby granted, free of charge, to any person obtaining a
 * copy of this software and associated documentation files (the "Software"),
@@ -113,13 +113,13 @@ namespace dxvk
     RTX_OPTION_ENV("rtx.camera", Vector3, freeCameraPosition, Vector3(0.f, 0.f, 0.f), "RTX_FREE_CAMERA_POSITION", "Free camera's position.");
     RTX_OPTION_ENV("rtx.camera", float, freeCameraYaw, 0.f, "RTX_FREE_CAMERA_YAW", "Free camera's position.");
     RTX_OPTION_ENV("rtx.camera", float, freeCameraPitch, 0.f, "RTX_FREE_CAMERA_PITCH", "Free camera's pitch.");
-    RTX_OPTION("rtx.camera", bool, lockFreeCamera, false, "Locks free camera.");
+    RTX_OPTION_ENV("rtx.camera", bool, lockFreeCamera, false, "RTX_LOCK_FREE_CAMERA", "Locks free camera.");
     RTX_OPTION("rtx.camera", bool, freeCameraViewRelative, true, "Free camera transform is relative to the view.");
     RTX_OPTION("rtx.camera", bool, useFreeCameraForComponents, true, "Use free camera for graph components when free camera is enabled.");
     RTX_OPTION("rtx", float, freeCameraSpeed, 200, "Free camera speed [GameUnits/s].");
     RTX_OPTION("rtx", float, freeCameraTurningSpeed, 1, "Free camera turning speed (applies to keyboard, not mouse) [radians/s].");
     RTX_OPTION("rtx", bool, freeCameraInvertY, false, "Invert free camera pitch direction.");
-    RTX_OPTION("rtx.camera", bool, correctProjectionYFlip, true,
+    RTX_OPTION("rtx.camera", bool, correctProjectionYFlip, false,
                "Some games (typically Unity titles) use a projection matrix with a negative Y scale, causing the "
                "ray-traced scene to render upside down. Enable this to automatically detect and correct the Y-flip "
                "in the projection matrix at runtime.");

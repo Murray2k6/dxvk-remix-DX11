@@ -1,3 +1,4 @@
+#include "rtx/dx11/dx11_material_fog_state.h"
 /*
 * Copyright (c) 2021-2026, NVIDIA CORPORATION. All rights reserved.
 *
@@ -21,16 +22,13 @@
 */
 
 #include <cassert>
-#include <atomic>
 #include <tuple>
-#include <vector>
-#include <algorithm>
 #include <string>
 #include <sstream>
 #include <iomanip>
 #include <optional>
 #include <nvapi.h>
-#include <NVIDIASansRg.ttf.h>
+#include <NVIDIASansMd.ttf.h>
 #include <NVIDIASansBd.ttf.h>
 #include <RobotoMonoRg.ttf.h>
 
@@ -60,7 +58,7 @@
 #include "dxvk_image.h"
 #include "../util/rc/util_rc_ptr.h"
 #include "../util/util_math.h"
-#include "../util/util_globaltime.h"
+#include "../util/util_global_time.h"
 #include "rtx_render/rtx_opacity_micromap_manager.h"
 #include "rtx_render/rtx_bridge_message_channel.h"
 #include "dxvk_imgui_about.h"
@@ -69,7 +67,7 @@
 #include "rtx_render/rtx_option_layer_gui.h"
 #include "rtx_render/rtx_option_manager.h"
 #include "dxvk_scoped_annotation.h"
-#include "rtx_render/rtx_options.h"
+#include "../../d3d11/d3d11_rtx.h"
 #include "dxvk_memory_tracker.h"
 #include "rtx_render/rtx_particle_system.h"
 #include "rtx_render/rtx_point_instancer_system.h"
@@ -77,138 +75,8 @@
 
 
 namespace dxvk {
-namespace {
-  // DX11 Remix startup safety:
-  // RtxOptions can invoke UI style callbacks while the D3D11 device is still
-  // being created. At that point ImGui may not have a current context yet.
-  // Calling ImGui::GetStyle(), ImGui::GetIO(), or font/style accessors with no
-  // current context causes the exact launch crash seen in UE4 titles such as
-  // Hello Neighbor 2:
-  //   ImGUI::setupStyle -> RtxOptionImpl::invokeOnChangeCallback -> RtxOptions
-  std::atomic_bool g_dx11RemixImguiStyleRefreshPending { false };
-
-  inline bool dx11RemixImguiContextReady() {
-    return ImGui::GetCurrentContext() != nullptr;
-  }
-
-  inline void dx11RemixDeferImguiStyleRefresh() {
-    g_dx11RemixImguiStyleRefreshPending.store(true, std::memory_order_release);
-  }
-
-  inline bool dx11RemixConsumePendingImguiStyleRefresh() {
-    return g_dx11RemixImguiStyleRefreshPending.exchange(false, std::memory_order_acq_rel);
-  }
-}
-
-namespace {
-  // Set when an RTX option callback asks ImGUI::setupStyle() to run before
-  // an ImGui context exists. The request is replayed after SetCurrentContext.
-  std::atomic_bool g_dx11RemixPendingImguiStyleRefresh { false };
-}
-
   extern size_t g_streamedTextures_budgetBytes;
   extern size_t g_streamedTextures_usedBytes;
-
-  static UINT getRemixToggleUiMessage() {
-    static const UINT s_msg = RegisterWindowMessageA("DXVK_REMIX_TOGGLE_UI");
-    return s_msg;
-  }
-
-  static bool getValidImguiRenderTarget(HWND hwnd, VkExtent2D surfaceSize, VkExtent2D& clientExtent) {
-    clientExtent = { 0u, 0u };
-
-    if (surfaceSize.width == 0u || surfaceSize.height == 0u)
-      return false;
-
-    if (!::IsWindow(hwnd) || !::IsWindowVisible(hwnd) || ::IsIconic(hwnd))
-      return false;
-
-    RECT clientRect = {};
-    if (::GetClientRect(hwnd, &clientRect) == FALSE)
-      return false;
-
-    const LONG clientWidth = clientRect.right - clientRect.left;
-    const LONG clientHeight = clientRect.bottom - clientRect.top;
-    if (clientWidth <= 0 || clientHeight <= 0)
-      return false;
-
-    clientExtent.width = static_cast<uint32_t>(clientWidth);
-    clientExtent.height = static_cast<uint32_t>(clientHeight);
-    return true;
-  }
-
-  static void logSkippedImguiRender(HWND hwnd, VkExtent2D surfaceSize, VkExtent2D clientExtent) {
-    static std::atomic<uint32_t> s_logCount { 0u };
-    const uint32_t logIndex = s_logCount.fetch_add(1u, std::memory_order_relaxed);
-    if (logIndex >= 8u)
-      return;
-
-    Logger::info(str::format("[ImGUI] render skipped: invalid/occluded target",
-      " HWND=", (uintptr_t) hwnd,
-      " visible=", (::IsWindow(hwnd) && ::IsWindowVisible(hwnd)) ? 1 : 0,
-      " iconic=", (::IsWindow(hwnd) && ::IsIconic(hwnd)) ? 1 : 0,
-      " surface=", surfaceSize.width, "x", surfaceSize.height,
-      " client=", clientExtent.width, "x", clientExtent.height));
-  }
-
-  static const char* getUiTypeName(UIType type) {
-    switch (type) {
-  case UIType::None: return "None";
-  case UIType::Basic: return "Basic";
-  case UIType::Advanced: return "Advanced";
-  case UIType::Count: return "Count";
-  }
-
-    return "Unknown";
-  }
-
-  static const char* getRtxOptionTypeName(OptionType type) {
-    switch (type) {
-    case OptionType::Bool: return "Bool";
-    case OptionType::Int: return "Int";
-    case OptionType::Float: return "Float";
-    case OptionType::HashSet: return "HashSet";
-    case OptionType::HashVector: return "HashVector";
-    case OptionType::Vector2: return "Vector2";
-    case OptionType::Vector3: return "Vector3";
-    case OptionType::Vector2i: return "Vector2i";
-    case OptionType::String: return "String";
-    case OptionType::VirtualKeys: return "VirtualKeys";
-    case OptionType::Vector4: return "Vector4";
-    }
-
-    return "Unknown";
-  }
-
-  static bool isNullLayerValue(OptionType type, const GenericValue& value) {
-    switch (type) {
-    case OptionType::HashSet:
-      return value.hashSet == nullptr;
-    case OptionType::HashVector:
-      return value.hashVector == nullptr;
-    case OptionType::VirtualKeys:
-      return value.virtualKeys == nullptr;
-    case OptionType::Vector2:
-      return value.v2 == nullptr;
-    case OptionType::Vector3:
-      return value.v3 == nullptr;
-    case OptionType::Vector2i:
-      return value.v2i == nullptr;
-    case OptionType::String:
-      return value.string == nullptr;
-    case OptionType::Vector4:
-      return value.v4 == nullptr;
-    default:
-      return false;
-    }
-  }
-
-  static void addDiagnosticSample(std::vector<std::string>& samples, const std::string& sample) {
-    constexpr size_t kMaxSamples = 32;
-    if (samples.size() < kMaxSamples) {
-      samples.push_back(sample);
-    }
-  }
 }
 
 
@@ -290,638 +158,18 @@ namespace dxvk {
     Rc<DxvkImageView> imageView = VK_NULL_HANDLE;
     ImTextureID texID = VK_NULL_HANDLE;
     uint32_t textureFeatureFlags = 0;
-    VkExtent3D extent { 0, 0, 1 };
-    VkFormat format = VK_FORMAT_UNDEFINED;
-    VkImageUsageFlags usage = 0;
-    uint64_t lastTouchedAtMs = 0;
-    bool released = false;
   };
   std::unordered_map<XXH64_hash_t, ImGuiTexture> g_imguiTextureMap;
-  std::atomic<UIType> g_lastKnownUiType = UIType::None;
   fast_unordered_cache<FogState> g_imguiFogMap;
   XXH64_hash_t g_usedFogStateHash;
   std::mutex g_imguiFogMapMutex; // protects g_imguiFogMap
-
-  constexpr size_t kMaxRetainedReleasedTexturePreviews = 65536;
-
-  // ---------------------------------------------------------------------------
-  // DirectInput defeater: steal foreground with a tiny invisible helper
-  // window when the UI is open.
-  //
-  // ---------------------------------------------------------------------------
-  // FocusSteal — PERMANENTLY DISABLED.
-  //
-  // This entire subsystem is guarded behind #if 0 to prevent accidental
-  // re-enablement.  Two failure modes were observed in the wild:
-  //   1. On true fullscreen-exclusive games, calling SetForegroundWindow
-  //      on an off-screen helper window forces Windows to minimise the
-  //      FSE swapchain and the game vanishes.
-  //   2. On borderless-windowed games the AttachThreadInput dance has
-  //      been observed to hard-crash the D3D11 render thread.
-  //
-  // DI8 force-unacquire + IAT SetCursorPos/ClipCursor/mouse_event/
-  // SendInput hooks + the cursor-unclip watchdog already fully isolate
-  // game input from the Remix UI.
-  // ---------------------------------------------------------------------------
-#if 0
-  namespace {
-    static std::atomic<bool>   g_focusStealRun      { false };
-    static std::atomic<bool>   g_focusStealWanted   { false };
-    static std::atomic<HWND>   g_focusStealHwnd     { nullptr };
-    static std::atomic<HWND>   g_focusStealGameHwnd { nullptr };
-    static std::thread         g_focusStealThread;
-
-    static LRESULT CALLBACK focusStealWndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
-      return DefWindowProcW(h, m, w, l);
-    }
-
-    static void focusStealThreadMain() {
-      Logger::info("[FocusSteal] thread starting");
-      WNDCLASSW wc {};
-      wc.lpfnWndProc   = &focusStealWndProc;
-      wc.hInstance     = GetModuleHandleW(nullptr);
-      wc.lpszClassName = L"RemixFocusSink";
-      RegisterClassW(&wc);
-
-      HWND sink = CreateWindowExW(
-        WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
-        wc.lpszClassName, L"RemixFocusSink",
-        WS_POPUP,
-        -32000, -32000, 1, 1, // off-screen
-        nullptr, nullptr, wc.hInstance, nullptr);
-      if (!sink) {
-        Logger::warn("[FocusSteal] failed to create helper window");
-        return;
-      }
-      g_focusStealHwnd.store(sink);
-
-      bool stolen = false;
-      while (g_focusStealRun.load(std::memory_order_relaxed)) {
-        MSG msg;
-        while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
-          TranslateMessage(&msg);
-          DispatchMessageW(&msg);
-        }
-
-        const bool want = g_focusStealWanted.load(std::memory_order_relaxed);
-        HWND gameHwnd = g_focusStealGameHwnd.load(std::memory_order_relaxed);
-
-        if (want && !stolen) {
-          ShowWindow(sink, SW_SHOWNOACTIVATE);
-          const DWORD myTid   = GetCurrentThreadId();
-          const DWORD gameTid = gameHwnd ? GetWindowThreadProcessId(gameHwnd, nullptr) : 0;
-          if (gameTid && gameTid != myTid) {
-            AttachThreadInput(gameTid, myTid, TRUE);
-          }
-          SetForegroundWindow(sink);
-          SetFocus(sink);
-          if (gameTid && gameTid != myTid) {
-            AttachThreadInput(gameTid, myTid, FALSE);
-          }
-          Logger::info("[FocusSteal] stole foreground for UI");
-          stolen = true;
-        } else if (!want && stolen) {
-          if (gameHwnd) {
-            const DWORD myTid   = GetCurrentThreadId();
-            const DWORD gameTid = GetWindowThreadProcessId(gameHwnd, nullptr);
-            if (gameTid && gameTid != myTid) {
-              AttachThreadInput(gameTid, myTid, TRUE);
-            }
-            SetForegroundWindow(gameHwnd);
-            SetFocus(gameHwnd);
-            if (gameTid && gameTid != myTid) {
-              AttachThreadInput(gameTid, myTid, FALSE);
-            }
-          }
-          ShowWindow(sink, SW_HIDE);
-          Logger::info("[FocusSteal] returned foreground to game");
-          stolen = false;
-        }
-
-        std::this_thread::sleep_for(std::chrono::milliseconds(16));
-      }
-
-      DestroyWindow(sink);
-      g_focusStealHwnd.store(nullptr);
-    }
-
-    static void startFocusStealThread() {
-      bool expected = false;
-      if (!g_focusStealRun.compare_exchange_strong(expected, true)) {
-        return;
-      }
-      g_focusStealThread = std::thread(&focusStealThreadMain);
-    }
-
-    static void stopFocusStealThread() {
-      if (!g_focusStealRun.exchange(false)) {
-        return;
-      }
-      // Wake the thread's message loop.
-      if (HWND h = g_focusStealHwnd.load()) {
-        PostMessageW(h, WM_NULL, 0, 0);
-      }
-      if (g_focusStealThread.joinable()) {
-        g_focusStealThread.join();
-      }
-    }
-  } // namespace
-#endif // FocusSteal — PERMANENTLY DISABLED
-
-  // ---------------------------------------------------------------------------
-  // IAT hook for user32!SetCursorPos.
-  //
-  // Skyrim (and other Bethesda / engine-specific mouselook implementations)
-  // read mouse input via DirectInput8, which runs on its own thread and
-  // never reaches our WndProc. Every game tick the engine then calls
-  // user32!SetCursorPos(center_x, center_y) to re-center the cursor for
-  // its relative-motion mouselook.  The result is that while the Remix UI
-  // is open the cursor visibly "locks" to screen centre a few ms after
-  // every attempt to move it, because we can see the movement via WM_*
-  // but the game instantly warps it back.
-  //
-  // None of the normal WndProc-level mitigations (blockInputToGameInUI,
-  // ClipCursor(nullptr) watchdog, ReleaseCapture, etc.) can stop this
-  // because SetCursorPos bypasses both the message pump and the clip
-  // rectangle.  The only reliable fix is to intercept SetCursorPos itself.
-  //
-  // We do this with an IAT (import address table) patch of every loaded
-  // module except our own.  When g_uiBlocksSetCursorPos is true the thunk
-  // silently no-ops; otherwise it forwards to the real function.  The
-  // atomic flag is raised in render() while the UI is visible and
-  // blockInputToGameInUI is set.
-  // ---------------------------------------------------------------------------
-  namespace {
-    using SetCursorPos_t = BOOL (WINAPI*)(int, int);
-    using mouse_event_t  = VOID (WINAPI*)(DWORD, DWORD, DWORD, DWORD, ULONG_PTR);
-    using SendInput_t    = UINT (WINAPI*)(UINT, LPINPUT, int);
-    static SetCursorPos_t g_realSetCursorPos = &::SetCursorPos;
-    static mouse_event_t  g_realMouseEvent   = &::mouse_event;
-    static SendInput_t    g_realSendInput    = &::SendInput;
-    static std::atomic<bool> g_uiBlocksSetCursorPos { false };
-    // Separate flag: true when the Remix UI is open.  Used by DI8 hooks
-    // to suppress game mouse input without locking/clipping the cursor.
-    static std::atomic<bool> g_uiIsOpen { false };
-    static std::atomic<bool> g_setCursorPosHooked { false };
-
-    static BOOL WINAPI SetCursorPos_Thunk(int X, int Y) {
-      const bool blocking = g_uiBlocksSetCursorPos.load(std::memory_order_relaxed);
-      // Log the first few calls after the UI opens so we can tell whether
-      // the game is actually trying to warp the cursor.  Reset on close.
-      static std::atomic<uint32_t> sLoggedThisSession { 0 };
-      if (blocking) {
-        const uint32_t n = sLoggedThisSession.fetch_add(1, std::memory_order_relaxed);
-        if (n < 5) {
-          Logger::info(str::format("[CursorLock] SetCursorPos(", X, ",", Y,
-                                   ") blocked (hit #", n + 1, ")"));
-        }
-      } else {
-        sLoggedThisSession.store(0, std::memory_order_relaxed);
-      }
-      if (blocking) {
-        return TRUE;
-      }
-      return g_realSetCursorPos(X, Y);
-    }
-
-    static VOID WINAPI mouse_event_Thunk(DWORD dwFlags, DWORD dx, DWORD dy,
-                                         DWORD dwData, ULONG_PTR dwExtraInfo) {
-      if (g_uiBlocksSetCursorPos.load(std::memory_order_relaxed)) {
-        static std::atomic<uint32_t> sLogged { 0 };
-        const uint32_t n = sLogged.fetch_add(1, std::memory_order_relaxed);
-        if (n < 5) {
-          Logger::info(str::format("[CursorLock] mouse_event(flags=0x",
-                                   std::hex, dwFlags, std::dec,
-                                   ",dx=", (int) dx, ",dy=", (int) dy,
-                                   ") blocked (hit #", n + 1, ")"));
-        }
-        return;
-      }
-      g_realMouseEvent(dwFlags, dx, dy, dwData, dwExtraInfo);
-    }
-
-    static UINT WINAPI SendInput_Thunk(UINT cInputs, LPINPUT pInputs, int cbSize) {
-      if (g_uiBlocksSetCursorPos.load(std::memory_order_relaxed) && pInputs) {
-        // Only swallow mouse inputs; keep keyboard/hardware passthrough
-        // for other normal consumers (ImGui uses WM_*, not SendInput).
-        bool anyMouse = false;
-        for (UINT i = 0; i < cInputs; ++i) {
-          if (pInputs[i].type == INPUT_MOUSE) { anyMouse = true; break; }
-        }
-        if (anyMouse) {
-          static std::atomic<uint32_t> sLogged { 0 };
-          const uint32_t n = sLogged.fetch_add(1, std::memory_order_relaxed);
-          if (n < 5) {
-            Logger::info(str::format("[CursorLock] SendInput(n=", cInputs,
-                                     ") mouse blocked (hit #", n + 1, ")"));
-          }
-          // Pretend we processed them all.
-          return cInputs;
-        }
-      }
-      return g_realSendInput(cInputs, pInputs, cbSize);
-    }
-
-    // ---------------- DirectInput8 vtable hooks ----------------
-    // Bethesda's Creation Engine (Skyrim/FO4) reads mouse deltas via
-    // DirectInput8 (IDirectInputDevice8::GetDeviceState / GetDeviceData)
-    // on an exclusively-cooperative mouse device.  That path does not
-    // generate WM_* messages, does not call SetCursorPos / mouse_event /
-    // SendInput, and cannot be killed by ClipCursor or focus theft alone.
-    //
-    // Strategy: IAT-hook dinput8!DirectInput8Create.  When the game
-    // creates the IDirectInput8 interface we patch its vtable slot for
-    // CreateDevice.  Every device it hands back then gets its vtable
-    // patched for GetDeviceState / GetDeviceData / Poll.  While the UI
-    // is open those thunks return zeroed state / zero events, so the
-    // game reads "no mouse motion, no buttons".
-    using DirectInput8Create_t = HRESULT (WINAPI*)(HINSTANCE, DWORD, REFIID, LPVOID*, LPUNKNOWN);
-    using DI8_GetDeviceState_t = HRESULT (STDMETHODCALLTYPE*)(IUnknown*, DWORD, LPVOID);
-    using DI8_GetDeviceData_t  = HRESULT (STDMETHODCALLTYPE*)(IUnknown*, DWORD, LPVOID, LPDWORD, DWORD);
-    using DI8_Acquire_t        = HRESULT (STDMETHODCALLTYPE*)(IUnknown*);
-    using DI8_Unacquire_t      = HRESULT (STDMETHODCALLTYPE*)(IUnknown*);
-    using DI8_CreateDevice_t   = HRESULT (STDMETHODCALLTYPE*)(IUnknown*, REFGUID, IUnknown**, LPUNKNOWN);
-
-    // DirectInput HRESULTs we return from thunks.
-    static constexpr HRESULT kDI_OK                    = 0;
-    static constexpr HRESULT kDIERR_OTHERAPPHASPRIO    = 0x80070005L; // E_ACCESSDENIED reinterpretation per DX docs
-
-    static DirectInput8Create_t                g_realDI8Create      { nullptr };
-    static std::atomic<DI8_GetDeviceState_t>   g_realGetDeviceState { nullptr };
-    static std::atomic<DI8_GetDeviceData_t>    g_realGetDeviceData  { nullptr };
-    static std::atomic<DI8_Acquire_t>          g_realAcquire        { nullptr };
-    static std::atomic<DI8_Unacquire_t>        g_realUnacquire      { nullptr };
-    static std::atomic<DI8_CreateDevice_t>     g_realCreateDevice   { nullptr };
-
-    // DI8 hooks block game mouse input when the UI is open (g_uiIsOpen).
-    // The user32 hooks also block viewport cursor warps while UI input is captured.
-
-    static HRESULT STDMETHODCALLTYPE DI8_GetDeviceState_Thunk(IUnknown* self, DWORD cbData, LPVOID lpvData) {
-      auto real = g_realGetDeviceState.load(std::memory_order_relaxed);
-      if (!real) return E_FAIL;
-      HRESULT hr = real(self, cbData, lpvData);
-      if (SUCCEEDED(hr) && g_uiIsOpen.load(std::memory_order_relaxed) && lpvData && cbData) {
-        memset(lpvData, 0, cbData);
-      }
-      return hr;
-    }
-
-    static HRESULT STDMETHODCALLTYPE DI8_GetDeviceData_Thunk(IUnknown* self, DWORD cbOD,
-                                                             LPVOID rgdod, LPDWORD pdwInOut, DWORD dwFlags) {
-      if (g_uiIsOpen.load(std::memory_order_relaxed)) {
-        if (pdwInOut) *pdwInOut = 0;
-        return kDI_OK;
-      }
-      auto real = g_realGetDeviceData.load(std::memory_order_relaxed);
-      if (!real) return E_FAIL;
-      return real(self, cbOD, rgdod, pdwInOut, dwFlags);
-    }
-
-    // Block Acquire while UI is open so exclusive-mode DI8 devices
-    // drop their hold and WM_MOUSEMOVE flows to ImGui.
-    static HRESULT STDMETHODCALLTYPE DI8_Acquire_Thunk(IUnknown* self) {
-      if (g_uiIsOpen.load(std::memory_order_relaxed)) {
-        return kDIERR_OTHERAPPHASPRIO;
-      }
-      auto real = g_realAcquire.load(std::memory_order_relaxed);
-      if (!real) return kDI_OK;
-      return real(self);
-    }
-
-    static std::mutex g_di8VtableMtx;
-    static constexpr size_t kMaxDI8Vtables = 32;
-    static void* g_di8DevVtablesPatched[kMaxDI8Vtables]   { };
-    static void* g_di8IfaceVtablesPatched[kMaxDI8Vtables] { };
-    static size_t g_di8DevVtCount   = 0;
-    static size_t g_di8IfaceVtCount = 0;
-
-    static bool alreadyPatchedVt(void** list, size_t& count, void* vt) {
-      for (size_t i = 0; i < count; ++i) {
-        if (list[i] == vt) return true;
-      }
-      if (count < kMaxDI8Vtables) { list[count++] = vt; return false; }
-      return true;
-    }
-
-    static void patchVtableSlot(void** vtbl, int slot, void* newFn, void** outOld) {
-      void** entry = vtbl + slot;
-      DWORD oldProt = 0;
-      if (VirtualProtect(entry, sizeof(void*), PAGE_READWRITE, &oldProt)) {
-        if (outOld) *outOld = *entry;
-        *entry = newFn;
-        VirtualProtect(entry, sizeof(void*), oldProt, &oldProt);
-      }
-    }
-
-    static std::mutex g_di8DevicesMtx;
-    static std::vector<IUnknown*> g_di8Devices;
-
-    // IDirectInputDevice8 vtable layout (W/A are identical in layout):
-    //   3 GetCapabilities  7  Acquire     9  GetDeviceState
-    //   4 EnumObjects      8  Unacquire   10 GetDeviceData
-    static void hookDI8Device(IUnknown* dev) {
-      if (!dev) return;
-      void** vtbl = *reinterpret_cast<void***>(dev);
-      {
-        std::lock_guard<std::mutex> lk(g_di8VtableMtx);
-        if (!alreadyPatchedVt(g_di8DevVtablesPatched, g_di8DevVtCount, vtbl)) {
-          void* oldGS = nullptr; patchVtableSlot(vtbl,  9, reinterpret_cast<void*>(&DI8_GetDeviceState_Thunk), &oldGS);
-          void* oldGD = nullptr; patchVtableSlot(vtbl, 10, reinterpret_cast<void*>(&DI8_GetDeviceData_Thunk),  &oldGD);
-          void* oldAc = nullptr; patchVtableSlot(vtbl,  7, reinterpret_cast<void*>(&DI8_Acquire_Thunk),        &oldAc);
-          if (oldGS && !g_realGetDeviceState.load()) g_realGetDeviceState.store(reinterpret_cast<DI8_GetDeviceState_t>(oldGS));
-          if (oldGD && !g_realGetDeviceData.load())  g_realGetDeviceData.store (reinterpret_cast<DI8_GetDeviceData_t>(oldGD));
-          if (oldAc && !g_realAcquire.load())        g_realAcquire.store       (reinterpret_cast<DI8_Acquire_t>(oldAc));
-          if (!g_realUnacquire.load()) {
-            g_realUnacquire.store(reinterpret_cast<DI8_Unacquire_t>(vtbl[8]));
-          }
-        }
-      }
-      {
-        std::lock_guard<std::mutex> lk(g_di8DevicesMtx);
-        bool found = false;
-        for (auto* d : g_di8Devices) { if (d == dev) { found = true; break; } }
-        if (!found) {
-          dev->AddRef();
-          g_di8Devices.push_back(dev);
-        }
-      }
-    }
-
-    static bool safeCallUnacquire(DI8_Unacquire_t fn, IUnknown* dev) {
-      __try {
-        fn(dev);
-        return true;
-      } __except (EXCEPTION_EXECUTE_HANDLER) {
-        return false;
-      }
-    }
-
-    static bool safeCallAcquire(DI8_Acquire_t fn, IUnknown* dev) {
-      __try {
-        fn(dev);
-        return true;
-      } __except (EXCEPTION_EXECUTE_HANDLER) {
-        return false;
-      }
-    }
-
-    static void forceUnacquireAllDI8Devices() {
-      auto real = g_realUnacquire.load(std::memory_order_relaxed);
-      if (!real) return;
-      std::lock_guard<std::mutex> lk(g_di8DevicesMtx);
-      for (IUnknown* dev : g_di8Devices) {
-        if (!dev) continue;
-        safeCallUnacquire(real, dev);
-      }
-    }
-
-    static void forceReacquireAllDI8Devices() {
-      auto real = g_realAcquire.load(std::memory_order_relaxed);
-      if (!real) return;
-      std::lock_guard<std::mutex> lk(g_di8DevicesMtx);
-      for (IUnknown* dev : g_di8Devices) {
-        if (!dev) continue;
-        safeCallAcquire(real, dev);
-      }
-    }
-
-    static HRESULT STDMETHODCALLTYPE DI8_CreateDevice_Thunk(IUnknown* self, REFGUID rguid,
-                                                            IUnknown** ppDevice, LPUNKNOWN pOuter) {
-      auto real = g_realCreateDevice.load(std::memory_order_relaxed);
-      if (!real) return E_FAIL;
-      HRESULT hr = real(self, rguid, ppDevice, pOuter);
-      if (SUCCEEDED(hr) && ppDevice && *ppDevice) {
-        hookDI8Device(*ppDevice);
-      }
-      return hr;
-    }
-
-    static void hookDI8Interface(IUnknown* iface) {
-      if (!iface) return;
-      void** vtbl = *reinterpret_cast<void***>(iface);
-      std::lock_guard<std::mutex> lk(g_di8VtableMtx);
-      if (alreadyPatchedVt(g_di8IfaceVtablesPatched, g_di8IfaceVtCount, vtbl)) return;
-      void* old = nullptr;
-      patchVtableSlot(vtbl, 3, reinterpret_cast<void*>(&DI8_CreateDevice_Thunk), &old);
-      if (old && !g_realCreateDevice.load()) {
-        g_realCreateDevice.store(reinterpret_cast<DI8_CreateDevice_t>(old));
-      }
-    }
-
-    static HRESULT WINAPI DirectInput8Create_Thunk(HINSTANCE hinst, DWORD dwVersion,
-                                                   REFIID riid, LPVOID* ppvOut, LPUNKNOWN pUnk) {
-      if (!g_realDI8Create) return E_FAIL;
-      HRESULT hr = g_realDI8Create(hinst, dwVersion, riid, ppvOut, pUnk);
-      if (SUCCEEDED(hr) && ppvOut && *ppvOut) {
-        hookDI8Interface(reinterpret_cast<IUnknown*>(*ppvOut));
-      }
-      return hr;
-    }
-
-    // Patch a single module's IAT entries for user32 + dinput8 imports we care about.
-    static void patchModuleIAT(HMODULE hMod, HMODULE hSelf) {
-      if (!hMod || hMod == hSelf) {
-        return;
-      }
-      struct HookEntry { const char* name; void* thunk; };
-      const HookEntry user32Hooks[] = {
-        { "SetCursorPos", reinterpret_cast<void*>(&SetCursorPos_Thunk) },
-        { "mouse_event",  reinterpret_cast<void*>(&mouse_event_Thunk)  },
-        { "SendInput",    reinterpret_cast<void*>(&SendInput_Thunk)    },
-      };
-      const HookEntry dinput8Hooks[] = {
-        { "DirectInput8Create", reinterpret_cast<void*>(&DirectInput8Create_Thunk) },
-      };
-
-      auto base = reinterpret_cast<BYTE*>(hMod);
-      auto dos = reinterpret_cast<IMAGE_DOS_HEADER*>(base);
-      if (dos->e_magic != IMAGE_DOS_SIGNATURE) return;
-      auto nt = reinterpret_cast<IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
-      if (nt->Signature != IMAGE_NT_SIGNATURE) return;
-
-      auto& impDir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
-      if (impDir.VirtualAddress == 0 || impDir.Size == 0) return;
-
-      auto desc = reinterpret_cast<IMAGE_IMPORT_DESCRIPTOR*>(base + impDir.VirtualAddress);
-      for (; desc->Name; ++desc) {
-        const char* modName = reinterpret_cast<const char*>(base + desc->Name);
-        const HookEntry* hooks = nullptr;
-        size_t hookCount = 0;
-        if (_stricmp(modName, "user32.dll") == 0) {
-          hooks = user32Hooks;
-          hookCount = sizeof(user32Hooks) / sizeof(user32Hooks[0]);
-        } else if (_stricmp(modName, "dinput8.dll") == 0) {
-          hooks = dinput8Hooks;
-          hookCount = sizeof(dinput8Hooks) / sizeof(dinput8Hooks[0]);
-        } else {
-          continue;
-        }
-
-        auto origThunk = reinterpret_cast<IMAGE_THUNK_DATA*>(
-          base + (desc->OriginalFirstThunk ? desc->OriginalFirstThunk : desc->FirstThunk));
-        auto iat = reinterpret_cast<IMAGE_THUNK_DATA*>(base + desc->FirstThunk);
-
-        for (; origThunk->u1.AddressOfData; ++origThunk, ++iat) {
-          if (IMAGE_SNAP_BY_ORDINAL(origThunk->u1.Ordinal)) continue;
-          auto importByName = reinterpret_cast<IMAGE_IMPORT_BY_NAME*>(
-            base + origThunk->u1.AddressOfData);
-
-          void* newFn = nullptr;
-          for (size_t i = 0; i < hookCount; ++i) {
-            if (strcmp(importByName->Name, hooks[i].name) == 0) {
-              newFn = hooks[i].thunk;
-              break;
-            }
-          }
-          if (!newFn) continue;
-
-          void** slot = reinterpret_cast<void**>(&iat->u1.Function);
-          if (*slot == newFn) continue; // already patched
-
-          DWORD oldProt = 0;
-          if (VirtualProtect(slot, sizeof(void*), PAGE_READWRITE, &oldProt)) {
-            *slot = newFn;
-            VirtualProtect(slot, sizeof(void*), oldProt, &oldProt);
-          }
-        }
-      }
-    }
-
-    // SEH wrapper — kept in its own function so the caller can use C++
-    // objects with destructors (MSVC disallows __try in functions that
-    // require object unwinding).
-    static void patchModuleIAT_Safe(HMODULE hMod, HMODULE hSelf) {
-      __try {
-        patchModuleIAT(hMod, hSelf);
-      } __except (EXCEPTION_EXECUTE_HANDLER) {
-        // A module with a malformed header; skip.
-      }
-    }
-
-    static void installSetCursorPosHook() {
-      const bool firstTime = !g_setCursorPosHooked.exchange(true);
-      if (firstTime) {
-        // Resolve the real addresses from user32 directly so we don't chain
-        // through another hooker's thunk.
-        if (HMODULE u32 = GetModuleHandleW(L"user32.dll")) {
-          if (auto real = reinterpret_cast<SetCursorPos_t>(GetProcAddress(u32, "SetCursorPos"))) {
-            g_realSetCursorPos = real;
-          }
-          if (auto real = reinterpret_cast<mouse_event_t>(GetProcAddress(u32, "mouse_event"))) {
-            g_realMouseEvent = real;
-          }
-          if (auto real = reinterpret_cast<SendInput_t>(GetProcAddress(u32, "SendInput"))) {
-            g_realSendInput = real;
-          }
-        }
-        // Resolve real dinput8!DirectInput8Create.  Force-load dinput8 if
-        // the game hasn't imported it yet so the IAT fixup below finds it
-        // in modules that bind it lazily via LoadLibrary + GetProcAddress.
-        HMODULE dinput8 = GetModuleHandleW(L"dinput8.dll");
-        if (!dinput8) {
-          dinput8 = LoadLibraryW(L"dinput8.dll");
-        }
-        if (dinput8) {
-          if (auto real = reinterpret_cast<DirectInput8Create_t>(
-                GetProcAddress(dinput8, "DirectInput8Create"))) {
-            g_realDI8Create = real;
-          }
-        }
-      }
-
-      HMODULE hSelf = nullptr;
-      GetModuleHandleExW(
-        GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-        reinterpret_cast<LPCWSTR>(&installSetCursorPosHook), &hSelf);
-
-      HMODULE mods[1024];
-      DWORD needed = 0;
-      HANDLE hProc = GetCurrentProcess();
-      // EnumProcessModules is in psapi; load dynamically to avoid a new
-      // link-time dep.
-      using EnumProcModules_t = BOOL (WINAPI*)(HANDLE, HMODULE*, DWORD, LPDWORD);
-      EnumProcModules_t pEnum = nullptr;
-      if (HMODULE k32 = GetModuleHandleW(L"kernel32.dll")) {
-        pEnum = reinterpret_cast<EnumProcModules_t>(GetProcAddress(k32, "K32EnumProcessModules"));
-      }
-      if (!pEnum) {
-        if (HMODULE psapi = LoadLibraryW(L"psapi.dll")) {
-          pEnum = reinterpret_cast<EnumProcModules_t>(GetProcAddress(psapi, "EnumProcessModules"));
-        }
-      }
-      if (!pEnum) {
-        Logger::warn("[ImGUI] SetCursorPos IAT hook: EnumProcessModules unavailable");
-        return;
-      }
-      if (!pEnum(hProc, mods, sizeof(mods), &needed)) {
-        return;
-      }
-      const DWORD count = std::min<DWORD>(needed / sizeof(HMODULE), 1024);
-      uint32_t patched = 0;
-      for (DWORD i = 0; i < count; ++i) {
-        if (!mods[i] || mods[i] == hSelf) continue;
-        patchModuleIAT_Safe(mods[i], hSelf);
-        ++patched;
-      }
-      if (firstTime) {
-        Logger::info(str::format("[ImGUI] user32 + dinput8 IAT hooks installed across ",
-                               patched, " modules"));
-      }
-    }
-  } // namespace
-
-  void forceOsCursorVisible(bool visible) {
-    CURSORINFO cursorInfo {};
-    cursorInfo.cbSize = sizeof(cursorInfo);
-
-    if (GetCursorInfo(&cursorInfo)) {
-      const bool isVisible = (cursorInfo.flags & CURSOR_SHOWING) != 0;
-      if (isVisible == visible) {
-        return;
-      }
-    }
-
-    if (visible) {
-      while (ShowCursor(TRUE) < 0) { }
-    } else {
-      while (ShowCursor(FALSE) >= 0) { }
-    }
-  }
-
-  void pruneReleasedTexturePreviews() {
-    if (RtxOptions::keepTexturesForTagging()) {
-      return;
-    }
-
-    std::vector<std::pair<XXH64_hash_t, uint64_t>> releasedTextures;
-    releasedTextures.reserve(g_imguiTextureMap.size());
-
-    for (const auto& [hash, texture] : g_imguiTextureMap) {
-      if (texture.released) {
-        releasedTextures.emplace_back(hash, texture.lastTouchedAtMs);
-      }
-    }
-
-    if (releasedTextures.size() <= kMaxRetainedReleasedTexturePreviews) {
-      return;
-    }
-
-    std::sort(releasedTextures.begin(), releasedTextures.end(),
-      [](const auto& left, const auto& right) {
-        return left.second < right.second;
-      });
-
-    const size_t removeCount = releasedTextures.size() - kMaxRetainedReleasedTexturePreviews;
-    for (size_t index = 0; index < removeCount; index++) {
-      g_imguiTextureMap.erase(releasedTextures[index].first);
-    }
-  }
 
   struct RtxTextureOption {
     const char* uniqueId;
     const char* displayName;
     RtxOption<fast_unordered_set>* textureSetOption;
     uint32_t featureFlagMask = ImGUI::kTextureFlagsDefault;
+    bool bufferToggle;
   };
 
   std::vector<RtxTextureOption> rtxTextureOptions = {
@@ -1030,6 +278,15 @@ namespace dxvk {
       {SkyAutoDetectMode::CameraPositionAndDepthFlags, "By Camera Position and Depth Flags"}
   } });
 
+  static auto upscalerNoDLSSCombo = RemixGui::ComboWithKey<UpscalerType>(
+    "Upscaler Type",
+    { {
+      {UpscalerType::None, "None"},
+      {UpscalerType::NIS, "NIS"},
+      {UpscalerType::TAAU, "TAA-U"},
+      {UpscalerType::XeSS, "XeSS"},
+  } });
+
   static auto upscalerDLSSCombo = RemixGui::ComboWithKey<UpscalerType>(
     "Upscaler Type",
     { {
@@ -1038,7 +295,6 @@ namespace dxvk {
       {UpscalerType::NIS, "NIS"},
       {UpscalerType::TAAU, "TAA-U"},
       {UpscalerType::XeSS, "XeSS"},
-      {UpscalerType::FSR4, "FSR 4"},
   } });
 
   RemixGui::ComboWithKey<DLSSProfile> dlssProfileCombo{
@@ -1226,7 +482,6 @@ namespace dxvk {
   static auto themeCombo = RemixGui::ComboWithKey<ImGUI::Theme>(
     "Mode##theme",
     {
-      {ImGUI::Theme::Auto,     "Auto Theme"},
       {ImGUI::Theme::Toolkit,  "Default Theme"},
       {ImGUI::Theme::Legacy,   "Legacy Theme"},
       {ImGUI::Theme::Nvidia,   "NVIDIA Theme"},
@@ -1240,29 +495,33 @@ namespace dxvk {
   constexpr ImGuiWindowFlags popupWindowFlags = ImGuiWindowFlags_NoSavedSettings;
 
   RemixGui::ComboWithKey<UpscalerType>& getUpscalerCombo(DxvkDLSS& dlss, DxvkRayReconstruction& rayReconstruction) {
-    (void) dlss;
-    (void) rayReconstruction;
-    // Keep every manufacturer-authored mode selectable. Unsupported SDKs are
-    // resolved to a compatible runtime backend later without changing the
-    // user's requested mode in the UI.
-    return upscalerDLSSCombo;
+    if (dlss.supportsDLSS()) {
+      return upscalerDLSSCombo;
+    } else {
+      // Drop DLSS item if unsupported.
+      return upscalerNoDLSSCombo;
+    }
   }
 
   bool ImGUI::showRayReconstructionEnable(bool supportsRR) {
-    (void) supportsRR;
-
     // Only show DLSS-RR option if "showRayReconstructionOption" is set to true.
     bool changed = false;
+    bool rayReconstruction = RtxOptions::enableRayReconstruction();
     if (RtxOptions::showRayReconstructionOption()) {
-      // Note: Ray Reconstruction is always accessible.
-      // Users should have full control over Remix functionality at all times.
+      ImGui::BeginDisabled(!supportsRR);
       changed = RemixGui::Checkbox("Ray Reconstruction", &RtxOptions::enableRayReconstructionObject());
 
       if (RtxOptions::enableRayReconstruction()) {
         rayReconstructionModelCombo.getKey(&DxvkRayReconstruction::modelObject());
       }
+      ImGui::EndDisabled();
     }
 
+    // Disable DLSS-RR if it's unsupported.
+    if (!supportsRR && RtxOptions::enableRayReconstruction()) {
+      RtxOptions::enableRayReconstruction.setDeferred(false);
+      changed = true;
+    }
     return changed;
   }
 
@@ -1272,9 +531,6 @@ namespace dxvk {
   , m_about  (new ImGuiAbout)
   , m_splash  (new ImGuiSplash)
   , m_graphGUI  (new RtxGraphGUI) {
-    m_activeUiType = RtxOptions::showUI();
-    m_lastObservedRequestedUiType = m_activeUiType;
-
     // Set up constant state
     m_rsState.polygonMode       = VK_POLYGON_MODE_FILL;
     m_rsState.cullMode          = VK_CULL_MODE_BACK_BIT;
@@ -1334,12 +590,6 @@ namespace dxvk {
     m_plotContext = ImPlot::CreateContext();
 
     ImGui::SetCurrentContext(m_context);
-  // DX11 Remix: replay any style refresh that was requested before ImGui had
-  // a current context. This preserves option-driven UI styling and avoids the
-  // startup access violation in ImGUI::setupStyle().
-  if (dx11RemixImguiContextReady() && dx11RemixConsumePendingImguiStyleRefresh()) {
-    ImGUI::setupStyle();
-  }
     ImPlot::SetCurrentContext(m_plotContext);
 
     // Setup custom style
@@ -1354,127 +604,12 @@ namespace dxvk {
     if (RtxOptions::useNewGuiInputMethod()) {
       m_overlayWin = new GameOverlay("RemixGuiInputSink", this);
     }
-
-    // Install the user32!SetCursorPos IAT hook exactly once. Required to
-    // defeat Skyrim-style DirectInput mouselook (see thunk comment above).
-    installSetCursorPosHook();
-
-    // FocusSteal thread is PERMANENTLY DISABLED — do not start it.
-    // DI8 force-unacquire + IAT hooks already handle input isolation.
-    // See the #if 0 guarded FocusSteal namespace above.
-
-    // Launch the cursor-unclip watchdog. It spins at ~200Hz only while the
-    // UI is actually open; otherwise it sleeps on a long interval. This is
-    // how we defeat Skyrim's per-frame ClipCursor/SetCapture: we win the
-    // race by polling faster than the game can re-apply its clip.
-    m_cursorWatchdogRun.store(true);
-    m_cursorWatchdogThread = std::thread([this]() {
-      // Cursor-lock detector state. We sample the OS cursor once per
-      // iteration and count how many consecutive samples are identical
-      // while the UI is open. If the cursor has not moved by even a
-      // single pixel for roughly 250 ms while a Remix menu is up, the
-      // game is almost certainly pinning it via SetCursorPos / raw
-      // input / a mouse hook that bypassed our IAT patch.  We log
-      // that so you can correlate it with the observed mouse lock.
-      POINT lastPt = {INT_MIN, INT_MIN};
-      uint32_t stuckSamples = 0;
-      bool stuckLogged = false;
-      RECT lastClip = {};
-      bool lastClipValid = false;
-      HWND lastForeground = nullptr;
-      while (m_cursorWatchdogRun.load(std::memory_order_relaxed)) {
-        if (!m_cursorWatchdogUiOpen.load(std::memory_order_relaxed)) {
-          std::this_thread::sleep_for(std::chrono::milliseconds(50));
-          lastPt = {INT_MIN, INT_MIN};
-          stuckSamples = 0;
-          stuckLogged = false;
-          lastClipValid = false;
-          lastForeground = nullptr;
-          continue;
-        }
-        // Foreground-window tracker: reveals "game alt-tabbing itself".
-        HWND fgNow = ::GetForegroundWindow();
-        if (fgNow != lastForeground) {
-          Logger::info(str::format(
-            "[CursorLock] foreground changed: ", (void*) lastForeground,
-            " -> ", (void*) fgNow,
-            " (gameHwnd=", (void*) m_gameHwnd, ")"));
-          lastForeground = fgNow;
-        }
-        RECT clip;
-        if (::GetClipCursor(&clip)) {
-          const int vx = ::GetSystemMetrics(SM_XVIRTUALSCREEN);
-          const int vy = ::GetSystemMetrics(SM_YVIRTUALSCREEN);
-          const int vr = vx + ::GetSystemMetrics(SM_CXVIRTUALSCREEN);
-          const int vb = vy + ::GetSystemMetrics(SM_CYVIRTUALSCREEN);
-          if (clip.left != vx || clip.top != vy || clip.right != vr || clip.bottom != vb) {
-            // Log the first time someone re-clips while UI is open
-            // (but only once per "session", to avoid spam).
-            if (!lastClipValid ||
-                clip.left   != lastClip.left   || clip.top    != lastClip.top ||
-                clip.right  != lastClip.right  || clip.bottom != lastClip.bottom) {
-              Logger::info(str::format(
-                "[CursorLock] ClipCursor re-applied by game while UI open: rect=(",
-                clip.left, ",", clip.top, "-", clip.right, ",", clip.bottom,
-                ") -> unclipping"));
-              lastClip = clip;
-              lastClipValid = true;
-            }
-            ::ClipCursor(nullptr);
-          }
-        }
-
-        POINT pt;
-        if (::GetCursorPos(&pt)) {
-          if (pt.x == lastPt.x && pt.y == lastPt.y) {
-            ++stuckSamples;
-            // 400 samples @ 5ms = ~2000 ms of zero movement, which is
-            // well past anything a user would perceive as "lag"; a
-            // genuine mouselock will trivially trip this, a user just
-            // looking at a menu will not.
-            if (stuckSamples == 400 && !stuckLogged) {
-              stuckLogged = true;
-              HWND fg = ::GetForegroundWindow();
-              HWND cap = ::GetCapture();
-              Logger::info(str::format(
-                "[CursorLock] cursor pinned at (", pt.x, ",", pt.y,
-                ") for ~2s while UI open;",
-                " foreground=", (void*) fg,
-                " capture=", (void*) cap,
-                " gameHwnd=", (void*) m_gameHwnd,
-                " hookActive=", g_uiBlocksSetCursorPos.load() ? 1 : 0));
-            }
-          } else {
-            stuckSamples = 0;
-            stuckLogged = false;
-            lastPt = pt;
-          }
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds(5));
-      }
-    });
   }
 
   ImGUI::~ImGUI() {
-    // Stop the watchdog first so it can't touch state during teardown.
-    m_cursorWatchdogRun.store(false);
-    m_cursorWatchdogUiOpen.store(false);
-    g_uiBlocksSetCursorPos.store(false);
-    g_uiIsOpen.store(false);
-    if (m_cursorWatchdogThread.joinable()) {
-      m_cursorWatchdogThread.join();
-    }
-    // FocusSteal thread is PERMANENTLY DISABLED — nothing to stop.
-
     g_imguiTextureMap.clear();
 
     ImGui::SetCurrentContext(m_context);
-  // DX11 Remix: replay any style refresh that was requested before ImGui had
-  // a current context. This preserves option-driven UI styling and avoids the
-  // startup access violation in ImGUI::setupStyle().
-  if (dx11RemixImguiContextReady() && dx11RemixConsumePendingImguiStyleRefresh()) {
-    ImGUI::setupStyle();
-  }
     ImPlot::SetCurrentContext(m_plotContext);
 
     if(m_init) {
@@ -1500,43 +635,24 @@ namespace dxvk {
     ImPlot::DestroyContext(m_plotContext);
     ImGui::DestroyContext(m_context);
   }
-
-  UIType ImGUI::GetLastKnownMenuType() {
-    return g_lastKnownUiType.load(std::memory_order_relaxed);
-  }
   
   void ImGUI::AddTexture(const XXH64_hash_t hash, const Rc<DxvkImageView>& imageView, uint32_t textureFeatureFlags) {
-    const uint64_t nowMs = GlobalTime::get().absoluteTimeMs();
-    auto& texture = g_imguiTextureMap[hash];
-    if (texture.imageView.ptr() != imageView.ptr()) {
+    if (g_imguiTextureMap.find(hash) == g_imguiTextureMap.end()) {
+      ImGuiTexture texture;
+      texture.imageView = imageView; // Hold a refcount
       texture.texID = VK_NULL_HANDLE;
+      texture.textureFeatureFlags = textureFeatureFlags;
+      g_imguiTextureMap[hash] = texture;
     }
-
-    const auto& imageInfo = imageView->imageInfo();
-    texture.imageView = imageView; // Hold a refcount while preview is live
-    texture.textureFeatureFlags |= textureFeatureFlags;
-    texture.extent = imageInfo.extent;
-    texture.format = imageInfo.format;
-    texture.usage = imageInfo.usage;
-    texture.lastTouchedAtMs = nowMs;
-    texture.released = false;
   }
 
   void ImGUI::ReleaseTexture(const XXH64_hash_t hash) {
     if (RtxOptions::keepTexturesForTagging()) {
       return;
     }
-
-    auto iter = g_imguiTextureMap.find(hash);
-    if (iter == g_imguiTextureMap.end()) {
-      return;
-    }
-
-    iter->second.released = true;
-    iter->second.imageView = nullptr;
-    iter->second.texID = VK_NULL_HANDLE;
-    iter->second.lastTouchedAtMs = GlobalTime::get().absoluteTimeMs();
-    pruneReleasedTexturePreviews();
+    
+    // Note: Erase will do nothing if the hash does not exist in the map, and erase it if it is.
+    g_imguiTextureMap.erase(hash);
   }
 
   void ImGUI::SetFogStates(const fast_unordered_cache<FogState>& fogStates, XXH64_hash_t usedFogHash) {
@@ -1546,84 +662,18 @@ namespace dxvk {
   }
 
   bool ImGUI::wndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
-    // Pin ImGui + ImPlot to the dev menu's private contexts so input events
-    // are written into the correct context. Without this, plugin activity on
-    // other threads can drift GImGui off the dev menu's context, causing
-    // keyboard input (Alt+X etc.) to silently fail.
-    ImGui::SetCurrentContext(m_context);
-  // DX11 Remix: replay any style refresh that was requested before ImGui had
-  // a current context. This preserves option-driven UI styling and avoids the
-  // startup access violation in ImGUI::setupStyle().
-  if (dx11RemixImguiContextReady() && dx11RemixConsumePendingImguiStyleRefresh()) {
-    ImGUI::setupStyle();
-  }
-  // Replay deferred setupStyle() request once ImGui has a valid current context.
-  if (g_dx11RemixPendingImguiStyleRefresh.exchange(false, std::memory_order_acq_rel)) {
-    setupStyle();
-  }
-    ImPlot::SetCurrentContext(m_plotContext);
-
-    const bool isKeyMsg = (msg >= WM_KEYFIRST && msg <= WM_KEYLAST)
-                       || (msg >= WM_SYSKEYDOWN && msg <= WM_SYSDEADCHAR);
-    const bool isMouseMsg = (msg >= WM_MOUSEFIRST && msg <= WM_MOUSELAST);
-    // Raw input: games with WM_INPUT-based mouselook read the mouse through
-    // this message, not through WM_MOUSEMOVE - so consuming only legacy
-    // messages left the camera spinning while the user moved the cursor over
-    // the open UI. Treat WM_INPUT as game input to block while the UI is open.
-    const bool isRawInputMsg = (msg == WM_INPUT);
-    const bool uiOpen = getEffectiveUIType() != UIType::None;
-
-    // When the UI is closed, the hook must be invisible to the game.
-    // Feeding every message into the ImGui Win32 backend regardless of UI
-    // state had real side effects: the backend calls SetCapture /
-    // ReleaseCapture on mouse buttons and answers WM_SETCURSOR, which
-    // releases the game's own mouse capture (cursor drifts out of the
-    // window, mouselook breaks) and fights games that hide the cursor -
-    // all without the UI ever being opened. Hotkey detection does not
-    // depend on this path (it uses async key-state polling), so with the
-    // UI closed we only forward non-input window-management messages to
-    // the overlay and let everything else flow untouched to the game.
-    if (!uiOpen) {
-      if (m_overlayWin.ptr() != nullptr && !isKeyMsg && !isMouseMsg && msg != WM_SETCURSOR) {
-        m_overlayWin->gameWndProcHandler(hWnd, msg, wParam, lParam);
-      }
-      return false;
-    }
-
-    // UI open: forward to the overlay's gameWndProcHandler first.
-    // The overlay handles keyboard forwarding to ImGui and window management events.
     if (m_overlayWin.ptr() != nullptr) {
       m_overlayWin->gameWndProcHandler(hWnd, msg, wParam, lParam);
+      return false;
+    } else {
+      // Note this is the old method for grabbing keyboard/mouse inputs which relies on hooking
+      //  the wndproc from the original game, and sending that data across the x86 -> x64 bridge.
+      //  We see compatibilities in older applications with this approach that are tricky to resolve.
+      //  Favour the new approach `useNewGuiInputMethod` when possible.
+      // DX11_V225: return whether ImGui consumed the message so the DX11 in-process
+      // swapchain can block it from reaching the game's WndProc.
+      return ImGui_ImplWin32_WndProcHandler(hWnd, msg, wParam, lParam) != 0;
     }
-
-    // Forward to ImGui's Win32 backend so it sees all input events.
-    // This is critical for checkbox clicks, dropdown selections, slider drags,
-    // and all other widget interactions. The overlay's raw input path (WM_INPUT)
-    // handles mouse position tracking, but ImGui still needs the legacy
-    // WM_LBUTTONDOWN/UP, WM_MOUSEMOVE etc. for widget hit-testing and state.
-    ImGui_ImplWin32_WndProcHandler(hWnd, msg, wParam, lParam);
-
-    // System task-switch keys must always flow: consuming Alt+Tab or the
-    // Windows keys traps the user inside the game window with the UI open
-    // (reported as "cursor locked into the game scene, cannot alt-tab").
-    const bool isSystemSwitchKey =
-         ((msg == WM_SYSKEYDOWN || msg == WM_SYSKEYUP) && wParam == VK_TAB)
-      || wParam == VK_LWIN
-      || wParam == VK_RWIN;
-
-    // Consume ALL mouse, keyboard, and raw-input messages while the UI is
-    // open so the game never sees them. This prevents the game's mouselook,
-    // weapon swings, camera moves etc. from interfering with the UI.
-    if ((isMouseMsg || isKeyMsg || isRawInputMsg) && !isSystemSwitchKey) {
-      if (isRawInputMsg) {
-        // Per the WM_INPUT contract the message must still reach
-        // DefWindowProc for the system to perform cleanup, even when the
-        // application swallows it.
-        ::DefWindowProcW(hWnd, msg, wParam, lParam);
-      }
-      return true;
-    }
-    return false;
   }
 
   void ImGUI::showMemoryStats() const {
@@ -1681,259 +731,31 @@ namespace dxvk {
     ImGui::Dummy(ImVec2 { 4, 0 });
   }
 
-  void ImGUI::switchMenu(UIType type, bool force, bool allowCrossModuleFallback) {
-    UIType oldType = getEffectiveUIType();
-    Logger::info(str::format("[ImGUI] switchMenu: old=", (int)oldType, " new=", (int)type, " force=", force));
+  void ImGUI::switchMenu(UIType type, bool force) {
+    UIType oldType = RtxOptions::showUI();
     if (oldType == type && !force) {
-      Logger::info("[ImGUI] switchMenu: same state, skipping");
       return;
     }
-
-    if (oldType == UIType::Basic && type != UIType::Basic) {
-      m_closeUserPopupNextFrame = true;
-    }
     
-    if (oldType != UIType::None && type == UIType::None) {
+    if (type == UIType::None) {
       onCloseMenus();
-    } else if (oldType == UIType::None && type != UIType::None) {
+    } else {
       onOpenMenus();
     }
 
-    m_activeUiType = type;
-
-    // showUI is runtime menu state, not a persisted user setting. Clear stale
-    // user-override state before writing it or the user-setting guard can block
-    // Basic/Advanced/closed transitions.
-    const RtxOptionLayer* derivedLayer = RtxOptionLayer::getDerivedLayer();
-    RtxOptions::showUI.clearUserOverridden();
-    RtxOptions::showUI.clearFromStrongerLayers(derivedLayer);
-    RtxOptions::showUI.setImmediately(type, derivedLayer);
-
-    UIType readback = RtxOptions::showUI();
-    if (readback != type) {
-      RtxOptions::showUI.clearUserOverridden();
-      RtxOptions::showUI.clearFromStrongerLayers(derivedLayer);
-      RtxOptions::showUI.setImmediately(type, derivedLayer);
-      readback = RtxOptions::showUI();
-    }
-
-    Logger::info(str::format("[ImGUI] switchMenu: set showUI=", (int)type,
-      " immediately on Derived layer, readback=", (int)readback));
-
-    m_lastObservedRequestedUiType = type;
-
-    g_lastKnownUiType.store(type, std::memory_order_relaxed);
-  }
-
-  void ImGUI::markRemixMenuHotkeyHandled() {
-    m_remixMenuHotkeyLatched = true;
-    m_lastRemixMenuToggleTime = std::chrono::steady_clock::now();
-  }
-
-  void ImGUI::logUiDiagnosticPass(const char* reason, UIType mode) {
-    ++m_uiDiagnosticPassSerial;
-
-    const ImGuiIO& io = ImGui::GetIO();
-    const ImGuiContext* imgui = GImGui;
-    const HWND captureHwnd = ::GetCapture();
-    const HWND foregroundHwnd = ::GetForegroundWindow();
-
-    RECT clipRect = {};
-    const bool clipValid = ::GetClipCursor(&clipRect) != FALSE;
-    POINT cursorPos = {};
-    const bool cursorValid = ::GetCursorPos(&cursorPos) != FALSE;
-
-    const RtxOptionLayer* userLayer = RtxOptionLayer::getUserLayer();
-    const RtxOptionLayer* derivedLayer = RtxOptionLayer::getDerivedLayer();
-    const RtxOptionLayer* qualityLayer = RtxOptionLayer::getQualityLayer();
-    const RtxOptionLayer* rtxConfLayer = RtxOptionLayer::getRtxConfLayer();
-
-    uint32_t totalOptions = 0;
-    uint32_t nullOptionEntries = 0;
-    uint32_t nullTargetLayer = 0;
-    uint32_t targetUser = 0;
-    uint32_t targetDerived = 0;
-    uint32_t targetQuality = 0;
-    uint32_t targetRtxConf = 0;
-    uint32_t targetOther = 0;
-    uint32_t dirtyOptions = 0;
-    uint32_t userSettingOptions = 0;
-    uint32_t runtimeOnlyUserSettings = 0;
-    uint32_t strongerLayerValues = 0;
-    uint32_t qualityLayerBlocks = 0;
-    uint32_t derivedLayerBlocks = 0;
-    uint32_t nullLayerPayloads = 0;
-
-    std::vector<std::string> nullSamples;
-    std::vector<std::string> blockerSamples;
-    std::vector<std::string> runtimeSamples;
-
     {
-      // Force the same target resolution that UI widgets use. This finds
-      // locks/blocks even when the user has not clicked a setting yet.
-      RtxOptionLayerTarget userTarget(RtxOptionEditTarget::User);
-
-      for (auto& [optionHash, optionPtr] : RtxOptionImpl::getGlobalOptionMap()) {
-        (void) optionHash;
-        ++totalOptions;
-
-        if (optionPtr == nullptr) {
-          ++nullOptionEntries;
-          addDiagnosticSample(nullSamples, "<null option entry>");
-          continue;
-        }
-
-        const uint32_t flags = optionPtr->getFlags();
-        const bool userSetting = (flags & RtxOptionFlags::UserSetting) != 0;
-        const bool noSave = (flags & RtxOptionFlags::NoSave) != 0;
-        if (userSetting) {
-          ++userSettingOptions;
-        }
-
-        const RtxOptionLayer* targetLayer = optionPtr->getTargetLayer();
-        if (targetLayer == nullptr) {
-          ++nullTargetLayer;
-          addDiagnosticSample(nullSamples, str::format(optionPtr->getFullName(), " targetLayer=null"));
-          continue;
-        }
-
-        if (targetLayer == userLayer) {
-          ++targetUser;
-        } else if (targetLayer == derivedLayer) {
-          ++targetDerived;
-        } else if (targetLayer == qualityLayer) {
-          ++targetQuality;
-        } else if (targetLayer == rtxConfLayer) {
-          ++targetRtxConf;
-        } else {
-          ++targetOther;
-        }
-
-        if (optionPtr->isDirty()) {
-          ++dirtyOptions;
-        }
-
-        if (userSetting && noSave) {
-          ++runtimeOnlyUserSettings;
-          addDiagnosticSample(runtimeSamples, str::format(optionPtr->getFullName(),
-            " flags=UserSetting|NoSave target=", targetLayer->getName()));
-        }
-
-        const RtxOptionLayer* blockingLayer = optionPtr->getBlockingLayer(targetLayer);
-        if (blockingLayer != nullptr) {
-          ++strongerLayerValues;
-          if (blockingLayer == qualityLayer) {
-            ++qualityLayerBlocks;
-          } else if (blockingLayer == derivedLayer) {
-            ++derivedLayerBlocks;
-          }
-
-          addDiagnosticSample(blockerSamples, str::format(optionPtr->getFullName(),
-            " type=", getRtxOptionTypeName(optionPtr->getType()),
-            " uiTarget=", targetLayer->getName(),
-            " strongerLayer=", blockingLayer->getName()));
-        }
-
-        const OptionType optionType = optionPtr->getType();
-        optionPtr->forEachLayerValue([&](const RtxOptionLayer* layer, const GenericValue& value) {
-          if (isNullLayerValue(optionType, value)) {
-            ++nullLayerPayloads;
-            addDiagnosticSample(nullSamples, str::format(optionPtr->getFullName(),
-              " layer=", layer ? layer->getName() : "<null layer>",
-              " nullPayload type=", getRtxOptionTypeName(optionType)));
-          }
-          return true;
-        }, std::nullopt, true);
-      }
+      // Target user layer for UI state changes (this is a user preference)
+      RtxOptionLayerTarget layerTarget(RtxOptionEditTarget::User);
+      RtxOptions::showUI.setDeferred(type);
     }
 
-    Logger::info(str::format("[ImGUI][Diag] pass=", m_uiDiagnosticPassSerial,
-      " reason=", reason ? reason : "<null>",
-      " mode=", getUiTypeName(mode),
-      " gameHwnd=", (uintptr_t) m_gameHwnd,
-      " hwndValid=", (m_gameHwnd != nullptr && ::IsWindow(m_gameHwnd)) ? 1 : 0,
-      " hwndVisible=", (m_gameHwnd != nullptr && ::IsWindowVisible(m_gameHwnd)) ? 1 : 0,
-      " hwndIconic=", (m_gameHwnd != nullptr && ::IsIconic(m_gameHwnd)) ? 1 : 0,
-      " foreground=", (uintptr_t) foregroundHwnd,
-      " capture=", (uintptr_t) captureHwnd,
-      " captureIsGame=", (captureHwnd != nullptr && captureHwnd == m_gameHwnd) ? 1 : 0));
-
-    Logger::info(str::format("[ImGUI][Diag] input ioWantMouse=", io.WantCaptureMouse ? 1 : 0,
-      " ioWantKeyboard=", io.WantCaptureKeyboard ? 1 : 0,
-      " ioWantText=", io.WantTextInput ? 1 : 0,
-      " mouseDrawCursor=", io.MouseDrawCursor ? 1 : 0,
-      " mousePos=", io.MousePos.x, ",", io.MousePos.y,
-      " mouseDown=", io.MouseDown[0] ? 1 : 0, io.MouseDown[1] ? 1 : 0, io.MouseDown[2] ? 1 : 0,
-      io.MouseDown[3] ? 1 : 0, io.MouseDown[4] ? 1 : 0,
-      " keyCtrl=", io.KeyCtrl ? 1 : 0,
-      " keyShift=", io.KeyShift ? 1 : 0,
-      " keyAlt=", io.KeyAlt ? 1 : 0,
-      " hotkeyLatched=", m_remixMenuHotkeyLatched ? 1 : 0));
-
-    Logger::info(str::format("[ImGUI][Diag] imgui activeId=",
-      imgui ? imgui->ActiveId : 0,
-      " hoveredId=", imgui ? imgui->HoveredId : 0,
-      " navId=", imgui ? imgui->NavId : 0,
-      " openPopups=", imgui ? imgui->OpenPopupStack.Size : 0,
-      " windows=", imgui ? imgui->Windows.Size : 0,
-      " currentWindow=", (imgui && imgui->CurrentWindow && imgui->CurrentWindow->Name) ? imgui->CurrentWindow->Name : "<null>",
-      " clipValid=", clipValid ? 1 : 0,
-      " clip=", clipRect.left, ",", clipRect.top, ",", clipRect.right, ",", clipRect.bottom,
-      " cursorValid=", cursorValid ? 1 : 0,
-      " cursor=", cursorPos.x, ",", cursorPos.y));
-
-    Logger::info(str::format("[ImGUI][Diag] options total=", totalOptions,
-      " userSettings=", userSettingOptions,
-      " dirty=", dirtyOptions,
-      " nullOptionEntries=", nullOptionEntries,
-      " nullTargetLayers=", nullTargetLayer,
-      " nullLayerPayloads=", nullLayerPayloads,
-      " targetUser=", targetUser,
-      " targetDerived=", targetDerived,
-      " targetQuality=", targetQuality,
-      " targetRtxConf=", targetRtxConf,
-      " targetOther=", targetOther,
-      " runtimeOnlyUserSettings=", runtimeOnlyUserSettings,
-      " strongerLayerValues=", strongerLayerValues,
-      " qualityLayerBlocks=", qualityLayerBlocks,
-      " derivedLayerBlocks=", derivedLayerBlocks));
-
-    auto logSamples = [](const char* label, const std::vector<std::string>& samples, uint32_t totalCount) {
-      if (samples.empty()) {
-        return;
-      }
-
-      Logger::warn(str::format("[ImGUI][Diag] ", label, " samples shown=",
-        samples.size(), " total=", totalCount));
-      for (const std::string& sample : samples) {
-        Logger::warn(str::format("[ImGUI][Diag] ", label, ": ", sample));
-      }
-    };
-
-    logSamples("blocker", blockerSamples, strongerLayerValues);
-    logSamples("runtimeOnlyUserSetting", runtimeSamples, runtimeOnlyUserSettings);
-    logSamples("null", nullSamples, nullOptionEntries + nullTargetLayer + nullLayerPayloads);
+    if (RtxOptions::blockInputToGameInUI()) {
+      BridgeMessageChannel::get().send("UWM_REMIX_UIACTIVE_MSG",
+                                       type != UIType::None ? 1 : 0, 0);
+    }
   }
   
   void ImGUI::showMaterialOptions() {
-    if (RemixGui::CollapsingHeader("DX11 Bridge", collapsingHeaderClosedFlags)) {
-      ImGui::Indent();
-
-      RemixGui::Checkbox("Force Injection", &RtxOptions::forceInjectionObject());
-      RemixGui::SetTooltipToLastWidgetOnHover("Forces Remix injection every frame with a backbuffer. Escape hatch for games whose cameras never pass validation (which otherwise blocks both path tracing and this menu). The overflow guard keeps the acceleration structure empty while no real scene is found, so this is safe to leave on.");
-
-      RemixGui::Checkbox("Allow Viewport-Fallback Camera After Real Camera", &RtxOptions::allowViewportFallbackAfterRealCameraObject());
-      RemixGui::SetTooltipToLastWidgetOnHover("Lets menu and loading-screen draws synthesize a camera from the viewport even after a real scene camera has been seen this session.");
-
-      RemixGui::Checkbox("Taggable Untextured Draws", &RtxOptions::taggableUntexturedDrawsObject());
-      RemixGui::SetTooltipToLastWidgetOnHover("Attaches a small neutral fallback material texture to draws that bind no texture, so they appear in the texture browser and can be picked in the viewport and tagged (including ignore-tags that remove them).");
-
-      RemixGui::DragInt("VRAM Budget Headroom (MiB)", &RtxOptions::TextureManager::budgetHeadroomMiBObject(), 8.0f, 0, 4096, "%d MiB");
-      RemixGui::SetTooltipToLastWidgetOnHover("Memory reserved out of the driver-reported VRAM budget before textures claim it. Prevents over-budget allocation failures (Vulkan device-lost popups) from acceleration structures and render targets that cannot fall back to system memory.");
-
-      ImGui::Unindent();
-    }
-
     if (RemixGui::CollapsingHeader("Material Options (optional)", collapsingHeaderClosedFlags)) {
       ImGui::Indent();
 
@@ -2034,124 +856,23 @@ namespace dxvk {
   void ImGUI::processHotkeys() {
     auto& io = ImGui::GetIO();
 
-    auto isModifierKey = [](const VirtualKey& vk) {
-      return vk.val == VK_SHIFT || vk.val == VK_CONTROL || vk.val == VK_MENU;
-    };
-
-    auto isHotkeyPressedThisFrame = [&](const VirtualKeys& virtKeys) {
-      if (virtKeys.empty()) {
-        return false;
+    if (checkHotkeyState(RtxOptions::remixMenuKeyBinds())) {
+      if(RtxOptions::defaultToAdvancedUI()) {
+        switchMenu(RtxOptions::showUI() != UIType::None ? UIType::None : UIType::Advanced);
+      } else {
+        switchMenu(RtxOptions::showUI() != UIType::None ? UIType::None : UIType::Basic);
       }
-
-      bool allKeysDown = true;
-      bool hasNonModifier = false;
-      bool anyNonModifierPressed = false;
-
-      for (const auto& vk : virtKeys) {
-        if (vk.val == VK_SHIFT) {
-          allKeysDown = allKeysDown && io.KeyShift;
-          continue;
-        }
-
-        if (vk.val == VK_CONTROL) {
-          allKeysDown = allKeysDown && io.KeyCtrl;
-          continue;
-        }
-
-        if (vk.val == VK_MENU) {
-          allKeysDown = allKeysDown && io.KeyAlt;
-          continue;
-        }
-
-        hasNonModifier = true;
-
-        const ImGuiKey key = ImGui_ImplWin32_VirtualKeyToImGuiKey(vk.val);
-        if (key == ImGuiKey_None) {
-          return false;
-        }
-
-        allKeysDown = allKeysDown && ImGui::IsKeyDown(key);
-        anyNonModifierPressed = anyNonModifierPressed || ImGui::IsKeyPressed(key, false);
-      }
-
-      if (!allKeysDown) {
-        return false;
-      }
-
-      return hasNonModifier ? anyNonModifierPressed : true;
-    };
-
-    // Diagnostic: log when Alt key state is first seen, confirming WndProc delivers keys.
-    {
-      static bool loggedAltSeen = false;
-      if (!loggedAltSeen && io.KeyAlt) {
-        loggedAltSeen = true;
-        Logger::info("[ImGUI] processHotkeys: Alt key detected by ImGui (WndProc delivering keys)");
-      }
-    }
-
-    // GetAsyncKeyState-based hotkey check (fallback when WndProc doesn't deliver keys)
-    // Static tracker for rising edge detection - prevents multiple toggles per key press
-    static bool s_asyncKeyStatePrevDown = false;
-    auto checkHotkeyWithGetAsyncKeyState = [](const VirtualKeys& virtKeys) -> bool {
-      if (virtKeys.empty()) return false;
-      for (const auto& vk : virtKeys) {
-        if ((::GetAsyncKeyState(vk.val) & 0x8000) == 0)
-          return false;
-      }
-      return true;
-    };
-
-    const VirtualKeys& remixMenuKeyBinds = RtxOptions::remixMenuKeyBinds();
-    const bool imguiHotkeyDown = checkHotkeyState(remixMenuKeyBinds, true);
-    const bool asyncKeyDown = checkHotkeyWithGetAsyncKeyState(remixMenuKeyBinds);
-    const bool asyncKeyPressed = asyncKeyDown && !s_asyncKeyStatePrevDown; // Rising edge only
-    
-    // Log when async key state changes
-    if (asyncKeyDown != s_asyncKeyStatePrevDown) {
-      Logger::info(str::format("[ImGUI] processHotkeys: asyncKeyDown changed to ", asyncKeyDown ? 1 : 0,
-        " (risingEdge=", asyncKeyPressed ? 1 : 0,
-        " imguiHotkeyDown=", imguiHotkeyDown ? 1 : 0,
-        " latch=", m_remixMenuHotkeyLatched ? 1 : 0, ")"));
-    }
-    s_asyncKeyStatePrevDown = asyncKeyDown;
-
-    const bool remixMenuHotkeyDown = imguiHotkeyDown || asyncKeyDown;
-    // For "pressed this frame" with GetAsyncKeyState, use rising edge detection
-    const bool remixMenuHotkeyPressed = isHotkeyPressedThisFrame(remixMenuKeyBinds) || asyncKeyPressed;
-    // Always handle hotkey here - m_remixMenuHotkeyLatched prevents double-toggle if WndProc also handled it
-    if (!remixMenuHotkeyDown) {
-      m_remixMenuHotkeyLatched = false;
-    } else {
-      constexpr auto kRemixMenuHotkeyDebounce = std::chrono::milliseconds(250);
-      const auto now = std::chrono::steady_clock::now();
-      const bool debounceExpired = m_lastRemixMenuToggleTime.time_since_epoch().count() == 0
-        || now - m_lastRemixMenuToggleTime >= kRemixMenuHotkeyDebounce;
-
-      if (remixMenuHotkeyPressed && !m_remixMenuHotkeyLatched && debounceExpired) {
-        Logger::info("[ImGUI] Alt+X hotkey detected — toggling Remix menu");
-        const bool uiOpen = getEffectiveUIType() != UIType::None;
-        if(RtxOptions::defaultToAdvancedUI()) {
-          switchMenu(uiOpen ? UIType::None : UIType::Advanced);
-        } else {
-          switchMenu(uiOpen ? UIType::None : UIType::Basic);
-        }
-
-        m_lastRemixMenuToggleTime = now;
-      }
-
-      m_remixMenuHotkeyLatched = true;
     }
 
 
     // Toggle ImGUI mouse cursor. Alt-Del
     if (io.KeyAlt && ImGui::IsKeyPressed(ImGui::GetKeyIndex(ImGuiKey_Delete))) {
-      RemixGui::ApplyRtxOptionUserChange(&RtxOptions::showUICursorObject(), !RtxOptions::showUICursor());
+      RtxOptions::showUICursor.setDeferred(!RtxOptions::showUICursor());
     }
 
     // Toggle input blocking. Alt-Backspace
     if (io.KeyAlt && ImGui::IsKeyPressed(ImGui::GetKeyIndex(ImGuiKey_Backspace))) {
-      RemixGui::ApplyRtxOptionUserChange(&RtxOptions::blockInputToGameInUIObject(), !RtxOptions::blockInputToGameInUI());
+      RtxOptions::blockInputToGameInUI.setDeferred(!RtxOptions::blockInputToGameInUI());
     }
   }
 
@@ -2161,15 +882,12 @@ namespace dxvk {
 
     ImGui::NewFrame();
 
+    // DX11_V225: clear the per-frame Remix-menu hotkey latch at the start of each
+    // frame so the DX11 in-process WndProc paths can toggle the menu once per press.
+    m_remixMenuHotkeyLatched = false;
+
     processHotkeys();
     updateQuickActions(ctx);
-
-    if (m_closeUserPopupNextFrame) {
-      if (GImGui != nullptr && GImGui->OpenPopupStack.Size > 0) {
-        ImGui::ClosePopupToLevel(0, true);
-      }
-      m_closeUserPopupNextFrame = false;
-    }
 
     m_splash->update(m_largeFont);
 
@@ -2179,47 +897,14 @@ namespace dxvk {
 
     showDebugVisualizations(ctx);
 
-    const auto showUI = getEffectiveUIType();
-    g_lastKnownUiType.store(showUI, std::memory_order_relaxed);
-    {
-      static UIType lastLoggedUI = UIType::None;
-      if (showUI != lastLoggedUI) {
-        Logger::info(str::format("[ImGUI] update: showUI changed to ", (int)showUI,
-          " (0=None, 1=Basic, 2=Advanced)"));
-        lastLoggedUI = showUI;
-      }
-    }
-    if (showUI != UIType::None && useFreshDx11Ui()) {
-      // Dev-menu routing fix:
-      // The DX11 Fresh UI should own the Basic menu, but the true Developer
-      // menu must still render through showMainMenu(). Without this split,
-      // the Basic->Advanced button updates showUI correctly while the same
-      // Fresh UI keeps rendering, which makes the Dev button appear broken.
-      if (showUI == UIType::Advanced) {
-        showMainMenu(ctx);
-
-        // Uncomment to see the ImGUI demo, good reference!  Also, need to undefine IMGUI_DISABLE_DEMO_WINDOWS (in "imconfig.h")
-        //ImGui::ShowDemoWindow();
-      } else {
-        showFreshMenu(ctx, showUI);
-      }
-    } else if (showUI == UIType::Advanced) {
+    const auto showUI = RtxOptions::showUI();
+    if (showUI == UIType::Advanced) {
       showMainMenu(ctx);
 
       // Uncomment to see the ImGUI demo, good reference!  Also, need to undefine IMGUI_DISABLE_DEMO_WINDOWS (in "imconfig.h")
       //ImGui::ShowDemoWindow();
     } else if (showUI == UIType::Basic) {
       showUserMenu(ctx);
-    }
-
-    if (showUI != UIType::None) {
-      RtxOptionManager::applyPendingValues(m_device, /* forceOnChange */ false);
-      if (m_lastUiDiagnosticPassType != showUI) {
-        logUiDiagnosticPass("ui-open-or-mode-change", showUI);
-        m_lastUiDiagnosticPassType = showUI;
-      }
-    } else {
-      m_lastUiDiagnosticPassType = UIType::None;
     }
     
     // Render any blocked edit popup warnings
@@ -2231,80 +916,17 @@ namespace dxvk {
       showReflexLatencyStats();
     }
 
-    const bool uiOpen = showUI != UIType::None;
-    const bool drawImGuiCursor = uiOpen
-      && RtxOptions::showUICursor()
-      && m_overlayWin.ptr() == nullptr;
-
-    if (!uiOpen) {
-      const bool uiInputLatched = m_uiWasOpenLastFrame
-        || m_cursorWatchdogUiOpen.load(std::memory_order_relaxed)
-        || g_uiIsOpen.load(std::memory_order_relaxed)
-        || g_uiBlocksSetCursorPos.load(std::memory_order_relaxed);
+    if (showUI == UIType::None) {
       ImGui::CloseCurrentPopup();
       ImGui::GetIO().MouseDrawCursor = false;
-      m_cursorWatchdogUiOpen.store(false, std::memory_order_relaxed);
-      g_uiBlocksSetCursorPos.store(false, std::memory_order_relaxed);
-      g_uiIsOpen.store(false, std::memory_order_relaxed);
-      if (uiInputLatched) {
-        if (::GetCapture() == m_gameHwnd) {
-          ::ReleaseCapture();
-        }
-        ::ClipCursor(nullptr);
-        forceReacquireAllDI8Devices();
-      }
-      m_uiWasOpenLastFrame = false;
     } else {
-      ImGui::GetIO().MouseDrawCursor = drawImGuiCursor;
-      forceOsCursorVisible(!drawImGuiCursor);
-      const bool blockGameInput = RtxOptions::blockInputToGameInUI();
-      // Tell DI8 and user32 hooks to suppress game mouse input while UI is open.
-      // This blocks viewport cursor warps while leaving normal ImGui input active.
-      g_uiIsOpen.store(true, std::memory_order_relaxed);
-      m_cursorWatchdogUiOpen.store(true, std::memory_order_relaxed);
-      g_uiBlocksSetCursorPos.store(blockGameInput, std::memory_order_relaxed);
-      // Tell the focus-steal helper thread to pull the game out of the
-      // foreground so any DirectInput devices acquired with
-      // DISCL_FOREGROUND lose acquisition and stop feeding input to the
-      // game's logic.  This is the only reliable, non-invasive way to
-      // stop DirectInput-based mouselook (Skyrim SE, FO4, etc.).
-      //
-      // FocusSteal is PERMANENTLY DISABLED.  Two failure modes have
-      // been seen in the wild:
-      //   1. On true fullscreen-exclusive games, calling
-      //      SetForegroundWindow on an off-screen helper window forces
-      //      Windows to minimise the FSE swapchain and the game
-      //      vanishes.
-      //   2. On borderless-windowed games (Skyrim SE in many configs)
-      //      the AttachThreadInput dance has been observed to hard-
-      //      crash the D3D11 render thread when the swapchain is
-      //      actively presenting.
-      //
-      // We don't need FocusSteal anyway: DI8 force-unacquire + the IAT
-      // SetCursorPos/ClipCursor/mouse_event/SendInput hooks + the
-      // cursor-unclip watchdog already fully isolate game input from
-      // the Remix UI.  The `[CursorLock] DI8 Acquire blocked` hits in
-      // prior logs prove that path is functioning.
-      if (blockGameInput) {
-        if (!m_uiWasOpenLastFrame) {
-          Logger::info("[FocusSteal] disabled (DI8 + IAT hooks handle input isolation)");
-        }
-      }
-      // Re-run the IAT patch on every UI-open transition to catch any
-      // modules that were loaded after the initial hook installation
-      // (DLSS, streamline, upscalers, reshade-style shims, etc.).
-      // Without this, a settings change that pulls in a new DLL can
-      // reintroduce the SetCursorPos mouselock because that DLL's
-      // thunk was never redirected.
-      if (!m_uiWasOpenLastFrame) {
-        installSetCursorPosHook();
-        forceUnacquireAllDI8Devices();
-        m_uiWasOpenLastFrame = true;
-      }
-      // Also release any capture the game took on the last mouse-down so
-      // subsequent mouse moves route to our WndProc and ImGui sees them.
-      if (blockGameInput && ::GetCapture() == m_gameHwnd) {
-        ::ReleaseCapture();
+      if (RtxOptions::showUICursor()) {
+        ImGui::GetIO().MouseDrawCursor = true;
+        // Force display counter into invisible state
+        while (ShowCursor(FALSE) >= 0) { }
+      } else {
+        // Force display counter into visible state
+        while (ShowCursor(TRUE) < 0) {  }
       }
     }
 
@@ -2346,22 +968,22 @@ namespace dxvk {
 
       switch (sQuickAction) {
       case RtxQuickAction::kOriginal:
-        RemixGui::ApplyRtxOptionUserChange(&RtxOptions::enableRaytracingObject(), false);
-        RemixGui::ApplyRtxOptionUserChange(&RtxOptions::enableReplacementLightsObject(), false);
-        RemixGui::ApplyRtxOptionUserChange(&RtxOptions::enableReplacementMaterialsObject(), false);
-        RemixGui::ApplyRtxOptionUserChange(&RtxOptions::enableReplacementMeshesObject(), false);
+        RtxOptions::enableRaytracing.setDeferred(false);
+        RtxOptions::enableReplacementLights.setDeferred(false);
+        RtxOptions::enableReplacementMaterials.setDeferred(false);
+        RtxOptions::enableReplacementMeshes.setDeferred(false);
         break;
       case RtxQuickAction::kRtxOnEnhanced:
-        RemixGui::ApplyRtxOptionUserChange(&RtxOptions::enableRaytracingObject(), true);
-        RemixGui::ApplyRtxOptionUserChange(&RtxOptions::enableReplacementLightsObject(), true);
-        RemixGui::ApplyRtxOptionUserChange(&RtxOptions::enableReplacementMaterialsObject(), true);
-        RemixGui::ApplyRtxOptionUserChange(&RtxOptions::enableReplacementMeshesObject(), true);
+        RtxOptions::enableRaytracing.setDeferred(true);
+        RtxOptions::enableReplacementLights.setDeferred(true);
+        RtxOptions::enableReplacementMaterials.setDeferred(true);
+        RtxOptions::enableReplacementMeshes.setDeferred(true);
         break;
       case RtxQuickAction::kRtxOn:
-        RemixGui::ApplyRtxOptionUserChange(&RtxOptions::enableRaytracingObject(), true);
-        RemixGui::ApplyRtxOptionUserChange(&RtxOptions::enableReplacementLightsObject(), false);
-        RemixGui::ApplyRtxOptionUserChange(&RtxOptions::enableReplacementMaterialsObject(), false);
-        RemixGui::ApplyRtxOptionUserChange(&RtxOptions::enableReplacementMeshesObject(), false);
+        RtxOptions::enableRaytracing.setDeferred(true);
+        RtxOptions::enableReplacementLights.setDeferred(false);
+        RtxOptions::enableReplacementMaterials.setDeferred(false);
+        RtxOptions::enableReplacementMeshes.setDeferred(false);
         break;
       case RtxQuickAction::kCount:
         assert(false && "invalid RtxQuickAction::kCount in ImGUI::updateQuickActions");
@@ -2387,7 +1009,7 @@ namespace dxvk {
 
     // Remember switch state first, the switch UI when the curent window is finished.
     int switchUI = -1;
-    bool advancedMenuOpen = getEffectiveUIType() == UIType::Advanced;
+    bool advancedMenuOpen = RtxOptions::showUI() == UIType::Advanced;
 
     if (ImGui::Begin("RTX Remix Developer Menu", &advancedMenuOpen, windowFlags)) {
       // Begin handles window resize so this is fine. Do not set m_windowWidth after tabs so that tabs can modify the width
@@ -2404,20 +1026,14 @@ namespace dxvk {
 
       const static ImGuiTabBarFlags tab_bar_flags = ImGuiTabBarFlags_Reorderable | ImGuiTabBarFlags_NoCloseWithMiddleMouseButton;
       const static ImGuiTabItemFlags tab_item_flags = ImGuiTabItemFlags_NoCloseWithMiddleMouseButton;
-      // Only force-select a tab when there's an explicit programmatic trigger.
-      // Using SetSelected every frame based on m_curTab conflicts with ImGui's
-      // internal tab bar state, causing tabs to bounce when the user clicks.
-      const bool hasProgrammaticTrigger = m_triggerTab != kTab_Count;
-      const int triggerTabIndex = hasProgrammaticTrigger ? static_cast<int>(m_triggerTab) : -1;
-      m_triggerTab = kTab_Count;
 
       // Tab Bar
       if (ImGui::BeginTabBar("Developer Tabs", tab_bar_flags)) {
         for (int n = 0; n < kTab_Count; n++) {
           auto tabItemFlags = tab_item_flags;
-          // Only use SetSelected for one-time programmatic switches
-          if (hasProgrammaticTrigger && n == triggerTabIndex) {
+          if(n == m_triggerTab) {
             tabItemFlags |= ImGuiTabItemFlags_SetSelected;
+            m_triggerTab = kTab_Count;
           }
           if (ImGui::BeginTabItem(tabNames[n], nullptr, tabItemFlags)) {
             const Tabs tab = (Tabs) n;
@@ -2594,6 +1210,7 @@ namespace dxvk {
       ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - 100);
       ImGui::InputText("##ExportFileName", exportFileName, IM_ARRAYSIZE(exportFileName));
       ImGui::SameLine();
+      ImGui::BeginDisabled(!rtxHasUnsaved);
       if (ImGui::Button("Create", ImVec2(-1, 0))) {
         if (rtxConfLayer) {
           std::string exportPath(exportFileName);
@@ -2607,6 +1224,7 @@ namespace dxvk {
           ImGui::SetTooltip("No unsaved changes in rtx.conf to export.");
         }
       }
+      ImGui::EndDisabled();
 
     }
 
@@ -2615,6 +1233,7 @@ namespace dxvk {
     // --- Bottom Buttons ---
     const float buttonWidth = ImGui::GetContentRegionAvail().x / 2 - (ImGui::GetStyle().ItemSpacing.x / 2);
     const bool anyUnsavedChanges = rtxHasUnsaved || userHasUnsaved;
+    ImGui::BeginDisabled(!anyUnsavedChanges);
     if (ImGui::Button("Revert All Unsaved Changes", ImVec2(buttonWidth, 0))) {
       // Reload all layers that have unsaved changes
       if (rtxConfLayer && rtxConfLayer->hasUnsavedChanges()) {
@@ -2631,6 +1250,7 @@ namespace dxvk {
         ImGui::SetTooltip("No unsaved changes to revert.");
       }
     }
+    ImGui::EndDisabled();
 
     ImGui::SameLine();
     if (ImGui::Button("Hide UI", ImVec2(buttonWidth, 0))) {
@@ -2823,10 +1443,13 @@ namespace dxvk {
 
       // Note: Only allow the Recompile Shaders button to function if a shader recompile is not currently in progress (be
       // it one manually initiated by the user, or something automatic from the live shader edit mode).
+      ImGui::BeginDisabled(shaderReloadPhase != ShaderManager::ShaderReloadPhase::Idle);
 
       if (ImGui::Button("Recompile Shaders")) {
         shaderManager->requestReloadShaders();
       }
+
+      ImGui::EndDisabled();
 
       ImGui::SameLine(200.f);
       RemixGui::Checkbox("Live shader edit mode", &RtxOptions::Shader::useLiveEditModeObject());
@@ -3002,10 +1625,10 @@ namespace dxvk {
 
         RemixGui::Checkbox("Skip Objects Rendered with Unknown Camera", &RtxOptions::skipObjectsWithUnknownCameraObject());
 
-        // Note: Near plane override settings are always accessible.
-        // Users should have full control over Remix functionality at all times.
         RemixGui::Checkbox("Override Near Plane (if less than original)", &RtxOptions::enableNearPlaneOverrideObject());
+        ImGui::BeginDisabled(!RtxOptions::enableNearPlaneOverride());
         RemixGui::DragFloat("Desired Near Plane Distance", &RtxOptions::nearPlaneOverrideObject(), 0.01f, 0.0001f, FLT_MAX, "%.3f");
+        ImGui::EndDisabled();
       }
       ImGui::Unindent();
     }
@@ -3291,15 +1914,7 @@ namespace dxvk {
         }
       }
 
-      if (RemixGui::Checkbox("Always Developer Menu", &RtxOptions::defaultToAdvancedUIObject())) {
-        // Dev-menu fix only:
-        // This option previously changed only the default menu for future opens.
-        // Make the click immediately open the current Developer Menu as well.
-        if (getEffectiveUIType() == UIType::Basic && RtxOptions::defaultToAdvancedUI()) {
-          switchMenu(UIType::Advanced, true);
-          return;
-        }
-      }
+      RemixGui::Checkbox("Always Developer Menu", &RtxOptions::defaultToAdvancedUIObject());
 
       if (RemixGui::SliderFloat("Background Alpha", &backgroundAlphaObject(), 0.0f, 1.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp)) {
         adjustStyleBackgroundAlpha(backgroundAlpha());
@@ -3350,21 +1965,19 @@ namespace dxvk {
       if (iter == g_imguiTextureMap.end()) {
         return {};
       }
-      const auto& textureInfo = iter->second;
+      const auto& imageInfo = iter->second.imageView->imageInfo();
 
-      const auto isRT = (textureInfo.usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
+      const auto isRT = (imageInfo.usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
 
-      const auto vkFormatName = (std::stringstream{} << textureInfo.format).str();
+      const auto vkFormatName = (std::stringstream{} << imageInfo.format).str();
       const auto formatName = std::string_view { vkFormatName }.substr(std::string_view{"VK_FORMAT_"}.length());
 
       auto str = std::ostringstream {};
       str << (isMaterialReplacement ? "Replaced material" : "Legacy material") << '\n';
-      str << (isRT ? "Render Target " : "Texture ") << textureInfo.extent.width << 'x' << textureInfo.extent.height << '\n';
+      str << (isRT ? "Render Target " : "Texture ") << imageInfo.extent.width << 'x' << imageInfo.extent.height << '\n';
       str << formatName << '\n';
       str << "Hash: " << hashToString(texHash) << '\n';
-      if (textureInfo.released || textureInfo.imageView.ptr() == nullptr) {
-        str << "Preview: Released from live preview cache\n";
-      }
+      
       if (!includeLayerInfo) {
         return str.str();
       }
@@ -3384,93 +1997,80 @@ namespace dxvk {
       return str.str();
     }
 
-    struct TextureSelectionState {
-      const RtxOptionLayer* targetLayer = nullptr;
-      bool targetHasPositive = false;
-      bool targetHasNegative = false;
-      bool weakerLayerAddsHash = false;
-      bool resolvedChecked = false;
-      bool hasBlockingLayer = false;
-
-      bool editableChecked() const {
-        if (targetHasPositive) {
-          return true;
+    float computeTexturePopupLabelColumnWidth(uint32_t textureFeatureFlags) {
+      float maxWidth = 0.0f;
+      for (const auto& rtxOption : rtxTextureOptions) {
+        if ((rtxOption.featureFlagMask & textureFeatureFlags) != rtxOption.featureFlagMask) {
+          continue;
         }
-        if (targetHasNegative) {
-          return false;
-        }
-        return weakerLayerAddsHash;
+        const std::string labelForWidth = std::string(rtxOption.displayName) + " [!]";
+        maxWidth = ImMax(maxWidth, ImGui::CalcTextSize(labelForWidth.c_str()).x);
       }
-    };
-
-    TextureSelectionState analyzeTextureSelectionState(XXH64_hash_t textureHash, RtxOption<fast_unordered_set>* textureSet) {
-      auto state = TextureSelectionState {};
-      if (textureHash == kEmptyHash || textureSet == nullptr) {
-        return state;
-      }
-
-      state.resolvedChecked = textureSet->containsHash(textureHash);
-      state.targetLayer = textureSet->getTargetLayer();
-      if (state.targetLayer == nullptr) {
-        return state;
-      }
-
-      const auto& targetKey = state.targetLayer->getLayerKey();
-      textureSet->forEachLayerValue([&](const RtxOptionLayer* layer, const GenericValue& value) {
-        const HashSetLayer* hashSet = value.hashSet;
-        const auto& layerKey = layer->getLayerKey();
-
-        if (layerKey == targetKey) {
-          state.targetHasPositive = hashSet->hasPositive(textureHash);
-          state.targetHasNegative = hashSet->hasNegative(textureHash);
-        } else if (targetKey < layerKey) {
-          state.weakerLayerAddsHash = hashSet->hasPositive(textureHash);
-          return false;
-        }
-
-        return true;
-      }, textureHash);
-
-      state.hasBlockingLayer = textureSet->getBlockingLayer(state.targetLayer, textureHash) != nullptr;
-      return state;
+      return maxWidth + ImGui::GetStyle().FramePadding.x * 2.0f;
     }
 
-    void setTextureSelection(XXH64_hash_t textureHash, const char* uniqueId, RtxOption<fast_unordered_set>* textureSet, bool desiredChecked) {
+    void toggleTextureSelection(XXH64_hash_t textureHash, const char* uniqueId, RtxOption<fast_unordered_set>* textureSet) {
       if (textureHash == kEmptyHash) {
         return;
       }
+      
+      // Determine if user wants to add (currently unchecked) or remove (currently checked)
+      const bool userWantsRemove = textureSet->containsHash(textureHash);
 
-      const auto state = analyzeTextureSelectionState(textureHash, textureSet);
-      const RtxOptionLayer* targetLayer = state.targetLayer;
-      if (targetLayer == nullptr) {
-        return;
-      }
+      // Analyze the layer state in a single pass
+      const RtxOptionLayer* targetLayer = textureSet->getTargetLayer();
+      const auto& targetKey = targetLayer->getLayerKey();
+      
+      // Track target layer's opinion and strongest weaker layer's opinion
+      bool targetHasPositive = false;
+      bool targetHasNegative = false;
+      bool weakerLayerAddsHash = false;  // True if strongest weaker layer adds this hash
+      
+      textureSet->forEachLayerValue([&](const RtxOptionLayer* layer, const GenericValue& value) {
+        const HashSetLayer* hashSet = value.hashSet;
+        const auto& layerKey = layer->getLayerKey();
+        
+        if (layerKey == targetKey) {
+          targetHasPositive = hashSet->hasPositive(textureHash);
+          targetHasNegative = hashSet->hasNegative(textureHash);
+        } else if (targetKey < layerKey) {
+          // First weaker layer with an opinion - determines what happens without target layer
+          weakerLayerAddsHash = hashSet->hasPositive(textureHash);
+          return false; // Stop iteration
+        }
+        return true; // Continue
+      }, textureHash);
 
       // Lambda to apply the user's intended action to the target layer
-      auto applyAction = [textureSet, textureHash, targetLayer, desiredChecked, uniqueId,
-                          targetHasPositive = state.targetHasPositive,
-                          targetHasNegative = state.targetHasNegative]() {
+      auto applyAction = [textureSet, textureHash, targetLayer, userWantsRemove, weakerLayerAddsHash, uniqueId,
+                          targetHasPositive, targetHasNegative]() {
         const char* action;
-        if (desiredChecked) {
-          // User wants a positive opinion in the editable layer.
-          if (!targetHasPositive) {
-            textureSet->addHash(textureHash, targetLayer);
-            action = "added (positive opinion)";
-          } else {
-            action = "already added";
-          }
-        } else {
-          // User wants a negative opinion in the editable layer.
+        if (userWantsRemove) {
+          // User wants to remove this hash from the resolved set
           if (!targetHasNegative) {
+            // Either the target has a positive opinion, or no opinion at all
+            // In both cases, create a negative opinion to express "I don't want this"
             textureSet->removeHash(textureHash, targetLayer);
             action = "removed (negative opinion)";
           } else {
+            // Already has a negative opinion - nothing to do
             action = "already removed";
+          }
+        } else {
+          // User wants to add this hash to the resolved set
+          if (!targetHasPositive) {
+            // Either the target has a negative opinion, or no opinion at all
+            // In both cases, create a positive opinion to express "I want this"
+            textureSet->addHash(textureHash, targetLayer);
+            action = "added (positive opinion)";
+          } else {
+            // Already has a positive opinion - nothing to do
+            action = "already added";
           }
         }
 
         char buffer[256];
-        sprintf_s(buffer, "[Settings] TextureHash %s - %s %016llX", uniqueId, action, textureHash);
+        sprintf_s(buffer, "%s - %s %016llX\n", uniqueId, action, textureHash);
         Logger::info(buffer);
       };
 
@@ -3480,11 +2080,6 @@ namespace dxvk {
       if (!RemixGui::CheckRtxOptionPopups(textureSet, textureHash, applyAction)) {
         applyAction();
       }
-    }
-
-    void toggleTextureSelection(XXH64_hash_t textureHash, const char* uniqueId, RtxOption<fast_unordered_set>* textureSet) {
-      const auto state = analyzeTextureSelectionState(textureHash, textureSet);
-      setTextureSelection(textureHash, uniqueId, textureSet, !state.editableChecked());
     }
 
     RtxOption<fast_unordered_set>* findTextureSetByUniqueId(const char* uniqueId) {
@@ -3509,27 +2104,14 @@ namespace dxvk {
       // need to keep a reference to a texture that was passed to 'open()',
       // as 'open()' is called only once, but popup needs to reference that texture throughout open-close
       std::atomic<XXH64_hash_t> g_holdingTexture {};
-      dxvk::mutex g_holdingObjectPickingValuesMutex {};
-      std::vector<ObjectPickingValue> g_holdingObjectPickingValues {};
       bool g_openWhenAvailable {};
-
-      void setHoldingObjectPickingValues(std::vector<ObjectPickingValue>&& objectPickingValues) {
-        std::lock_guard lock { g_holdingObjectPickingValuesMutex };
-        g_holdingObjectPickingValues = std::move(objectPickingValues);
-      }
-
-      std::vector<ObjectPickingValue> copyHoldingObjectPickingValues() {
-        std::lock_guard lock { g_holdingObjectPickingValuesMutex };
-        return g_holdingObjectPickingValues;
-      }
 
       void openImguiPopupOrToggle() {
         // don't show popup window and toggle the list directly,
         // if was a left mouse click in the splitted lists
         bool toggleWithoutPopup = ImGUI::showLegacyTextureGui() &&
-                g_wasLeftClick &&
-                g_holdingTexture.load() != kEmptyHash &&
-                !lastOpenCategoryId.empty();
+                                  g_wasLeftClick &&
+                                  !lastOpenCategoryId.empty();
         g_wasLeftClick = false;
 
         if (toggleWithoutPopup) {
@@ -3543,9 +2125,8 @@ namespace dxvk {
         }
       }
 
-      void open(std::optional<XXH64_hash_t> texHash, std::vector<ObjectPickingValue>&& objectPickingValues = {}) {
+      void open(std::optional<XXH64_hash_t> texHash) {
         g_holdingTexture.exchange(texHash.value_or(kEmptyHash));
-        setHoldingObjectPickingValues(std::move(objectPickingValues));
         g_openWhenAvailable = false;
         // no need to wait, open immediately
         openImguiPopupOrToggle();
@@ -3553,7 +2134,6 @@ namespace dxvk {
 
       void openAsync() {
         g_holdingTexture.exchange(kEmptyHash);
-        setHoldingObjectPickingValues({});
         g_openWhenAvailable = true;
       }
 
@@ -3564,16 +2144,31 @@ namespace dxvk {
       // Returns a texture hash that it holds, if the popup is opened.
       // Must be called every frame.
       std::optional<XXH64_hash_t> produce(SceneManager& sceneMgr) {
-        const std::vector<ObjectPickingValue> objectPickingValues = copyHoldingObjectPickingValues();
-
         // delayed open, if waiting async to set g_holdingTexture
         if (g_openWhenAvailable) {
-          if (g_holdingTexture.load() != kEmptyHash || !objectPickingValues.empty()) {
+          if (g_holdingTexture.load() != kEmptyHash) {
             openImguiPopupOrToggle();
             g_openWhenAvailable = false;
           }
         }
-        
+
+        const XXH64_hash_t texHashForSizing = g_holdingTexture.load();
+        float texturePopupLabelColumnW = 0.0f;
+        if (texHashForSizing != kEmptyHash) {
+          uint32_t textureFeatureFlagsForSizing = 0;
+          const auto pairForSizing = g_imguiTextureMap.find(texHashForSizing);
+          if (pairForSizing != g_imguiTextureMap.end()) {
+            textureFeatureFlagsForSizing = pairForSizing->second.textureFeatureFlags;
+          }
+          texturePopupLabelColumnW = computeTexturePopupLabelColumnWidth(textureFeatureFlagsForSizing);
+          if (ImGui::IsPopupOpen(POPUP_NAME, ImGuiPopupFlags_None)) {
+            const ImGuiStyle& sizingStyle = ImGui::GetStyle();
+            const float minPopupW =
+              texturePopupLabelColumnW + sizingStyle.ItemInnerSpacing.x + ImGui::GetFrameHeight() + sizingStyle.WindowPadding.x * 2.0f;
+            ImGui::SetNextWindowSizeConstraints(ImVec2(minPopupW, 0.0f), ImVec2(FLT_MAX, FLT_MAX));
+          }
+        }
+
         if (ImGui::BeginPopup(POPUP_NAME)) {
           const XXH64_hash_t texHash = g_holdingTexture.load();
           if (texHash != kEmptyHash) {
@@ -3586,35 +2181,35 @@ namespace dxvk {
             if (pair != g_imguiTextureMap.end()) {
               textureFeatureFlags = pair->second.textureFeatureFlags;
             }
+            RemixGui::PushLabelColumnFixedWidth(texturePopupLabelColumnW);
             for (auto& rtxOption : rtxTextureOptions) {
-              const TextureSelectionState selectionState = analyzeTextureSelectionState(texHash, rtxOption.textureSetOption);
+              rtxOption.bufferToggle = rtxOption.textureSetOption->containsHash(texHash);
               if ((rtxOption.featureFlagMask & textureFeatureFlags) != rtxOption.featureFlagMask) {
                 // option requires a feature, but the texture doesn't have that feature.
                 continue;
               }
-
-              bool checkboxValue = selectionState.editableChecked();
+              
+              // Quick check for blocking layer (need this for display name)
+              bool hasBlockingLayer = false;
+              const RtxOptionLayer* targetLayer = rtxOption.textureSetOption->getTargetLayer();
+              if (targetLayer) {
+                hasBlockingLayer = rtxOption.textureSetOption->getBlockingLayer(targetLayer, texHash) != nullptr;
+              }
               
               // Build display name with warning indicator if hash is blocked by higher priority layer
               std::string displayName = rtxOption.displayName;
-              if (selectionState.hasBlockingLayer) {
+              if (hasBlockingLayer) {
                 displayName = std::string(rtxOption.displayName) + " [!]";
               }
 
-              ImGui::PushID(rtxOption.uniqueId);
-              if (RemixGui::Checkbox(displayName.c_str(), &checkboxValue)) {
-                setTextureSelection(texHash, rtxOption.uniqueId, rtxOption.textureSetOption, checkboxValue);
+              if (RemixGui::Checkbox(displayName.c_str(), &rtxOption.bufferToggle)) {
+                toggleTextureSelection(texHash, rtxOption.uniqueId, rtxOption.textureSetOption);
               }
-              ImGui::PopID();
               
               // Only build the expensive tooltip when this item is actually hovered
               if (ImGui::IsItemHovered()) {
                 std::ostringstream tooltipStream;
                 tooltipStream << rtxOption.textureSetOption->getDescription() << "\n";
-
-                if (selectionState.hasBlockingLayer && selectionState.editableChecked() != selectionState.resolvedChecked) {
-                  tooltipStream << "\nThis checkbox shows the editable layer state. A stronger layer is still overriding the final resolved result.\n";
-                }
                 
                 std::string layerValues = RemixGui::FormatOptionLayerValues(rtxOption.textureSetOption, texHash, false);
                 if (!layerValues.empty()) {
@@ -3624,102 +2219,16 @@ namespace dxvk {
                 ImGui::SetTooltip("%s", tooltipStream.str().c_str());
               }
             }
+            RemixGui::PopLabelColumnFixedWidth();
 
             ImGui::EndPopup();
             return texHash;
-          } else if (!objectPickingValues.empty()) {
-            for (size_t index = 0; index < objectPickingValues.size(); index++) {
-              const ObjectPickingValue pickingValue = objectPickingValues[index];
-              const auto resolvedTexHash = sceneMgr.findLegacyTextureHashByObjectPickingValue(pickingValue);
-              if (!resolvedTexHash.has_value()) {
-                continue;
-              }
-
-              const XXH64_hash_t texHash = *resolvedTexHash;
-              ImGui::TextWrapped("Resolved legacy texture hash from object picking.");
-              ImGui::Separator();
-
-              ImGui::TextWrapped("%s", makeTextureInfo(texHash, isMaterialReplacement(sceneMgr, texHash), false).c_str());
-              if (ImGui::Button("Copy Texture hash##texture_popup_from_pick")) {
-                ImGui::SetClipboardText(hashToString(texHash).c_str());
-              }
-
-              uint32_t textureFeatureFlags = 0;
-              const auto& pair = g_imguiTextureMap.find(texHash);
-              if (pair != g_imguiTextureMap.end()) {
-                textureFeatureFlags = pair->second.textureFeatureFlags;
-              }
-
-              for (auto& rtxOption : rtxTextureOptions) {
-                const TextureSelectionState selectionState = analyzeTextureSelectionState(texHash, rtxOption.textureSetOption);
-                if ((rtxOption.featureFlagMask & textureFeatureFlags) != rtxOption.featureFlagMask) {
-                  continue;
-                }
-
-                bool checkboxValue = selectionState.editableChecked();
-
-                std::string displayName = rtxOption.displayName;
-                if (selectionState.hasBlockingLayer) {
-                  displayName = std::string(rtxOption.displayName) + " [!]";
-                }
-
-                ImGui::PushID(rtxOption.uniqueId);
-                if (RemixGui::Checkbox(displayName.c_str(), &checkboxValue)) {
-                  setTextureSelection(texHash, rtxOption.uniqueId, rtxOption.textureSetOption, checkboxValue);
-                }
-                ImGui::PopID();
-
-                if (ImGui::IsItemHovered()) {
-                  std::ostringstream tooltipStream;
-                  tooltipStream << rtxOption.textureSetOption->getDescription() << "\n";
-
-                  if (selectionState.hasBlockingLayer && selectionState.editableChecked() != selectionState.resolvedChecked) {
-                    tooltipStream << "\nThis checkbox shows the editable layer state. A stronger layer is still overriding the final resolved result.\n";
-                  }
-
-                  std::string layerValues = RemixGui::FormatOptionLayerValues(rtxOption.textureSetOption, texHash, false);
-                  if (!layerValues.empty()) {
-                    tooltipStream << "\nPer-layer status for this hash:\n" << layerValues;
-                  }
-
-                  ImGui::SetTooltip("%s", tooltipStream.str().c_str());
-                }
-              }
-
-              ImGui::Separator();
-              ImGui::TextDisabled("Resolved via object picking value %u", static_cast<unsigned>(pickingValue));
-              ImGui::EndPopup();
-              return texHash;
-            }
-
-            ImGui::TextWrapped("No legacy texture hash was found for this selection, but the path-traced object is still readable through object picking.");
-            ImGui::Separator();
-
-            const size_t valuesToShow = std::min<size_t>(objectPickingValues.size(), 8);
-            for (size_t index = 0; index < valuesToShow; index++) {
-              const ObjectPickingValue pickingValue = objectPickingValues[index];
-              ImGui::PushID(static_cast<int>(pickingValue));
-              ImGui::TextWrapped("%s", sceneMgr.describeObjectPickingValue(pickingValue).c_str());
-              if (ImGui::Button("Copy Object Picking Value")) {
-                const std::string text = std::to_string(pickingValue);
-                ImGui::SetClipboardText(text.c_str());
-              }
-              ImGui::PopID();
-              if (index + 1 < valuesToShow) {
-                ImGui::Separator();
-              }
-            }
-
-            if (objectPickingValues.size() > valuesToShow) {
-              ImGui::TextDisabled("%zu additional object-picking values omitted.", objectPickingValues.size() - valuesToShow);
-            }
           }
           ImGui::EndPopup();
           return {};
         } else {
           // popup is closed, forget texture
           g_holdingTexture.exchange(kEmptyHash);
-          setHoldingObjectPickingValues({});
           return {};
         }
       }
@@ -3845,51 +2354,33 @@ namespace dxvk {
         ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.f, 0.f, 0.f, 1.00f));
       }
 
-      const float y = ImGui::GetCursorPosY();
-      const bool hasLivePreview = texImgui.imageView.ptr() != nullptr;
-      if (hasLivePreview) {
-        // Lazily create the tex ID ImGUI wants once a live image view exists.
+      // Lazily create the tex ID ImGUI wants
+      if (texImgui.texID == VK_NULL_HANDLE) {
+        texImgui.texID = ImGui_ImplDxvk::AddTexture(nullptr, texImgui.imageView);
+
         if (texImgui.texID == VK_NULL_HANDLE) {
-          texImgui.texID = ImGui_ImplDxvk::AddTexture(nullptr, texImgui.imageView);
-
-          if (texImgui.texID == VK_NULL_HANDLE) {
-            ONCE(Logger::err("Failed to allocate ImGUI handle for texture, likely because we're trying to render more textures than VkDescriptorPoolCreateInfo::maxSets.  As such, we will truncate the texture list to show only what we can."));
-            return;
-          }
+          ONCE(Logger::err("Failed to allocate ImGUI handle for texture, likely because we're trying to render more textures than VkDescriptorPoolCreateInfo::maxSets.  As such, we will truncate the texture list to show only what we can."));
+          return;
         }
+      }
 
-        const float aspect = static_cast<float>(std::max(texImgui.extent.width, 1u)) / std::max(texImgui.extent.height, 1u);
-        const ImVec2 extent {
-          aspect >= 1.f ? thumbnailSize : thumbnailSize * aspect,
-          aspect <= 1.f ? thumbnailSize : thumbnailSize / aspect
-        };
+      const auto& imageInfo = texImgui.imageView->imageInfo();
 
-        ImGui::SetCursorPosX(x + startX + (thumbnailSize - extent.x) / 2.f);
-        ImGui::SetCursorPosY(y + (thumbnailSize - extent.y) / 2.f);
+      // Calculate thumbnail extent with respect to image aspect
+      const float aspect = static_cast<float>(imageInfo.extent.width) / imageInfo.extent.height;
+      const ImVec2 extent {
+        aspect >= 1.f ? thumbnailSize : thumbnailSize * aspect,
+        aspect <= 1.f ? thumbnailSize : thumbnailSize / aspect
+      };
 
-        if (ImGui::ImageButton(texImgui.texID, extent)) {
-          clickedOnTextureButton = true;
-          texture_popup::g_wasLeftClick = true;
-        }
-      } else {
-        ImGui::SetCursorPosX(x + startX);
-        ImGui::SetCursorPosY(y);
+      // Align thumbnail image button
+      const float y = ImGui::GetCursorPosY();
+      ImGui::SetCursorPosX(x + startX + (thumbnailSize - extent.x) / 2.f);
+      ImGui::SetCursorPosY(y + (thumbnailSize - extent.y) / 2.f);
 
-        const std::string buttonId = str::format("##texture_hash_box_", texHash);
-        if (ImGui::Button(buttonId.c_str(), ImVec2(thumbnailSize, thumbnailSize))) {
-          clickedOnTextureButton = true;
-          texture_popup::g_wasLeftClick = true;
-        }
-
-        const std::string hashString = hashToString(texHash);
-        const std::string shortHash = hashString.size() > 10 ? hashString.substr(hashString.size() - 10) : hashString;
-        const ImVec2 min = ImGui::GetItemRectMin();
-        const ImVec2 max = ImGui::GetItemRectMax();
-        const ImVec2 textSize = ImGui::CalcTextSize(shortHash.c_str());
-        ImGui::GetWindowDrawList()->AddText(
-          ImVec2(min.x + (max.x - min.x - textSize.x) * 0.5f, min.y + (max.y - min.y - textSize.y) * 0.5f),
-          ImGui::GetColorU32(ImGuiCol_Text),
-          shortHash.c_str());
+      if (ImGui::ImageButton(texImgui.texID, extent)) {
+        clickedOnTextureButton = true;
+        texture_popup::g_wasLeftClick = true;
       }
 
       if (!showLegacyTextureGui() || uniqueId == texture_popup::lastOpenCategoryId) {
@@ -3973,7 +2464,6 @@ namespace dxvk {
             // assert(legacyTextureHash);
             // found asynchronously the legacy texture hash, place it into texture_popup; so we would highlight it
             texture_popup::g_holdingTexture.exchange(legacyTextureHash.value_or(kEmptyHash));
-            texture_popup::setHoldingObjectPickingValues(std::move(objectPickingValues));
             // move UI menu focus
             g_jumpto.exchange(legacyTextureHash.value_or(kEmptyHash));
           });
@@ -3984,7 +2474,6 @@ namespace dxvk {
       }
 
       auto texHashToHighlight = std::optional<XXH64_hash_t>{};
-      auto objectPickingValuesToHighlight = std::vector<ObjectPickingValue> {};
 
       // top priority for what's inside a currently open texture popup
       if (auto texInPopup = texture_popup::produce(common->getSceneManager())) {
@@ -3996,17 +2485,8 @@ namespace dxvk {
         }
       }
 
-      if (!texHashToHighlight.has_value()) {
-        objectPickingValuesToHighlight = texture_popup::copyHoldingObjectPickingValues();
-        if (!objectPickingValuesToHighlight.empty()) {
-          highlightColor = HighlightColor::UI;
-        }
-      }
-
       if (texHashToHighlight) {
         common->metaDebugView().Highlighting.requestHighlighting(*texHashToHighlight, highlightColor, ctx->getDevice()->getCurrentFrameId());
-      } else if (!objectPickingValuesToHighlight.empty()) {
-        common->metaDebugView().Highlighting.requestHighlighting(&objectPickingValuesToHighlight, highlightColor, ctx->getDevice()->getCurrentFrameId());
       } else {
         // if no hash to highlight: world -- highlight under a mouse cursor, ui - just desaturate
         if (isWorldTextureSelectionAllowed()) {
@@ -4051,18 +2531,20 @@ namespace dxvk {
       ImGui::Text("No USD enhancements detected, the following options have been disabled.  See documentation for how to use enhancements with Remix.");
     }
 
-    // Note: All replacement asset settings are always accessible.
-    // Users should have full control over Remix functionality at all times.
+    ImGui::BeginDisabled(!ctx->getCommonObjects()->getSceneManager().areAllReplacementsLoaded());
     RemixGui::Checkbox("Enable Enhanced Assets", &RtxOptions::enableReplacementAssetsObject());
     {
       ImGui::Indent();
+      ImGui::BeginDisabled(!RtxOptions::enableReplacementAssets());
 
       RemixGui::Checkbox("Enable Enhanced Materials", &RtxOptions::enableReplacementMaterialsObject());
       RemixGui::Checkbox("Enable Enhanced Meshes", &RtxOptions::enableReplacementMeshesObject());
       RemixGui::Checkbox("Enable Enhanced Lights", &RtxOptions::enableReplacementLightsObject());
 
+      ImGui::EndDisabled();
       ImGui::Unindent();
     }
+    ImGui::EndDisabled();
     RemixGui::Separator();
     RemixGui::Checkbox("Highlight Legacy Materials (flash red)", &RtxOptions::useHighlightLegacyModeObject());
     RemixGui::Checkbox("Highlight Legacy Meshes with Shared Vertex Buffers (dull purple)", &RtxOptions::useHighlightUnsafeAnchorModeObject());
@@ -4140,9 +2622,7 @@ namespace dxvk {
     const float thumbnailPadding = ImGui::GetStyle().CellPadding.x;
     const uint32_t numThumbnailsPerRow = uint32_t(std::max(1.f, (m_windowWidth - 18.f) / (thumbnailSize + thumbnailSpacing + thumbnailPadding * 2.f)));
 
-    if (IMGUI_ADD_TOOLTIP(ImGui::BeginTabItem("Step 1: Categorize Textures", nullptr, tab_item_flags),
-        "Select texture definitions for Remix")) {
-      m_curSetupTab = kSetupTab_CategorizeTextures;
+    if (IMGUI_ADD_TOOLTIP(ImGui::BeginTabItem("Step 1: Categorize Textures", nullptr, tab_item_flags), "Select texture definitions for Remix")) {
       spacing();
       RemixGui::Checkbox("Preserve discarded textures", &RtxOptions::keepTexturesForTaggingObject());
       separator();
@@ -4170,14 +2650,15 @@ namespace dxvk {
         }
 
         if (changed) {
-          RemixGui::ApplyRtxOptionUserChange(&RtxOptions::textureGridThumbnailScaleObject(), static_cast<float>(percentage) / 100.f);
+          RemixGui::CheckRtxOptionPopups(&RtxOptions::textureGridThumbnailScaleObject());
+          RtxOptions::textureGridThumbnailScale.setDeferred(static_cast<float>(percentage) / 100.f);
         }
       }
 
-      // Note: Texture category list settings are always accessible.
-      // Users should have full control over Remix functionality at all times.
       RemixGui::Checkbox("Split Texture Category List", &showLegacyTextureGuiObject());
+      ImGui::BeginDisabled(!showLegacyTextureGui());
       RemixGui::Checkbox("Only Show Assigned Textures in Category Lists", &legacyTextureGuiShowAssignedOnlyObject());
+      ImGui::EndDisabled();
 
       separator();
 
@@ -4238,8 +2719,10 @@ namespace dxvk {
           const bool countOnlySelected = legacyTextureGuiShowAssignedOnly() && !(strcmp(uniqueId, Uncategorized) == 0);
           const auto height = calculateTextureCategoryHeight(countOnlySelected, uniqueId, numThumbnailsPerRow, thumbnailSize);
           if (!height.has_value()) {
+            ImGui::BeginDisabled(true);
             const auto label = displayName + std::string { " [Empty]" };
             RemixGui::CollapsingHeader(label.c_str(), collapsingHeaderClosedFlags);
+            ImGui::EndDisabled();
             return;
           }
           const bool isForToggle = (texture_popup::lastOpenCategoryId == uniqueId);
@@ -4281,7 +2764,6 @@ namespace dxvk {
     }
 
     if (ImGui::BeginTabItem("Step 2: Parameter Tuning", nullptr, tab_item_flags)) {
-      m_curSetupTab = kSetupTab_ParameterTuning;
       spacing();
       RemixGui::DragFloat("Scene Unit Scale", &RtxOptions::sceneScaleObject(), 0.00001f, 0.00001f, FLT_MAX, "%.5f", sliderFlags);
       RemixGui::Checkbox("Scene Z-Up", &RtxOptions::zUpObject());
@@ -4299,10 +2781,10 @@ namespace dxvk {
 
       if (RemixGui::CollapsingHeader("Heuristics", collapsingHeaderClosedFlags)) {
         ImGui::Indent();
-        RemixGui::Checkbox("Orthographic Is UI", &RtxOptions::orthographicIsUIObject());
-        RemixGui::Checkbox("Allow Cubemaps", &RtxOptions::allowCubemapsObject());
+        RemixGui::Checkbox("Orthographic Is UI", &D3D11Rtx::orthographicIsUIObject());
+        RemixGui::Checkbox("Allow Cubemaps", &D3D11Rtx::allowCubemapsObject());
         RemixGui::Checkbox("Always Calculate AABB (For Instance Matching)", &RtxOptions::enableAlwaysCalculateAABBObject());
-        RemixGui::Checkbox("Volumetric Fog Skip Sky", &RtxOptions::volumetricFogSkipSkyObject());
+        RemixGui::Checkbox("Skip Sky Fog Values", &RtxOptions::fogIgnoreSkyObject());
         ImGui::Unindent();
       }
 
@@ -4310,16 +2792,17 @@ namespace dxvk {
         ImGui::Indent();
         RemixGui::DragFloat("Force Cutout Alpha", &RtxOptions::forceCutoutAlphaObject(), 0.01f, 0.0f, 1.0f, "%.3f", sliderFlags);
         RemixGui::DragFloat("World Space UI Background Offset", &RtxOptions::worldSpaceUiBackgroundOffsetObject(), 0.01f, -FLT_MAX, FLT_MAX, "%.3f", sliderFlags);
-        RemixGui::Checkbox("Ignore Secondary Textures", &RtxOptions::ignoreSecondaryTexturesObject());
+        RemixGui::Checkbox("Ignore last texture stage", &RtxOptions::ignoreLastTextureStageObject());
+        RemixGui::Checkbox("Enable Multiple Stage Texture Factor Blending", &RtxOptions::enableMultiStageTextureFactorBlendingObject());
         ImGui::Unindent();
       }
 
-      if (RemixGui::CollapsingHeader("D3D11 Pipeline", collapsingHeaderClosedFlags)) {
+      if (RemixGui::CollapsingHeader("Shader Support (Experimental)", collapsingHeaderClosedFlags)) {
         ImGui::Indent();
-        RemixGui::Checkbox("Capture Vertices from Shader", &RtxOptions::useVertexCaptureObject());
-        RemixGui::Checkbox("Use Input Assembler Normals", &RtxOptions::useInputAssemblerNormalsObject());
+        RemixGui::Checkbox("Capture Vertices from Shader", &D3D11Rtx::useVertexCaptureObject());
+        RemixGui::Checkbox("Capture Normals from Shader", &D3D11Rtx::useVertexCapturedNormalsObject());
         RemixGui::Separator();
-        RemixGui::Checkbox("Use CBuffer World Matrices", &RtxOptions::useCBufferWorldMatricesObject());
+        RemixGui::Checkbox("Use World Transforms", &D3D11Rtx::useWorldMatricesForShadersObject());
         ImGui::Unindent();
       }
 
@@ -4343,12 +2826,12 @@ namespace dxvk {
         if (RemixGui::CollapsingHeader("Advanced", collapsingHeaderClosedFlags)) {
           ImGui::Indent();
 
-          // Note: Sky reproject settings are always accessible.
-          // Users should have full control over Remix functionality at all times.
           RemixGui::Checkbox("Reproject Sky to Main Camera", &RtxOptions::skyReprojectToMainCameraSpaceObject());
           {
+            ImGui::BeginDisabled(!RtxOptions::skyReprojectToMainCameraSpace());
             RemixGui::DragFloat("Reprojected Sky Scale", &RtxOptions::skyReprojectScaleObject(), 1.0f, 0.1f, 1000.0f);
             RemixGui::Checkbox("Force Auto-Detected Sky to Reproject", &RtxOptions::skyForceAutoDetectedToReprojectObject());
+            ImGui::EndDisabled();
           }
           RemixGui::DragFloat("Sky Auto-Detect Unique Camera Search Distance", &RtxOptions::skyAutoDetectUniqueCameraDistanceObject(), 1.0f, 0.1f, 1000.0f);
 
@@ -4361,8 +2844,9 @@ namespace dxvk {
           extIdx = std::clamp(bit::tzcnt(RtxOptions::skyProbeSide()), 8u, 13u) - 8;
 
           if (RemixGui::Combo("Sky Probe Extent", &extIdx, exts, IM_ARRAYSIZE(exts))) {
-            RemixGui::ApplyRtxOptionUserChange(&RtxOptions::skyProbeSideObject(), 1u << (extIdx + 8));
+            RemixGui::CheckRtxOptionPopups(&RtxOptions::skyProbeSideObject());
           }
+          RtxOptions::skyProbeSide.setDeferred(1 << (extIdx + 8));
 
           ImGui::Unindent();
         }
@@ -4371,15 +2855,15 @@ namespace dxvk {
 
       if (RtxOptions::Eye::showOptions() && RemixGui::CollapsingHeader("Eyes", collapsingHeaderClosedFlags)) {
         ImGui::Indent();
-        // Note: Eye shading settings are always accessible.
-        // Users should have full control over Remix functionality at all times.
         RemixGui::Checkbox("Enable eye shading", &RtxOptions::Eye::enableObject());
+        ImGui::BeginDisabled(!RtxOptions::Eye::enable());
         RemixGui::Checkbox("Detect texture-generation draw call as Eye", &RtxOptions::Eye::assumeViewTexgenModeAsEyeObject());
         RemixGui::DragFloat("Eye Whites Albedo Scale", &RtxOptions::Eye::eyeWhitesAlbedoScaleObject(), 0.01F);
         RemixGui::DragFloat("Normals: Eyeball Offset", &RtxOptions::Eye::eyeballSphereOffsetObject(), 0.001F);
         RemixGui::DragFloat("Normals: Cornea Offset", &RtxOptions::Eye::corneaSphereOffsetObject(), 0.001F);
         RemixGui::DragFloat("Iris Radius", &RtxOptions::Eye::irisRadiusObject(), 0.001F);
         RemixGui::DragFloat("Iris Depth", &RtxOptions::Eye::irisDepthObject(), 0.001F);
+        ImGui::EndDisabled();
         ImGui::Unindent();
       }
 
@@ -4393,7 +2877,7 @@ namespace dxvk {
         ImGui::PushID("FogInfos");
         if (RemixGui::CollapsingHeader("Explanation", collapsingHeaderClosedFlags)) {
           ImGui::Indent();
-          ImGui::TextWrapped("In the legacy rendering pipeline, every draw call comes with its own fog settings."
+          ImGui::TextWrapped("In D3D11, every draw call comes with its own fog settings."
             " In Remix pathtracing, all rays need to use the same fog setting."
             " So Remix will choose the earliest valid non-sky fog to use."
 
@@ -4413,10 +2897,10 @@ namespace dxvk {
         }
 
         constexpr static const char* fogModes[] = {
-          "None",
-          "Exp",
-          "Exp2",
-          "Linear",
+          "DX11_FOG_NONE",
+          "DX11_FOG_EXP",
+          "DX11_FOG_EXP2",
+          "DX11_FOG_LINEAR",
         };
 
         {
@@ -4495,10 +2979,10 @@ namespace dxvk {
     style->ScrollbarSize = 15.0f;
     style->GrabMinSize = 10.0f;
 
-    style->WindowBorderSize = 1.0f;
-    style->ChildBorderSize = 1.0f;
-    style->PopupBorderSize = 1.0f;
-    style->FrameBorderSize = 1.0f;
+    style->WindowBorderSize = 1.5f;
+    style->ChildBorderSize = 1.5f;
+    style->PopupBorderSize = 1.5f;
+    style->FrameBorderSize = 1.5f;
     style->TabBorderSize = 0.0f;
 
     style->WindowRounding = 0.0f;
@@ -4523,7 +3007,7 @@ namespace dxvk {
     style->Colors[ImGuiCol_Text] = ImVec4(0.8f, 0.8f, 0.8f, 1.00f);
     style->Colors[ImGuiCol_TextDisabled] = ImVec4(0.44f, 0.44f, 0.44f, 1.00f);
     style->Colors[ImGuiCol_ChildBg] = ImVec4(0.16f, 0.16f, 0.16f, 0.86f);
-    style->Colors[ImGuiCol_Border] = ImVec4(0.34f, 0.34f, 0.34f, 0.86f);
+    style->Colors[ImGuiCol_Border] = ImVec4(0.34f, 0.34f, 0.34f, 1.0f);
     style->Colors[ImGuiCol_BorderShadow] = ImVec4(0.00f, 0.00f, 0.00f, 0.00f);
     style->Colors[ImGuiCol_FrameBg] = ImVec4(0.188f, 0.188f, 0.188f, 1.00f);
     style->Colors[ImGuiCol_FrameBgHovered] = ImVec4(0.15f, 0.30f, 0.35f, 1.00f);
@@ -4686,85 +3170,48 @@ namespace dxvk {
   }
 
   void ImGUI::onThemeChange(DxvkDevice* device) {
-  // RtxOptionManager calls option callbacks during RtxOptions construction with
-  // device == nullptr. That happens before the DX11 Remix ImGUI object is fully
-  // initialized. Do not touch device->getCommon()->getImgui() or ImGui style
-  // state until a real device and current ImGui context exist.
-  //
-  // Startup GUI config is still applied because ImGUI::ImGUI() calls
-  // setupStyle() immediately after ImGui::CreateContext() and
-  // ImGui::SetCurrentContext().
-  if (device == nullptr || GImGui == nullptr || ImGui::GetCurrentContext() == nullptr) {
-    return;
-  }
+    if (GImGui != nullptr) {
+      ImGUI& gui = device->getCommon()->getImgui();
+      gui.setupStyle();
 
-  ImGUI& gui = device->getCommon()->getImgui();
-  gui.setupStyle();
-}
-
-void ImGUI::onBackgroundAlphaChange(DxvkDevice* device) {
-  // Same initialization rule as onThemeChange(): this callback may run while
-  // RtxOptions is being constructed and there is no usable DX11 Remix ImGUI
-  // object yet. The resolved option value is applied by setupStyle() once the
-  // GUI context exists.
-  if (device == nullptr || GImGui == nullptr || ImGui::GetCurrentContext() == nullptr) {
-    return;
-  }
-
-  ImGUI& gui = device->getCommon()->getImgui();
-  gui.adjustStyleBackgroundAlpha(backgroundAlpha());
-}
-
-void ImGUI::setupStyle(ImGuiStyle* dst) {
-  // setupStyle() must only operate on a live ImGui context. Option callbacks can
-  // request a style update before ImGUI::ImGUI() has created and selected the
-  // context, so this function must be safe to call at any point in startup.
-  if (GImGui == nullptr || ImGui::GetCurrentContext() == nullptr) {
-    return;
-  }
-
-  ImGuiIO& io = ImGui::GetIO();
-
-  // m_regularFont and m_largeFont are documented as possibly unavailable until
-  // the font texture is created. Never force FontDefault to an unloaded font.
-  ImFont* preferredFont = largeUiMode() ? m_largeFont : m_regularFont;
-  if (preferredFont == nullptr) {
-    preferredFont = (m_regularFont != nullptr) ? m_regularFont : m_largeFont;
-  }
-  if (preferredFont != nullptr) {
-    io.FontDefault = preferredFont;
-  }
-
-  updateWindowWidths();
-
-  ImGuiStyle* style = dst ? dst : &ImGui::GetStyle();
-
-  switch (themeGui()) {
-  default:
-  case Theme::Toolkit:
-    setToolkitStyle(style);
-    break;
-  case Theme::Legacy:
-    setLegacyStyle(style);
-    break;
-  case Theme::Nvidia:
-    setNvidiaStyle(style);
-    break;
-  }
-}
-void ImGUI::showVsyncOptions(bool enableDLFGGuard) {
-    // If the swapchain hasn't latched the vsync state yet (can happen with
-    // borderless windowed D3D11 titles where implicit-swapchain latching is
-    // delayed), don't render the row - don't assert. Rendering against
-    // WaitingForImplicitSwapchain would fire a debug assertion and wedge
-    // the menu on the Graphics tab.
-    if (RtxOptions::enableVsyncState == EnableVsync::WaitingForImplicitSwapchain) {
-      ImGui::TextWrapped("V-Sync: waiting for swapchain (unavailable right now).");
-      return;
     }
+  }
 
+  void ImGUI::onBackgroundAlphaChange(DxvkDevice* device) {
+    if (GImGui != nullptr) {
+      ImGUI& gui = device->getCommon()->getImgui();
+      gui.adjustStyleBackgroundAlpha(backgroundAlpha());
+    }
+  }
+
+  void ImGUI::setupStyle(ImGuiStyle* dst) {
+    ImGui::GetIO().FontDefault = largeUiMode() ? m_largeFont : m_regularFont;
+    updateWindowWidths();
+   
+    ImGuiStyle* style = dst ? dst : &ImGui::GetStyle();
+    switch (themeGui())
+    {
+    default:
+    case Theme::Toolkit:
+      setToolkitStyle(style);
+      break;
+
+    case Theme::Legacy:
+      setLegacyStyle(style);
+      break;
+    
+    case Theme::Nvidia:
+      setNvidiaStyle(style);
+      break;
+    }
+  }
+
+  void ImGUI::showVsyncOptions(bool enableDLFGGuard) {
+    // we should never get here without a swapchain, so we must have latched the vsync value already
+    assert(RtxOptions::enableVsyncState != EnableVsync::WaitingForImplicitSwapchain);
+    
     if (enableDLFGGuard && DxvkDLFG::enable()) {
-      // DLFG active — V-Sync setting still accessible
+      ImGui::BeginDisabled();
     }
 
     bool vsyncEnabled = RtxOptions::enableVsyncState == EnableVsync::On;
@@ -4772,17 +3219,22 @@ void ImGUI::showVsyncOptions(bool enableDLFGGuard) {
     if (changed) {
       // option has been toggled manually, so we need to actually store the value in the option.
       // RtxOptions::enableVsyncState will be changed by the onChange handler at the end of the frame.
-      RemixGui::ApplyRtxOptionUserChange(&RtxOptions::enableVsyncObject(), vsyncEnabled ? EnableVsync::On : EnableVsync::Off);
+      RemixGui::CheckRtxOptionPopups(&RtxOptions::enableVsyncObject());
+      RtxOptions::enableVsync.setDeferred(vsyncEnabled ? EnableVsync::On : EnableVsync::Off);
     }
 
+    ImGui::BeginDisabled();
     ImGui::Indent();
     ImGui::TextWrapped("This setting overrides the native game's V-Sync setting.");
     ImGui::Unindent();
+    ImGui::EndDisabled();
     
     if (enableDLFGGuard && DxvkDLFG::enable()) {
       ImGui::Indent();
       ImGui::TextWrapped("When Frame Generation is active, V-Sync is automatically disabled.");
       ImGui::Unindent();
+
+      ImGui::EndDisabled();
     }
   }
 
@@ -4792,7 +3244,7 @@ void ImGUI::showVsyncOptions(bool enableDLFGGuard) {
     const bool supportsMultiFrame = maxInterpolatedFrames > 1;
 
     if (!supportsDLFG) {
-      // DLFG not supported — settings still accessible
+      ImGui::BeginDisabled();
     }
 
     bool dlfgChanged = RemixGui::Checkbox("Enable DLSS Frame Generation", &DxvkDLFG::enableObject());
@@ -4807,7 +3259,7 @@ void ImGUI::showVsyncOptions(bool enableDLFGGuard) {
     }
 
     if (!supportsDLFG) {
-      // end of not-supported section
+      ImGui::EndDisabled();
     }
 
     // Need to change Reflex in sync with DLFG, not on the next frame.
@@ -4833,7 +3285,10 @@ void ImGUI::showVsyncOptions(bool enableDLFGGuard) {
     // Display Reflex mode selector
 
     {
+      bool disableReflexUI = ctx->isDLFGEnabled();
+      ImGui::BeginDisabled(disableReflexUI);
       reflexModeCombo.getKey(&RtxOptions::reflexModeObject());
+      ImGui::EndDisabled();
     }
 
     // Add a button to toggle the Reflex latency stats Window if requested
@@ -5020,32 +3475,25 @@ void ImGUI::showVsyncOptions(bool enableDLFGGuard) {
 
       RemixGui::Separator();
 
-      const UpscalerType oldUpscalerType = RtxOptions::upscalerType();
-      const bool oldDLSSRREnabled = RtxOptions::enableRayReconstruction();
-
-      getUpscalerCombo(dlss, rayReconstruction).getKey(&RtxOptions::upscalerTypeObject());
-
-      if (ctx->getCommonObjects()->metaDLSS().supportsDLSS() || RtxOptions::upscalerType() == UpscalerType::DLSS) {
+      if (ctx->getCommonObjects()->metaDLSS().supportsDLSS()) {
+        // Show upscaler and DLSS-RR option.
+        auto oldUpscalerType = RtxOptions::upscalerType();
+        bool oldDLSSRREnabled = RtxOptions::enableRayReconstruction();
+        getUpscalerCombo(dlss, rayReconstruction).getKey(&RtxOptions::upscalerTypeObject());
         showRayReconstructionEnable(rayReconstruction.supportsRayReconstruction());
 
-        // Note: upstream called updateLightingSetting() here on any
-        // upscaler change, which resets a pile of user-visible
-        // options to compile-time defaults AND deadlocks the render
-        // thread by reinitialising heavy subsystems mid-frame.
-        // Preserve the user's settings instead.
+        // Update path tracer settings when upscaler is changed or DLSS-RR is toggled.
         if (oldUpscalerType != RtxOptions::upscalerType() || oldDLSSRREnabled != RtxOptions::enableRayReconstruction()) {
-          Logger::info("[Settings] Upscaler changed; skipping auto path-tracer retune (kept user settings)");
+          RtxOptions::updateLightingSetting();
         }
+      } else {
+        getUpscalerCombo(dlss, rayReconstruction).getKey(&RtxOptions::upscalerTypeObject());
       }
 
-      const UpscalerType requestedUpscaler = RtxOptions::upscalerType();
-      const UpscalerType resolvedUpscaler = RtxOptions::getSupportedUpscalerForDevice(ctx->getDevice().ptr(), requestedUpscaler);
-      if (resolvedUpscaler != requestedUpscaler) {
-        ImGui::TextWrapped("Selected manufacturer mode is kept, but this Vulkan device will dispatch through the closest supported runtime backend.");
-      }
+      RtxOptions::updatePresetFromUpscaler();
 
-      if (oldUpscalerType != RtxOptions::upscalerType() || oldDLSSRREnabled != RtxOptions::enableRayReconstruction()) {
-        RtxOptions::updatePresetFromUpscaler();
+      if (RtxOptions::upscalerType() == UpscalerType::DLSS && !ctx->getCommonObjects()->metaDLSS().supportsDLSS()) {
+        RtxOptions::upscalerType.setDeferred(UpscalerType::TAAU);
       }
 
       if (RtxOptions::isRayReconstructionEnabled()) {
@@ -5073,11 +3521,9 @@ void ImGUI::showVsyncOptions(bool enableDLFGGuard) {
           uint32_t inputHeight;
           xess.getInputSize(inputWidth, inputHeight);
           ImGui::TextWrapped(str::format("Render Resolution: ", inputWidth, "x", inputHeight).c_str());
-        } else if (RtxOptions::upscalerType() == UpscalerType::FSR4) {
-          ImGui::TextWrapped("AMD FSR Upscaling mode is selected. This Vulkan build keeps the mode selected and uses a temporal compatibility backend until native FSR4 dispatch is implemented.");
         } else if (RtxOptions::upscalerType() == UpscalerType::TAAU) {
-          RemixGui::SliderFloat("Resolution scale", &RtxOptions::resolutionScaleObject(), 0.5f, 1.0f);
-        }
+        RemixGui::SliderFloat("Resolution scale", &RtxOptions::resolutionScaleObject(), 0.5f, 1.0f);
+      }
 
       RemixGui::Separator();
 
@@ -5090,6 +3536,7 @@ void ImGUI::showVsyncOptions(bool enableDLFGGuard) {
       ImGui::Indent();
 
       RemixGui::Checkbox("RNG: seed with frame index", &RtxOptions::rngSeedWithFrameIndexObject());
+      RemixGui::Checkbox("Advance time", &RtxOptions::advanceTimeObject());
 
       if (RemixGui::CollapsingHeader("Resolver", collapsingHeaderClosedFlags)) {
         ImGui::Indent();
@@ -5140,10 +3587,10 @@ void ImGUI::showVsyncOptions(bool enableDLFGGuard) {
         RemixGui::Checkbox("Enable Secondary Bounces", &RtxOptions::enableSecondaryBouncesObject());
         RemixGui::Checkbox("Enable Russian Roulette", &RtxOptions::enableRussianRouletteObject());
         RemixGui::Checkbox("Enable Probability Dithering Filtering for Primary Bounce", &RtxOptions::enableFirstBounceLobeProbabilityDitheringObject());
-        // Note: Unordered resolve settings are always accessible.
-        // Users should have full control over Remix functionality at all times.
         RemixGui::Checkbox("Unordered Resolve in Indirect Rays", &RtxOptions::enableUnorderedResolveInIndirectRaysObject());
+        ImGui::BeginDisabled(!RtxOptions::enableUnorderedResolveInIndirectRays());
         RemixGui::Checkbox("Probabilistic Unordered Resolve in Indirect Rays", &RtxOptions::enableProbabilisticUnorderedResolveInIndirectRaysObject());
+        ImGui::EndDisabled();
         RemixGui::Checkbox("Unordered Emissive Particles in Indirect Rays", &RtxOptions::enableUnorderedEmissiveParticlesInIndirectRaysObject());
         RemixGui::Checkbox("Transmission Approximation in Indirect Rays", &RtxOptions::enableTransmissionApproximationInIndirectRaysObject());
         // # bounces limitted by 4b allocation in payload
@@ -5195,9 +3642,9 @@ void ImGUI::showVsyncOptions(bool enableDLFGGuard) {
 
         RemixGui::Checkbox("Enable Opacity Micromap", &RtxOptions::OpacityMicromap::enableObject());
         
-        if (common->getOpacityMicromapManager())
+        if (common->getOpacityMicromapManager()) {
           common->getOpacityMicromapManager()->showImguiSettings();
-
+        }
         ImGui::Unindent();
       }
 
@@ -5232,7 +3679,9 @@ void ImGUI::showVsyncOptions(bool enableDLFGGuard) {
         RemixGui::DragFloat("Light Radius", &RtxOptions::effectLightRadiusObject(), 0.01f, 0.01f, FLT_MAX, "%.3f", sliderFlags);
         // Plasma ball has first priority
         RemixGui::Checkbox("Plasma Ball Effect", &RtxOptions::effectLightPlasmaBallObject());
+        ImGui::BeginDisabled(RtxOptions::effectLightPlasmaBall());
         RemixGui::ColorPicker3("Light Color", &RtxOptions::effectLightColorObject());
+        ImGui::EndDisabled();
         ImGui::Unindent();
       }
 
@@ -5349,26 +3798,29 @@ void ImGUI::showVsyncOptions(bool enableDLFGGuard) {
       RemixGui::SliderFloat("Particle Softness", &RtxOptions::particleSoftnessFactorObject(), 0.f, 0.5f);
       RemixGui::Separator();
       if (RemixGui::CollapsingHeader("Weighted Blended OIT", collapsingHeaderClosedFlags)) {
-        // Note: WBOIT settings are always accessible.
-        // Users should have full control over Remix functionality at all times.
         RemixGui::Checkbox("Enable", &RtxOptions::wboitEnabledObject());
+        ImGui::BeginDisabled(!RtxOptions::wboitEnabled());
         RemixGui::SliderFloat("Energy Compensation", &RtxOptions::wboitEnergyLossCompensationObject(), 1.f, 10.f);
         RemixGui::SliderFloat("Depth Weight Tuning", &RtxOptions::wboitDepthWeightTuningObject(), 0.01f, 10.f);
+        ImGui::EndDisabled();
       }
       common->metaComposite().showStochasticAlphaBlendImguiSettings();
       ImGui::Unindent();
     }
 
     if (RemixGui::CollapsingHeader("Denoising", collapsingHeaderClosedFlags)) {
-      // Note: Denoising settings are always accessible.
-      // Users should have full control over Remix functionality at all times.
+      bool isRayReconstructionEnabled = RtxOptions::isRayReconstructionEnabled();
+      bool useNRD = !isRayReconstructionEnabled || common->metaRayReconstruction().enableNRDForTraining();
       ImGui::Indent();
+      ImGui::BeginDisabled(!useNRD);
       RemixGui::Checkbox("Denoising Enabled", &RtxOptions::useDenoiserObject());
       RemixGui::Checkbox("Reference Mode | Accumulation", &RtxOptions::useDenoiserReferenceModeObject());
 
       if (RtxOptions::useDenoiserReferenceMode()) {
         common->metaComposite().showAccumulationImguiSettings();
       }
+
+      ImGui::EndDisabled();
 
       if(RemixGui::CollapsingHeader("Settings", collapsingHeaderClosedFlags)) {
         ImGui::Indent();
@@ -5383,7 +3835,6 @@ void ImGUI::showVsyncOptions(bool enableDLFGGuard) {
         ImGui::Unindent();
       }
       bool useDoubleDenoisers = RtxOptions::denoiseDirectAndIndirectLightingSeparately();
-      bool isRayReconstructionEnabled = RtxOptions::isRayReconstructionEnabled();
       if (isRayReconstructionEnabled) {
         if (RemixGui::CollapsingHeader("DLSS-RR", collapsingHeaderClosedFlags)) {
           ImGui::Indent();
@@ -5394,8 +3845,7 @@ void ImGUI::showVsyncOptions(bool enableDLFGGuard) {
         }
       }
       
-      // Note: NRD denoiser settings are always accessible.
-      // Users should have full control over Remix functionality at all times.
+      if (useNRD)
       {
         if (useDoubleDenoisers) {
           if (RemixGui::CollapsingHeader("Primary Direct Light Denoiser", collapsingHeaderClosedFlags)) {
@@ -5432,6 +3882,17 @@ void ImGUI::showVsyncOptions(bool enableDLFGGuard) {
         }
       }
 
+      // Show secondary denoiser settings when RR is enabled and secondary signal uses external denoiser
+      if (!useNRD && isRayReconstructionEnabled && common->metaRayReconstruction().denoiseSecondarySignalWithExternalDenoiser()) {
+        if (RemixGui::CollapsingHeader("Secondary Direct/Indirect Light Denoiser", collapsingHeaderClosedFlags)) {
+          ImGui::Indent();
+          ImGui::PushID("Secondary Direct/Indirect Light Denoiser");
+          common->metaSecondaryCombinedLightDenoiser().showImguiSettings();
+          ImGui::PopID();
+          ImGui::Unindent();
+        }
+      }
+
       ImGui::Unindent();
     }
 
@@ -5457,8 +3918,8 @@ void ImGUI::showVsyncOptions(bool enableDLFGGuard) {
         RemixGui::SliderInt("User Brightness", &RtxOptions::userBrightnessObject(), 0, 100, "%d");
         RemixGui::DragFloat("User Brightness EV Range", &RtxOptions::userBrightnessEVRangeObject(), 0.5f, 0.f, 10.f, "%.1f");
         RemixGui::Separator();
-        RemixGui::Combo("Tonemapping Mode", &RtxOptions::tonemappingModeObject(), "Global\0Local\0Direct\0");
-        if (RtxOptions::tonemappingMode() == TonemappingMode::Global || RtxOptions::tonemappingMode() == TonemappingMode::Direct) {
+        RemixGui::Combo("Tonemapping Mode", &RtxOptions::tonemappingModeObject(), "Global\0Local\0");
+        if (RtxOptions::tonemappingMode() == TonemappingMode::Global) {
           common->metaToneMapping().showImguiSettings();
         } else {
           common->metaLocalToneMapping().showImguiSettings();
@@ -5508,8 +3969,7 @@ void ImGUI::showVsyncOptions(bool enableDLFGGuard) {
         ImGui::TextColored(ImVec4{ 250 / 255.F, 176 / 255.F, 50 / 255.F, 1.F }, "Hot-reloading active.");
         ImGui::Dummy({ 0, 2 });
       }
-      // Note: Texture manager settings are always accessible.
-      // Users should have full control over Remix functionality at all times.
+      ImGui::BeginDisabled(!RtxOptions::TextureManager::samplerFeedbackEnable());
       {
         if (RtxOptions::TextureManager::fixedBudgetEnable() && RtxOptions::TextureManager::samplerFeedbackEnable()) {
           if (RemixGui::DragFloatMB_showGB("Texture Budget##1",
@@ -5519,6 +3979,7 @@ void ImGUI::showVsyncOptions(bool enableDLFGGuard) {
           }
         } else {
           // always disabled drag float just to show the available texture cache budget
+          ImGui::BeginDisabled(true);
           const char* formatstr = RtxOptions::TextureManager::samplerFeedbackEnable()
             ? "%.1f GB"
             : "UNB%0.0fUND";
@@ -5527,9 +3988,11 @@ void ImGUI::showVsyncOptions(bool enableDLFGGuard) {
             ? float(g_streamedTextures_budgetBytes) / 1024.F / 1024.F / 1024.F
             : 0.F;
           RemixGui::DragFloat("Texture Cache##2", &s_dummy, 0.5f, 1.f, 32.f, formatstr, ImGuiSliderFlags_NoRoundToFormat);
+          ImGui::EndDisabled();
         }
       }
       {
+        ImGui::BeginDisabled(RtxOptions::TextureManager::fixedBudgetEnable());
         if (RemixGui::DragInt("of VRAM is dedicated to Textures",
                             &RtxOptions::TextureManager::budgetPercentageOfAvailableVramObject(),
                             10.F,
@@ -5538,11 +4001,13 @@ void ImGUI::showVsyncOptions(bool enableDLFGGuard) {
                             "%d%%")) {
           ctx->getCommonObjects()->getSceneManager().requestVramCompaction();
         }
+        ImGui::EndDisabled();
       }
       if (RemixGui::Checkbox("Force Fixed Texture Budget", &RtxOptions::TextureManager::fixedBudgetEnableObject())) {
         // budgeting technique changed => ask DXVK to return unused VRAM chunks to OS to better represent consumption
         ctx->getCommonObjects()->getSceneManager().requestVramCompaction();
       }
+      ImGui::EndDisabled();
 
       ImGui::Dummy({ 0, 2 });
       if (RemixGui::CollapsingHeader("Advanced##texstream", collapsingHeaderClosedFlags)) {
@@ -5597,18 +4062,18 @@ void ImGUI::showVsyncOptions(bool enableDLFGGuard) {
 
         switch (mode) {
         case TerrainMode::None: {
-          RemixGui::ApplyRtxOptionUserChange(&TerrainBaker::enableBakingObject(), false);
-          RemixGui::ApplyRtxOptionUserChange(&RtxOptions::terrainAsDecalsEnabledIfNoBakerObject(), false);
+          TerrainBaker::enableBaking.setDeferred(false);
+          RtxOptions::terrainAsDecalsEnabledIfNoBaker.setDeferred(false);
           break;
         }
         case TerrainMode::TerrainBaker: {
-          RemixGui::ApplyRtxOptionUserChange(&TerrainBaker::enableBakingObject(), true);
-          RemixGui::ApplyRtxOptionUserChange(&RtxOptions::terrainAsDecalsEnabledIfNoBakerObject(), false);
+          TerrainBaker::enableBaking.setDeferred(true);
+          RtxOptions::terrainAsDecalsEnabledIfNoBaker.setDeferred(false);
           break;
         }
         case TerrainMode::AsDecals: {
-          RemixGui::ApplyRtxOptionUserChange(&TerrainBaker::enableBakingObject(), false);
-          RemixGui::ApplyRtxOptionUserChange(&RtxOptions::terrainAsDecalsEnabledIfNoBakerObject(), true);
+          TerrainBaker::enableBaking.setDeferred(false);
+          RtxOptions::terrainAsDecalsEnabledIfNoBaker.setDeferred(true);
           break;
         }
         default: break;
@@ -5744,31 +4209,6 @@ void ImGUI::showVsyncOptions(bool enableDLFGGuard) {
     bool               vsync) {
     ScopedGpuProfileZone(ctx, "ImGUI Render");
 
-    ONCE(Logger::info(str::format("[ImGUI] render() first call: HWND=", (uintptr_t)gameHwnd,
-      " size=", surfaceSize.width, "x", surfaceSize.height,
-      " init=", m_init ? 1 : 0)));
-
-    VkExtent2D clientExtent = {};
-    if (!getValidImguiRenderTarget(gameHwnd, surfaceSize, clientExtent)) {
-      const bool uiInputLatched = m_uiWasOpenLastFrame
-        || m_cursorWatchdogUiOpen.load(std::memory_order_relaxed)
-        || g_uiIsOpen.load(std::memory_order_relaxed)
-        || g_uiBlocksSetCursorPos.load(std::memory_order_relaxed);
-      if (uiInputLatched) {
-        m_cursorWatchdogUiOpen.store(false, std::memory_order_relaxed);
-        g_uiBlocksSetCursorPos.store(false, std::memory_order_relaxed);
-        g_uiIsOpen.store(false, std::memory_order_relaxed);
-        m_uiWasOpenLastFrame = false;
-        const HWND capture = ::GetCapture();
-        if (capture == gameHwnd || capture == m_gameHwnd) {
-          ::ReleaseCapture();
-        }
-        ::ClipCursor(nullptr);
-      }
-      logSkippedImguiRender(gameHwnd, surfaceSize, clientExtent);
-      return;
-    }
-
     if (m_overlayWin.ptr() != nullptr) {
       m_overlayWin->update(gameHwnd);
     }
@@ -5776,12 +4216,6 @@ void ImGUI::showVsyncOptions(bool enableDLFGGuard) {
     m_lastRenderVsyncStatus = vsync;
 
     ImGui::SetCurrentContext(m_context);
-  // DX11 Remix: replay any style refresh that was requested before ImGui had
-  // a current context. This preserves option-driven UI styling and avoids the
-  // startup access violation in ImGUI::setupStyle().
-  if (dx11RemixImguiContextReady() && dx11RemixConsumePendingImguiStyleRefresh()) {
-    ImGUI::setupStyle();
-  }
     ImPlot::SetCurrentContext(m_plotContext);
 
     // Sometimes games can change windows on us, so we need to check that here and tell ImGUI
@@ -5792,11 +4226,7 @@ void ImGUI::showVsyncOptions(bool enableDLFGGuard) {
         ImGui_ImplWin32_Shutdown();
       }
 
-      if (!ImGui_ImplWin32_Init(gameHwnd)) {
-        Logger::warn(str::format("[ImGUI] Win32 backend init failed for HWND=", (uintptr_t) gameHwnd));
-        m_gameHwnd = nullptr;
-        return;
-      }
+      ImGui_ImplWin32_Init(gameHwnd);
     }
 
     if (!m_init) {
@@ -5806,8 +4236,6 @@ void ImGUI::showVsyncOptions(bool enableDLFGGuard) {
       createFontsTexture(ctx);
 
       m_init = true;
-      Logger::info(str::format("[ImGUI] Initialized: HWND=", (uintptr_t)gameHwnd,
-        " size=", surfaceSize.width, "x", surfaceSize.height));
     }
 
     update(ctx);
@@ -5851,14 +4279,13 @@ void ImGUI::showVsyncOptions(bool enableDLFGGuard) {
     normalFontCfg.SizePixels = 16.f;
     normalFontCfg.FontDataOwnedByAtlas = false;
 
-    const size_t nvidiaSansLength = sizeof(___NVIDIASansRg) / sizeof(___NVIDIASansRg[0]);
+    const size_t nvidiaSansLength = sizeof(___NVIDIASansMd) / sizeof(___NVIDIASansMd[0]);
     const size_t nvidiaSansBdLength = sizeof(___NVIDIASansBd) / sizeof(___NVIDIASansBd[0]);
     const size_t robotoMonoLength = sizeof(___RobotoMonoRg) / sizeof(___RobotoMonoRg[0]);
 
     {
       // Add letters/symbols (NVIDIA-Sans)
-      m_regularFont = io.Fonts->AddFontFromMemoryTTF(&___NVIDIASansRg[0], nvidiaSansLength, 0, &normalFontCfg, characterRange.Data);
-      io.FontDefault = m_regularFont;
+      m_regularFont = io.Fonts->AddFontFromMemoryTTF(&___NVIDIASansMd[0], nvidiaSansLength, 0, &normalFontCfg, characterRange.Data);
 
       // Enable merging
       normalFontCfg.MergeMode = true;
@@ -5890,6 +4317,9 @@ void ImGUI::showVsyncOptions(bool enableDLFGGuard) {
     // Build the fonts
 
     io.Fonts->Build();
+
+    // Apply the correct default font based on largeUiMode setting
+    io.FontDefault = largeUiMode() ? m_largeFont : m_regularFont;
 
 
     // Allocate/upload glyph cache...
@@ -5959,11 +4389,7 @@ void ImGUI::showVsyncOptions(bool enableDLFGGuard) {
         } else if(vk.val == VK_MENU) {
           result = result && io.KeyAlt;
         } else {
-          ImGuiKey key = ImGui_ImplWin32_VirtualKeyToImGuiKey(vk.val);
-          if (key == ImGuiKey_None) {
-            result = false;
-            continue;
-          }
+          ImGuiKey key = ImGui::GetKeyIndex(ImGui_ImplWin32_VirtualKeyToImGuiKey(vk.val));
           if (allowContinuousPress) {
             result = result && ImGui::IsKeyDown(key);
           } else {
@@ -5981,22 +4407,8 @@ void ImGUI::showVsyncOptions(bool enableDLFGGuard) {
     //  inflation.
     freeUnusedMemory();
 
-    bool windowRectChanged = false;
-    if (m_menuOpenClientRectValid && m_gameHwnd != nullptr) {
-      RECT currentClientRect = {};
-      if (::GetClientRect(m_gameHwnd, &currentClientRect) != FALSE) {
-        windowRectChanged = std::memcmp(&currentClientRect, &m_menuOpenClientRect, sizeof(RECT)) != 0;
-      }
-    }
-
-    forceOsCursorVisible(m_prevCursorVisible);
-    if (m_prevCursorClipValid && !windowRectChanged) {
-      ::ClipCursor(&m_prevCursorClipRect);
-    }
-    m_prevCursorClipValid = false;
-    m_menuOpenClientRectValid = false;
-
-    if (RtxOptions::restoreCursorPosition() && !windowRectChanged) {
+    ::ShowCursor(m_prevCursorVisible);
+    if (RtxOptions::restoreCursorPosition()) {
       ::SetPhysicalCursorPos(m_cachedGameCursorX, m_cachedGameCursorY);
     }
   }
@@ -6016,12 +4428,6 @@ void ImGUI::showVsyncOptions(bool enableDLFGGuard) {
     ::GetPhysicalCursorPos(&pt);
     m_cachedGameCursorX = pt.x;
     m_cachedGameCursorY = pt.y;
-
-    m_menuOpenClientRectValid = m_gameHwnd != nullptr && ::GetClientRect(m_gameHwnd, &m_menuOpenClientRect) != FALSE;
-
-    m_prevCursorClipValid = ::GetClipCursor(&m_prevCursorClipRect) != FALSE;
-    ::ClipCursor(nullptr);
-    ::ReleaseCapture();
   }
 
   void ImGUI::freeUnusedMemory() {

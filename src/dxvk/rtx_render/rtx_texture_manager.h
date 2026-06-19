@@ -24,7 +24,6 @@
 
 #include <mutex>
 #include <queue>
-#include <chrono>
 
 #include "../../util/thread.h"
 #include "../../util/rc/util_rc_ptr.h"
@@ -133,8 +132,16 @@ namespace dxvk {
       return showProgress();
     }
 
+    /**
+    * \brief Marks a texture as used in the current frame to prevent garbage collection.
+    * \param [in] textureIndex Index of the texture in the resource table.
+    */
+    void keepTextureAlive(uint32_t textureIndex);
+
     // Do not use. This is here temporarily for WAR for REMIX-1557
-    void releaseTexture(TextureRef& textureRef);
+    void releaseTexture(TextureRef& textureRef) {
+      m_textureCache.free(textureRef);
+    }
 
     void requestHotReload(const Rc<ManagedTexture>& tex);
     void processAllHotReloadRequests();
@@ -159,25 +166,10 @@ namespace dxvk {
     AsyncRunner_RTXIO* m_asyncThread_rtxio;
 
     fast_unordered_cache<Rc<ManagedTexture>> m_assetHashToTextures;
-    // Tracks last-access time for each entry in m_assetHashToTextures.
-    // Entries not accessed within kAssetHashEvictionTTL are evicted to
-    // prevent unbounded growth of the asset hash map over long sessions.
-    std::unordered_map<XXH64_hash_t, std::chrono::steady_clock::time_point, XXH64_hash_passthrough> m_assetHashAccessTimes;
     dxvk::mutex m_assetHashToTextures_mutex;
 
     SamplerFeedback m_sf = {};
     bool m_wasTextureBudgetPressure = false;
-
-    // Timer for periodic shrink_to_fit on the texture cache to reclaim memory
-    // after eviction passes. Prevents monotonic memory growth during long sessions.
-    std::chrono::steady_clock::time_point m_lastShrinkToFitTime = std::chrono::steady_clock::now();
-    static constexpr std::chrono::seconds kShrinkToFitInterval{ 60 };
-
-    // Timer for periodic eviction of stale entries from m_assetHashToTextures.
-    // Entries not accessed within kAssetHashEvictionTTL are removed to bound map growth.
-    std::chrono::steady_clock::time_point m_lastAssetHashEvictionTime = std::chrono::steady_clock::now();
-    static constexpr std::chrono::minutes kAssetHashEvictionTTL{ 5 };
-    static constexpr std::chrono::seconds kAssetHashEvictionInterval{ 30 };
 
     RTX_OPTION("rtx.texturemanager", bool, showProgress, false, "Show texture loading progress in the HUD.");
 

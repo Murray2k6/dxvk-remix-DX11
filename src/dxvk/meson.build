@@ -215,12 +215,12 @@ dxvk_src = files([
   'rtx_render/rtx_dlss.h',
   'rtx_render/rtx_draw_call_cache.cpp',
   'rtx_render/rtx_draw_call_cache.h',
+  'rtx_render/rtx_draw_call_tracker.cpp',
+  'rtx_render/rtx_draw_call_tracker.h',
   'rtx_render/rtx_dust_particles.cpp',
   'rtx_render/rtx_dust_particles.h',
   'rtx_render/rtx_env.cpp',
   'rtx_render/rtx_env.h',
-  'rtx_render/rtx_fsr.cpp',
-  'rtx_render/rtx_fsr.h',
   'rtx_render/rtx_file_watch.cpp',
   'rtx_render/rtx_file_watch.h',
   'rtx_render/rtx_game_capturer.cpp',
@@ -336,8 +336,6 @@ dxvk_src = files([
   'rtx_render/rtx_texture_manager.h',
   'rtx_render/rtx_tone_mapping.cpp',
   'rtx_render/rtx_tone_mapping.h',
-  'rtx_render/rtx_fork_tonemap.cpp',
-  'rtx_render/rtx_fork_tonemap.h',
   'rtx_render/rtx_types.cpp',
   'rtx_render/rtx_types.h',
   'rtx_render/rtx_utils.h',
@@ -384,6 +382,8 @@ dxvk_src = files([
 
   'rtx_render/rtx_gui_widgets.cpp',
   'rtx_render/rtx_gui_widgets.h',
+  'rtx_render/rtx_option_blocking_popup.cpp',
+  'rtx_render/rtx_option_blocking_popup.h',
 
   'platform/dxvk_win32_exts.cpp',
   
@@ -404,7 +404,6 @@ dxvk_src = files([
   'imgui/dxvk_imgui_capture.h',
   'imgui/dxvk_imgui_splash.cpp',
   'imgui/dxvk_imgui_splash.h',
-  'imgui/rtx_fresh_menu.cpp',
   'imgui/rtx_user_menu.cpp',
   'imgui/imconfig.h',
   'imgui/imgui.cpp',
@@ -428,8 +427,6 @@ dxvk_src = files([
   'imgui/implot_items.cpp',
 ])
 
-fs = import('fs')
-
 thread_dep = dependency('threads')
 
 nrd_include_dir = include_directories(join_paths('../../', 'external/nrd/Include'))
@@ -439,19 +436,93 @@ nrd_dep = declare_dependency(
 
 # Note: Include directory paths must be relative paths due to a limitation in Meson (currently at least)
 dlss_include_dir = include_directories(join_paths('../../', dlss_root_path, 'include'))
-dlss_lib_path = join_paths(global_src_root_norm, dlss_root_path, 'lib/Windows_x86_64/x64')
+dlss_lib_path = join_paths(global_src_root_norm, dlss_root_path, 'lib/Windows_x86_64/x86_64')
 dlfg_include_dir = include_directories(join_paths('../../', dlfg_root_path, 'include'))
 cc = meson.get_compiler('c')
-dlss_lib_name = 'nvsdk_ngx_d'
-if get_option('buildtype') == 'debug'
-  dlss_lib_name = 'nvsdk_ngx_d_dbg'
-endif
-dlss_lib = cc.find_library(dlss_lib_name, dirs : dlss_lib_path)
+dlss_lib_name = 'nvsdk_ngx'
+dlss_lib = cc.find_library(
+  dlss_lib_name,
+  dirs : join_paths(meson.project_source_root(), 'external', 'nv_ngx_real', 'lib', 'x64'),
+  required : true
+)
 dlss_dep = declare_dependency(
   dependencies : [ dlss_lib ],
   include_directories : [ dlss_include_dir, dlfg_include_dir ]
 )
-
+message('DX11_V219_REAL_NGX_IMPORT_LIBRARY: using real staged NVIDIA NGX import library from external/nv_ngx_real/lib/x64')
+message('DX11_V219_REAL_NGX_IMPORT_LIBRARY: using real staged NVIDIA NGX import library from external/nv_ngx_real/lib/x64')
+message('DX11_V219_REAL_NGX_IMPORT_LIBRARY: using real staged NVIDIA NGX import library from external/nv_ngx_real/lib/x64')
+message('DX11_V219_REAL_NGX_IMPORT_LIBRARY: using real staged NVIDIA NGX import library from external/nv_ngx_real/lib/x64')
+message('DX11_V219_REAL_NGX_IMPORT_LIBRARY: using real staged NVIDIA NGX import library from external/nv_ngx_real/lib/x64')
+message('DX11_V219_REAL_NGX_IMPORT_LIBRARY: using real staged NVIDIA NGX import library from external/nv_ngx_real/lib/x64')
+message('DX11_V219_REAL_NGX_IMPORT_LIBRARY: using real staged NVIDIA NGX import library from external/nv_ngx_real/lib/x64')
+message('DX11_V219_REAL_NGX_IMPORT_LIBRARY: using real staged NVIDIA NGX import library from external/nv_ngx_real/lib/x64')
+message('DX11_V219_REAL_NGX_IMPORT_LIBRARY: using real staged NVIDIA NGX import library from external/nv_ngx_real/lib/x64')
+message('DX11_V219_REAL_NGX_IMPORT_LIBRARY: using real staged NVIDIA NGX import library from external/nv_ngx_real/lib/x64')
+message('DX11_V219_REAL_NGX_IMPORT_LIBRARY: using real staged NVIDIA NGX import library from external/nv_ngx_real/lib/x64')
+message('DX11_V219_REAL_NGX_IMPORT_LIBRARY: using real staged NVIDIA NGX import library from external/nv_ngx_real/lib/x64')
+message('DX11_V219_REAL_NGX_IMPORT_LIBRARY: using real staged NVIDIA NGX import library from external/nv_ngx_real/lib/x64')
+message('DX11_V219_REAL_NGX_IMPORT_LIBRARY: using real staged NVIDIA NGX import library from external/nv_ngx_real/lib/x64')
+message('DX11_V219_REAL_NGX_IMPORT_LIBRARY: using real staged NVIDIA NGX import library from external/nv_ngx_real/lib/x64')
+message('DX11_V219_REAL_NGX_IMPORT_LIBRARY: using real staged NVIDIA NGX import library from external/nv_ngx_real/lib/x64')
+message('DX11_V219_REAL_NGX_IMPORT_LIBRARY: using real staged NVIDIA NGX import library from external/nv_ngx_real/lib/x64')
+message('DX11_V219_REAL_NGX_IMPORT_LIBRARY: using real staged NVIDIA NGX import library from external/nv_ngx_real/lib/x64')
+message('DX11_V219_REAL_NGX_IMPORT_LIBRARY: using real staged NVIDIA NGX import library from external/nv_ngx_real/lib/x64')
+message('DX11_V219_REAL_NGX_IMPORT_LIBRARY: using real staged NVIDIA NGX import library from external/nv_ngx_real/lib/x64')
+message('DX11_V219_REAL_NGX_IMPORT_LIBRARY: using real staged NVIDIA NGX import library from external/nv_ngx_real/lib/x64')
+message('DX11_V219_REAL_NGX_IMPORT_LIBRARY: using real staged NVIDIA NGX import library from external/nv_ngx_real/lib/x64')
+message('DX11_V219_REAL_NGX_IMPORT_LIBRARY: using real staged NVIDIA NGX import library from external/nv_ngx_real/lib/x64')
+message('DX11_V219_REAL_NGX_IMPORT_LIBRARY: using real staged NVIDIA NGX import library from external/nv_ngx_real/lib/x64')
+message('DX11_V219_REAL_NGX_IMPORT_LIBRARY: using real staged NVIDIA NGX import library from external/nv_ngx_real/lib/x64')
+message('DX11_V219_REAL_NGX_IMPORT_LIBRARY: using real staged NVIDIA NGX import library from external/nv_ngx_real/lib/x64')
+message('DX11_V219_REAL_NGX_IMPORT_LIBRARY: using real staged NVIDIA NGX import library from external/nv_ngx_real/lib/x64')
+message('DX11_V219_REAL_NGX_IMPORT_LIBRARY: using real staged NVIDIA NGX import library from external/nv_ngx_real/lib/x64')
+message('DX11_V219_REAL_NGX_IMPORT_LIBRARY: using real staged NVIDIA NGX import library from external/nv_ngx_real/lib/x64')
+message('DX11_V219_REAL_NGX_IMPORT_LIBRARY: using real staged NVIDIA NGX import library from external/nv_ngx_real/lib/x64')
+message('DX11_V219_REAL_NGX_IMPORT_LIBRARY: using real staged NVIDIA NGX import library from external/nv_ngx_real/lib/x64')
+message('DX11_V219_REAL_NGX_IMPORT_LIBRARY: using real staged NVIDIA NGX import library from external/nv_ngx_real/lib/x64')
+message('DX11_V219_REAL_NGX_IMPORT_LIBRARY: using real staged NVIDIA NGX import library from external/nv_ngx_real/lib/x64')
+message('DX11_V219_REAL_NGX_IMPORT_LIBRARY: using real staged NVIDIA NGX import library from external/nv_ngx_real/lib/x64')
+message('DX11_V218_REAL_NGX_IMPORT_LIBRARY: using real staged NVIDIA NGX import library from external/nv_ngx_real/lib/x64')
+message('DX11_V216_REAL_NGX_IMPORT_LIBRARY: using real staged NVIDIA NGX import library from external/nv_ngx_real/lib/x64')
+message('DX11_V215_REAL_NGX_IMPORT_LIBRARY: using real staged NVIDIA NGX import library from external/nv_ngx_real/lib/x64')
+message('DX11_V214_REAL_NGX_IMPORT_LIBRARY: using real staged NVIDIA NGX import library from external/nv_ngx_real/lib/x64')
+message('DX11_V213_REAL_NGX_IMPORT_LIBRARY: using real staged NVIDIA NGX import library from external/nv_ngx_real/lib/x64')
+message('DX11_V213_REAL_NGX_IMPORT_LIBRARY: using real staged NVIDIA NGX import library from external/nv_ngx_real/lib/x64')
+message('DX11_V212_REAL_NGX_IMPORT_LIBRARY: using real staged NVIDIA NGX import library from external/nv_ngx_real/lib/x64')
+message('DX11_V210_REAL_NGX_IMPORT_LIBRARY: using real staged NVIDIA NGX import library from external/nv_ngx_real/lib/x64')
+message('DX11_V209_REAL_NGX_IMPORT_LIBRARY: using real staged NVIDIA NGX import library from external/nv_ngx_real/lib/x64')
+message('DX11_V204_REAL_NGX_IMPORT_LIBRARY: using real staged NVIDIA NGX import library from external/nv_ngx_real/lib/x64')
+message('DX11_V203_REAL_NGX_IMPORT_LIBRARY: using real staged NVIDIA NGX import library from external/nv_ngx_real/lib/x64')
+message('DX11_V201_REAL_NGX_IMPORT_LIBRARY: using real staged NVIDIA NGX import library from external/nv_ngx_real/lib/x64')
+message('DX11_V200_REAL_NGX_IMPORT_LIBRARY: using real staged NVIDIA NGX import library from external/nv_ngx_real/lib/x64')
+message('DX11_V198_REAL_NGX_IMPORT_LIBRARY: using real staged NVIDIA NGX import library from external/nv_ngx_real/lib/x64')
+message('DX11_V197_REAL_NGX_IMPORT_LIBRARY: using real staged NVIDIA NGX import library from external/nv_ngx_real/lib/x64')
+message('DX11_V196_REAL_NGX_IMPORT_LIBRARY: using real staged NVIDIA NGX import library from external/nv_ngx_real/lib/x64')
+message('DX11_V195_REAL_NGX_IMPORT_LIBRARY: using real staged NVIDIA NGX import library from external/nv_ngx_real/lib/x64')
+message('DX11_V193_REAL_NGX_IMPORT_LIBRARY: using real staged NVIDIA NGX import library from external/nv_ngx_real/lib/x64')
+message('DX11_V191_REAL_NGX_IMPORT_LIBRARY: using real staged NVIDIA NGX import library from external/nv_ngx_real/lib/x64')
+message('DX11_V190_REAL_NGX_IMPORT_LIBRARY: using real staged NVIDIA NGX import library from external/nv_ngx_real/lib/x64')
+message('DX11_V180_REAL_NGX_IMPORT_LIBRARY: using real staged NVIDIA NGX import library from external/nv_ngx_real/lib/x64')
+message('DX11_V179_REAL_NGX_IMPORT_LIBRARY: using real staged NVIDIA NGX import library from external/nv_ngx_real/lib/x64')
+message('DX11_V177_REAL_NGX_IMPORT_LIBRARY: using real staged NVIDIA NGX import library from external/nv_ngx_real/lib/x64')
+message('DX11_V176_REAL_NGX_IMPORT_LIBRARY: using real staged NVIDIA NGX import library from external/nv_ngx_real/lib/x64')
+message('DX11_V175_REAL_NGX_IMPORT_LIBRARY: using real staged NVIDIA NGX import library from external/nv_ngx_real/lib/x64')
+message('DX11_V174_REAL_NGX_IMPORT_LIBRARY: using real staged NVIDIA NGX import library from external/nv_ngx_real/lib/x64')
+message('DX11_V173_REAL_NGX_IMPORT_LIBRARY: using real staged NVIDIA NGX import library from external/nv_ngx_real/lib/x64')
+message('DX11_V172_REAL_NGX_IMPORT_LIBRARY: using real staged NVIDIA NGX import library from external/nv_ngx_real/lib/x64')
+message('DX11_V171_REAL_NGX_IMPORT_LIBRARY: using real staged NVIDIA NGX import library from external/nv_ngx_real/lib/x64')
+message('DX11_V169_REAL_NGX_IMPORT_LIBRARY: using real staged NVIDIA NGX import library from external/nv_ngx_real/lib/x64')
+message('DX11_V167_REAL_NGX_IMPORT_LIBRARY: using real staged NVIDIA NGX import library from external/nv_ngx_real/lib/x64')
+message('DX11_V166_REAL_NGX_IMPORT_LIBRARY: using real staged NVIDIA NGX import library from external/nv_ngx_real/lib/x64')
+message('DX11_V165_REAL_NGX_IMPORT_LIBRARY: using real staged NVIDIA NGX import library from external/nv_ngx_real/lib/x64')
+message('DX11_V164_REAL_NGX_IMPORT_LIBRARY: using real staged NVIDIA NGX import library from external/nv_ngx_real/lib/x64')
+message('DX11_V163_REAL_NGX_IMPORT_LIBRARY: using real staged NVIDIA NGX import library from external/nv_ngx_real/lib/x64')
+message('DX11_V162_REAL_NGX_IMPORT_LIBRARY: using real staged NVIDIA NGX import library from external/nv_ngx_real/lib/x64')
+message('DX11_V161_REAL_NGX_IMPORT_LIBRARY: using real staged NVIDIA NGX import library from external/nv_ngx_real/lib/x64')
+message('DX11_V160_REAL_NGX_IMPORT_LIBRARY: using real staged NVIDIA NGX import library from external/nv_ngx_real/lib/x64')
+message('DX11_V159_REAL_NGX_IMPORT_LIBRARY: using real staged NVIDIA NGX import library from external/nv_ngx_real/lib/x64')
+message('DX11_V158_REAL_NGX_IMPORT_LIBRARY: using real staged NVIDIA NGX import library from external/nv_ngx_real/lib/x64')
 # XeSS dependency
 xess_lib_path = join_paths(global_src_root_norm, 'submodules/xess/lib')
 xess_include_dir = include_directories('../../submodules/xess/inc')
@@ -460,19 +531,6 @@ xess_dep = declare_dependency(
   dependencies : [ xess_lib ],
   include_directories : xess_include_dir
 )
-
-ffx_sdk_root = join_paths(global_src_root_norm, 'submodules/fidelityfx-sdk/FidelityFX-SDK-2.2.0/Kits/FidelityFX')
-ffx_api_include_dir = include_directories('../../submodules/fidelityfx-sdk/FidelityFX-SDK-2.2.0/Kits/FidelityFX/api/include')
-ffx_upscaler_include_dir = include_directories('../../submodules/fidelityfx-sdk/FidelityFX-SDK-2.2.0/Kits/FidelityFX/upscalers/include')
-ffx_header_path = join_paths(ffx_sdk_root, 'api/include/ffx_api_loader.h')
-if fs.exists(ffx_header_path)
-  ffx_dep = declare_dependency(
-    include_directories : [ ffx_api_include_dir, ffx_upscaler_include_dir ],
-    compile_args : [ '-DWITH_AMD_FFX_SDK' ]
-  )
-else
-  ffx_dep = declare_dependency()
-endif
 
 nrc_dll_path = join_paths(meson.global_source_root(), 'submodules/nrc/bin/')
 nrc_lib_path = join_paths(meson.global_source_root(), 'submodules/nrc/lib/')
@@ -495,14 +553,14 @@ rtx_shaders = custom_target(
 )
 
 dxvk_embedded_data_files = files([
-  '../../external/fonts/NVIDIASans/NVIDIASansRg.ttf',
+  '../../external/fonts/NVIDIASans/NVIDIASansMd.ttf',
   '../../external/fonts/NVIDIASans/NVIDIASansBd.ttf',
   '../../external/fonts/RobotoMono/RobotoMonoRg.ttf'
 ])
 
 dxvk_generated_embedded_files = embedding_compiler.process(dxvk_embedded_data_files)
 
-dxvk_deps = [ thread_dep, vkcommon_dep, dxvk_extradep, usd_dep, lssUsd_dep, nrc_dep, nrd_dep, dlss_dep, submodules_dep, xess_dep, ffx_dep, tracy_dep, tracy_dep_dynamic, aftermath_dep, nvapi_dep, reflex_dep, usd_plugin_deps ]
+dxvk_deps = [ thread_dep, vkcommon_dep, dxvk_extradep, usd_dep, lssUsd_dep, nrc_dep, nrd_dep, dlss_dep, submodules_dep, xess_dep, tracy_dep, tracy_dep_dynamic, aftermath_dep, nvapi_dep, reflex_dep, usd_plugin_deps ]
 
 if enable_rtxio
   dxvk_deps += rtxio_dep

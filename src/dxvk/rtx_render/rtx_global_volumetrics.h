@@ -129,6 +129,8 @@ namespace dxvk {
                "Enabling volumetric lighting provides higher quality ray traced physical volumetrics, disabling falls back to cheaper depth based fog.\n"
                "Note that disabling this option does not disable the froxel radiance cache as a whole as it is still needed for other non-volumetric lighting approximations.",
                args.flags = RtxOptionFlags::UserSetting);
+    RTX_OPTION("rtx.volumetrics", bool, enableTranslucentShadows, false,
+               "Calculate coloured shadows from translucent materials (i.e. glass, water) in volumetric lighting. In engineering terms: include OBJECT_MASK_TRANSLUCENT into volumetric visibility rays.");
     RTX_OPTION_ARGS("rtx.volumetrics", Vector3, transmittanceColor, Vector3(0.999f, 0.999f, 0.999f),
                "The color to use for calculating transmittance measured at a specific distance.\n"
                "Note that this color is assumed to be in sRGB space and gamma encoded as it will be converted to linear for use in volumetrics.",
@@ -181,46 +183,46 @@ namespace dxvk {
                "Disables the volumetric radiance scaling feature, this effectively sets the per light radiance scaling to 1.f.  Useful when debugging issues when this feature is suspected.\n"
                "Do not ship your mod with this in the rtx.conf.");
 
-    // Note: Options for remapping legacy fog parameters to volumetric lighting parameters and overwriting the global volumetric parameters when legacy fog is enabled.
+    // Note: Options for remapping legacy D3D11 fixed function fog parameters to volumetric lighting parameters and overwriting the global volumetric parameters when fixed function fog is enabled.
     // Useful for cases where dynamic fog parameters are used throughout a game (or very per-level) that cannot be captrued merely in a global set of volumetric parameters. To see remapped results
     // volumetric lighting in general must be enabled otherwise these settings will have no effect.
     RTX_OPTION("rtx.volumetrics", bool, enableFogRemap, false,
-               "A flag to enable or disable legacy fog remapping. Only takes effect when volumetrics are enabled.\n"
-               "Typically many old games used legacy fog for various effects and while sometimes this fog can be replaced with proper volumetrics globally, other times require some amount of dynamic behavior controlled by the game.\n"
-               "When enabled this option allows for remapping of legacy fog parameters from the game to volumetric parameters to accomodate this dynamic need.");
+               "A flag to enable or disable fixed function fog remapping. Only takes effect when volumetrics are enabled.\n"
+               "Typically many old games used fixed function fog for various effects and while sometimes this fog can be replaced with proper volumetrics globally, other times require some amount of dynamic behavior controlled by the game.\n"
+               "When enabled this option allows for remapping of fixed function fog parameters from the game to volumetric parameters to accomodate this dynamic need.");
     RTX_OPTION("rtx.volumetrics", bool, enableFogColorRemap, false,
-               "A flag to enable or disable remapping legacy fog's color. Only takes effect when fog remapping in general is enabled.\n"
-               "Enables or disables remapping functionality relating to the color parameter of legacy fog with the exception of the multiscattering scale (as this scale can be set to 0 to disable it).\n"
+               "A flag to enable or disable remapping fixed function fox's color. Only takes effect when fog remapping in general is enabled.\n"
+               "Enables or disables remapping functionality relating to the color parameter of fixed function fog with the exception of the multiscattering scale (as this scale can be set to 0 to disable it).\n"
                "This allows dynamic changes to the game's fog color to be reflected somewhat in the volumetrics system. Overrides the specified volumetric transmittance color.");
     RTX_OPTION("rtx.volumetrics", bool, enableFogMaxDistanceRemap, true,
-               "A flag to enable or disable remapping legacy fog's max distance. Only takes effect when fog remapping in general is enabled.\n"
-               "Enables or disables remapping functionality relating to the max distance parameter of legacy fog.\n"
+               "A flag to enable or disable remapping fixed function fox's max distance. Only takes effect when fog remapping in general is enabled.\n"
+               "Enables or disables remapping functionality relating to the max distance parameter of fixed function fog.\n"
                "This allows dynamic changes to the game's fog max distance to be reflected somewhat in the volumetrics system. Overrides the specified volumetric transmittance measurement distance.");
     RTX_OPTION("rtx.volumetrics", float, waterFogDensityThreshold, 0.065f,
-               "The fog density threshold for determining when to use physical volumetrics vs legacy fog.\n"
-               "Values below this threshold will use physical volumetrics, while values above will fall back to legacy fog.\n"
-               "This threshold was created specifically for Portal RTX's underwater legacy fog.");
+               "The fog density threshold for determining when to use physical volumetrics vs fixed function fog.\n"
+               "Values below this threshold will use physical volumetrics, while values above will fall back to fixed function fog.\n"
+               "This threshold was created specifically for Portal RTX's underwater fixed function fog.");
     RTX_OPTION_ARGS("rtx.volumetrics", float, fogRemapMaxDistanceMinMeters, 1.0f,
-               "A value controlling the \"max distance\" legacy fog parameter's minimum remapping bound.\n"
+               "A value controlling the \"max distance\" fixed function fog parameter's minimum remapping bound.\n"
                "Note that fog remapping and fog max distance remapping must be enabled for this setting to have any effect.  In meters.",
                args.minValue = 0.0f);
     RTX_OPTION_ARGS("rtx.volumetrics", float, fogRemapMaxDistanceMaxMeters, 40.0f,
-               "A value controlling the \"max distance\" legacy fog parameter's maximum remapping bound.\n"
+               "A value controlling the \"max distance\" fixed function fog parameter's maximum remapping bound.\n"
                "Note that fog remapping and fog max distance remapping must be enabled for this setting to have any effect.  In meters.",
                args.minValue = 0.0f);
     RTX_OPTION_ARGS("rtx.volumetrics", float, fogRemapTransmittanceMeasurementDistanceMinMeters, 20.0f,
                "A value representing the transmittance measurement distance's minimum remapping bound.\n"
-               "When the legacy fog's \"max distance\" parameter is at or below its specified minimum the volumetric system's transmittance measurement distance will be set to this value and interpolated upwards.\n"
+               "When the fixed function fog's \"max distance\" parameter is at or below its specified minimum the volumetric system's transmittance measurement distance will be set to this value and interpolated upwards.\n"
                "Note that fog remapping and fog max distance remapping must be enabled for this setting to have any effect.  In meters.",
                args.minValue = 0.0f);
     RTX_OPTION_ARGS("rtx.volumetrics", float, fogRemapTransmittanceMeasurementDistanceMaxMeters, 100.0f,
                "A value representing the transmittance measurement distance's maximum remapping bound.\n"
-               "When the legacy fog's \"max distance\" parameter is at or above its specified maximum the volumetric system's transmittance measurement distance will be set to this value and interpolated upwards.\n"
+               "When the fixed function fog's \"max distance\" parameter is at or above its specified maximum the volumetric system's transmittance measurement distance will be set to this value and interpolated upwards.\n"
                "Note that fog remapping and fog max distance remapping must be enabled for this setting to have any effect.  In meters.",
                args.minValue = 0.0f);
     RTX_OPTION_ARGS("rtx.volumetrics", float, fogRemapColorMultiscatteringScale, 0.1f,
-               "A value representing the scale of the legacy fog's color in the multiscattering approximation.\n"
-               "This scaling factor is applied to the legacy fog's color and becomes a multiscattering approximation in the volumetrics system.\n"
+               "A value representing the scale of the fixed function fog's color in the multiscattering approximation.\n"
+               "This scaling factor is applied to the fixed function fog's color and becomes a multiscattering approximation in the volumetrics system.\n"
                "Sometimes useful but this multiscattering approximation is very basic (just a simple ambient term for now essentially) and may not look very good depending on various conditions.",
                args.minValue = 0.0f);
 

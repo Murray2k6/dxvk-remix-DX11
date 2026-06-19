@@ -1,4 +1,4 @@
-// ImGui Win32 + DirectX9 binding
+// ImGui Win32 + DirectX11 binding
 
 // Implemented features:
 //  [X] User texture binding. Use 'LPDIRECT3DTEXTURE9' as ImTextureID. Read the FAQ about ImTextureID in imgui.cpp.
@@ -13,16 +13,16 @@
 //  2018-05-07: Render: Saving/restoring Transform because they don't seem to be included in the StateBlock. Setting shading mode to Gouraud.
 //  2018-03-20: Misc: Setup io.BackendFlags ImGuiBackendFlags_HasMouseCursors and ImGuiBackendFlags_HasSetMousePos flags + honor ImGuiConfigFlags_NoMouseCursorChange flag.
 //  2018-02-20: Inputs: Added support for mouse cursors (ImGui::GetMouseCursor() value and WM_SETCURSOR message handling).
-//  2018-02-16: Misc: Obsoleted the io.RenderDrawListsFn callback and exposed ImGui_ImplDX9_RenderDrawData() in the .h file so you can call it yourself.
+//  2018-02-16: Misc: Obsoleted the io.RenderDrawListsFn callback and exposed ImGui_ImplDX11_RenderDrawData() in the .h file so you can call it yourself.
 //  2018-02-06: Misc: Removed call to ImGui::Shutdown() which is not available from 1.60 WIP, user needs to call CreateContext/DestroyContext themselves.
 //  2018-02-06: Inputs: Honoring the io.WantSetMousePos by repositioning the mouse (when using navigation and ImGuiConfigFlags_NavEnableSetMousePos is set).
 //  2018-02-06: Inputs: Added mapping for ImGuiKey_Space.
 
 #include "imgui.h"
-#include "imgui_impl_dx9.h"
+#include "imgui_impl_dx11.h"
 
 // DirectX
-#include <d3d9.h>
+#include <d3d11.h>
 #define DIRECTINPUT_VERSION 0x0800
 #include <dinput.h>
 
@@ -49,7 +49,7 @@ struct CUSTOMVERTEX
 
 // Render function.
 // (this used to be set in io.RenderDrawListsFn and called by ImGui::Render(), but you can now call this directly from your main loop)
-void ImGui_ImplDX9_RenderDrawData(ImDrawData* draw_data)
+void ImGui_ImplDX11_RenderDrawData(ImDrawData* draw_data)
 {
     // Avoid rendering when minimized
     ImGuiIO& io = ImGui::GetIO();
@@ -72,18 +72,18 @@ void ImGui_ImplDX9_RenderDrawData(ImDrawData* draw_data)
             return;
     }
 
-    // Backup the DX9 state
-    IDirect3DStateBlock9* d3d9_state_block = NULL;
-    if (g_pd3dDevice->CreateStateBlock(D3DSBT_ALL, &d3d9_state_block) < 0)
+    // Backup the DX11 state
+    IDirect3DStateBlock9* d3d11_state_block = NULL;
+    if (g_pd3dDevice->CreateStateBlock(D3DSBT_ALL, &d3d11_state_block) < 0)
         return;
 
-    // Backup the DX9 transform (DX9 documentation suggests that it is included in the StateBlock but it doesn't appear to)
+    // Backup the DX11 transform (DX11 documentation suggests that it is included in the StateBlock but it doesn't appear to)
     D3DMATRIX last_world, last_view, last_projection;
     g_pd3dDevice->GetTransform(D3DTS_WORLD, &last_world);
     g_pd3dDevice->GetTransform(D3DTS_VIEW, &last_view);
     g_pd3dDevice->GetTransform(D3DTS_PROJECTION, &last_projection);
 
-    // Copy and convert all vertices into a single contiguous buffer, convert colors to DX9 default format.
+    // Copy and convert all vertices into a single contiguous buffer, convert colors to DX11 default format.
     // FIXME-OPT: This is a waste of resource, the ideal is to use imconfig.h and
     //  1) to avoid repacking colors:   #define IMGUI_USE_BGRA_PACKED_COLOR
     //  2) to avoid repacking vertices: #define IMGUI_OVERRIDE_DRAWVERT_STRUCT_LAYOUT struct ImDrawVert { ImVec2 pos; float z; ImU32 col; ImVec2 uv; }
@@ -102,7 +102,7 @@ void ImGui_ImplDX9_RenderDrawData(ImDrawData* draw_data)
             vtx_dst->pos[0] = vtx_src->pos.x;
             vtx_dst->pos[1] = vtx_src->pos.y;
             vtx_dst->pos[2] = 0.0f;
-            vtx_dst->col = (vtx_src->col & 0xFF00FF00) | ((vtx_src->col & 0xFF0000) >> 16) | ((vtx_src->col & 0xFF) << 16);     // RGBA --> ARGB for DirectX9
+            vtx_dst->col = (vtx_src->col & 0xFF00FF00) | ((vtx_src->col & 0xFF0000) >> 16) | ((vtx_src->col & 0xFF) << 16);     // RGBA --> ARGB for DirectX11
             vtx_dst->uv[0] = vtx_src->uv.x;
             vtx_dst->uv[1] = vtx_src->uv.y;
             vtx_dst++;
@@ -149,7 +149,7 @@ void ImGui_ImplDX9_RenderDrawData(ImDrawData* draw_data)
     g_pd3dDevice->SetSamplerState(0, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
 
     // Setup orthographic projection matrix
-    // Being agnostic of whether <d3dx9.h> or <DirectXMath.h> can be used, we aren't relying on D3DXMatrixIdentity()/D3DXMatrixOrthoOffCenterLH() or DirectX::XMMatrixIdentity()/DirectX::XMMatrixOrthographicOffCenterLH()
+    // Being agnostic of whether <d3dx11.h> or <DirectXMath.h> can be used, we aren't relying on D3DXMatrixIdentity()/D3DXMatrixOrthoOffCenterLH() or DirectX::XMMatrixIdentity()/DirectX::XMMatrixOrthographicOffCenterLH()
     {
         const float L = 0.5f, R = io.DisplaySize.x+0.5f, T = 0.5f, B = io.DisplaySize.y+0.5f;
         D3DMATRIX mat_identity = { { 1.0f, 0.0f, 0.0f, 0.0f,  0.0f, 1.0f, 0.0f, 0.0f,  0.0f, 0.0f, 1.0f, 0.0f,  0.0f, 0.0f, 0.0f, 1.0f } };
@@ -190,14 +190,14 @@ void ImGui_ImplDX9_RenderDrawData(ImDrawData* draw_data)
         vtx_offset += cmd_list->VtxBuffer.Size;
     }
 
-    // Restore the DX9 transform
+    // Restore the DX11 transform
     g_pd3dDevice->SetTransform(D3DTS_WORLD, &last_world);
     g_pd3dDevice->SetTransform(D3DTS_VIEW, &last_view);
     g_pd3dDevice->SetTransform(D3DTS_PROJECTION, &last_projection);
 
-    // Restore the DX9 state
-    d3d9_state_block->Apply();
-    d3d9_state_block->Release();
+    // Restore the DX11 state
+    d3d11_state_block->Apply();
+    d3d11_state_block->Release();
 }
 
 static bool ImGui_ImplWin32_UpdateMouseCursor()
@@ -310,7 +310,7 @@ IMGUI_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hwnd, UINT msg, WPARAM wPa
     return 0;
 }
 
-bool    ImGui_ImplDX9_Init(void* hwnd, IDirect3DDevice9* device)
+bool    ImGui_ImplDX11_Init(void* hwnd, IDirect3DDevice9* device)
 {
     g_hWnd = (HWND)hwnd;
     g_pd3dDevice = device;
@@ -353,14 +353,14 @@ bool    ImGui_ImplDX9_Init(void* hwnd, IDirect3DDevice9* device)
     return true;
 }
 
-void ImGui_ImplDX9_Shutdown()
+void ImGui_ImplDX11_Shutdown()
 {
-    ImGui_ImplDX9_InvalidateDeviceObjects();
+    ImGui_ImplDX11_InvalidateDeviceObjects();
     g_pd3dDevice = NULL;
     g_hWnd = 0;
 }
 
-static bool ImGui_ImplDX9_CreateFontsTexture()
+static bool ImGui_ImplDX11_CreateFontsTexture()
 {
     // Build texture atlas
     ImGuiIO& io = ImGui::GetIO();
@@ -385,16 +385,16 @@ static bool ImGui_ImplDX9_CreateFontsTexture()
     return true;
 }
 
-bool ImGui_ImplDX9_CreateDeviceObjects()
+bool ImGui_ImplDX11_CreateDeviceObjects()
 {
     if (!g_pd3dDevice)
         return false;
-    if (!ImGui_ImplDX9_CreateFontsTexture())
+    if (!ImGui_ImplDX11_CreateFontsTexture())
         return false;
     return true;
 }
 
-void ImGui_ImplDX9_InvalidateDeviceObjects()
+void ImGui_ImplDX11_InvalidateDeviceObjects()
 {
     if (!g_pd3dDevice)
         return;
@@ -418,10 +418,10 @@ void ImGui_ImplDX9_InvalidateDeviceObjects()
     io.Fonts->TexID = NULL;
 }
 
-void ImGui_ImplDX9_NewFrame()
+void ImGui_ImplDX11_NewFrame()
 {
     if (!g_FontTexture)
-        ImGui_ImplDX9_CreateDeviceObjects();
+        ImGui_ImplDX11_CreateDeviceObjects();
 
     ImGuiIO& io = ImGui::GetIO();
 

@@ -86,7 +86,7 @@ typedef DWORD (WINAPI *PFN_XInputGetState)(DWORD, XINPUT_STATE*);
 //  2018-11-30: Misc: Setting up io.BackendPlatformName so it can be displayed in the About Window.
 //  2018-06-29: Inputs: Added support for the ImGuiMouseCursor_Hand cursor.
 //  2018-06-10: Inputs: Fixed handling of mouse wheel messages to support fine position messages (typically sent by track-pads).
-//  2018-06-08: Misc: Extracted imgui_impl_win32.cpp/.h away from the old combined DX9/DX10/DX11/DX12 examples.
+//  2018-06-08: Misc: Extracted imgui_impl_win32.cpp/.h away from the old combined DX11/DX10/DX11/DX12 examples.
 //  2018-03-20: Misc: Setup io.BackendFlags ImGuiBackendFlags_HasMouseCursors and ImGuiBackendFlags_HasSetMousePos flags + honor ImGuiConfigFlags_NoMouseCursorChange flag.
 //  2018-02-20: Inputs: Added support for mouse cursors (ImGui::GetMouseCursor() value and WM_SETCURSOR message handling).
 //  2018-02-06: Inputs: Added mapping for ImGuiKey_Space.
@@ -128,24 +128,6 @@ static ImGui_ImplWin32_Data* ImGui_ImplWin32_GetBackendData()
 {
     return ImGui::GetCurrentContext() ? (ImGui_ImplWin32_Data*)ImGui::GetIO().BackendPlatformUserData : NULL;
 }
-
-// Track which raw-input categories we've processed recently to avoid
-// duplicates. Keep movement, buttons, and keyboard separate: UE viewports can
-// stream raw mouse movement every frame while still delivering clicks through
-// WM_LBUTTONDOWN/UP. Treating any raw motion as "buttons handled" makes every
-// checkbox/combo appear dead.
-static DWORD s_lastRawMouseMoveTime = 0;
-static DWORD s_lastRawMouseButtonTime = 0;
-static DWORD s_lastRawKeyboardTime = 0;
-
-// Software cursor for the Remix UI, integrated from raw-input deltas.
-// Games that pin the OS cursor to the screen center every frame
-// (SetCursorPos-based mouselook) make any GetCursorPos-derived position
-// snap back to mid-screen; raw deltas from the physical device keep
-// flowing regardless, so the UI cursor stays usable.
-static float s_softCursorX = 0.0f;
-static float s_softCursorY = 0.0f;
-static bool  s_softCursorValid = false;
 
 // Functions
 bool    ImGui_ImplWin32_Init(void* hwnd)
@@ -254,7 +236,7 @@ static bool ImGui_ImplWin32_UpdateMouseCursor()
 
 static bool IsVkDown(int vk)
 {
-    return (::GetAsyncKeyState(vk) & 0x8000) != 0;
+    return (::GetKeyState(vk) & 0x8000) != 0;
 }
 
 void ImGui_ImplWin32_AddKeyEvent(ImGuiKey key, bool down, int native_keycode, int native_scancode = -1)
@@ -389,6 +371,22 @@ void    ImGui_ImplWin32_NewFrame()
     ::QueryPerformanceCounter((LARGE_INTEGER*)&current_time);
     io.DeltaTime = (float)(current_time - bd->Time) / bd->TicksPerSecond;
     bd->Time = current_time;
+
+    // NV-DXVK start: clamp DeltaTime to a small positive value
+    // ImGui::NewFrame()'s ErrorCheckNewFrameSanityChecks asserts on
+    // DeltaTime <= 0 (imgui.cpp line 7984, "Need a positive DeltaTime!").
+    // On fast or virtualized hardware, two consecutive NewFrame() calls
+    // can fall within a single QPC tick (~100 ns), producing exactly 0.0f
+    // here. That has been observed as an intermittent CI fast-fail
+    // (0xC0000409) on a multi-frame image test while the game is on an
+    // init/menu screen presenting at high rate with minimal work between
+    // frames. Clamp to a small positive value so ImGui's sanity check
+    // passes; any reasonable lower bound works because this only fires in
+    // the degenerate same-tick case.
+    if (io.DeltaTime <= 0.0f) {
+      io.DeltaTime = 1.0f / 1000.0f; // 1 ms
+    }
+    // NV-DXVK end
 
     // Update OS mouse position
     ImGui_ImplWin32_UpdateMouseData();
@@ -544,7 +542,6 @@ ImGuiKey ImGui_ImplWin32_VirtualKeyToImGuiKey(WPARAM wParam)
 // Copy this line into your .cpp file to forward declare the function.
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
 #endif
-
 IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
     if (ImGui::GetCurrentContext() == NULL)
@@ -561,6 +558,7 @@ IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hwnd, UINT msg, WPARA
       if (GetRawInputData((HRAWINPUT) lParam, RID_INPUT, nullptr, &size, sizeof(RAWINPUTHEADER)) != 0 || size == 0)
         break;
 
+      // Small stack buffer for common cases; heap fallback for large HID packets.
       BYTE stack_buf[256];
       std::unique_ptr<BYTE[]> heap_buf;
       BYTE* buf = size <= sizeof(stack_buf) ? stack_buf : (heap_buf.reset(new BYTE[size]), heap_buf.get());
@@ -568,123 +566,111 @@ IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hwnd, UINT msg, WPARA
         break;
 
       RAWINPUT* ri = reinterpret_cast<RAWINPUT*>(buf);
-      const DWORD rawNow = GetTickCount();
 
       if (ri->header.dwType == RIM_TYPEMOUSE) {
         const RAWMOUSE& m = ri->data.mouse;
-        const DWORD prevRawMouseMoveTime = s_lastRawMouseMoveTime;
-        s_lastRawMouseMoveTime = rawNow;
 
-        constexpr USHORT rawMouseButtonMask =
-          RI_MOUSE_LEFT_BUTTON_DOWN | RI_MOUSE_LEFT_BUTTON_UP |
-          RI_MOUSE_RIGHT_BUTTON_DOWN | RI_MOUSE_RIGHT_BUTTON_UP |
-          RI_MOUSE_MIDDLE_BUTTON_DOWN | RI_MOUSE_MIDDLE_BUTTON_UP |
-          RI_MOUSE_BUTTON_4_DOWN | RI_MOUSE_BUTTON_4_UP |
-          RI_MOUSE_BUTTON_5_DOWN | RI_MOUSE_BUTTON_5_UP;
-        if ((m.usButtonFlags & rawMouseButtonMask) != 0)
-          s_lastRawMouseButtonTime = rawNow;
-
-        // Software cursor position from raw deltas. Reading GetCursorPos
-        // here broke whenever the game warped the OS cursor to the screen
-        // center every frame (SetCursorPos-based mouselook): the UI cursor
-        // locked to mid-screen and the menu became unusable. Integrate the
-        // raw relative deltas into a virtual cursor instead; absolute
-        // devices (tablets, RDP) map directly. After half a second without
-        // raw motion the virtual cursor re-seeds from the OS position so it
-        // appears where the user expects when the UI is reopened.
-        const bool reseed = !s_softCursorValid
-                         || prevRawMouseMoveTime == 0
-                         || (rawNow - prevRawMouseMoveTime) > 500;
-        if ((m.usFlags & MOUSE_MOVE_ABSOLUTE) != 0) {
-          const bool virtualDesktop = (m.usFlags & MOUSE_VIRTUAL_DESKTOP) != 0;
-          const int vw = ::GetSystemMetrics(virtualDesktop ? SM_CXVIRTUALSCREEN : SM_CXSCREEN);
-          const int vh = ::GetSystemMetrics(virtualDesktop ? SM_CYVIRTUALSCREEN : SM_CYSCREEN);
-          POINT ap = { (LONG) (m.lLastX / 65535.0f * vw), (LONG) (m.lLastY / 65535.0f * vh) };
-          ::ScreenToClient(hwnd, &ap);
-          s_softCursorX = (float) ap.x;
-          s_softCursorY = (float) ap.y;
-          s_softCursorValid = true;
-        } else {
-          if (reseed) {
-            POINT p; ::GetCursorPos(&p);
-            ::ScreenToClient(hwnd, &p);
-            s_softCursorX = (float) p.x;
-            s_softCursorY = (float) p.y;
-            s_softCursorValid = true;
-          }
-          s_softCursorX += (float) m.lLastX;
-          s_softCursorY += (float) m.lLastY;
+        // Position: prefer absolute cursor (screen->client) if available, else use deltas.
+        if (m.usFlags & MOUSE_MOVE_ABSOLUTE) {
+          POINT p; GetCursorPos(&p);
+          // Convert to this window's client space (overlay/input window)
+          ScreenToClient(hwnd, &p);
+          io.AddMousePosEvent((float) p.x, (float) p.y);
+        } else if (m.lLastX || m.lLastY) {
+          // Relative movement: accumulate to last known position
+          // ImGui expects absolute (client) positions, so query current and add deltas.
+          POINT p; GetCursorPos(&p);
+          ScreenToClient(hwnd, &p);
+          p.x += (int) m.lLastX;
+          p.y += (int) m.lLastY;
+          io.AddMousePosEvent((float) p.x, (float) p.y);
         }
 
-        RECT client = {};
-        if (::GetClientRect(hwnd, &client)) {
-          if (s_softCursorX < 0.0f) s_softCursorX = 0.0f;
-          if (s_softCursorY < 0.0f) s_softCursorY = 0.0f;
-          if (client.right  > 0 && s_softCursorX > (float) (client.right - 1))  s_softCursorX = (float) (client.right - 1);
-          if (client.bottom > 0 && s_softCursorY > (float) (client.bottom - 1)) s_softCursorY = (float) (client.bottom - 1);
+        auto push_button = [&](int imgui_button, bool down) {
+          io.AddMouseButtonEvent(imgui_button, down);
+        };
+        if (m.usButtonFlags & RI_MOUSE_LEFT_BUTTON_DOWN)  push_button(0, true);
+        if (m.usButtonFlags & RI_MOUSE_LEFT_BUTTON_UP)    push_button(0, false);
+        if (m.usButtonFlags & RI_MOUSE_RIGHT_BUTTON_DOWN) push_button(1, true);
+        if (m.usButtonFlags & RI_MOUSE_RIGHT_BUTTON_UP)   push_button(1, false);
+        if (m.usButtonFlags & RI_MOUSE_MIDDLE_BUTTON_DOWN)push_button(2, true);
+        if (m.usButtonFlags & RI_MOUSE_MIDDLE_BUTTON_UP)  push_button(2, false);
+        if (m.usButtonFlags & RI_MOUSE_BUTTON_4_DOWN)     push_button(3, true);
+        if (m.usButtonFlags & RI_MOUSE_BUTTON_4_UP)       push_button(3, false);
+        if (m.usButtonFlags & RI_MOUSE_BUTTON_5_DOWN)     push_button(4, true);
+        if (m.usButtonFlags & RI_MOUSE_BUTTON_5_UP)       push_button(4, false);
+
+        if (m.usButtonFlags & RI_MOUSE_WHEEL) {
+          const float dy = (short) m.usButtonData / (float) WHEEL_DELTA;
+          io.AddMouseWheelEvent(0.0f, dy);
         }
-        io.AddMousePosEvent(s_softCursorX, s_softCursorY);
-
-        // Mouse buttons from raw input
-        if (m.usButtonFlags & RI_MOUSE_LEFT_BUTTON_DOWN)   io.AddMouseButtonEvent(0, true);
-        if (m.usButtonFlags & RI_MOUSE_LEFT_BUTTON_UP)     io.AddMouseButtonEvent(0, false);
-        if (m.usButtonFlags & RI_MOUSE_RIGHT_BUTTON_DOWN)  io.AddMouseButtonEvent(1, true);
-        if (m.usButtonFlags & RI_MOUSE_RIGHT_BUTTON_UP)    io.AddMouseButtonEvent(1, false);
-        if (m.usButtonFlags & RI_MOUSE_MIDDLE_BUTTON_DOWN) io.AddMouseButtonEvent(2, true);
-        if (m.usButtonFlags & RI_MOUSE_MIDDLE_BUTTON_UP)   io.AddMouseButtonEvent(2, false);
-        if (m.usButtonFlags & RI_MOUSE_BUTTON_4_DOWN)      io.AddMouseButtonEvent(3, true);
-        if (m.usButtonFlags & RI_MOUSE_BUTTON_4_UP)        io.AddMouseButtonEvent(3, false);
-        if (m.usButtonFlags & RI_MOUSE_BUTTON_5_DOWN)      io.AddMouseButtonEvent(4, true);
-        if (m.usButtonFlags & RI_MOUSE_BUTTON_5_UP)        io.AddMouseButtonEvent(4, false);
-
-        // Mouse wheel
-        if (m.usButtonFlags & RI_MOUSE_WHEEL)
-          io.AddMouseWheelEvent(0.0f, (short) m.usButtonData / (float) WHEEL_DELTA);
-        if (m.usButtonFlags & RI_MOUSE_HWHEEL)
-          io.AddMouseWheelEvent((short) m.usButtonData / (float) WHEEL_DELTA, 0.0f);
+        if (m.usButtonFlags & RI_MOUSE_HWHEEL) {
+          const float dx = (short) m.usButtonData / (float) WHEEL_DELTA;
+          io.AddMouseWheelEvent(dx, 0.0f);
+        }
 
         return 0;
       }
 
       if (ri->header.dwType == RIM_TYPEKEYBOARD) {
         const RAWKEYBOARD& k = ri->data.keyboard;
-        s_lastRawKeyboardTime = rawNow;
+
+        // Filter fake events
         if (k.VKey == 255)
           return 0;
 
-        const bool is_down = (k.Message == WM_KEYDOWN) || (k.Message == WM_SYSKEYDOWN);
+        const bool is_down =
+          (k.Message == WM_KEYDOWN) || (k.Message == WM_SYSKEYDOWN);
+
+        // Virtual-key --> ImGui key
         int vk = (int) k.VKey;
-        if (vk == VK_RETURN && (k.Flags & RI_KEY_E0))
+        if (vk == VK_RETURN && (k.Flags & RI_KEY_E0)) // keypad enter remap (same as legacy path)
           vk = IM_VK_KEYPAD_ENTER;
 
         const ImGuiKey key = ImGui_ImplWin32_VirtualKeyToImGuiKey(vk);
-        const int scancode = (int) k.MakeCode;
+        const int scancode = (int) k.MakeCode; // Win32 scancode; backend uses scancode for workarounds
         if (key != ImGuiKey_None)
           ImGui_ImplWin32_AddKeyEvent(key, is_down, vk, scancode);
 
-        // Modifiers
-        if (vk == VK_SHIFT) {
-          if (IsVkDown(VK_LSHIFT) == is_down) ImGui_ImplWin32_AddKeyEvent(ImGuiKey_LeftShift, is_down, VK_LSHIFT, scancode);
-          if (IsVkDown(VK_RSHIFT) == is_down) ImGui_ImplWin32_AddKeyEvent(ImGuiKey_RightShift, is_down, VK_RSHIFT, scancode);
-        } else if (vk == VK_CONTROL) {
-          if (IsVkDown(VK_LCONTROL) == is_down) ImGui_ImplWin32_AddKeyEvent(ImGuiKey_LeftCtrl, is_down, VK_LCONTROL, scancode);
-          if (IsVkDown(VK_RCONTROL) == is_down) ImGui_ImplWin32_AddKeyEvent(ImGuiKey_RightCtrl, is_down, VK_RCONTROL, scancode);
-        } else if (vk == VK_MENU) {
-          if (IsVkDown(VK_LMENU) == is_down) ImGui_ImplWin32_AddKeyEvent(ImGuiKey_LeftAlt, is_down, VK_LMENU, scancode);
-          if (IsVkDown(VK_RMENU) == is_down) ImGui_ImplWin32_AddKeyEvent(ImGuiKey_RightAlt, is_down, VK_RMENU, scancode);
+        // Submit individual left/right modifier events
+        if (vk == VK_SHIFT)
+        {
+          // Important: Shift keys tend to get stuck when pressed together, missing key-up events are corrected in ImGui_ImplWin32_ProcessKeyEventsWorkarounds()
+          if (IsVkDown(VK_LSHIFT) == is_down) { ImGui_ImplWin32_AddKeyEvent(ImGuiKey_LeftShift, is_down, VK_LSHIFT, scancode); }
+          if (IsVkDown(VK_RSHIFT) == is_down) { ImGui_ImplWin32_AddKeyEvent(ImGuiKey_RightShift, is_down, VK_RSHIFT, scancode); }
+        }
+        else if (vk == VK_CONTROL)
+        {
+          if (IsVkDown(VK_LCONTROL) == is_down) {
+            ImGui_ImplWin32_AddKeyEvent(ImGuiKey_LeftCtrl, is_down, VK_LCONTROL, scancode);
+          }
+          if (IsVkDown(VK_RCONTROL) == is_down) {
+            ImGui_ImplWin32_AddKeyEvent(ImGuiKey_RightCtrl, is_down, VK_RCONTROL, scancode);
+          }
+        }
+        else if (vk == VK_MENU)
+        {
+          if (IsVkDown(VK_LMENU) == is_down) { ImGui_ImplWin32_AddKeyEvent(ImGuiKey_LeftAlt, is_down, VK_LMENU, scancode); }
+          if (IsVkDown(VK_RMENU) == is_down) { ImGui_ImplWin32_AddKeyEvent(ImGuiKey_RightAlt, is_down, VK_RMENU, scancode); }
         }
 
+        // Modifiers (explicit L/R)
+        // Important: modifiers can miss key-up events; backend has a workaround but keep these in sync.
         ImGui_ImplWin32_UpdateKeyModifiers();
 
-        // Text input
+        // generate text input
         if (is_down) {
           BYTE keyboard_state[256] = {};
           GetKeyboardState(keyboard_state);
+
+          // Map VK scan to Unicode for this layout
           WCHAR wbuf[8];
           HKL layout = GetKeyboardLayout(0);
           int n = ToUnicodeEx((UINT) vk, (UINT) k.MakeCode, keyboard_state, wbuf, IM_ARRAYSIZE(wbuf), 0, layout);
-          for (int i = 0; i < n; ++i)
-            io.AddInputCharacterUTF16((ImWchar) wbuf[i]);
+          if (n > 0) {
+            for (int i = 0; i < n; ++i)
+              io.AddInputCharacterUTF16((ImWchar) wbuf[i]);
+          }
         }
 
         return 0;
@@ -692,14 +678,8 @@ IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hwnd, UINT msg, WPARA
 
       break;
     }
-
     case WM_MOUSEMOVE:
-    {
-        // Skip if raw input is active (avoid duplicate position updates)
-        DWORD now = GetTickCount();
-        if (s_lastRawMouseMoveTime != 0 && (now - s_lastRawMouseMoveTime) < 100)
-          break;
-
+        // We need to call TrackMouseEvent in order to receive WM_MOUSELEAVE events
         bd->MouseHwnd = hwnd;
         if (!bd->MouseTracked)
         {
@@ -709,7 +689,6 @@ IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hwnd, UINT msg, WPARA
         }
         io.AddMousePosEvent((float)GET_X_LPARAM(lParam), (float)GET_Y_LPARAM(lParam));
         break;
-    }
     case WM_MOUSELEAVE:
         if (bd->MouseHwnd == hwnd)
             bd->MouseHwnd = NULL;
@@ -721,11 +700,6 @@ IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hwnd, UINT msg, WPARA
     case WM_MBUTTONDOWN: case WM_MBUTTONDBLCLK:
     case WM_XBUTTONDOWN: case WM_XBUTTONDBLCLK:
     {
-        // Skip if raw input is handling buttons
-        DWORD now = GetTickCount();
-        if (s_lastRawMouseButtonTime != 0 && (now - s_lastRawMouseButtonTime) < 100)
-          return 0;
-
         int button = 0;
         if (msg == WM_LBUTTONDOWN || msg == WM_LBUTTONDBLCLK) { button = 0; }
         if (msg == WM_RBUTTONDOWN || msg == WM_RBUTTONDBLCLK) { button = 1; }
@@ -742,11 +716,6 @@ IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hwnd, UINT msg, WPARA
     case WM_MBUTTONUP:
     case WM_XBUTTONUP:
     {
-        // Skip if raw input is handling buttons
-        DWORD now = GetTickCount();
-        if (s_lastRawMouseButtonTime != 0 && (now - s_lastRawMouseButtonTime) < 100)
-          return 0;
-
         int button = 0;
         if (msg == WM_LBUTTONUP) { button = 0; }
         if (msg == WM_RBUTTONUP) { button = 1; }
@@ -769,11 +738,6 @@ IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hwnd, UINT msg, WPARA
     case WM_SYSKEYDOWN:
     case WM_SYSKEYUP:
     {
-        // Skip if raw input is handling keyboard
-        DWORD now = GetTickCount();
-        if (s_lastRawKeyboardTime != 0 && (now - s_lastRawKeyboardTime) < 100)
-          return 0;
-
         const bool is_key_down = (msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN);
         if (wParam < 256)
         {
@@ -814,10 +778,6 @@ IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hwnd, UINT msg, WPARA
     }
     case WM_SETFOCUS:
     case WM_KILLFOCUS:
-        // Reset raw input tracking on focus change to prevent input lockup after alt-tab
-        s_lastRawMouseMoveTime = 0;
-        s_lastRawMouseButtonTime = 0;
-        s_lastRawKeyboardTime = 0;
         io.AddFocusEvent(msg == WM_SETFOCUS);
         return 0;
     case WM_CHAR:

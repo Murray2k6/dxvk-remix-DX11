@@ -27,8 +27,8 @@
 #include <limits>
 
 namespace Commands {
-  // The complete set of D3D9 interfaces
-  enum D3D9Command : uint16_t {
+  // The complete set of D3D11 interfaces
+  enum D3D11Command : uint16_t {
     Bridge_Terminate = std::numeric_limits<uint16_t>::max(),
     Bridge_Invalid = 0,
     Bridge_Syn,
@@ -47,47 +47,47 @@ namespace Commands {
     RemixApi_DestroyLight,
     RemixApi_DrawLightInstance,
     RemixApi_SetConfigVariable,
-    RemixApi_CreateD3D9,
+    RemixApi_CreateD3D11,
     RemixApi_RegisterDevice,
 
     Bridge_SharedHeap_AddSeg,
     Bridge_SharedHeap_Alloc,
     Bridge_SharedHeap_Dealloc,
 
-    // Unlink x86 d3d9 resource from x64 counterpart to prevent hash
+    // Unlink x86 d3d11 resource from x64 counterpart to prevent hash
     // collisions at server side. The resource must be properly
     // desposed of, or known to be released before the unlink to
     // prevent leaks.
     Bridge_UnlinkResource,
     Bridge_UnlinkVolumeResource,
-    // These are not actually official D3D9 API calls.
+    // These are not actually official D3D11 API calls.
     IDirect3DDevice9Ex_LinkSwapchain,
     IDirect3DDevice9Ex_LinkBackBuffer,
     IDirect3DDevice9Ex_LinkAutoDepthStencil,
 
 
-    IDirect3D9Ex_QueryInterface,
-    IDirect3D9Ex_AddRef,
-    IDirect3D9Ex_Destroy,
-    IDirect3D9Ex_RegisterSoftwareDevice,
-    IDirect3D9Ex_GetAdapterCount,
-    IDirect3D9Ex_GetAdapterIdentifier,
-    IDirect3D9Ex_GetAdapterModeCount,
-    IDirect3D9Ex_EnumAdapterModes,
-    IDirect3D9Ex_GetAdapterDisplayMode,
-    IDirect3D9Ex_CheckDeviceType,
-    IDirect3D9Ex_CheckDeviceFormat,
-    IDirect3D9Ex_CheckDeviceMultiSampleType,
-    IDirect3D9Ex_CheckDepthStencilMatch,
-    IDirect3D9Ex_CheckDeviceFormatConversion,
-    IDirect3D9Ex_GetDeviceCaps,
-    IDirect3D9Ex_GetAdapterMonitor,
-    IDirect3D9Ex_CreateDevice,
-    IDirect3D9Ex_GetAdapterModeCountEx,
-    IDirect3D9Ex_EnumAdapterModesEx,
-    IDirect3D9Ex_GetAdapterDisplayModeEx,
-    IDirect3D9Ex_CreateDeviceEx,
-    IDirect3D9Ex_GetAdapterLUID,
+    IDirect3D11Ex_QueryInterface,
+    IDirect3D11Ex_AddRef,
+    IDirect3D11Ex_Destroy,
+    IDirect3D11Ex_RegisterSoftwareDevice,
+    IDirect3D11Ex_GetAdapterCount,
+    IDirect3D11Ex_GetAdapterIdentifier,
+    IDirect3D11Ex_GetAdapterModeCount,
+    IDirect3D11Ex_EnumAdapterModes,
+    IDirect3D11Ex_GetAdapterDisplayMode,
+    IDirect3D11Ex_CheckDeviceType,
+    IDirect3D11Ex_CheckDeviceFormat,
+    IDirect3D11Ex_CheckDeviceMultiSampleType,
+    IDirect3D11Ex_CheckDepthStencilMatch,
+    IDirect3D11Ex_CheckDeviceFormatConversion,
+    IDirect3D11Ex_GetDeviceCaps,
+    IDirect3D11Ex_GetAdapterMonitor,
+    IDirect3D11Ex_CreateDevice,
+    IDirect3D11Ex_GetAdapterModeCountEx,
+    IDirect3D11Ex_EnumAdapterModesEx,
+    IDirect3D11Ex_GetAdapterDisplayModeEx,
+    IDirect3D11Ex_CreateDeviceEx,
+    IDirect3D11Ex_GetAdapterLUID,
 
 
     IDirect3DDevice9Ex_QueryInterface,
@@ -447,7 +447,7 @@ namespace Commands {
 
   // Maybe this will be useful...  
   enum Type {
-    kIDirect3D9 = IDirect3D9Ex_QueryInterface,
+    kIDirect3D11 = IDirect3D11Ex_QueryInterface,
     kIDirect3DDevice9 = IDirect3DDevice9Ex_QueryInterface,
     kIDirect3DStateBlock9 = IDirect3DStateBlock9_QueryInterface,
     kIDirect3DSwapChain9 = IDirect3DSwapChain9_QueryInterface,
@@ -465,7 +465,7 @@ namespace Commands {
     kIDirect3DQuery9 = IDirect3DQuery9_QueryInterface
   };
 
-  inline static std::string toString(const D3D9Command& command) {
+  inline static std::string toString(const D3D11Command& command) {
     switch (command) {
     case Bridge_Terminate: return "Terminate";
     case Bridge_Invalid: return "Invalid";
@@ -485,7 +485,7 @@ namespace Commands {
     case RemixApi_DestroyLight: return "RemixApi_DestroyLight";
     case RemixApi_DrawLightInstance: return "DrawLightInstance";
     case RemixApi_SetConfigVariable: return "RemixApi_SetConfigVariable";
-    case RemixApi_CreateD3D9: return "RemixApi_CreateD3D9";
+    case RemixApi_CreateD3D11: return "RemixApi_CreateD3D11";
     case RemixApi_RegisterDevice: return "RemixApi_RegisterDevice";
 
     case Bridge_SharedHeap_AddSeg: return "SharedHeap_AddSeg";
@@ -499,28 +499,28 @@ namespace Commands {
     case IDirect3DDevice9Ex_LinkBackBuffer: return "IDirect3DDevice9Ex_LinkBackBuffer";
     case IDirect3DDevice9Ex_LinkAutoDepthStencil: return "IDirect3DDevice9Ex_LinkAutoDepthStencil";
 
-    case IDirect3D9Ex_QueryInterface: return "IDirect3D9Ex_QueryInterface";
-    case IDirect3D9Ex_AddRef: return "IDirect3D9Ex_AddRef";
-    case IDirect3D9Ex_Destroy: return "IDirect3D9Ex_Destroy";
-    case IDirect3D9Ex_RegisterSoftwareDevice: return "IDirect3D9Ex_RegisterSoftwareDevice";
-    case IDirect3D9Ex_GetAdapterCount: return "IDirect3D9Ex_GetAdapterCount";
-    case IDirect3D9Ex_GetAdapterIdentifier: return "IDirect3D9Ex_GetAdapterIdentifier";
-    case IDirect3D9Ex_GetAdapterModeCount: return "IDirect3D9Ex_GetAdapterModeCount";
-    case IDirect3D9Ex_EnumAdapterModes: return "IDirect3D9Ex_EnumAdapterModes";
-    case IDirect3D9Ex_GetAdapterDisplayMode: return "IDirect3D9Ex_GetAdapterDisplayMode";
-    case IDirect3D9Ex_CheckDeviceType: return "IDirect3D9Ex_CheckDeviceType";
-    case IDirect3D9Ex_CheckDeviceFormat: return "IDirect3D9Ex_CheckDeviceFormat";
-    case IDirect3D9Ex_CheckDeviceMultiSampleType: return "IDirect3D9Ex_CheckDeviceMultiSampleType";
-    case IDirect3D9Ex_CheckDepthStencilMatch: return "IDirect3D9Ex_CheckDepthStencilMatch";
-    case IDirect3D9Ex_CheckDeviceFormatConversion: return "IDirect3D9Ex_CheckDeviceFormatConversion";
-    case IDirect3D9Ex_GetDeviceCaps: return "IDirect3D9Ex_GetDeviceCaps";
-    case IDirect3D9Ex_GetAdapterMonitor: return "IDirect3D9Ex_GetAdapterMonitor";
-    case IDirect3D9Ex_CreateDevice: return "IDirect3D9Ex_CreateDevice";
-    case IDirect3D9Ex_GetAdapterModeCountEx: return "IDirect3D9Ex_GetAdapterModeCountEx";
-    case IDirect3D9Ex_EnumAdapterModesEx: return "IDirect3D9Ex_EnumAdapterModesEx";
-    case IDirect3D9Ex_GetAdapterDisplayModeEx: return "IDirect3D9Ex_GetAdapterDisplayModeEx";
-    case IDirect3D9Ex_CreateDeviceEx: return "IDirect3D9Ex_CreateDeviceEx";
-    case IDirect3D9Ex_GetAdapterLUID: return "IDirect3D9Ex_GetAdapterLUID";
+    case IDirect3D11Ex_QueryInterface: return "IDirect3D11Ex_QueryInterface";
+    case IDirect3D11Ex_AddRef: return "IDirect3D11Ex_AddRef";
+    case IDirect3D11Ex_Destroy: return "IDirect3D11Ex_Destroy";
+    case IDirect3D11Ex_RegisterSoftwareDevice: return "IDirect3D11Ex_RegisterSoftwareDevice";
+    case IDirect3D11Ex_GetAdapterCount: return "IDirect3D11Ex_GetAdapterCount";
+    case IDirect3D11Ex_GetAdapterIdentifier: return "IDirect3D11Ex_GetAdapterIdentifier";
+    case IDirect3D11Ex_GetAdapterModeCount: return "IDirect3D11Ex_GetAdapterModeCount";
+    case IDirect3D11Ex_EnumAdapterModes: return "IDirect3D11Ex_EnumAdapterModes";
+    case IDirect3D11Ex_GetAdapterDisplayMode: return "IDirect3D11Ex_GetAdapterDisplayMode";
+    case IDirect3D11Ex_CheckDeviceType: return "IDirect3D11Ex_CheckDeviceType";
+    case IDirect3D11Ex_CheckDeviceFormat: return "IDirect3D11Ex_CheckDeviceFormat";
+    case IDirect3D11Ex_CheckDeviceMultiSampleType: return "IDirect3D11Ex_CheckDeviceMultiSampleType";
+    case IDirect3D11Ex_CheckDepthStencilMatch: return "IDirect3D11Ex_CheckDepthStencilMatch";
+    case IDirect3D11Ex_CheckDeviceFormatConversion: return "IDirect3D11Ex_CheckDeviceFormatConversion";
+    case IDirect3D11Ex_GetDeviceCaps: return "IDirect3D11Ex_GetDeviceCaps";
+    case IDirect3D11Ex_GetAdapterMonitor: return "IDirect3D11Ex_GetAdapterMonitor";
+    case IDirect3D11Ex_CreateDevice: return "IDirect3D11Ex_CreateDevice";
+    case IDirect3D11Ex_GetAdapterModeCountEx: return "IDirect3D11Ex_GetAdapterModeCountEx";
+    case IDirect3D11Ex_EnumAdapterModesEx: return "IDirect3D11Ex_EnumAdapterModesEx";
+    case IDirect3D11Ex_GetAdapterDisplayModeEx: return "IDirect3D11Ex_GetAdapterDisplayModeEx";
+    case IDirect3D11Ex_CreateDeviceEx: return "IDirect3D11Ex_CreateDeviceEx";
+    case IDirect3D11Ex_GetAdapterLUID: return "IDirect3D11Ex_GetAdapterLUID";
 
     case IDirect3DDevice9Ex_QueryInterface: return "IDirect3DDevice9Ex_QueryInterface";
     case IDirect3DDevice9Ex_AddRef: return "IDirect3DDevice9Ex_AddRef";
@@ -884,7 +884,7 @@ namespace Commands {
 }
 
 struct Header {
-  Commands::D3D9Command command = Commands::Bridge_Invalid; // Named function
+  Commands::D3D11Command command = Commands::Bridge_Invalid; // Named function
   Commands::Flags flags = 0; // Command flags
   uint32_t dataOffset = 0;   // Current data queue position value to ensure client and server are in sync
   uint32_t pHandle = 0;      // Handle for client side resource invoking the command, which we map to matching resource on server side

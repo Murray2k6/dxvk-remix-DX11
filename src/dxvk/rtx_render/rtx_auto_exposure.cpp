@@ -1,5 +1,5 @@
 /*
-* Copyright (c) 2023-2025, NVIDIA CORPORATION. All rights reserved.
+* Copyright (c) 2023-2026, NVIDIA CORPORATION. All rights reserved.
 *
 * Permission is hereby granted, free of charge, to any person obtaining a
 * copy of this software and associated documentation files (the "Software"),
@@ -105,7 +105,9 @@ namespace dxvk {
       RemixGui::DragFloat("Max (EV100)", &evMaxValueObject(), 0.01f, -24.f, 24.f);
 
       RemixGui::Checkbox("Center Weighted Metering", &exposureCenterMeteringEnabledObject());
+      ImGui::BeginDisabled(!exposureCenterMeteringEnabled());
       RemixGui::DragFloat("Center Metering Size", &centerMeteringSizeObject(), 0.01f, 0.01f, 1.0f);
+      ImGui::EndDisabled();
 
       RemixGui::Checkbox("Exposure Compensation", &useExposureCompensationObject());
 
@@ -277,7 +279,11 @@ namespace dxvk {
         ToneMappingAutoExposureArgs pushArgs = {};
         pushArgs.numPixels = rtOutput.m_finalOutputExtent.width * rtOutput.m_finalOutputExtent.height;
         // Note: Autoexposure speed is in units per second, so convert from milliseconds to seconds here.
-        pushArgs.autoExposureSpeed = autoExposureSpeed() * (0.001f * frameTimeMilliseconds);
+        // Fall back to the configured constant frame time (or 60 FPS) when the per-frame delta is 0,
+        // so eye adaptation still progresses on frame 0 in deterministic mode and when advanceTime is off.
+        const float fallbackMs = RtxOptions::timeDeltaBetweenFrames() > 0.f ? RtxOptions::timeDeltaBetweenFrames() : 16.6f;
+        const float effectiveFrameTimeMs = frameTimeMilliseconds > 0.0f ? frameTimeMilliseconds : fallbackMs;
+        pushArgs.autoExposureSpeed = autoExposureSpeed() * (0.001f * effectiveFrameTimeMs);
         pushArgs.evMinValue = evMinValue();
         pushArgs.evRange = evMaxValue() - evMinValue();
         pushArgs.debugMode = (ctx->getCommonObjects()->metaDebugView().debugViewIdx() == DEBUG_VIEW_EXPOSURE_HISTOGRAM);

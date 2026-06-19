@@ -1,5 +1,5 @@
 /*
-* Copyright (c) 2021-2025, NVIDIA CORPORATION. All rights reserved.
+* Copyright (c) 2021-2026, NVIDIA CORPORATION. All rights reserved.
 *
 * Permission is hereby granted, free of charge, to any person obtaining a
 * copy of this software and associated documentation files (the "Software"),
@@ -38,7 +38,7 @@
 #include "rtx_texture_manager.h"
 #include "rtx_debug_view.h"
 #include "rtx_xess.h"
-#include "../util/util_globaltime.h"
+#include "../util/util_global_time.h"
 
 namespace dxvk {
 
@@ -311,14 +311,7 @@ namespace dxvk {
       case AccessType::ReadWrite:
       case AccessType::Read:
         if (!ownsResource()) {
-          // Note: this ownership tracker only records Writes / ReadWrites, so any
-          // legitimate multi-reader pattern (a later pass reading the output of
-          // an earlier writer that didn't explicitly hand off ownership) trips
-          // this path.  It is a development aid, not a GPU-side hazard — the
-          // real memory dependency is expressed by DXVK barriers.  Log it as a
-          // warning (once) so it is still visible when someone is actively
-          // hunting aliasing bugs, but don't emit it as an error.
-          std::string errorMessage = str::format("AliasedResource WAR hazard tracker tripped:",
+          std::string errorMessage = str::format("AliasedResource WAR hazard detected:",
                  "\nNew access type: ", accessType == AccessType::Read ? "Read" : "ReadWrite",
                  "\nNew owner: \"", name() ? name() : "name unknown", "\""
                  "\nPrevious owner: \"", m_sharedResource->owner.expired()
@@ -326,7 +319,8 @@ namespace dxvk {
                                        : (*m_sharedResource->owner.lock().get())->name()
                                           ? (*m_sharedResource->owner.lock().get())->name()
                                           : "name unknown", "\"");
-          ONCE(Logger::warn(errorMessage));
+          ONCE(Logger::err(errorMessage));
+          assert(0 && "[AliasedResource] WAR hazard detected");
         }
         break;
       default:
@@ -415,30 +409,29 @@ namespace dxvk {
     m_raytracingOutput.m_gbufferPSRData[0] = AliasedResource(m_raytracingOutput.getCurrentPrimaryWorldPositionWorldTriangleNormal(), ctx, m_downscaledExtent, VK_FORMAT_R32G32B32A32_SFLOAT, "GBuffer PSR Data 0");
 
     // Alias resources depends on RTX Denoising and GI Options
-    // Resource aliasing is configured based on active options to optimize VRAM usage
+    // TODO: We should automatically assign available resources at run-time instead of manually figure it out.
+    //       There are numerous option combinations, which makes it easy to miss some. Review this part of the code if the AliasedResource WAR hazard is triggered.
     bool isConditionalAliasingsShareSameView = true;
     static bool cachedIsRayReconstructionEnabled = RtxOptions::isRayReconstructionEnabled();
     if (RtxOptions::isRayReconstructionEnabled()) {
-      // Keep RTXDI temporal position separate from the denoiser normal/roughness
-      // input. Sharing these can trip WAR hazards on strict drivers and has
-      // shown up directly before device loss in DX11 Remix logs.
+      // Reset aliasing for m_primaryRtxdiTemporalPosition only when the RR setting is toggled between enabled and disabled
       if (cachedIsRayReconstructionEnabled != RtxOptions::isRayReconstructionEnabled() || m_raytracingOutput.m_primaryRtxdiTemporalPosition.empty()) {
-        m_raytracingOutput.m_primaryRtxdiTemporalPosition = AliasedResource(ctx, m_downscaledExtent, VK_FORMAT_R32_UINT, "primary rtxdi temporal position", true);
+        m_raytracingOutput.m_primaryRtxdiTemporalPosition = AliasedResource(m_raytracingOutput.m_primaryVirtualWorldShadingNormalPerceptualRoughnessDenoising, ctx, m_downscaledExtent, VK_FORMAT_R32_UINT, "primary rtxdi temporal position", true);
       }
 
-      if (RtxOptions::getSupportedIntegrateIndirectMode(m_device, RtxOptions::integrateIndirectMode()) == IntegrateIndirectMode::NeuralRadianceCache && RtxOptions::captureDebugImage() == false) {
+      if (RtxOptions::integrateIndirectMode() == IntegrateIndirectMode::NeuralRadianceCache && RtxOptions::captureDebugImage() == false) {
         m_raytracingOutput.m_indirectRadianceHitDistance = AliasedResource(m_raytracingOutput.m_primaryVirtualMotionVector, ctx, m_downscaledExtent, VK_FORMAT_R16G16B16A16_SFLOAT, "Indirect Radiance Hit Distance", true);
 
+        // m_primaryRtxdiTemporalPosition and m_primaryVirtualWorldShadingNormalPerceptualRoughnessDenoising has different format, so they have different image views
         isConditionalAliasingsShareSameView = m_raytracingOutput.m_indirectRadianceHitDistance.sharesTheSameView(m_raytracingOutput.m_primaryVirtualMotionVector);
       } else {
         // Indirect Radiance HitT can't be aliased when using ReSTIR-GI and DLSS-RR is enabled, or debug view is enabled
         m_raytracingOutput.m_indirectRadianceHitDistance = AliasedResource(ctx, m_downscaledExtent, VK_FORMAT_R16G16B16A16_SFLOAT, "Indirect Radiance Hit Distance", true);
       }
     } else {
-      // Keep RTXDI temporal position standalone in non-RR mode as well so
-      // toggling RR does not restore an unsafe denoiser/RTXDI alias.
+      // Reset aliasing for m_primaryRtxdiTemporalPosition only when the RR setting is toggled between enabled and disabled
       if (cachedIsRayReconstructionEnabled != RtxOptions::isRayReconstructionEnabled() || m_raytracingOutput.m_primaryRtxdiTemporalPosition.empty()) {
-        m_raytracingOutput.m_primaryRtxdiTemporalPosition = AliasedResource(ctx, m_downscaledExtent, VK_FORMAT_R32_UINT, "primary rtxdi temporal position", true);
+        m_raytracingOutput.m_primaryRtxdiTemporalPosition = AliasedResource(m_raytracingOutput.m_primaryDepthDLSSRR, ctx, m_downscaledExtent, VK_FORMAT_R32_UINT, "primary rtxdi temporal position", true);
       }
       m_raytracingOutput.m_indirectRadianceHitDistance = AliasedResource(m_raytracingOutput.m_primaryWorldShadingNormalDLSSRR, ctx, m_downscaledExtent, VK_FORMAT_R16G16B16A16_SFLOAT, "Indirect Radiance Hit Distance", true);
 
@@ -457,10 +450,12 @@ namespace dxvk {
     // Only create SSS Textures when there're SSS materials in the scene
     {
       if (sceneManager.isSssMaterialExist() || sceneManager.isThinOpaqueMaterialExist()) {
-        if (!m_raytracingOutput.m_sharedSubsurfaceData.isValid()) {
+        if (!m_raytracingOutput.m_sharedSubsurfaceData.isValid() ||
+            m_raytracingOutput.m_sharedSubsurfaceData.image->info().extent != m_downscaledExtent) {
           m_raytracingOutput.m_sharedSubsurfaceData = createImageResource(ctx, "primary subsurface material buffer", m_downscaledExtent, VK_FORMAT_R16G16_UINT);
         }
-        if (!m_raytracingOutput.m_sharedSubsurfaceDiffusionProfileData.isValid()) {
+        if (!m_raytracingOutput.m_sharedSubsurfaceDiffusionProfileData.isValid() ||
+            m_raytracingOutput.m_sharedSubsurfaceDiffusionProfileData.image->info().extent != m_downscaledExtent) {
           // The single scattering is also stored in diffusion profile texture which is used in thin opaque. So we need to create this texture for thin opaque as well.
           m_raytracingOutput.m_sharedSubsurfaceDiffusionProfileData = createImageResource(ctx, "primary subsurface material diffusion profile data buffer", m_downscaledExtent, VK_FORMAT_R32G32_UINT);
         }
@@ -676,8 +671,8 @@ namespace dxvk {
     // Calculate upscaling mip bias for both usage and logging
     float calculatedUpscalingBias = 0.0f;
     
-    // Add upscaling mip bias when XeSS is the runtime backend
-    if (RtxOptions::isRuntimeXeSSEnabled()) {
+    // Add upscaling mip bias when XeSS is active
+    if (RtxOptions::isXeSSEnabled()) {
       // Use XeSS developer guide formula: -log2(upscale_factor)
       Resources& resourceManager = m_device->getCommon()->getResources();
       calculatedUpscalingBias = -log2(resourceManager.getUpscaleRatio());
@@ -1045,7 +1040,7 @@ namespace dxvk {
       }
     }
     m_raytracingOutput.m_primaryVirtualWorldShadingNormalPerceptualRoughness = createImageResource(ctx, "primary virtual world shading normal perceptual roughness", m_downscaledExtent, VK_FORMAT_R16G16B16A16_UNORM);
-    m_raytracingOutput.m_primaryVirtualWorldShadingNormalPerceptualRoughnessDenoising = AliasedResource(ctx, m_downscaledExtent, VK_FORMAT_A2B10G10R10_UNORM_PACK32, "primary virtual world shading normal perceptual roughness denoising", true);
+    m_raytracingOutput.m_primaryVirtualWorldShadingNormalPerceptualRoughnessDenoising = AliasedResource(ctx, m_downscaledExtent, VK_FORMAT_A2B10G10R10_UNORM_PACK32, "primary virtual world shading normal perceptual roughness denoising", true);;
     m_raytracingOutput.m_primaryHitDistance = createImageResource(ctx, "primary hit distance", m_downscaledExtent, VK_FORMAT_R32_SFLOAT);
     m_raytracingOutput.m_primaryViewDirection = createImageResource(ctx, "primary view direction", m_downscaledExtent, VK_FORMAT_R16G16_SNORM);
     m_raytracingOutput.m_primaryConeRadius = createImageResource(ctx, "primary cone radius", m_downscaledExtent, VK_FORMAT_R16_SFLOAT);
@@ -1065,7 +1060,7 @@ namespace dxvk {
       m_raytracingOutput.m_primaryObjectPicking = createImageResource(ctx, "primary object picking", m_downscaledExtent, VK_FORMAT_R32_UINT);
     }
 
-    // DLSSRR outputs
+    // DLSSRR outputs (TODO: allocate only if used)
     m_raytracingOutput.m_primaryDepthDLSSRR = AliasedResource(ctx, m_downscaledExtent, VK_FORMAT_R32_SFLOAT, "Primary Depth DLSSRR", allowCompatibleFormatAliasing);
     m_raytracingOutput.m_primaryWorldShadingNormalDLSSRR = AliasedResource(ctx, m_downscaledExtent, VK_FORMAT_R16G16B16A16_SFLOAT, "Primary Shading Normal DLSSRR", allowCompatibleFormatAliasing);
     m_raytracingOutput.m_primaryScreenSpaceMotionVectorDLSSRR = createImageResource(ctx, "Primary Screen Space Motion Vector DLSSRR", m_downscaledExtent, VK_FORMAT_R16G16_SFLOAT);

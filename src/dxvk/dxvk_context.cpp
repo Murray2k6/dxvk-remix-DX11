@@ -19,87 +19,16 @@
 * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 * DEALINGS IN THE SOFTWARE.
 */
-#include <algorithm>
-#include <cmath>
 #include <cstring>
-#include <atomic>
 #include <vector>
 #include <utility>
 
 #include "dxvk_device.h"
 #include "dxvk_context.h"
-#include "rtx_render/rtx_options.h"
-#include "rtx_render/rtx_cb_types.h"
-#include "rtx_render/rtx_spec_constants.h"
+#include "../d3d11/d3d11_state.h"
+#include "../d3d11/d3d11_spec_constants.h"
 
 namespace dxvk {
-
-  namespace {
-
-    bool isFiniteViewportValue(float value) {
-      return std::isfinite(value);
-    }
-
-    float clampViewportDepth(float value) {
-      return value < 0.0f ? 0.0f : (value > 1.0f ? 1.0f : value);
-    }
-
-    bool isUsableVkViewport(
-      const VkViewport&             viewport,
-      const VkPhysicalDeviceLimits& limits) {
-      if (!isFiniteViewportValue(viewport.x)
-       || !isFiniteViewportValue(viewport.y)
-       || !isFiniteViewportValue(viewport.width)
-       || !isFiniteViewportValue(viewport.height)
-       || !isFiniteViewportValue(viewport.minDepth)
-       || !isFiniteViewportValue(viewport.maxDepth)
-       || viewport.width <= 0.0f
-       || viewport.height == 0.0f)
-        return false;
-
-      const float minX = viewport.x;
-      const float maxX = viewport.x + viewport.width;
-      const float minY = viewport.height > 0.0f ? viewport.y : viewport.y + viewport.height;
-      const float maxY = viewport.height > 0.0f ? viewport.y + viewport.height : viewport.y;
-
-      if (!isFiniteViewportValue(maxX)
-       || !isFiniteViewportValue(minY)
-       || !isFiniteViewportValue(maxY))
-        return false;
-
-      return viewport.width <= float(limits.maxViewportDimensions[0])
-          && std::abs(viewport.height) <= float(limits.maxViewportDimensions[1])
-          && minX >= limits.viewportBoundsRange[0]
-          && maxX <= limits.viewportBoundsRange[1]
-          && minY >= limits.viewportBoundsRange[0]
-          && maxY <= limits.viewportBoundsRange[1];
-    }
-
-    VkRect2D sanitizeScissorRect(VkRect2D rect) {
-      if (rect.offset.x < 0) {
-        const uint32_t shift = uint32_t(std::min<int64_t>(-int64_t(rect.offset.x), rect.extent.width));
-        rect.offset.x = 0;
-        rect.extent.width -= shift;
-      }
-
-      if (rect.offset.y < 0) {
-        const uint32_t shift = uint32_t(std::min<int64_t>(-int64_t(rect.offset.y), rect.extent.height));
-        rect.offset.y = 0;
-        rect.extent.height -= shift;
-      }
-
-      return rect;
-    }
-
-    void makeEmptyViewport(VkViewport& viewport, VkRect2D& scissor) {
-      viewport = VkViewport { 0.0f, 0.0f, 1.0f, 1.0f, 0.0f, 1.0f };
-      scissor = VkRect2D {
-        VkOffset2D { 0, 0 },
-        VkExtent2D { 0, 0 } };
-    }
-
-  }
-
   DxvkContext::DxvkContext(const Rc<DxvkDevice>& device)
     : m_device(device),
     m_common(&device->m_objects),
@@ -2779,39 +2708,24 @@ namespace dxvk {
     const VkViewport* viewports,
     const VkRect2D* scissorRects) {
     ScopedCpuProfileZone();
-
-    if (unlikely(!viewportCount || viewports == nullptr || scissorRects == nullptr)) {
-      viewportCount = 1;
-      if (m_state.gp.state.rs.viewportCount() != viewportCount) {
-        m_state.gp.state.rs.setViewportCount(viewportCount);
-        m_flags.set(DxvkContextFlag::GpDirtyPipelineState);
-      }
-
-      makeEmptyViewport(m_state.vp.viewports[0], m_state.vp.scissorRects[0]);
-      m_flags.set(DxvkContextFlag::GpDirtyViewport);
-      return;
-    }
-
-    viewportCount = std::min<uint32_t>(viewportCount, m_state.vp.viewports.size());
-
     if (m_state.gp.state.rs.viewportCount() != viewportCount) {
       m_state.gp.state.rs.setViewportCount(viewportCount);
       m_flags.set(DxvkContextFlag::GpDirtyPipelineState);
     }
 
-    const VkPhysicalDeviceLimits& limits = m_device->properties().core.properties.limits;
-
     for (uint32_t i = 0; i < viewportCount; i++) {
       m_state.vp.viewports[i] = viewports[i];
-      m_state.vp.scissorRects[i] = sanitizeScissorRect(scissorRects[i]);
+      m_state.vp.scissorRects[i] = scissorRects[i];
 
-      // Vulkan viewports cannot be garbage, and width must be positive. DXVK
-      // uses negative height for the D3D-style Y flip, so keep that valid.
-      if (!isUsableVkViewport(viewports[i], limits)) {
-        makeEmptyViewport(m_state.vp.viewports[i], m_state.vp.scissorRects[i]);
-      } else {
-        m_state.vp.viewports[i].minDepth = clampViewportDepth(m_state.vp.viewports[i].minDepth);
-        m_state.vp.viewports[i].maxDepth = clampViewportDepth(m_state.vp.viewports[i].maxDepth);
+      // Vulkan viewports are not allowed to have a width or
+      // height of zero, so we fall back to a dummy viewport
+      // and instead set an empty scissor rect, which is legal.
+      if (viewports[i].width == 0.0f || viewports[i].height == 0.0f) {
+        m_state.vp.viewports[i] = VkViewport{
+          0.0f, 0.0f, 1.0f, 1.0f, 0.0f, 1.0f };
+        m_state.vp.scissorRects[i] = VkRect2D{
+          VkOffset2D { 0, 0 },
+          VkExtent2D { 0, 0 } };
       }
     }
 
@@ -2984,7 +2898,7 @@ namespace dxvk {
     uint32_t            value) {
     ScopedCpuProfileZone();
     // NV-DXVK start: terrain baking
-    static_assert(RtxSpecConstantId::Count <= DxvkLimits::MaxNumSpecConstants);
+    static_assert(D3D11SpecConstantId::Count <= DxvkLimits::MaxNumSpecConstants);
     // NV-DXVK end
     auto& specConst =
       pipeline == VK_PIPELINE_BIND_POINT_GRAPHICS
@@ -4675,38 +4589,8 @@ namespace dxvk {
   }
 
 
-  bool DxvkContext::shouldDeferRaytracingPipelineCompilation() {
-    if (m_state.rp.pipeline == nullptr)
-      return false;
-
-    if (!RtxOptions::Shader::enableAsyncCompilation() || m_state.rp.pipeline->isCompiled())
-      return false;
-
-    m_common->pipelineManager().registerRaytracingShaders(m_state.rp.pipeline->shaders());
-
-    if (m_state.rp.pipeline->isCompiled())
-      return false;
-
-    if (m_common->pipelineManager().remixShaderCompilationCount() == 0)
-      return false;
-
-    static std::atomic<uint32_t> sDeferredRtPipelineLogCount = 0;
-    const uint32_t previousLogCount = sDeferredRtPipelineLogCount.fetch_add(1);
-    if (previousLogCount < 8) {
-      Logger::info(str::format(
-        "DXVK: Deferring raytracing dispatch until async pipeline compilation completes: ",
-        m_state.rp.pipeline->shaders().debugName));
-    }
-
-    return true;
-  }
-
-
   bool DxvkContext::updateRaytracingPipelineState() {
     ScopedCpuProfileZone();
-
-    if (shouldDeferRaytracingPipelineCompilation())
-      return false;
 
     m_rpActivePipeline = m_state.rp.pipeline->getPipelineHandle();
 

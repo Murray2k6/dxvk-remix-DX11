@@ -628,13 +628,13 @@ NVAPI_INTERFACE NvAPI_GPU_GetMemoryInfoEx(NvPhysicalGpuHandle hPhysicalGpu, NV_G
 //! \ingroup gpu
 ///////////////////////////////////////////////////////////////////////////////
 NVAPI_INTERFACE NvAPI_EnumPhysicalGPUs(NvPhysicalGpuHandle nvGPUHandle[NVAPI_MAX_PHYSICAL_GPUS], NvU32 *pGpuCount);
-#if defined(_D3D9_H_) || defined(__d3d10_h__) || defined(__d3d11_h__) || defined(__d3d12_h__)
+#if defined(_D3D11_H_) || defined(__d3d10_h__) || defined(__d3d11_h__) || defined(__d3d12_h__)
 
 NV_DECLARE_HANDLE(NVDX_ObjectHandle);  // DX Objects
 static const NVDX_ObjectHandle NVDX_OBJECT_NONE = 0;
 
-#endif //if defined(_D3D9_H_) || defined(__d3d10_h__) || defined(__d3d11_h__) || defined(__d3d12_h__)
-#if defined(_D3D9_H_) || defined(__d3d10_h__) || defined(__d3d11_h__) || defined(__d3d12_h__)
+#endif //if defined(_D3D11_H_) || defined(__d3d10_h__) || defined(__d3d11_h__) || defined(__d3d12_h__)
+#if defined(_D3D11_H_) || defined(__d3d10_h__) || defined(__d3d11_h__) || defined(__d3d12_h__)
 
 ///////////////////////////////////////////////////////////////////////////////
 //
@@ -662,7 +662,7 @@ NVAPI_INTERFACE NvAPI_D3D_GetObjectHandleForResource(
     NVDX_ObjectHandle *pHandle);
 
 
-#endif //if defined(_D3D9_H_) || defined(__d3d10_h__) || defined(__d3d11_h__) || defined(__d3d12_h__)
+#endif //if defined(_D3D11_H_) || defined(__d3d10_h__) || defined(__d3d11_h__) || defined(__d3d12_h__)
 
 #include"nvapi_lite_salend.h"
 #ifdef __cplusplus

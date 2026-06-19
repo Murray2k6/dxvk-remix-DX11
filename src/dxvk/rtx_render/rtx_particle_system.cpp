@@ -1,5 +1,5 @@
 /*
-* Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+* Copyright (c) 2025-2026, NVIDIA CORPORATION. All rights reserved.
 *
 * Permission is hereby granted, free of charge, to any person obtaining a
 * copy of this software and associated documentation files (the "Software"),
@@ -29,7 +29,7 @@
 #include "rtx_context.h"
 #include "rtx_imgui.h"
 
-#include "../util/util_globaltime.h"
+#include "../util/util_global_time.h"
 
 #include <rtx_shaders/particle_system_spawn.h>
 #include <rtx_shaders/particle_system_evolve.h>
@@ -184,6 +184,7 @@ namespace dxvk {
       ImGui::Indent();
 
       RemixGui::Checkbox("Enable", &enableObject());
+      ImGui::BeginDisabled(!enable());
       RemixGui::Checkbox("Enable Spawning", &enableSpawningObject());
       RemixGui::DragFloat("Time Scale", &timeScaleObject(), 0.01f, 0.f, 1.f, "%.2f");
 
@@ -239,7 +240,9 @@ namespace dxvk {
         if (ImGui::CollapsingHeader("Simulation", ImGuiTreeNodeFlags_CollapsingHeader | ImGuiTreeNodeFlags_DefaultOpen)) {
           ImGui::Indent();
           RemixGui::DragFloat("Gravity Force", &gravityForceObject(), 0.01f, -1000.f, 1000.f, "%.2f");
+          ImGui::BeginDisabled();
           RemixGui::DragFloat("Max Speed", &maxSpeedObject(), 0.01f, 0.f, 100000.f, "%.2f");
+          ImGui::EndDisabled();
           RemixGui::DragFloat("Drag Coefficient", &dragCoefficientObject(), 0.01f, 0.f, 100.f, "%.2f");
 
           if (ImGui::CollapsingHeader("Attractor", ImGuiTreeNodeFlags_CollapsingHeader | ImGuiTreeNodeFlags_DefaultOpen)) {
@@ -257,6 +260,7 @@ namespace dxvk {
           }
 
           RemixGui::Checkbox("Enable Particle World Collisions", &enableCollisionDetectionObject());
+          ImGui::BeginDisabled(!enableCollisionDetection());
           RemixGui::DragFloat("Collision Restitution", &collisionRestitutionObject(), 0.01f, 0.f, 1.f, "%.2f");
           RemixGui::DragFloat("Collision Thickness", &collisionThicknessObject(), 0.01f, 0.f, 10000.f, "%.2f");
           {
@@ -270,16 +274,22 @@ namespace dxvk {
             collisionModeCombo.getKey(&collisionModeObject());
           }
 
+          ImGui::EndDisabled();
+
           RemixGui::Checkbox("Simulate Turbulence", &useTurbulenceObject());
+          ImGui::BeginDisabled(!useTurbulence());
           RemixGui::DragFloat("Turbulence Force", &turbulenceForceObject(), 0.01f, 0.f, 1000.f, "%.2f");
           RemixGui::DragFloat("Turbulence Frequency", &turbulenceFrequencyObject(), 0.01f, 0.f, 10.f, "%.2f");
+          ImGui::EndDisabled();
           ImGui::Unindent();
         }
 
         if (RemixGui::CollapsingHeader("Visual", ImGuiTreeNodeFlags_DefaultOpen)) {
           RemixGui::Checkbox("Align Particles with Velocity", &alignParticlesToVelocityObject());
           RemixGui::Checkbox("Enable Motion Trail", &enableMotionTrailObject());
+          ImGui::BeginDisabled(!enableMotionTrail());
           RemixGui::DragFloat("Motion Trail Length Multiplier", &motionTrailMultiplierObject(), 0.01f, 0.001f, 10000.f, "%.2f");
+          ImGui::EndDisabled();
           {
             static auto billboardTypeCombo = RemixGui::ComboWithKey<ParticleBillboardType>(
               "Billboard Type",
@@ -320,6 +330,7 @@ namespace dxvk {
         ImGui::Unindent();
       }
       ImGui::Unindent();
+      ImGui::EndDisabled();
       ImGui::PopID();
     }
   }
@@ -782,7 +793,7 @@ namespace dxvk {
         continue;
       }
 
-      // This is used to uniquely hash particle system geometry data - we do this because the particle data is hashed differently from regular geometry.
+      // This is used to uniquely hash particle system geometry data - we do this because the particle data is hashed differently from regular D3D11 geometry.
       const XXH64_hash_t particleHashConstant = XXH3_64bits_withSeed(&numParticles, sizeof(numParticles), particleSystem.getHash());
 
       const DxvkBufferSlice& vertexSlice = DxvkBufferSlice(particleSystem.getVertexBuffer());

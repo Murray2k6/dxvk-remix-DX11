@@ -22,7 +22,6 @@
 #include "dxvk_device.h"
 #include "dxvk_pipemanager.h"
 #include "dxvk_state_cache.h"
-#include "rtx_render/rtx_options.h"
 
 namespace dxvk {
 
@@ -214,12 +213,8 @@ namespace dxvk {
     if (numWorkers <  1) numWorkers =  1;
     if (numWorkers > 32) numWorkers = 32;
 
-    if (device->config().numCompilerThreads > 0) {
+    if (device->config().numCompilerThreads > 0)
       numWorkers = device->config().numCompilerThreads;
-    } else {
-      const uint32_t remixCompileLimit = std::max(1u, RtxOptions::Shader::maxConcurrentShaderCompilations());
-      numWorkers = std::min(numWorkers, remixCompileLimit);
-    }
     
     Logger::info(str::format("DXVK: Using ", numWorkers, " compiler threads"));
     

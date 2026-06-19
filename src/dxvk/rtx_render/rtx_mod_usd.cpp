@@ -72,7 +72,6 @@
 #include "rtx_lights_data.h"
 #include <filesystem>
 #include <algorithm>
-#include <cstdint>
 
 namespace fs = std::filesystem;
 
@@ -252,7 +251,7 @@ static std::string resolveTexturePath(
           // Skip it
           ++pathStartPos;
           // Check for parent folder symbol
-          if (pathStartPos < textureAssetPath.size() && textureAssetPath[pathStartPos] == '.') {
+          if (textureAssetPath[pathStartPos] == '.') {
             resolvedPath = resolvedPath.parent_path();
             ++pathStartPos;
           }
@@ -275,7 +274,8 @@ static std::string resolveTexturePath(
 }
 
 Rc<ManagedTexture> UsdMod::Impl::getTexture(const Args& args, const pxr::UsdPrim& shader, const pxr::TfToken& textureToken, bool forcePreload) const {
-  pxr::SdfAssetPath path;
+  static const pxr::TfToken kSRGBColorSpace("sRGB");
+  static pxr::SdfAssetPath path;
   auto attr = shader.GetAttribute(textureToken);
   if (attr.Get(&path)) {
     const ColorSpace colorSpace = ColorSpace::AUTO; // Always do this, whether or not force SRGB is required or not is unclear at this time.
@@ -365,7 +365,7 @@ MaterialData* UsdMod::Impl::processMaterial(Args& args, const pxr::UsdPrim& matP
   static const pxr::TfToken sourceAsset("info:mdl:sourceAsset");
   pxr::UsdAttribute sourceAssetAttr = shader.GetAttribute(sourceAsset);
   if (sourceAssetAttr.HasValue()) {
-    pxr::SdfAssetPath assetPath;
+    static pxr::SdfAssetPath assetPath;
     sourceAssetAttr.Get(&assetPath);
     std::string assetPathStr = assetPath.GetAssetPath();
     if (assetPathStr.find("AperturePBR_Portal.mdl") != std::string::npos) {
@@ -873,8 +873,8 @@ void UsdMod::Impl::processPointInstancer(Args& args, const pxr::UsdPrim& prim) {
           // Fast Path - this will attach a list of transforms to the replacement, which can be used later to render multiple copies of it.
           
           // Copy the transform vector to this mesh
-          args.meshes[meshInd].instancesToObject = instanceToObjectTransforms;
-          auto& instancesToObject = args.meshes[meshInd].instancesToObject;
+          args.meshes[meshInd].instancesToObject = std::make_shared<std::vector<Matrix4>>(instanceToObjectTransforms);
+          auto& instancesToObject = *args.meshes[meshInd].instancesToObject;
           // Append the meshToProtoRoot transform
           for (size_t instanceInd = 0; instanceInd < instancesToObject.size(); ++instanceInd) {
             instancesToObject[instanceInd] = instancesToObject[instanceInd] * args.meshes[meshInd].replacementToObject;
@@ -1429,37 +1429,6 @@ void UsdMod::Impl::TEMP_parseSecretReplacementVariants(const fast_unordered_cach
 }
 
 
-namespace {
-bool readUsdCategoryBool(const pxr::VtValue& value, bool& out) {
-  if (value.IsHolding<bool>()) {
-    out = value.UncheckedGet<bool>();
-    return true;
-  }
-  if (value.IsHolding<int>()) {
-    out = value.UncheckedGet<int>() != 0;
-    return true;
-  }
-  if (value.IsHolding<unsigned int>()) {
-    out = value.UncheckedGet<unsigned int>() != 0;
-    return true;
-  }
-  if (value.IsHolding<int64_t>()) {
-    out = value.UncheckedGet<int64_t>() != 0;
-    return true;
-  }
-  if (value.IsHolding<uint64_t>()) {
-    out = value.UncheckedGet<uint64_t>() != 0;
-    return true;
-  }
-  if (value.IsHolding<uint8_t>()) {
-    out = value.UncheckedGet<uint8_t>() != 0;
-    return true;
-  }
-
-  return false;
-}
-}
-
 Categorizer UsdMod::Impl::processCategoryFlags(const pxr::UsdPrim& prim) {
   Categorizer categoryFlags;
   for (uint32_t i = 0; i < (uint32_t) InstanceCategories::Count; i++) {
@@ -1475,13 +1444,7 @@ Categorizer UsdMod::Impl::processCategoryFlags(const pxr::UsdPrim& prim) {
     }
 
     categoryFlags.categoryExists.set((InstanceCategories) i);
-    bool categoryEnabled = false;
-    if (!readUsdCategoryBool(value, categoryEnabled)) {
-      Logger::warn(str::format("Skipping unsupported USD category flag type for \'", categoryName, "\' on \'", prim.GetName().GetString(), "\'"));
-      continue;
-    }
-
-    if (categoryEnabled) {
+    if (value.Get<bool>()) {
       categoryFlags.categoryFlags.set((InstanceCategories) i);
     }
   }
@@ -1669,48 +1632,37 @@ UsdMod::UsdMod(const Mod::Path& usdFilePath)
 }
 
 void UsdMod::loadUsdPlugins() {
-  static std::string usdRootDir;
+  // Load plugins
   static std::string pluginsDir;
-
   auto dir = env::getDllDirectory();
-  if (dir.empty()) {
-    Logger::warn("usd plugins were not loaded — could not determine DLL directory");
-    return;
-  }
+  if (!dir.empty()) {
+    std::filesystem::path p(dir);
+    p /= "usd\\plugins";
+    pluginsDir = p.string();
+    const auto& plugins = pxr::PlugRegistry::GetInstance().RegisterPlugins(pluginsDir);
 
-  std::filesystem::path base(dir);
-  auto& registry = pxr::PlugRegistry::GetInstance();
-
-  // Register standard USD schemas (usdGeom, usdSkel, usdLux, etc.) from the
-  // root usd/ directory whose plugInfo.json includes "*/resources/".
-  usdRootDir = (base / "usd").string();
-  {
-    const auto& schemas = registry.RegisterPlugins(usdRootDir);
-    Logger::info(str::format("USD schemas: registered ", schemas.size(), " from ", usdRootDir));
-    for (auto const& p : schemas) {
-      if (!p->IsLoaded() && !p->Load()) {
-        Logger::warn(str::format("USD schema ", p->GetName(), " failed to load"));
-      }
-    }
-  }
-
-  // Register Remix custom plugins (RemixParticleSystem, etc.) from usd/plugins/.
-  pluginsDir = (base / "usd" / "plugins").string();
-  {
-    const auto& plugins = registry.RegisterPlugins(pluginsDir);
     if (plugins.empty()) {
-      Logger::warn(str::format("No Remix USD plugins found in ", pluginsDir));
+      Logger::warn("usd plugins were not loaded");
+      return;
     }
+
     for (auto const& notice : plugins) {
-      if (!notice->IsLoaded() && !notice->Load()) {
-        Logger::warn(str::format("USD plugin ", notice->GetName(), " failed to load"));
+      if(!notice->IsLoaded() && !notice->Load()) {
+        Logger::warn(str::format("USD plugin, ", notice->GetName(), " failed to load!"));
       } else {
-        Logger::info(str::format("USD plugin ", notice->GetName(), " loaded"));
+        Logger::info(str::format("USD plugin, ", notice->GetName(), " loaded!"));
       }
-      Logger::debug(str::format("Plugin Info: ", notice->GetName(), "\n"
-                                , "\tLibrary:       ", notice->GetPath(), "\n"
-                                , "\tResourcePath:  ", notice->GetResourcePath()));
+
+      const std::string& name = notice->GetName();
+      const std::string& libPath = notice->GetPath();
+      const std::string& resourcePath = notice->GetResourcePath();
+
+      Logger::debug(str::format("Plugin Info: ", name, "\n"
+                                , "\tLibrary:       ", libPath, "\n"
+                                , "\tResourcePath:  ", resourcePath));
     }
+  } else {
+    Logger::warn("usd plugins were not loaded");
   }
 }
 

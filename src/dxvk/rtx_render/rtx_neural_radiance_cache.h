@@ -52,6 +52,11 @@ namespace dxvk {
 
       RTX_OPTION("rtx.neuralRadianceCache", bool, learnIrradiance, true, "");
       RTX_OPTION_ENV("rtx.neuralRadianceCache", bool, includeDirectLighting, true, "RTX_NRC_INCLUDE_DIRECT_LIGHTING", "");
+      RTX_OPTION("rtx.neuralRadianceCache", bool, boostEmissives, true,
+                 "Preserves emissive lighting on indirect bounces where NRC would otherwise terminate the path before evaluating it.\n"
+                 "When Include Direct Lighting is enabled, NRC terminates paths immediately on cache hit, skipping emissive evaluation.\n"
+                 "The cache cannot accurately represent sharp emissive features, so this option defers termination\n"
+                 "until after MIS-weighted emissive accumulation. May cause minor double-counting in rare cases.");
       RTX_OPTION("rtx.neuralRadianceCache", bool, resetHistory, false, "");
       RTX_OPTION("rtx.neuralRadianceCache", bool, allowRussianRouletteOnUpdate, false, "");
       RTX_OPTION_ARGS("rtx.neuralRadianceCache", uint32_t, targetNumTrainingIterations, 4,
@@ -130,7 +135,7 @@ namespace dxvk {
       RTX_OPTION("rtx.neuralRadianceCache", bool, enableAdaptiveTrainingDimensions, true, "Enables adaptive training dimensions that scale based off pathtracer's execution behavior on a given scene.");
 
       static void onQualityPresetChanged(DxvkDevice* device);
-      RTX_OPTION_ARGS("rtx.neuralRadianceCache", QualityPreset, qualityPreset, QualityPreset::High,
+      RTX_OPTION_ARGS("rtx.neuralRadianceCache", QualityPreset, qualityPreset, QualityPreset::Ultra,
                       "Quality Preset: Medium (0), High (1), Ultra (2).\n"
                       "Adjusts quality of RTX Neural Radiance Cache (NRC):\n"
                       "  - How quickly path-tracer terminates paths into NRC cache. It terminates quicker on lower presets.\n"

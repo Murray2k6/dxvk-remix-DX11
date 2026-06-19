@@ -87,7 +87,7 @@ namespace dxvk {
    * eg. [m_refCount = 0]
    *     Release()
    *     [m_refCount = 0]
-   * This is a notable quirk of D3D9's COM implementation
+   * This is a notable quirk of D3D11's COM implementation
    * and is relied upon by some games.
    */
   template<typename Base>

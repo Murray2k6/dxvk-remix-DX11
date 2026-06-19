@@ -183,7 +183,7 @@ namespace donut::engine
 
                 if (ISBITMASK(0xffffffff, 0x00000000, 0x00000000, 0x00000000))
                 {
-                    // Only 32-bit color channel format in D3D9 was R32F
+                    // Only 32-bit color channel format in D3D11 was R32F
                     return nvrhi::Format::R32_FLOAT;
                 }
                 break;

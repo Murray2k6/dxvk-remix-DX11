@@ -238,9 +238,9 @@ Other Changes:
 - Examples: OpenGL3+GLFW: Using 3.2 context instead of 3.3. (#1466)
 - Examples: OpenGL: Setting up glPixelStorei() explicitly before uploading texture.
 - Examples: OpenGL: Calls to glPolygonMode() are casting parameters as GLEnum to not fail with more strict bindings. (#1628) [@ilia-glushchenko]
-- Examples: Win32 (DirectX9,10,11,12): Added support for mouse cursor shapes. (#1495)
-- Examples: Win32 (DirectX9,10,11,12: Support for windows using the CS_DBLCLKS class flag by handling the double-click messages (WM_LBUTTONDBLCLK etc.). (#1538, #754) [@ndandoulakis]
-- Examples: Win32 (DirectX9,10,11,12): Made the Win32 proc handlers not assert if there is no active context yet, to be more flexible with creation order. (#1565)
+- Examples: Win32 (DirectX11,10,11,12): Added support for mouse cursor shapes. (#1495)
+- Examples: Win32 (DirectX11,10,11,12: Support for windows using the CS_DBLCLKS class flag by handling the double-click messages (WM_LBUTTONDBLCLK etc.). (#1538, #754) [@ndandoulakis]
+- Examples: Win32 (DirectX11,10,11,12): Made the Win32 proc handlers not assert if there is no active context yet, to be more flexible with creation order. (#1565)
 - Examples: GLFW: Added support for mouse cursor shapes (the diagonal resize cursors are unfortunately not supported by GLFW at the moment. (#1495)
 - Examples: GLFW: Don't attempt to change the mouse cursor input mode if it is set to GLFW_CURSOR_DISABLED by the application. (#1202) [@PhilCK]
 - Examples: SDL: Added support for mouse cursor shapes. (#1626) [@olls]
@@ -387,7 +387,7 @@ Other Changes:
 - Demo: Display better mouse cursor info for debugging backends. 
 - Demo: Stopped using rand() function in demo code. 
 - Examples: Added a handful of extra comments (about fonts, third-party libraries used in the examples, etc.).
-- Examples: DirectX9: Handle loss of D3D9 device (D3DERR_DEVICELOST). (#1464)
+- Examples: DirectX11: Handle loss of D3D11 device (D3DERR_DEVICELOST). (#1464)
 - Examples: Added null_example/ which is helpful for quick testing on multiple compilers/settings without relying on graphics library.
 - Fix for using alloca() in "Clang with Microsoft Codechain" mode. 
 - Various fixes, optimizations, comments.
@@ -468,7 +468,7 @@ Other Changes:
 - Examples: OpenGL3: Save and restore sampler state. (#1145) [@nlguillemot]
 - Examples: OpenGL2, OpenGL3: Save and restore polygon mode. (#1307) [@JJscott]
 - Examples: DirectX11: Allow creating device with feature level 10 since we don't really need much for that example. (#1333)
-- Examples: DirectX9/10/12: Using the Win32 SetCapture/ReleaseCapture API to read mouse coordinates when they are out of bounds. (#1375) [@Gargaj, @ocornut]
+- Examples: DirectX11/10/12: Using the Win32 SetCapture/ReleaseCapture API to read mouse coordinates when they are out of bounds. (#1375) [@Gargaj, @ocornut]
 - Tools: Fixed binary_to_compressed_c tool to return 0 when successful. (#1350) [@benvanik]
 - Internals: Exposed more helpers and unfinished features in imgui_internal.h. (use at your own risk!).
 - Internals: A bunch of internal refactoring, hopefully haven't broken anything! Merged a bunch of internal changes from the upcoming Navigation branch.
@@ -640,8 +640,8 @@ Other Changes:
 - Examples: OpenGL*: Saving/restoring separate color/alpha blend functions correctly. (#1120) [@greggman] 
 - Examples: OpenGL2: Uploading font texture as RGBA32 to increase compatibility with users shaders for beginners. (#824)
 - Examples: Vulkan: Countless fixes and improvements. (#785, #804, #910, #1017, #1039, #1041, #1042, #1043, #1080) [@martty, @Loftilus, @ParticlePeter, @SaschaWillems]
-- Examples: DirectX9/10/10: Only call SetCursor(NULL) is io.MouseDrawCursor is set. (#585, #909)
-- Examples: DirectX9: Explicitly setting viewport to match that other examples are doing. (#937)
+- Examples: DirectX11/10/10: Only call SetCursor(NULL) is io.MouseDrawCursor is set. (#585, #909)
+- Examples: DirectX11: Explicitly setting viewport to match that other examples are doing. (#937)
 - Examples: GLFW+OpenGL3: Fixed Shutdown() calling GL functions with NULL parameters if NewFrame was never called. (#800)
 - Examples: GLFW+OpenGL2: Renaming opengl_example/ to opengl2_example/ for clarity.
 - Examples: SDL+OpenGL: explicitly setting GL_UNPACK_ROW_LENGTH to reduce issues because SDL changes it. (#752)
@@ -718,8 +718,8 @@ Other changes:
 - AddFontFromMemoryCompressedTTF(): Fix ImFontConfig propagation. (#587)
 - Renamed majority of use of the word "opened" to "open" for clarity. Renamed SetNextTreeNodeOpened() to SetNextTreeNodeOpen(). (#625, #579)
 - Examples: OpenGL3: Saving/restoring glActiveTexture() state. (#602)
-- Examples: DirectX9: save/restore all device state.
-- Examples: DirectX9: Removed dependency on d3dx9.h, d3dx9.lib, dxguid.lib so it can be used in a DirectXMath.h only environment. (#611)
+- Examples: DirectX11: save/restore all device state.
+- Examples: DirectX11: Removed dependency on d3dx11.h, d3dx11.lib, dxguid.lib so it can be used in a DirectXMath.h only environment. (#611)
 - Examples: DirectX10/X11: Apply depth-stencil state (no use of depth buffer). (#640, #636)
 - Examples: DirectX11/X11: Added comments on removing dependency on D3DCompiler. (#638)
 - Examples: SDL: Initialize video+timer subsystem only.

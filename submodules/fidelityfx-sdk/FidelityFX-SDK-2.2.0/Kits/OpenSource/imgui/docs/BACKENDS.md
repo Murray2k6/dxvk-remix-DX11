@@ -69,7 +69,7 @@ List of Platforms Backends:
 
 List of Renderer Backends:
 
-    imgui_impl_dx9.cpp        ; DirectX9
+    imgui_impl_dx11.cpp        ; DirectX11
     imgui_impl_dx10.cpp       ; DirectX10
     imgui_impl_dx11.cpp       ; DirectX11
     imgui_impl_dx12.cpp       ; DirectX12

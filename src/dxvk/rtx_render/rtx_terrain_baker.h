@@ -73,13 +73,13 @@ namespace dxvk {
 
       RTX_OPTION("rtx.terrainBaker.material", bool, replacementSupportInPS, true, 
                  "Enables reading of secondary PBR replacement textures in pixel shaders when supported.\n"
-                 "Current support is limited to legacy pipelines and programmable shaders with Shader Model 1.0.\n"
-                 "When set to false or unsupported, an extra compute shader is used to preprocess the secondary textures to make them compatible at an expense of performance and quality instead.\n"
-                 "Requires \"rtx.terrainBaker.material.replacementSupportInPS_legacyPipeline = True\" to apply for draw calls with legacy graphics pipeline.\n"
+                 "Current support is limitted to fixed function pipelines and programmable shaders with Shader Model 1.0.\n"
+                 "When set to false or unsupported, an extra compute shader is used to preproces the secondary textures to make them compatible at an expense of performance and quality instead.\n"
+                 "Requires \"rtx.terrainBaker.material.replacementSupportInPS_fixedFunction = True\" to apply for draw calls with fixed function graphics pipeline.\n"
                  "Requires \"rtx.terrainBaker.material.replacementSupportInPS_programmableShaders = True\" to apply for draw calls with programmable graphics pipeline.");
-      RTX_OPTION("rtx.terrainBaker.material", bool, replacementSupportInPS_legacyPipeline, true, 
-                 "Enables reading of secondary PBR replacement textures in pixel shaders for games with legacy graphics pipelines.\n"
-                 "When set to false, an extra compute shader is used to preprocess the secondary textures to make them compatible at an expense of performance and quality instead.\n"
+      RTX_OPTION("rtx.terrainBaker.material", bool, replacementSupportInPS_fixedFunction, true, 
+                 "Enables reading of secondary PBR replacement textures in pixel shaders for games with fixed function graphics pipelines.\n"
+                 "When set to false, an extra compute shader is used to preproces the secondary textures to make them compatible at an expense of performance and quality instead.\n"
                  "This parameter must be set at launch to apply.");
       RTX_OPTION_ENV("rtx.terrainBaker.material", bool, replacementSupportInPS_programmableShaders, true, "RTX_TERRAIN_BAKER_PS_REPLACEMENT_SUPPORT_IN_PROGRAMMABLE_SHADERS",
                  "[Experimental] Enables reading of secondary PBR replacement textures in pixel shaders for games with programmable graphics pipelines.\""

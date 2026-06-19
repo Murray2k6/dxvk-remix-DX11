@@ -68,7 +68,7 @@ typedef struct
 #define NV_GET_CURRENT_SLI_STATE_VER2  MAKE_NVAPI_VERSION(NV_GET_CURRENT_SLI_STATE_V2,1)
 #define NV_GET_CURRENT_SLI_STATE_VER NV_GET_CURRENT_SLI_STATE_VER2
 #define NV_GET_CURRENT_SLI_STATE     NV_GET_CURRENT_SLI_STATE_V2
-#if defined(_D3D9_H_) || defined(__d3d10_h__) || defined(__d3d11_h__)
+#if defined(_D3D11_H_) || defined(__d3d10_h__) || defined(__d3d11_h__)
 
 ///////////////////////////////////////////////////////////////////////////////
 //
@@ -90,8 +90,8 @@ typedef struct
 //! \ingroup  dx
 ///////////////////////////////////////////////////////////////////////////////
 NVAPI_INTERFACE NvAPI_D3D_GetCurrentSLIState(IUnknown *pDevice, NV_GET_CURRENT_SLI_STATE *pSliState);
-#endif //if defined(_D3D9_H_) || defined(__d3d10_h__) || defined(__d3d11_h__)
-#if defined(_D3D9_H_) || defined(__d3d10_h__) || defined(__d3d11_h__)
+#endif //if defined(_D3D11_H_) || defined(__d3d10_h__) || defined(__d3d11_h__)
+#if defined(_D3D11_H_) || defined(__d3d10_h__) || defined(__d3d11_h__)
 
 ///////////////////////////////////////////////////////////////////////////////
 //
@@ -172,9 +172,9 @@ NVAPI_INTERFACE NvAPI_D3D_SetResourceHint(IUnknown *pDev, NVDX_ObjectHandle obj,
                                           NVAPI_D3D_SETRESOURCEHINT_CATEGORY dwHintCategory, 
                                           NvU32 dwHintName, 
                                           NvU32 *pdwHintValue);
-#endif //defined(_D3D9_H_) || defined(__d3d10_h__) || defined(__d3d11_h__)
+#endif //defined(_D3D11_H_) || defined(__d3d10_h__) || defined(__d3d11_h__)
 
-#if defined(_D3D9_H_) || defined(__d3d10_h__) || defined(__d3d11_h__)
+#if defined(_D3D11_H_) || defined(__d3d10_h__) || defined(__d3d11_h__)
 ///////////////////////////////////////////////////////////////////////////////
 //
 // FUNCTION NAME: NvAPI_D3D_BeginResourceRendering
@@ -211,9 +211,9 @@ typedef enum  _NVAPI_D3D_RESOURCERENDERING_FLAG
 //! \ingroup dx
 NVAPI_INTERFACE NvAPI_D3D_BeginResourceRendering(IUnknown *pDeviceOrContext, NVDX_ObjectHandle obj, NvU32 Flags);
 
-#endif //defined(_D3D9_H_) || defined(__d3d10_h__) || defined(__d3d11_h__)
+#endif //defined(_D3D11_H_) || defined(__d3d10_h__) || defined(__d3d11_h__)
 
-#if defined(_D3D9_H_) || defined(__d3d10_h__) || defined(__d3d11_h__)
+#if defined(_D3D11_H_) || defined(__d3d10_h__) || defined(__d3d11_h__)
 ///////////////////////////////////////////////////////////////////////////////
 //
 // FUNCTION NAME: NvAPI_D3D_EndResourceRendering
@@ -238,7 +238,7 @@ NVAPI_INTERFACE NvAPI_D3D_BeginResourceRendering(IUnknown *pDeviceOrContext, NVD
 //! \ingroup dx
 ///////////////////////////////////////////////////////////////////////////////
 NVAPI_INTERFACE NvAPI_D3D_EndResourceRendering(IUnknown *pDeviceOrContext, NVDX_ObjectHandle obj, NvU32 Flags);
-#endif //if defined(_D3D9_H_) || defined(__d3d10_h__) || defined(__d3d11_h__)
+#endif //if defined(_D3D11_H_) || defined(__d3d10_h__) || defined(__d3d11_h__)
 
 #include"nvapi_lite_salend.h"
 #ifdef __cplusplus

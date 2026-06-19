@@ -146,6 +146,7 @@ namespace dxvk {
             hashResult = XXH64(&(fields[i]), sizeof(XXH64_hash_t), hashResult);
         }
       }
+      assert(hashResult != kEmptyHash);
       return hashResult;
     }
 

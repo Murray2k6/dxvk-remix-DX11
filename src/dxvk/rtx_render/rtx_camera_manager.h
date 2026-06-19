@@ -49,9 +49,6 @@ namespace dxvk {
     RtCamera& getMainCamera() { return getCamera(CameraType::Main); }
 
     CameraType::Enum getLastSetCameraType() const { return m_lastSetCameraType; }
-    bool lastMainCameraCandidateUsedViewportFallback() const { return m_mainCameraCandidateUsedFallback; }
-    bool mainCameraLastUpdateUsedViewportFallback() const { return m_hasLastMainUpdate && m_lastMainUsedFallbackProj; }
-    bool hasSeenRealMainCamera() const { return m_hasSeenRealMainCamera; }
     
     bool isCameraValid(CameraType::Enum cameraType) const;
 
@@ -63,6 +60,11 @@ namespace dxvk {
 
     uint32_t getLastCameraCutFrameId() const { return m_lastCameraCutFrameId; }
     bool isCameraCutThisFrame() const;
+
+    // DX11_V225: state used by the DX11 in-process layer to distinguish real game
+    // cameras from synthesized viewport-fallback projections during startup.
+    bool hasSeenRealMainCamera() const { return m_hasSeenRealMainCamera; }
+    bool mainCameraLastUpdateUsedViewportFallback() const { return m_mainCameraLastUpdateUsedViewportFallback; }
 
   private:
     template<
@@ -85,21 +87,8 @@ namespace dxvk {
     std::array<RtCamera, CameraType::Count> m_cameras;
     CameraType::Enum m_lastSetCameraType = CameraType::Unknown;
     uint32_t m_lastCameraCutFrameId = -1;
-    // Frame id of the most recent Main-camera update that came from a real
-    // cbuffer projection (not the viewport-fallback synthesis).  Used to
-    // suppress fallback-projection candidates for a short grace period once
-    // a real projection has been seen, so a single failed extraction frame
-    // does not snap Main to a synthetic projection and cause flicker.
-    uint32_t m_lastMainCbufferProjFrameId = UINT32_MAX;
-    // Whether the last successful Main update used the viewport fallback.
-    // When this flips between frames we force a camera cut so the denoiser
-    // discards temporal history accumulated under the wrong projection
-    // (kills the transition flicker from Remix-boot splash into gameplay).
-    bool m_lastMainUsedFallbackProj = false;
-    bool m_hasLastMainUpdate = false;
     bool m_hasSeenRealMainCamera = false;
-    float m_mainCameraCandidateScore = -1.0e30f;
-    bool m_mainCameraCandidateUsedFallback = false;
+    bool m_mainCameraLastUpdateUsedViewportFallback = false;
     fast_unordered_cache<DecomposeProjectionParams> m_decompositionCache;
 
     DecomposeProjectionParams getOrDecomposeProjection(const Matrix4& viewToProjection);
@@ -107,3 +96,4 @@ namespace dxvk {
     RTX_OPTION("rtx", bool, rayPortalEnabled, false, "Enables ray portal support. Note this requires portal texture hashes to be set for the ray portal geometries in rtx.rayPortalModelTextureHashes.");
   };
 }  // namespace dxvk
+

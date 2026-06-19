@@ -73,7 +73,7 @@ namespace dxvk {
     { R"(\\FarCry4\.exe$)", {{
       { "dxgi.nvapiHack",                   "False" },
     }} },
-    /* Frostpunk: Renders one frame with D3D9     *
+    /* Frostpunk: Renders one frame with D3D11     *
      * after creating the DXGI swap chain         */
     { R"(\\Frostpunk\.exe$)", {{
       { "dxgi.deferSurfaceCreation",        "True" },
@@ -179,30 +179,30 @@ namespace dxvk {
       { "d3d11.apitraceMode",               "True" },
     }} },
     /* Atelier series - games try to render video *
-     * with a D3D9 swap chain over the DXGI swap  *
+     * with a D3D11 swap chain over the DXGI swap  *
      * chain, which breaks D3D11 presentation     */
     { R"(\\Atelier_(Ayesha|Escha_and_Logy|Shallie)(_EN)?\.exe$)", {{
-      { "dxgi.deferSurfaceCreation",        "True" },
+      { "d3d11.deferSurfaceCreation",        "True" },
     }} },
     /* Atelier Rorona/Totori/Meruru               */
     { R"(\\A(11R|12V|13V)_x64_Release(_en)?\.exe$)", {{
-      { "dxgi.deferSurfaceCreation",        "True" },
+      { "d3d11.deferSurfaceCreation",        "True" },
     }} },
     /* Just how many of these games are there?    */
     { R"(\\Atelier_(Lulua|Lydie_and_Suelle|Ryza(_2)?)\.exe$)", {{
-      { "dxgi.deferSurfaceCreation",        "True" },
+      { "d3d11.deferSurfaceCreation",        "True" },
     }} },
     /* ...                                        */
     { R"(\\Atelier_(Lydie_and_Suelle|Firis|Sophie)_DX\.exe$)", {{
-      { "dxgi.deferSurfaceCreation",        "True" },
+      { "d3d11.deferSurfaceCreation",        "True" },
     }} },
     /* Fairy Tail                                 */
     { R"(\\FAIRY_TAIL\.exe$)", {{
-      { "dxgi.deferSurfaceCreation",        "True" },
+      { "d3d11.deferSurfaceCreation",        "True" },
     }} },
     /* Nights of Azure                            */
     { R"(\\CNN\.exe$)", {{
-      { "dxgi.deferSurfaceCreation",        "True" },
+      { "d3d11.deferSurfaceCreation",        "True" },
     }} },
     /* Star Wars Battlefront II: amdags issues    */
     { R"(\\starwarsbattlefrontii\.exe$)", {{
@@ -283,6 +283,680 @@ namespace dxvk {
       { "d3d11.apitraceMode",               "True" },
     }} },
 
+    /**********************************************/
+    /* D3D11 GAMES                                 */
+    /**********************************************/
+
+    /* A Hat in Time                              */
+    { R"(\\HatinTimeGame\.exe$)", {{
+      { "d3d11.strictPow",                   "False" },
+      { "d3d11.lenientClear",                "True" },
+    }} },
+    /* Anarchy Online                             */
+    { R"(\\anarchyonline\.exe$)", {{
+      { "d3d11.memoryTrackTest",             "True" },
+    }} },
+    /* Borderlands 2 and The Pre Sequel!           */
+    { R"(\\Borderlands(2|PreSequel)\.exe$)", {{
+      { "d3d11.lenientClear",                "True" },
+      { "d3d11.supportDFFormats",            "False" },
+    }} },
+    /* Borderlands                                */
+    { R"(\\Borderlands\.exe$)", {{
+      { "d3d11.lenientClear",                "True" },
+    }} },
+    /* Gothic 3                                   */
+    { R"(\\Gothic(3|3Final| III Forsaken Gods)\.exe$)", {{
+      { "d3d11.supportDFFormats",            "False" },
+    }} },
+    /* Risen                                      */
+    { R"(\\Risen[23]?\.exe$)", {{
+      { "d3d11.invariantPosition",           "True" },
+    }} },
+    /* Sonic Adventure 2                          */
+    { R"(\\Sonic Adventure 2\\(launcher|sonic2app)\.exe$)", {{
+      { "d3d11.floatEmulation",              "False" },
+    }} },
+    /* The Sims 2,
+       Body Shop,
+       The Sims Life Stories,
+       The Sims Pet Stories,
+       and The Sims Castaway Stories             */
+    { R"(\\(Sims2.*|TS2BodyShop|SimsLS|SimsPS|SimsCS)\.exe$)", {{
+      { "d3d11.customVendorId",              "10de" },
+      { "d3d11.customDeviceId",              "0091" },
+      { "d3d11.customDeviceDesc",            "GeForce 7800 GTX" },
+      { "d3d11.disableA8RT",                 "True" },
+      { "d3d11.supportX4R4G4B4",             "False" },
+      { "d3d11.maxAvailableMemory",          "2048" },
+      { "d3d11.memoryTrackTest",             "True" },
+    }} },
+    /* Dead Space uses the a NULL render target instead
+       of a 1x1 one if DF24 is NOT supported      */
+    { R"(\\Dead Space\.exe$)", {{
+      { "d3d11.supportDFFormats",                 "False" },
+    }} },
+    /* Halo 2                                     */
+    { R"(\\halo2\.exe$)", {{
+      { "d3d11.invariantPosition",           "True" },
+    }} },
+    /* Halo CE/HaloPC                             */
+    { R"(\\halo(ce)?\.exe$)", {{
+      { "d3d11.invariantPosition",           "True" },
+      // Game enables minor decal layering fixes
+      // specifically when it detects AMD.
+      // Avoids chip being detected as unsupported
+      // when on intel. Avoids possible path towards
+      // invalid texture addressing methods.
+      { "d3d11.customVendorId",              "1002" },
+      // Avoids card not recognized error.
+      // Keeps game's rendering methods consistent
+      // for optimal compatibility.
+      { "d3d11.customDeviceId",              "4172" },
+      // The game uses incorrect sampler types in
+      // the shaders for glass rendering which
+      // breaks it on native + us if we don't
+      // spec-constantly chose the sampler type
+      // automagically.
+      { "d3d11.forceSamplerTypeSpecConstants", "True" },
+      { "rtx.lightmapTextures",  "211F65249E6D4837, 60CD2BCF8482B187,992CC729B6D67939,9994DEAFA52F35CD,A0068A9A5106777A,AE968ECEAC209AFF,CE59061AA5CCAE8B,DF6558A0EF71AC4B,E601679429E67BA3,EC2CC02D0C24CACE,FF3A56BDAA5FE64D" },
+      { "rtx.skyBoxTextures",    "" },
+      { "rtx.ignoreTextures",    "0" },
+      { "rtx.uiTextures",        "" },
+      { "rtx.useObsoleteHashOnTextureUpload", "True" },
+    }} },
+    /* Counter Strike: Global Offensive
+       Needs NVAPI to avoid a forced AO + Smoke
+       exploit so we must force AMD vendor ID.    */
+    { R"(\\csgo\.exe$)", {{
+      { "d3d11.customVendorId",              "1002" },
+    }} },
+    /* Vampire - The Masquerade Bloodlines        */
+    { R"(\\vampire\.exe$)", {{
+      { "d3d11.deferSurfaceCreation",        "True" },
+      { "d3d11.memoryTrackTest",             "True" },
+      { "d3d11.maxAvailableMemory",          "1024" },
+    }} },
+    /* Senran Kagura Shinovi Versus               */
+    { R"(\\SKShinoviVersus\.exe$)", {{
+      { "d3d11.forceAspectRatio",            "16:9" },
+    }} },
+    /* Metal Slug X                               */
+    { R"(\\mslugx\.exe$)", {{
+      { "d3d11.supportD32",                  "False" },
+    }} },
+    /* Skyrim (NVAPI)                             */
+    { R"(\\TESV\.exe$)", {{
+      { "d3d11.customVendorId",              "1002" },
+    }} },
+    /* RTHDRIBL Demo                              
+       Uses DONOTWAIT after GetRenderTargetData
+       then goes into an infinite loop if it gets
+       D3DERR_WASSTILLDRAWING.
+       This is a better solution than penalizing
+       other apps that use this properly.         */
+    { R"(\\rthdribl\.exe$)", {{
+      { "d3d11.allowDoNotWait",              "False" },
+    }} },
+    /* Hyperdimension Neptunia U: Action Unleashed */
+    { R"(\\Neptunia\.exe$)", {{
+      { "d3d11.forceAspectRatio",            "16:9" },
+    }} },
+    /* D&D - The Temple Of Elemental Evil          */
+    { R"(\\ToEE\.exe$)", {{
+      { "d3d11.allowDiscard",                "False" },
+    }} },
+    /* ZUSI 3 - Aerosoft Edition                  */
+    { R"(\\ZusiSim\.exe$)", {{
+      { "d3d11.noExplicitFrontBuffer",       "True" },
+    }} },
+    /* GTA IV (NVAPI)                             */
+    /* Also thinks we're always on Intel          *
+     * and will report/use bad amounts of VRAM.   */
+    { R"(\\GTAIV\.exe$)", {{
+      { "d3d11.customVendorId",              "1002" },
+      { "dxgi.emulateUMA",                  "True" },
+    }} },
+    /* Battlefield 2 (bad z-pass)                 */
+    { R"(\\BF2\.exe$)", {{
+      { "d3d11.longMad",                     "True" },
+      { "d3d11.invariantPosition",           "True" },
+    }} },
+    /* SpellForce 2 Series                        */
+    { R"(\\SpellForce2.*\.exe$)", {{
+      { "d3d11.forceSamplerTypeSpecConstants", "True" },
+    }} },
+    /* Everquest 2                                */
+    { R"(\\EverQuest2.*\.exe$)", {{
+      { "d3d11.alphaTestWiggleRoom", "True" },
+    }} },
+    /* Tomb Raider: Legend                       */
+    { R"(\\trl\.exe$)", {{
+      { "d3d11.apitraceMode",                "True" },
+    }} },
+    /* Everquest                                 */
+    { R"(\\eqgame\.exe$)", {{
+      { "d3d11.apitraceMode",                "True" },
+    }} },
+    /* Dark Messiah of Might & Magic             */
+    { R"(\\mm\.exe$)", {{
+      { "d3d11.deferSurfaceCreation",        "True" },
+      { "d3d11.memoryTrackTest",             "True" },
+    }} },
+    /* Mafia 2                                   */
+    { R"(\\mafia2\.exe$)", {{
+      { "d3d11.customVendorId",              "10de" },
+      { "d3d11.customDeviceId",              "0402" },
+    }} },
+    /* Warhammer: Online                         */
+    { R"(\\WAR(-64)?\.exe$)", {{
+      { "d3d11.customVendorId",              "1002" },
+    }} },
+    /* Dragon Nest                               */
+    { R"(\\DragonNest_x64\.exe$)", {{
+      { "d3d11.memoryTrackTest ",            "True" },
+    }} },
+    /* Dal Segno                                 */
+    { R"(\\DST\.exe$)", {{
+      { "d3d11.deferSurfaceCreation",        "True" },
+    }} },
+    /* HL2 engine                              */
+    { R"(\\hl2\.exe$)", {{
+      { "rtx.baseGameModRegex", std::string("sourcemods") },
+      { "rtx.baseGameModPathRegex", std::string("-game \"([a-zA-Z]:.*sourcemods.*)\"") },
+      { "rtx.showRaytracingOption", "False" },
+      { "rtx.lightConverter",
+        "2ef850e6fbfd8c87,"
+        "11bdb0aec66e413a,"
+        "5d2b45a0e4d62133,"
+        "1d7191114ae3cab2,"
+        "2c53b6d1412d82ee,"
+        "6a7de931f906f159,"
+        "8f877d11c0c69b09,"
+        "e7afd1a8e179429b,"
+        "c02fe462ba62838a,"
+        "edda43a7194b6597,"
+        "460306e97fb2d4b5,"
+        "bcd2ca5224499175,"
+        "2d5ac1adc56a42fd,"
+        "b847641d0db70d7a,"
+        "6d1c7640f8e75e57,"
+        "3c9d70691e07b676,"
+        "81adda2b5d6af17b,"
+        "94c8baa2be97e3a, "
+        "d6a162813f232ec5,"
+        "407b3900391f92bb,"
+        "87dfcd7146139c4a,"
+        "7dc0376066ac76bc,"
+        "687c5f75f2c8d860,"
+        "cdeb53e58a94a92b,"
+        "7eb3f191000f642a,"
+        "de77f4f94de3dfc3,"
+        "4fd7aea93bcc3833,"
+        "f4a7f6be329029ca,"
+        "a3979feff1010a75,"
+        "89d244855965b001,"
+        "3b2c78b35e0a88d5,"
+        "f9387048e84ace7c,"
+        "e88e5843fd107382,"
+        "d0425187257ec023,"
+        "9158e4ac55129ecb,"
+        "aa16c42fa367111c"
+      },
+      { "rtx.lightmapTextures",
+        "441282E47FE7CB64,"
+        "050173DFF733DBE1,"
+        "913E194A071E2720,"
+        "8D39476483C92F63,"
+        "8BF8566E3C8B006F,"
+        "54392326AF548522,"
+        "AF312EE92AAD9609,"
+        "A66CF9B74461F3DE,"
+        "BD904729C36EEFE8,"
+        "DB0E52AC3A7C8F12,"
+        "C44E50BC6B433C6E,"
+        "EE61086C4E281087,"
+        "5371BABD1CDD7707,"
+        "E4CFD8B693D251DD,"
+        "BDD5ACBF489E7853,"
+        "7B16D306254AB39E,"
+        "C12951B8D7192A9E,"
+        "7DE4CAEA279A9A09,"
+        "5AF15B44D7E92568,"
+        "CFB3E770A1FAF3F2,"
+        "CDC07C4F6BD631F5,"
+        "1B8F23FC10195395,"
+        "8D6ACC0820F0D424,"
+        "FAD3E22AA96D7B51,"
+        "E9BEA521567E008E,"
+        "AA2B1355C046AA80,"
+        "26172AB99925C7AD,"
+        "7B16D306254AB39E,"
+        "7DE4CAEA279A9A09,"
+        "BDD5ACBF489E7853,"
+        "C12951B8D7192A9E,"
+        "5AF15B44D7E92568,"
+        "264724EA902655F8,"
+        "E51A3DB8B4CE10AF,"
+        "C8DECC54A0085620,"
+        "33D41383CC45BCE1,"
+        "CE19CDCC72E90FDF,"
+        "08790A05BF2829FB,"
+        "5F7DE781C2993BEC,"
+        "A60D1CF2839DC373,"
+        "FEE6D3D200FF4220,"
+        "216C17AA33DB5D75"
+      },
+      { "rtx.uiTextures",
+        "7C47908363E9FB46,"
+        "49C49D3F95609C9D,"
+        "0ACC5AF8C7A6A72C,"
+        "25F9AA6D11F0F1E0,"
+        "0F707B765176FA99,"
+        "A0B13F306011D748,"
+        "71C560B061683B20,"
+        "b1efb6a865b3082c,"
+        "aedb4949ec308638," 
+        "BC840D956C24C33C,"
+        "010500D8F9BC71A1,"
+        "65C067A6504C559E,"
+        "7E20D6C917522EE4,"
+        "1F06EE8596B7DD41,"
+        "1FB0EBA5FEBD1B5A,"
+        "C0F138D79131F8C1" // cake splash screen (after beating the game)
+      },
+      { "rtx.ignoreTextures",
+        // Fake lighting strips present around borders of the chambers
+        "2EF850E6FBFD8C87,"  
+        // Various glowing sprites/light shafts that we want to replace with modern effects
+        "2F40734A713AABCE,"
+        "C5D5E4DC2C8B16A4,"
+        "193E96F2A664E570,"
+        "4BEE64E543B72DE8,"
+        "A73A56119D34B9A8,"
+        "CCF171A5B95F42AC,"
+        "3588CCE077177F37,"
+        "C511630F7EE7383C,"
+        "0B0B3516EC8F2672,"
+        "CA4AA3441DAA53CA,"
+        "1A82AD51BADE42C6,"
+        "525F90354488C30B,"
+        "BAD0E1288F3F5A5A,"
+        "6A7DE931F906F159,"
+        "E7AFD1A8E179429B,"
+        "C02FE462BA62838A,"
+        "EDDA43A7194B6597,"
+        "11BDB0AEC66E413A,"
+        "260EAE29EC4727F3,"
+        "6010A18E22F8CE34,"
+        "A08B874535052615,"
+        "8AA105C2149F4119,"
+        "EFAC5FE5EB531111,"
+        "A0EF42611EFCDBA5,"  // Character - Chell Checkerboard pattern used on one of the eye passes (unknown material?)
+        "8AA105C2149F4119,"  // ugly textures used for energy balls sliced by portals
+        "068E64C3DB849782,"  // ugly textures used for plasma catchers for fake bloom
+        "92e275beee2d2c12,"  // tanker detail texture
+        "ace20008ae3a0a5b,"  // barrel detail texture
+        "504697625CCD3B45,"  // building detail texture
+      },
+      { "rtx.ignoreTransparencyLayerTextures",
+        // Light beams
+        "0x67801EDD7AA4E77A,"
+        "0xF116B8E9DA308EE8,"
+      },
+      { "rtx.ignoreLights",
+        // Chell atlases - associated with a light (player light?)
+        "460306E97FB2D4B5,"  // 5044883607524660405ULL
+        "2D5AC1ADC56A42FD,"  // 3268137431696294653ULL
+      },
+      // TREX-469 workaround: hide unwanted objects
+      // Used temporarily to disable meshes pending feature work, without breaking capture tests
+      { "rtx.hideInstanceTextures",
+        ""
+      },
+      { "rtx.playerModelTextures",
+        // Character - Chell
+        "8DD6F568BD126398,"  // Left eye
+        "EEF8EFD4B8A1B2A5,"  // Right eye
+        "4A066E5A5292D273,"  // Hair and eyelashes
+        "AC869B6F32D8BBDB,"  // Something in the eyes
+        "2D5AC1ADC56A42FD,"  // Body
+        "E53AE01AC1FF9E03,"  // Head
+        "9FC25F8E3D685EA5,"  // Held portal gun
+        "9DED9E2A03234E95,"  // Gun particles
+        "4DEEF5C779DDC88A,"  // Gun particles
+        "3CD4F0E2A8AAD575,"  // Gun particles
+        "F2A8C629EF1809C3,"  // Gun particles
+        "4FEB275B85245FB9,"  // Gun particles
+        // Chell - Medium texture detail
+        "1BE7E510328AB010,"  // Body
+        "2AF8E51AAA752D40,"
+        "234A8CD5F00F220D,"
+        "3B21664B1B19F463,"
+        "3A349F1B5FD0B874,"
+        "1E94FE2ABE6A3777,"
+        "D2B78D811954C600,"
+        "571EE878F3238A3F,"
+        // Chell - Low texture detail
+        "DC8E4C587DF53D4C,"  // Body
+        "CBDCB2327A1BB55B,"
+        "163DCDE80551AFE2,"
+        "7957972EDFF7EECC,"
+        "17AE2077ADBE2A57,"
+        "959F1B8A7563FDBB,"
+        "126DEB020C4E0D2D,"
+        "C3F3985DC82F765E,"
+        "7D177970C35D7225,"
+      },
+      { "rtx.playerModelBodyTextures",
+        "2D5AC1ADC56A42FD," // Chell - high texture detail
+        "1BE7E510328AB010," // Chell - medium texture detail
+        "DC8E4C587DF53D4C," // Chell - low texture detail
+      },
+      { "rtx.particleTextures",
+        "C0BE016F97F55259," // steam
+        "2CB02C7BB3702A1F," // collision dust
+        "F12275CBAFC9CA75," // collision dust
+        "12A8733BBDF0FE20," // bullet hit particles
+        "3AEFA6FD5CF2DEB4," // rope/cables
+        "9F874078BE0C83FF," // rope/cables
+        "A5153B06569D6510," // glados defeat particle
+        "CD28C5A663826A6C," // glados defeat particle
+        "9C5D83E7E6B76A7A," // glados defeat swirly black particles
+        "F54E5ECA2E1504FD," // end game smoke
+        "577C6F86C18AAAA5," // portal opening flash
+        "EEEF6F901EEE1164," // glowing circle trail from portal gun fire
+        "F3DF557E6DDC103C," // underwater particles
+        "554AE68A890A90FB," // underwater particles
+        "FFC88527F4693A87," // tiny elevator particle stream component
+        "9DED9E2A03234E95," // portal gun particles
+        "4DEEF5C779DDC88A," // portal gun particles
+        "bd6fe490eca6a50f," // turret bullet particles
+        "63FF8A68ADB06117," // portal ring particles
+        "05054E94DD6BB441," // portal ring particles
+        "0C50217D8C6FDCC2," // plasma catcher electric effect
+        "49E4EC22E559AFC2," // plasma catcher electric effect
+        "280AC336CFC68401," // plasma catcher electric effect
+        "394800E61100412F," // plasma catcher electric effect
+        "285E8D0537EBEBA1," // plasma catcher electric effect
+        "7862B129760B74F0," // plasma catcher electric effect
+        "6253F3CDC90DC6FB," // plasma catcher electric effect
+        "69E5FE25984A5529," // plasma catcher electric effect
+        "FFCE11F1540354CA," // plasma catcher electric effect
+        "232AE6FEF8EEF0BD," // plasma catcher electric effect
+        "105F7D19ED93147E," // platform pillar top effect
+      },
+      { "rtx.beamTextures",
+        "ad7af1c4fca862e4," // nonstationary platform track beam
+        "f116b8e9da308ee8," // turret laser
+        "059b0044c2e2d9dd," // rocket turret laser
+      },
+      { "rtx.decalTextures",
+        "0464EB8194DD2139,"
+        "077416B246F7EBF9,"
+        "0D21C78830B9B87E,"
+        "0E0905D9231B2621,"
+        "0F4986B12FBC9B10,"
+        "1CC7CA1FD5C7CEBC,"
+        "2288A5A74C035053,"
+        "25AF94A27B585E5A,"
+        "2DBF6CC9A5652816,"
+        "2F38DA65B73883EE,"
+        "35961208D8AA165B,"
+        "37AF209A1A371D8F,"
+        "3CE13ABFA28FB599,"
+        "3DB98F1B93F4679A,"
+        "40D969C3B7B837F2,"
+        "474E1B6A2EA8F082,"
+        "4E9D342DFAD12947,"
+        "4F33C5B2342FA20B,"
+        "5073D083DAE15E8B,"
+        "508B88AC09F56141,"
+        "51BD52AFFAAD4BE7,"
+        "53841B078528D4EF,"
+        "58DFED2F17277010,"
+        "60F5B0BF449D5C5C,"
+        "6643F8FF7C42CB18,"
+        "6C9DB83C1D5A5254,"
+        "7A619D021C573F04,"
+        "7FE3253F3EC79C0D,"
+        "810643D7974355CF,"
+        "8B3FA1ED9319A08B,"
+        "8D0AACAE9911101A,"
+        "8DA1232E36B0AB4D,"
+        "90B63328CD155524,"
+        "9B35406FACCF2C8F,"
+        "A5D050857A01EE5D,"
+        "AAAB0CB0C06F9934,"
+        "AE6FC0599B192217,"
+        "B0BA2CC643F93597,"
+        "B68F559B25BF12AE,"
+        "B798B753E4B43330,"
+        "B93C3AF34B6F3980,"
+        "C045D91DACCA62EB,"
+        "C3BA8F2EC836E2B1,"
+        "C41860E9CD66844C,"
+        "C805C1C433BE9CC3,"
+        "C9603739E8F2686B,"
+        "C97FD37AF7708F22,"
+        "D466A216C1A295DA,"
+        "D51BD114D87C00BD,"
+        "E0062D64AC9BAC08,"
+        "E37B04B0085B6401,"
+        "E83D04C31FE08619,"
+        "E9FD72BAAB0C5FD0,"
+        "EF607C1AF136DF26,"
+        "F4661A1B6AA2E97B,"
+        "F600C3C5174DBF69,"
+        "F974DA687E700B25,"
+        "FAD5EEA07EE81FCA,"
+        "FBF1F662D1232979,"
+        "FCF7F7862B76C49F,"
+        "FF487E33FC613B9C,"
+        "ED9A4736E697A97B,"
+        "5585E3941BBD8A30,"
+        "27C8BA6D1FB47A6A,"
+        "6F1EAF2F9481C02F,"
+        "121AF2BCC5B5AFCA,"
+        "215BAAFC5A07B208,"
+        "739825af5ff7b600," // end game asphalt
+        "8f622d6d3b46b751," // end game asphalt
+         // Previously "rtx.dynamicDecalTextures", merged into this list
+        "f017847a501d804b," // blood and bullet holes
+        "a65293be7ea5f7b7," // plasma ball burn marks etc.
+         // Previously "rtx.nonOffsetDecalTextures", merged into this list
+        "727B75DD886D94FD," // Alyx eye irises
+        "64A2E9E0169AE37F,"
+        "C4826ABA6336F7FF," // Citizen NPC eye irises
+        "5E53185FD64EEFF2,"
+      },
+      { "rtx.worldSpaceUiTextures",
+       // Challenge map score boards
+       "2F0654813BA4509B,"
+       "E5A693D8A8BE5D34,"
+       "62902E857F4B7230,"
+       "38F233758BDF24F1,"
+       "D764F53F9492150B,"
+       "03027CD7C8492876,"
+       "20D8A0C0EF108A33,"
+       "49B4A977C4971EBC,"
+       "34EBDE3214C50C43,"
+       "FCECEDB4661B60EE,"
+       "903E97BD3086C74B,"
+       "CA8490701F86CB04,"
+       "353CEC6EDBFBE689,"
+       "28CB3CB457979BDC,"
+       "49A6D4FA0F562B5C,"
+       "1954FDFC34E8D819,"
+       "9C16F4679F33F113,"
+       "87770D9B57CED8C1,"
+       "C7E5ED72431C4A6F,"
+      },
+      { "rtx.worldSpaceUiBackgroundTextures",
+        "ece63a6d1de44f11" // Monitors with countdown timer in the GLaDOS chamber
+      },
+      { "rtx.skyBoxTextures",
+        "ED271AB781D49A9A,"
+        "3574F482B41905E8,"
+        "C5C302766FA5F91D,"
+        "B25CD04A355C45D9,"
+        "BD2CBBFAECF0168C,"
+        "9083D293A167C5B,"
+        // Trees that drawn using a different view matrix
+        "6CB534F9ACD206D5,"
+        "CA4F5DA4FBB99FFC,"
+      },
+      { "rtx.animatedWaterTextures",
+        "522E5513DB9638B6,"
+      },
+      { "rtx.raytracedRenderTargetTextures",
+        "0x3FB65838F2469C64,"
+      },
+      { "rtx.zUp",                   "True" },
+      { "rtx.uniqueObjectDistance",  "300.0" }, // Game is 1unit=1cm - picking up objects can move them very quickly, 3m should be sufficient.
+      { "rtx.rayPortalModelTextureHashes",        "5EC61BC800744B26, DFDACB6DE1C7741E" }, // Orange and Blue Portal textures
+      { "rtx.rayPortalEnabled",                   "True" },
+      { "rtx.rayPortalModelNormalAxis",           "1.0, 0.0, 0.0" },
+      { "rtx.rayPortalModelWidthAxis",            "0.0, 1.0, 0.0" },
+      { "rtx.rayPortalModelHeightAxis",           "0.0, 0.0, 1.0" },
+      { "rtx.rayPortalSamplingWeightMinDistance", "100.0" },
+      { "rtx.rayPortalSamplingWeightMaxDistance", "10000.0" },
+      { "rtx.rayPortalCameraHistoryCorrection",   "True" },
+      { "rtx.rayPortalCameraInBetweenPortalsCorrection",   "True" },
+      { "rtx.viewModel.enable",                   "True" },
+      { "rtx.viewModel.viewRelativeOffsetMeters", "0.005, -0.002, -0.055" },
+      { "rtx.viewModel.scale",                    "0.4" },
+      { "rtx.effectLightPlasmaBall",              "True" },
+      { "rtx.secondarySpecularFireflyFilteringThreshold",  "120.0" },
+      { "rtx.volumetrics.enable",                 "True" },
+      { "rtx.volumetrics.transmittanceColor",     "0.953238, 0.948409, 0.943550" }, // Slight blue tint to act more like water vapor for now
+      { "rtx.volumetrics.transmittanceMeasurementDistance", "20000.0" },
+      { "rtx.volumetrics.froxelMaxDistanceMeters",              "35.0" }, // Raised to 35 over default to better accomodate long hallways and tall rooms in Portal RTX (testchmb_a_09, escape_02).
+      // Todo: Currently these non-ReSTIR froxel grid options are overridden by volumetric presets pending some sort of refactor of how volumetric presets should
+      // be data-driven by config files. These values are still used when using a custom graphics preset however, so they are kept as reasonable defaults.
+      { "rtx.volumetrics.froxelGridResolutionScale",            "16" },
+      { "rtx.volumetrics.froxelDepthSlices",                    "48" },
+      { "rtx.volumetrics.restirGridScale",                      "4" },
+      { "rtx.volumetrics.restirFroxelDepthSlices",              "96" },
+      // 16 chosen as Portal RTX does not have a huge number of lights in most scenes thus diminishing the benefit further of high initial RIS sample counts (still
+      // helps for lights in motion though). This may need to be overridden for other Source engine-based titles for higher quality volumetrics if many lights are
+      // in use.
+      { "rtx.volumetrics.initialRISSampleCount",                "16" },
+      { "rtx.volumetrics.enableFogRemap",                       "True" },
+      { "rtx.volumetrics.fogRemapMaxDistanceMin",               "100.0" },
+      { "rtx.volumetrics.fogRemapMaxDistanceMax",               "4000.0" },
+      { "rtx.volumetrics.fogRemapTransmittanceMeasurementDistanceMin", "2000.0" },
+      { "rtx.volumetrics.fogRemapTransmittanceMeasurementDistanceMax", "12000.0" },
+      { "rtx.useObsoleteHashOnTextureUpload",                   "True" },
+      { "rtx.temporalAA.maximumRadiance",                       "10000.0" },
+      { "rtx.temporalAA.colorClampingFactor",                   "1.0"  },
+      { "rtx.temporalAA.newFrameWeight",                        "0.05" },
+      { "rtx.postfx.motionBlurSampleCount",                     "4"     },
+      { "rtx.postfx.exposureFraction",                          "0.4"   },
+      { "rtx.postfx.blurDiameterFraction",                      "0.02"  },
+      { "rtx.postfx.motionBlurMinimumVelocityThresholdInPixel", "1.5"   },
+      { "rtx.postfx.motionBlurDynamicDeduction",                "0.075" },
+      { "rtx.postfx.motionBlurJitterStrength",                  "0.6"   },
+      { "rtx.postfx.enableMotionBlurNoiseSample",               "True"  },
+      { "rtx.postfx.chromaticAberrationAmount",                 "0.0"   },
+      { "rtx.postfx.chromaticCenterAttenuationAmount",          "0.975" },
+      { "rtx.postfx.vignetteIntensity",                         "1.0"   },
+      { "rtx.postfx.vignetteRadius",                            "0.8"   },
+      { "rtx.postfx.vignetteSoftness",                          "0.1"   },
+      { "rtx.enableNearPlaneOverride",                          "True"  },
+      { "rtx.nativeMipBias",                                    "0.9"   },
+      { "rtx.upscalingMipBias",                                 "-0.4"  },
+      { "rtx.legacyMaterial.roughnessConstant",                 "0.1"   },
+      { "rtx.opacityMicromap.enable",                           "True"  },
+      { "rtx.terrain.terrainAsDecalsEnabledIfNoBaker",          "True"  },
+      { "rtx.decals.maxOffsetIndex",                            "64" },
+      { "rtx.geometryGenerationHashRuleString", "positions,"
+                                                "indices,"
+                                                "texcoords,"
+                                                "geometrydescriptor,"
+                                                "vertexlayout" },
+        { "rtx.allowCubemaps",                  "True" },
+      { "rtx.showLegacyACESOption",                             "True"   },
+      { "rtx.eye.showOptions",              "True" },
+      { "rtx.eye.enable",                   "True" },
+    }} },
+    /* Kohan II                                  */
+    { R"(\\k2\.exe$)", {{
+      { "d3d11.memoryTrackTest",             "True" },
+    }} },
+    /* Ninja Gaiden Sigma 1/2                    */
+    { R"(\\NINJA GAIDEN SIGMA(2)?\.exe$)", {{
+      { "d3d11.deferSurfaceCreation",        "True" },
+    }} },
+    /* Demon Stone breaks at frame rates > 60fps */
+    { R"(\\Demonstone\.exe$)", {{
+      { "d3d11.maxFrameRate",                "60" },
+    }} },
+    /* Far Cry 1 has worse water rendering when it detects AMD GPUs */
+    { R"(\\FarCry\.exe$)", {{
+      { "d3d11.customVendorId",              "10de" },
+    }} },
+    /* Earth Defense Force 5 */
+    { R"(\\EDF5\.exe$)", {{
+      { "dxgi.tearFree",                    "False" },
+      { "dxgi.syncInterval",                "1"     },
+    }} },
+    /* Sine Mora EX */
+    { R"(\\SineMoraEX\.exe$)", {{
+      { "d3d11.maxFrameRate",                "60" },
+    }} },
+    /* Fantasy Grounds                           */
+    { R"(\\FantasyGrounds\.exe$)", {{
+      { "d3d11.noExplicitFrontBuffer",       "True" },
+    }} },
+    /* Red Orchestra 2                           */
+    { R"(\\ROGame\.exe$)", {{
+      { "d3d11.floatEmulation",              "Strict" },
+    }} },
+    /* Bully: Scholarship Edition uses three untextured calls for its skybox */
+    { R"(\\Bully\.exe$)",{{
+      { "rtx.skyDrawcallIdThreshold",       "3"      },
+    }} },
+    /* Driver: Parallel Lines crash prevention  */
+    { R"(\\DriverParallelLines\.exe$)",{{
+      { "d3d11.deferSurfaceCreation",       "False"   },
+    }} },
+    /* Sword and Fairy 4 flickering fix         */
+    { R"(\\PAL4\.exe$)",{{
+    { "d3d11.noExplicitFrontBuffer",        "True"    },
+    }} },
+    /* Dark Souls II                            */
+    { R"(\\DarkSoulsII\.exe$)", {{
+      { "d3d11.floatEmulation",              "Strict" },
+    }} },
+    /* Dogfight 1942                            */
+    { R"(\\Dogfight1942\.exe$)", {{
+      { "d3d11.floatEmulation",              "Strict" },
+    }} },
+    /* Bayonetta                                */
+    { R"(\\Bayonetta\.exe$)", {{
+      { "d3d11.floatEmulation",              "Strict" },
+    }} },
+    /* Rayman Origins                           */
+    { R"(\\Rayman Origins\.exe$)", {{
+      { "d3d11.floatEmulation",              "Strict" },
+    }} },
+    /* Guilty Gear Xrd -Relevator-              */
+    { R"(\\GuiltyGearXrd\.exe$)", {{
+      { "d3d11.floatEmulation",              "Strict" },
+    }} },
+    /* Richard Burns Rally                      */
+    { R"(\\RichardBurnsRally_SSE\.exe$)", {{
+      { "d3d11.floatEmulation",              "Strict" },
+    }} },
+    /* BlazBlue Centralfiction                  */
+    { R"(\\BBCF\.exe$)", {{
+      { "d3d11.floatEmulation",              "Strict" },
+    }} },
+    /* James Cameron's Avatar needs invariantPosition to fix black flickering vegetation */
+    { R"(\\Avatar\.exe$)", {{
+      { "d3d11.invariantPosition",              "True" },
+    }} },
   }};
 
 

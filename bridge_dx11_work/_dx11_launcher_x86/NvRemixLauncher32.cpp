@@ -3,6 +3,7 @@
 #include <shellapi.h>
 #include <stdio.h>
 #include <wchar.h>
+#include <string>
 
 static void dirnameOf(const wchar_t* in, wchar_t* out, DWORD cap) {
   out[0] = 0;
@@ -72,10 +73,10 @@ static bool pathLooksRooted(const wchar_t* p) {
 }
 
 
-// DX11_V125_STEAM_AWARE_FALLBACK_HELPER
+// DX11_V219_STEAM_AWARE_FALLBACK_HELPER
 // Normal Steam/Unity path: start the game through Steam, then the game loads
 // local d3d11.dll/dxgi.dll and those DLLs run the bridge client.
-// This launcher remains packaged as required fallback/helper, but if it is used
+// This launcher remains packaged as required DLL-started launcher/client helper, but if it is used
 // inside steamapps/common, it must hand off to Steam instead of direct-launching
 // the Unity EXE, or SteamAPI may exit/relaunch the process.
 static const wchar_t* findNoCaseW(const wchar_t* haystack, const wchar_t* needle) {
@@ -222,103 +223,578 @@ static bool handOffToSteamIfSteamGame(const wchar_t* root) {
   return true;
 }
 
+
+
+// DX11_V219_GAME_CMD_FILE_ANYWHERE
+static bool readLauncherTextFileV219(const wchar_t* path, wchar_t* out, DWORD cap) {
+  if (!path || !path[0] || !out || cap < 2) return false;
+  out[0] = 0;
+  HANDLE h = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (h == INVALID_HANDLE_VALUE) return false;
+  char raw[8192] = {};
+  DWORD read = 0;
+  BOOL ok = ReadFile(h, raw, sizeof(raw) - 1, &read, nullptr);
+  CloseHandle(h);
+  if (!ok || read == 0) return false;
+  raw[read] = 0;
+  while (read > 0 && (raw[read - 1] == '\r' || raw[read - 1] == '\n')) raw[--read] = 0;
+  int wrote = MultiByteToWideChar(CP_UTF8, 0, raw, -1, out, cap);
+  if (wrote <= 0) {
+    wrote = MultiByteToWideChar(CP_ACP, 0, raw, -1, out, cap);
+  }
+  return wrote > 0 && out[0] != 0;
+}
+
+static bool readLauncherGuidFileV219(const wchar_t* root, wchar_t* out, DWORD cap) {
+  if (!root || !out || cap < 37) return false;
+  out[0] = 0;
+  wchar_t path[MAX_PATH] = {};
+  lstrcpynW(path, root, MAX_PATH);
+  lstrcatW(path, L".trex\\dx11_bridge_guid.txt");
+  HANDLE h = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (h == INVALID_HANDLE_VALUE) return false;
+  char raw[128] = {};
+  DWORD read = 0;
+  BOOL ok = ReadFile(h, raw, sizeof(raw) - 1, &read, nullptr);
+  CloseHandle(h);
+  if (!ok || read == 0) return false;
+  raw[read] = 0;
+  while (read > 0 && (raw[read - 1] == '\r' || raw[read - 1] == '\n' || raw[read - 1] == ' ' || raw[read - 1] == '\t')) raw[--read] = 0;
+  if (read != 36) return false;
+  MultiByteToWideChar(CP_UTF8, 0, raw, -1, out, cap);
+  return out[0] != 0;
+}
+
+static bool envNameIsSteamOverlayV219(const wchar_t* name) {
+  if (!name) return false;
+  return _wcsicmp(name, L"SteamGameId") == 0 ||
+         _wcsicmp(name, L"SteamOverlayGameId") == 0 ||
+         _wcsicmp(name, L"SteamAppId") == 0 ||
+         _wcsicmp(name, L"SteamClientLaunch") == 0 ||
+         _wcsicmp(name, L"SteamEnv") == 0 ||
+         _wcsicmp(name, L"GAMEOVERLAYRENDERER_LOG") == 0 ||
+         _wcsicmp(name, L"SteamOverlayUI") == 0;
+}
+
+static void appendEnvPairV219(std::wstring& block, const wchar_t* name, const wchar_t* value) {
+  if (!name || !name[0] || !value) return;
+  block.append(name);
+  block.push_back(L'=');
+  block.append(value);
+  block.push_back(L'\0');
+}
+
+static std::wstring buildBridgeEnvBlockV219(const wchar_t* root, const wchar_t* trex, const wchar_t* guid, const wchar_t* version) {
+  std::wstring block;
+  LPWCH env = GetEnvironmentStringsW();
+  if (env) {
+    for (LPWCH cur = env; *cur; cur += wcslen(cur) + 1) {
+      const wchar_t* eq = wcschr(cur, L'=');
+      if (!eq || eq == cur) continue;
+      wchar_t name[256] = {};
+      size_t n = static_cast<size_t>(eq - cur);
+      if (n >= _countof(name)) n = _countof(name) - 1;
+      wcsncpy_s(name, cur, n);
+      if (envNameIsSteamOverlayV219(name)) continue;
+      block.append(cur);
+      block.push_back(L'\0');
+    }
+    FreeEnvironmentStringsW(env);
+  }
+
+  wchar_t oldPath[32767] = {};
+  GetEnvironmentVariableW(L"PATH", oldPath, 32767);
+  wchar_t newPath[32767] = {};
+  lstrcpynW(newPath, trex, 32767);
+  lstrcatW(newPath, L";");
+  lstrcatW(newPath, root);
+  lstrcatW(newPath, L";");
+  lstrcatW(newPath, oldPath);
+
+  appendEnvPairV219(block, L"PATH", newPath);
+  appendEnvPairV219(block, L"DXVK_REMIX_GAME_DIR", root);
+  appendEnvPairV219(block, L"DXVK_REMIX_TREX_DIR", trex);
+  appendEnvPairV219(block, L"DXVK_REMIX_BRIDGE_SERVER_HOSTS_RUNTIME", L"1");
+  appendEnvPairV219(block, L"DX11_BRIDGE_GUID", guid);
+  appendEnvPairV219(block, L"DX11_BRIDGE_FIXED_GUID", guid);
+  appendEnvPairV219(block, L"DX11_BRIDGE_VERSION", version);
+  appendEnvPairV219(block, L"DX11_BRIDGE_MODE", L"d3d11");
+  appendEnvPairV219(block, L"SteamNoOverlayUIDrawing", L"1");
+  appendEnvPairV219(block, L"SteamGameId", L"0");
+  appendEnvPairV219(block, L"SteamOverlayGameId", L"0");
+  appendEnvPairV219(block, L"SteamAppId", L"0");
+
+  wchar_t plugins[MAX_PATH] = {};
+  lstrcpynW(plugins, trex, MAX_PATH);
+  lstrcatW(plugins, L"plugins");
+  DWORD pluginAttr = GetFileAttributesW(plugins);
+  if (pluginAttr != INVALID_FILE_ATTRIBUTES && (pluginAttr & FILE_ATTRIBUTE_DIRECTORY)) {
+    appendEnvPairV219(block, L"PXR_PLUGINPATH_NAME", plugins);
+  }
+
+  block.push_back(L'\0');
+  return block;
+}
+
+// DX11_V219_SINGLE_BRIDGE_SERVER_OWNER
+static unsigned long long hashWidePathV219(const wchar_t* s) {
+  unsigned long long h = 1469598103934665603ull;
+  if (!s) return h;
+  while (*s) {
+    wchar_t c = *s++;
+    if (c >= L'A' && c <= L'Z') c = (wchar_t)(c - L'A' + L'a');
+    h ^= (unsigned long long)c;
+    h *= 1099511628211ull;
+  }
+  return h;
+}
+
+static HANDLE acquireSingleBridgeServerOwnerV219(const wchar_t* root, const wchar_t* guid, bool* owns) {
+  if (owns) *owns = false;
+  wchar_t name[256] = {};
+  unsigned long long h = hashWidePathV219(root);
+  // DX11_V219_SINGLE_BRIDGE_PER_GAME_FOLDER
+  // One bridge per game folder, not one bridge per GUID. Including GUID in
+  // the mutex let every new launch create another bridge.
+  swprintf_s(name, L"Local\\DX11RemixSingleBridge_%08X%08X",
+    (unsigned)((h >> 32) & 0xffffffffu),
+    (unsigned)(h & 0xffffffffu));
+
+  HANDLE m = CreateMutexW(nullptr, TRUE, name);
+  if (!m) {
+    return nullptr;
+  }
+
+  DWORD err = GetLastError();
+  if (err == ERROR_ALREADY_EXISTS) {
+    DWORD waitNow = WaitForSingleObject(m, 0);
+    if (waitNow == WAIT_OBJECT_0 || waitNow == WAIT_ABANDONED) {
+      if (owns) *owns = true;
+      return m;
+    }
+
+    appendLog(root, L"DX11_V219: another NvRemixBridge.exe owner is already active for this game folder; not starting a second bridge.");
+    CloseHandle(m);
+    return nullptr;
+  }
+
+  if (owns) *owns = true;
+  appendLog(root, L"DX11_V219: acquired single bridge server owner mutex.");
+  return m;
+}
+
+static void releaseSingleBridgeServerOwnerV219(HANDLE* ownerMutex) {
+  if (ownerMutex && *ownerMutex) {
+    ReleaseMutex(*ownerMutex);
+    CloseHandle(*ownerMutex);
+    *ownerMutex = nullptr;
+  }
+}
+
+// DX11_V219_REAL_SERVER_PID_FOR_CLIENT_HANDLE
+// DX11_V219_PID_RECORD_WITH_BRIDGE_PATH
+static void clearBridgeServerPidFileV219(const wchar_t* root) {
+  if (!root || !root[0]) return;
+  wchar_t path[MAX_PATH] = {};
+  lstrcpynW(path, root, MAX_PATH);
+  lstrcatW(path, L".trex\\dx11_bridge_server_pid.txt");
+  DeleteFileW(path);
+}
+
+// Kept original V219 function name so existing call sites stay simple until version labels are applied.
+static void writeBridgeServerPidFileV219(const wchar_t* root, DWORD pid, const wchar_t* bridgePath) {
+  if (!root || !root[0] || !pid || !bridgePath || !bridgePath[0]) return;
+  wchar_t path[MAX_PATH] = {};
+  lstrcpynW(path, root, MAX_PATH);
+  lstrcatW(path, L".trex\\dx11_bridge_server_pid.txt");
+
+  HANDLE h = CreateFileW(path, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (h == INVALID_HANDLE_VALUE) {
+    appendLog(root, L"DX11_V219 WARNING: failed to write .trex\\dx11_bridge_server_pid.txt.");
+    return;
+  }
+
+  // ASCII/UTF-8 record:
+  //   <pid>|<full path to .trex\NvRemixBridge.exe>
+  // The x86 client uses the path to validate it has the real server PID.
+  char bridgeUtf8[MAX_PATH * 3] = {};
+  WideCharToMultiByte(CP_UTF8, 0, bridgePath, -1, bridgeUtf8, sizeof(bridgeUtf8), nullptr, nullptr);
+
+  char buf[4096] = {};
+  sprintf_s(buf, "%lu|%s", pid, bridgeUtf8);
+
+  DWORD bytes = 0;
+  WriteFile(h, buf, static_cast<DWORD>(strlen(buf)), &bytes, nullptr);
+  CloseHandle(h);
+  appendLog(root, L"DX11_V219 wrote actual NvRemixBridge.exe PID+path to .trex\\dx11_bridge_server_pid.txt.");
+}
+
+// DX11_V219_LAUNCHER_DUPLICATES_REAL_CLIENT_HANDLE
+static DWORD readRealGamePidForLauncherV219(const wchar_t* root) {
+  if (!root || !root[0]) return 0;
+  wchar_t path[MAX_PATH] = {};
+  lstrcpynW(path, root, MAX_PATH);
+  lstrcatW(path, L".trex\\dx11_bridge_game_pid.txt");
+
+  HANDLE h = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (h == INVALID_HANDLE_VALUE) {
+    appendLog(root, L"DX11_V219 ERROR: missing .trex\\dx11_bridge_game_pid.txt.");
+    return 0;
+  }
+
+  char raw[64] = {};
+  DWORD got = 0;
+  BOOL ok = ReadFile(h, raw, sizeof(raw) - 1, &got, nullptr);
+  CloseHandle(h);
+  if (!ok || got == 0) {
+    appendLog(root, L"DX11_V219 ERROR: failed to read real game PID file.");
+    return 0;
+  }
+  raw[got] = 0;
+
+  char compact[64] = {};
+  DWORD ci = 0;
+  for (DWORD i = 0; i < got && ci + 1 < sizeof(compact); ++i) {
+    if (raw[i] >= '0' && raw[i] <= '9') compact[ci++] = raw[i];
+  }
+  compact[ci] = 0;
+  return static_cast<DWORD>(strtoul(compact, nullptr, 10));
+}
+
+static void writeLauncherDuplicatedClientHandleV219(const wchar_t* root, DWORD serverPid, DWORD gamePid, HANDLE remoteHandle) {
+  if (!root || !root[0] || !serverPid || !gamePid || !remoteHandle) return;
+  wchar_t path[MAX_PATH] = {};
+  lstrcpynW(path, root, MAX_PATH);
+  lstrcatW(path, L".trex\\dx11_bridge_client_remote_handle.txt");
+
+  HANDLE h = CreateFileW(path, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (h == INVALID_HANDLE_VALUE) {
+    appendLog(root, L"DX11_V219 ERROR: failed to write .trex\\dx11_bridge_client_remote_handle.txt.");
+    return;
+  }
+
+  char buf[256] = {};
+  sprintf_s(buf, "%lu|%llu|%lu",
+    serverPid,
+    static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(remoteHandle)),
+    gamePid);
+
+  DWORD bytes = 0;
+  WriteFile(h, buf, static_cast<DWORD>(strlen(buf)), &bytes, nullptr);
+  CloseHandle(h);
+  appendLog(root, L"DX11_V219 wrote server-side real game process handle to .trex\\dx11_bridge_client_remote_handle.txt.");
+}
+
+static bool duplicateRealGameProcessHandleIntoBridgeServerV219(const wchar_t* root, HANDLE bridgeProcess, DWORD serverPid) {
+  DWORD gamePid = readRealGamePidForLauncherV219(root);
+  if (!gamePid) {
+    appendLog(root, L"DX11_V219 ERROR: no real game PID available for server handle duplication.");
+    return false;
+  }
+
+  HANDLE gameProcess = OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, gamePid);
+  if (!gameProcess) {
+    wchar_t msg[256] = {};
+    swprintf_s(msg, L"DX11_V219 ERROR: launcher failed to open real game process pid=%lu err=%lu.", gamePid, GetLastError());
+    appendLog(root, msg);
+    return false;
+  }
+
+  HANDLE remoteHandle = nullptr;
+  BOOL ok = DuplicateHandle(
+    GetCurrentProcess(),
+    gameProcess,
+    bridgeProcess,
+    &remoteHandle,
+    0,
+    FALSE,
+    DUPLICATE_SAME_ACCESS);
+
+  CloseHandle(gameProcess);
+
+  if (!ok || !remoteHandle) {
+    wchar_t msg[256] = {};
+    swprintf_s(msg, L"DX11_V219 ERROR: launcher failed to duplicate real game handle into NvRemixBridge.exe pid=%lu err=%lu.", serverPid, GetLastError());
+    appendLog(root, msg);
+    return false;
+  }
+
+  writeLauncherDuplicatedClientHandleV219(root, serverPid, gamePid, remoteHandle);
+
+  wchar_t msg[256] = {};
+  swprintf_s(msg, L"DX11_V219 launcher duplicated real game process handle into NvRemixBridge.exe pid=%lu.", serverPid);
+  appendLog(root, msg);
+  return true;
+}
+
+// DX11_V219_REAL_GAME_TARGET_FOR_REMIX
+static bool extractRealGameExeForServerV219(const wchar_t* gameCmd, wchar_t* out, DWORD cap) {
+  if (!out || cap < 8) return false;
+  out[0] = 0;
+  if (!gameCmd || !gameCmd[0]) return false;
+
+  const wchar_t* p = gameCmd;
+  while (*p == L' ' || *p == L'\t') ++p;
+
+  if (*p == L'"') {
+    ++p;
+    DWORD n = 0;
+    while (*p && *p != L'"' && n + 1 < cap) {
+      out[n++] = *p++;
+    }
+    out[n] = 0;
+    return out[0] != 0;
+  }
+
+  const wchar_t* start = p;
+  const wchar_t* exeEnd = nullptr;
+  for (; *p; ++p) {
+    if (_wcsnicmp(p, L".exe", 4) == 0) {
+      exeEnd = p + 4;
+      break;
+    }
+  }
+
+  if (!exeEnd) {
+    p = start;
+    while (*p && *p != L' ' && *p != L'\t') ++p;
+    exeEnd = p;
+  }
+
+  DWORD n = 0;
+  for (const wchar_t* q = start; q < exeEnd && n + 1 < cap; ++q) {
+    out[n++] = *q;
+  }
+  out[n] = 0;
+  return out[0] != 0;
+}
+
+static void appendQuotedBridgeArgV219(wchar_t* cmd, DWORD cap, const wchar_t* arg) {
+  if (!cmd || !arg || !arg[0]) return;
+  DWORD used = static_cast<DWORD>(wcslen(cmd));
+  if (used + 4 >= cap) return;
+  cmd[used++] = L' ';
+  cmd[used++] = L'"';
+  while (*arg && used + 3 < cap) {
+    if (*arg != L'"') {
+      cmd[used++] = *arg;
+    }
+    ++arg;
+  }
+  cmd[used++] = L'"';
+  cmd[used] = 0;
+}
 int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
   wchar_t self[MAX_PATH] = {};
   GetModuleFileNameW(nullptr, self, MAX_PATH);
   wchar_t root[MAX_PATH] = {};
   dirnameOf(self, root, MAX_PATH);
 
-  appendLog(root, L"NvRemixLauncher32 DX11 client started.");
+  appendLog(root, L"NvRemixLauncher32 DX11 launcher/client helper started. DX11_V219_DLL_LAUNCHER_BRIDGE_CHAIN");
+
+  int argc = 0;
+  LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+
+  bool launchBridge = false;
+  wchar_t guid[128] = {};
+  wchar_t version[128] = {};
+  wchar_t gameCmd[4096] = {};
+  wchar_t gameCmdFile[MAX_PATH] = {}; // DX11_V219_GAME_CMD_FILE_ANYWHERE
+
+  if (argv) {
+    for (int i = 1; i < argc; ++i) {
+      if (_wcsicmp(argv[i], L"--dx11-launch-bridge") == 0) {
+        launchBridge = true;
+      } else if (_wcsicmp(argv[i], L"--guid") == 0 && i + 1 < argc) {
+        lstrcpynW(guid, argv[++i], 128);
+      } else if (_wcsicmp(argv[i], L"--version") == 0 && i + 1 < argc) {
+        lstrcpynW(version, argv[++i], 128);
+      } else if (_wcsicmp(argv[i], L"--game-root") == 0 && i + 1 < argc) {
+        ++i;
+      } else if (_wcsicmp(argv[i], L"--trex-root") == 0 && i + 1 < argc) {
+        ++i;
+      } else if (_wcsicmp(argv[i], L"--game-cmd-file") == 0 && i + 1 < argc) {
+        lstrcpynW(gameCmdFile, argv[++i], MAX_PATH);
+      } else if (_wcsicmp(argv[i], L"--game-cmd") == 0 && i + 1 < argc) {
+        // Legacy fallback only. V219 uses --game-cmd-file so games can be anywhere.
+        lstrcpynW(gameCmd, argv[++i], 4096);
+      }
+    }
+  }
+
+  if (!launchBridge) {
+    appendLog(root, L"NvRemixLauncher32.exe was opened manually. It is started by the game-loaded d3d11.dll/dxgi.dll.");
+    MessageBoxW(nullptr,
+      L"Run the actual game normally.\n\nThe game loads the local d3d11.dll/dxgi.dll, and that DLL starts NvRemixLauncher32.exe.\nNvRemixLauncher32.exe then starts .trex\\NvRemixBridge.exe.",
+      L"DX11 Remix Bridge",
+      MB_OK | MB_ICONINFORMATION);
+    if (argv) LocalFree(argv);
+    return 0;
+  }
+
+  if (!guid[0]) {
+    if (readLauncherGuidFileV219(root, guid, 128)) {
+      appendLog(root, L"DX11_V219 launcher recovered shared DX9-style GUID from .trex\dx11_bridge_guid.txt.");
+    }
+  }
+
+  if (!guid[0] || !version[0]) {
+    appendLog(root, L"ERROR: DLL launched NvRemixLauncher32.exe without shared DX9-style --guid/--version.");
+    if (argv) LocalFree(argv);
+    return 10;
+  }
+
+  if (!gameCmd[0] && gameCmdFile[0]) {
+    if (readLauncherTextFileV219(gameCmdFile, gameCmd, 4096)) {
+      appendLog(root, L"DX11_V219 launcher loaded original game command line from --game-cmd-file.");
+    } else {
+      appendLog(root, L"DX11_V219 WARNING: failed to read --game-cmd-file.");
+    }
+  }
+  if (!gameCmd[0]) {
+    DWORD gotGameCmd = GetEnvironmentVariableW(L"DX11_BRIDGE_GAME_CMD", gameCmd, 4096);
+    if (gotGameCmd > 0 && gotGameCmd < 4096) {
+      appendLog(root, L"DX11_V219 launcher loaded original game command line from DX11_BRIDGE_GAME_CMD.");
+    }
+  }
+
+  wchar_t realGameExeV219[MAX_PATH] = {};
+  if (extractRealGameExeForServerV219(gameCmd, realGameExeV219, MAX_PATH)) {
+    SetEnvironmentVariableW(L"DX11_BRIDGE_REAL_GAME_EXE", realGameExeV219);
+    SetEnvironmentVariableW(L"DXVK_REMIX_REAL_GAME_EXE", realGameExeV219);
+    SetEnvironmentVariableW(L"RTX_REMIX_TARGET_EXE", realGameExeV219);
+    wchar_t targetMsg[1024] = {};
+    swprintf_s(targetMsg, L"DX11_V219 real Remix target game exe: %s", realGameExeV219);
+    appendLog(root, targetMsg);
+  } else {
+    appendLog(root, L"DX11_V219 WARNING: could not extract real game exe from original command line; bridge config may still see launcher target.");
+  }
 
   wchar_t trex[MAX_PATH] = {};
   lstrcpynW(trex, root, MAX_PATH);
   lstrcatW(trex, L".trex\\");
 
-  wchar_t d3d11[MAX_PATH] = {}, dxgi[MAX_PATH] = {}, bridge[MAX_PATH] = {};
-  lstrcpynW(d3d11, root, MAX_PATH); lstrcatW(d3d11, L"d3d11.dll");
-  lstrcpynW(dxgi,  root, MAX_PATH); lstrcatW(dxgi,  L"dxgi.dll");
-  lstrcpynW(bridge, trex, MAX_PATH); lstrcatW(bridge, L"NvRemixBridge.exe");
+  wchar_t bridge[MAX_PATH] = {};
+  lstrcpynW(bridge, trex, MAX_PATH);
+  lstrcatW(bridge, L"NvRemixBridge.exe");
 
-  if (!existsFile(d3d11) || !existsFile(dxgi)) {
-    appendLog(root, L"ERROR: root d3d11.dll/dxgi.dll missing beside launcher.");
-    MessageBoxW(nullptr, L"DX11 Remix root d3d11.dll/dxgi.dll is missing beside NvRemixLauncher32.exe.", L"DX11 Remix Launcher", MB_ICONERROR);
-    return 2;
-  }
+  wchar_t rtD3D11[MAX_PATH] = {};
+  wchar_t rtDxgi[MAX_PATH] = {};
+  lstrcpynW(rtD3D11, trex, MAX_PATH); lstrcatW(rtD3D11, L"d3d11.dll");
+  lstrcpynW(rtDxgi,  trex, MAX_PATH); lstrcatW(rtDxgi,  L"dxgi.dll");
+
   if (!existsFile(bridge)) {
-    appendLog(root, L"ERROR: .trex\\NvRemixBridge.exe missing.");
-    MessageBoxW(nullptr, L".trex\\NvRemixBridge.exe is missing beside the DX11 Remix package.", L"DX11 Remix Launcher", MB_ICONERROR);
-    return 3;
+    appendLog(root, L"ERROR: .trex\\NvRemixBridge.exe missing; launcher cannot start Remix server.");
+    if (argv) LocalFree(argv);
+    return 11;
+  }
+  if (!existsFile(rtD3D11) || !existsFile(rtDxgi)) {
+    appendLog(root, L"ERROR: .trex\\d3d11.dll or .trex\\dxgi.dll missing; launcher cannot host Remix runtime.");
+    if (argv) LocalFree(argv);
+    return 12;
   }
 
-  int argc = 0;
-  LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
-
-  wchar_t target[MAX_PATH] = {};
-  wchar_t extra[4096] = {};
-  if (argv && argc >= 2) {
-    if (pathLooksRooted(argv[1])) {
-      lstrcpynW(target, argv[1], MAX_PATH);
-    } else {
-      lstrcpynW(target, root, MAX_PATH);
-      lstrcatW(target, argv[1]);
-    }
-    for (int i = 2; i < argc; i++) {
-      if (extra[0]) lstrcatW(extra, L" ");
-      quoteAppend(extra, 4096, argv[i]);
-    }
-  } else {
-    if (!autoFindGameExe(root, target, MAX_PATH)) {
-      appendLog(root, L"ERROR: no game exe argument and no auto-detected exe in package root.");
-      MessageBoxW(nullptr, L"Put NvRemixLauncher32.exe beside the 32-bit DX11 game exe, or run:\nNvRemixLauncher32.exe Game.exe", L"DX11 Remix Launcher", MB_ICONERROR);
-      if (argv) LocalFree(argv);
-      return 4;
-    }
-  }
-  if (argv) LocalFree(argv);
-
-  if (!existsFile(target)) {
-    appendLog(root, L"ERROR: requested game exe does not exist.");
-    MessageBoxW(nullptr, L"Requested game executable was not found.", L"DX11 Remix Launcher", MB_ICONERROR);
-    return 5;
-  }
-
-  if (handOffToSteamIfSteamGame(root)) {
+  bool ownsBridgeServerV219 = false;
+  HANDLE bridgeServerOwnerV219 = acquireSingleBridgeServerOwnerV219(root, guid, &ownsBridgeServerV219);
+  if (!ownsBridgeServerV219) {
+    appendLog(root, L"DX11_V219: duplicate launcher instance exiting after existing bridge owner finished; no second bridge was opened.");
+    if (argv) LocalFree(argv);
     return 0;
   }
 
   wchar_t oldPath[32767] = {};
   GetEnvironmentVariableW(L"PATH", oldPath, 32767);
   wchar_t newPath[32767] = {};
-  lstrcpynW(newPath, root, 32767);
+  lstrcpynW(newPath, trex, 32767);
   lstrcatW(newPath, L";");
-  lstrcatW(newPath, trex);
+  lstrcatW(newPath, root);
   lstrcatW(newPath, L";");
   lstrcatW(newPath, oldPath);
   SetEnvironmentVariableW(L"PATH", newPath);
-  SetEnvironmentVariableW(L"DXVK_REMIX_DX11_BRIDGE", L"1");
-  SetEnvironmentVariableW(L"DXVK_REMIX_LAUNCHED_BY_NVREMIXLAUNCHER32", L"1");
+  SetEnvironmentVariableW(L"DXVK_REMIX_GAME_DIR", root);
+  SetEnvironmentVariableW(L"DXVK_REMIX_TREX_DIR", trex);
+  SetEnvironmentVariableW(L"DXVK_REMIX_BRIDGE_SERVER_HOSTS_RUNTIME", L"1");
+  SetEnvironmentVariableW(L"DX11_BRIDGE_GUID", guid);
+  SetEnvironmentVariableW(L"DX11_BRIDGE_VERSION", version);
+  SetEnvironmentVariableW(L"DX11_BRIDGE_MODE", L"d3d11");
+
+  wchar_t plugins[MAX_PATH] = {};
+  lstrcpynW(plugins, trex, MAX_PATH);
+  lstrcatW(plugins, L"plugins");
+  DWORD pluginAttr = GetFileAttributesW(plugins);
+  if (pluginAttr != INVALID_FILE_ATTRIBUTES && (pluginAttr & FILE_ATTRIBUTE_DIRECTORY)) {
+    SetEnvironmentVariableW(L"PXR_PLUGINPATH_NAME", plugins);
+  }
 
   wchar_t cmd[8192] = {};
-  quoteAppend(cmd, 8192, target);
-  if (extra[0]) { lstrcatW(cmd, L" "); lstrcatW(cmd, extra); }
+  // DX11_V219_REAL_GAME_TARGET_FOR_REMIX
+  // NvRemixBridge.exe needs the real game exe target for Remix config/attachment.
+  // Pass only the already-running game exe path, not the full game command line.
+  // This gives Remix the correct target without relaunching the game.
+  swprintf_s(cmd, L"\"%s\" %s %s", bridge, guid, version);
+  if (gameCmd[0]) {
+    SetEnvironmentVariableW(L"DX11_BRIDGE_GAME_CMD", gameCmd);
+  }
+  if (realGameExeV219[0]) {
+    appendQuotedBridgeArgV219(cmd, 8192, realGameExeV219);
+    appendLog(root, L"DX11_V219 appended real game exe target to NvRemixBridge.exe command line for Remix config lookup.");
+  } else {
+    appendLog(root, L"DX11_V219 WARNING: no real game exe target appended; Remix may resolve launcher as the app target.");
+  }
 
-  wchar_t logMsg[8192] = {};
-  swprintf_s(logMsg, L"Launching non-Steam game directly: %s ; cwd=%s", cmd, root);
-  appendLog(root, logMsg);
+  wchar_t msg[8192] = {};
+  swprintf_s(msg, L"DX11_V219 launcher starting .trex bridge server with real game target. guid=%s cmd=%s cwd=%s", guid, cmd, trex);
+  appendLog(root, msg);
 
   STARTUPINFOW si = {};
   PROCESS_INFORMATION pi = {};
   si.cb = sizeof(si);
-  BOOL ok = CreateProcessW(nullptr, cmd, nullptr, nullptr, TRUE, 0, nullptr, root, &si, &pi);
+  std::wstring bridgeEnvV219 = buildBridgeEnvBlockV219(root, trex, guid, version);
+  SetEnvironmentVariableW(L"SteamNoOverlayUIDrawing", L"1");
+  SetEnvironmentVariableW(L"SteamGameId", L"0");
+  SetEnvironmentVariableW(L"SteamOverlayGameId", L"0");
+  SetEnvironmentVariableW(L"SteamAppId", L"0");
+  // DX11_V219_LAUNCHER_COMPILE_FIX
+  LPVOID bridgeEnvBlockV219 = bridgeEnvV219.empty()
+    ? nullptr
+    : static_cast<LPVOID>(const_cast<wchar_t*>(bridgeEnvV219.c_str()));
+  clearBridgeServerPidFileV219(root);
+  DeleteFileW(L".trex\\dx11_bridge_client_remote_handle.txt");
+  BOOL ok = CreateProcessW(
+    bridge,
+    cmd,
+    nullptr,
+    nullptr,
+    FALSE,
+    CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT,
+    bridgeEnvBlockV219,
+    trex,
+    &si,
+    &pi);
   if (!ok) {
-    wchar_t e[512] = {};
-    swprintf_s(e, L"ERROR: CreateProcessW failed. GetLastError=%lu", GetLastError());
-    appendLog(root, e);
-    MessageBoxW(nullptr, e, L"DX11 Remix Launcher", MB_ICONERROR);
-    return 6;
+    wchar_t fail[512] = {};
+    swprintf_s(fail, L"ERROR: launcher failed to start .trex\\NvRemixBridge.exe err=%lu", GetLastError());
+    appendLog(root, fail);
+    releaseSingleBridgeServerOwnerV219(&bridgeServerOwnerV219);
+    if (argv) LocalFree(argv);
+    return 13;
   }
+
   CloseHandle(pi.hThread);
+  writeBridgeServerPidFileV219(root, pi.dwProcessId, bridge);
+  duplicateRealGameProcessHandleIntoBridgeServerV219(root, pi.hProcess, pi.dwProcessId);
+  appendLog(root, L"DX11_V219 launcher started .trex\\NvRemixBridge.exe, duplicated the real game handle into it, and is staying alive until the server exits.");
+  WaitForSingleObject(pi.hProcess, INFINITE);
+  DWORD code = 0;
+  GetExitCodeProcess(pi.hProcess, &code);
   CloseHandle(pi.hProcess);
-  appendLog(root, L"Game process started successfully.");
-  return 0;
+  releaseSingleBridgeServerOwnerV219(&bridgeServerOwnerV219);
+
+  wchar_t done[256] = {};
+  swprintf_s(done, L"DX11_V219 .trex\\NvRemixBridge.exe exited with code %lu.", code);
+  appendLog(root, done);
+
+  if (argv) LocalFree(argv);
+  return static_cast<int>(code);
 }
+

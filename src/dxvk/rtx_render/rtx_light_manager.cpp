@@ -28,7 +28,7 @@
 #include "rtx_options.h"
 #include "rtx_utils.h"
 
-#include "rtx_cb_types.h"
+#include "../d3d11/d3d11_state.h"
 #include "rtx/pass/common_binding_indices.h"
 #include "rtx/pass/raytrace_args.h"
 #include "math.h"
@@ -52,7 +52,7 @@
 *     - Lights that are moving with some object
 *     - e.g. car lights, flash light
 * 
-*   For all lights, hardware limitations in the legacy rendering era meant only a  handful of 
+*   For all lights, hardware limitations in the fixed-function era meant only a  handful of 
 *   these lights can be enabled at any given time (max was 8 lights total back in the day).
 *   
 *   Many games will try to optimize and prioritize for these 8 available lights (and in many
@@ -156,7 +156,6 @@ namespace dxvk {
         // 3. Light replaces mesh: Do the same as Object Anti-Culling for the original mesh
         switch (rtLight.getLightAntiCullingType()) {
         case RtLightAntiCullingType::GameLight:
-        case RtLightAntiCullingType::LightReplacement:
           isLightInsideFrustum = sphereIntersectsFrustum(
             cameraLightAntiCullingFrustum, rtLight.getSphereLightReplacementOriginalPosition(), rtLight.getSphereLightReplacementOriginalRadius());
           break;
@@ -568,19 +567,19 @@ namespace dxvk {
     return addLight(rtLight, antiCullingType);
   }
 
-  void LightManager::addGameLight(const uint32_t type, const RtLight& rtLight) {
+  void LightManager::addGameLight(const Dx11LightType type, const RtLight& rtLight) {
     switch (type) {
-    case RtxLegacyLightType_Directional:
+    case DX11_LIGHT_DIRECTIONAL:
       if (ignoreGameDirectionalLights())
         return;
       break;
 
-    case RtxLegacyLightType_Point:
+    case DX11_LIGHT_POINT:
       if (ignoreGamePointLights())
         return;
       break;
 
-    case RtxLegacyLightType_Spot:
+    case DX11_LIGHT_SPOT:
       if (ignoreGameSpotLights())
         return;
       break;
@@ -589,7 +588,7 @@ namespace dxvk {
       break;
     }
 
-    if (RtxOptions::AntiCulling::isLightAntiCullingEnabled() && type == RtxLegacyLightType_Point) {
+    if (RtxOptions::AntiCulling::isLightAntiCullingEnabled() && type == DX11_LIGHT_POINT) {
       // Cache the sphere light data into replacement properties so we can unify the game light and light replacement into a single case in LightManager::garbageCollection
       rtLight.cacheLightReplacementAntiCullingProperties(rtLight.getSphereLight());
 
@@ -718,11 +717,6 @@ namespace dxvk {
     light->setBufferIdx(bufferIdx);
   }
 
-  // Marks an externally tracked light for garbage collection. The light's lifecycle is managed by external systems
-  // rather than LightManager's frame-to-frame tracking and anti-culling systems.
-  void LightManager::removeExternallyTrackedLight(RtLight* light) {
-    light->markForGarbageCollection();
-  }
 
   void LightManager::addExternalLight(remixapi_LightHandle handle, const RtLight& rtlight) {
     auto found = m_externalLights.find(handle);

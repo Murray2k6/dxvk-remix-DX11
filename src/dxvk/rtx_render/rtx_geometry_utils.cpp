@@ -280,7 +280,10 @@ namespace dxvk {
 
     // Note: VK_FORMAT_R32_UINT assumed to be 32 bit spherical octahedral normals.
     assert(normalVertexFormat == VK_FORMAT_R32G32B32_SFLOAT || normalVertexFormat == VK_FORMAT_R32G32B32A32_SFLOAT || normalVertexFormat == VK_FORMAT_R32_UINT);
-    assert(drawCallState.getGeometryData().blendWeightBuffer.defined());
+    if (!drawCallState.getGeometryData().blendWeightBuffer.defined()) {
+      ONCE(Logger::err("RtxGeometryUtils::dispatchSkinning: draw call has bones but no blend weight buffer, cannot apply skinning"));
+      return;
+    }
 
     memcpy(&params.bones[0], &drawCallState.getSkinningState().pBoneMatrices[0], sizeof(Matrix4) * drawCallState.getSkinningState().numBones);
 
@@ -596,10 +599,12 @@ namespace dxvk {
     const uint32_t numDispatches = dxvk::util::ceilDivide(numThreads, numThreadsPerDispatch);
     const uint32_t baseThreadIndexOffset = bakeState.numMicroTrianglesBaked / args.numMicroTrianglesPerThread;
 
-    args.numActiveThreads = numThreadsPerDispatch;
-
     for (uint32_t i = 0; i < numDispatches; i++) {
-      args.threadIndexOffset = i * numThreadsPerDispatch + baseThreadIndexOffset;
+      const uint32_t dispatchThreadOffset = i * numThreadsPerDispatch;
+      const uint32_t numActiveThreadsThisDispatch = std::min(numThreads - dispatchThreadOffset, numThreadsPerDispatch);
+
+      args.threadIndexOffset = dispatchThreadOffset + baseThreadIndexOffset;
+      args.numActiveThreads = numActiveThreadsThisDispatch;
 
       // Upload the arguments into a buffer slice
       const auto& devInfo = ctx->getDevice()->properties().core.properties;
@@ -611,7 +616,9 @@ namespace dxvk {
       ctx->bindResourceBuffer(BINDING_BAKE_OPACITY_MICROMAP_CONSTANTS, cb);
 
       // Run the shader
-      const VkExtent3D workgroups = util::computeBlockCount(VkExtent3D { numThreadsPerDispatch, 1, 1 }, VkExtent3D { BAKE_OPACITY_MICROMAP_NUM_THREAD_PER_COMPUTE_BLOCK, 1, 1 });
+      const VkExtent3D workgroups = util::computeBlockCount(
+        VkExtent3D { numActiveThreadsThisDispatch, 1, 1 },
+        VkExtent3D { BAKE_OPACITY_MICROMAP_NUM_THREAD_PER_COMPUTE_BLOCK, 1, 1 });
       ctx->dispatch(workgroups.width, workgroups.height, workgroups.depth);
     }
 
@@ -681,9 +688,7 @@ namespace dxvk {
 
   VkIndexType RtxGeometryUtils::getOptimalIndexFormat(uint32_t vertexCount) {
     assert(vertexCount > 0);
-    // Generated triangle lists always use 32-bit indices — no vertex count
-    // limitation on modern APIs.  The BLAS builder accepts both formats.
-    return VK_INDEX_TYPE_UINT32;
+    return (vertexCount < 64 * 1024) ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32;
   }
 
   bool RtxGeometryUtils::cacheIndexDataOnGPU(const Rc<DxvkContext>& ctx, const RasterGeometry& input, RaytraceGeometry& output) {
@@ -703,11 +708,8 @@ namespace dxvk {
     const uint32_t indexCount = getOptimalTriangleListSize(input);
     const uint32_t primIterCount = indexCount / 3;
 
-    // Always generate 32-bit indices — no vertex count limitation at
-    // Vulkan/D3D11 feature level 10.0+.  The BVH builder accepts both
-    // VK_INDEX_TYPE_UINT16 and VK_INDEX_TYPE_UINT32.
-    const uint32_t indexStride = 4;
-
+    const VkIndexType indexBufferType = getOptimalIndexFormat(input.vertexCount);
+    const uint32_t indexStride = (indexBufferType == VK_INDEX_TYPE_UINT16) ? 2 : 4;
     assert(output->info().size == align(indexCount * indexStride, CACHE_LINE_SIZE));
 
     // Prepare shader arguments
@@ -718,8 +720,8 @@ namespace dxvk {
     pushArgs.useIndexBuffer = (input.indexBuffer.defined() && input.indexCount > 0) ? 1 : 0;
     pushArgs.minVertex = 0;
     pushArgs.maxVertex = input.vertexCount - 1;
-    pushArgs.inputIsU16 = (pushArgs.useIndexBuffer && input.indexBuffer.indexType() == VK_INDEX_TYPE_UINT16) ? 1 : 0;
-    pushArgs._pad = 0;
+    pushArgs.useUint32 = (indexBufferType == VK_INDEX_TYPE_UINT32) ? 1 : 0;
+    pushArgs.srcUseUint32 = (input.indexBuffer.defined() && input.indexBuffer.indexType() == VK_INDEX_TYPE_UINT32) ? 1 : 0;
 
     ctx->getCommonObjects()->metaGeometryUtils().dispatchGenTriList(ctx, pushArgs, DxvkBufferSlice(output), pushArgs.useIndexBuffer ? &input.indexBuffer : nullptr);
 
@@ -731,10 +733,22 @@ namespace dxvk {
     return true;
   }
 
+  // CPU path only writes uint16 indices; meshes needing uint32 output (vertexCount >= 64K) use the compute shader.
+  template<typename SrcType>
+  static void dispatchGenTriListCpu(const Rc<DxvkContext>& ctx, const GenTriListArgs& cb, const DxvkBufferSlice& dstSlice, uint16_t* dst, const RasterBuffer* srcBuffer) {
+    const SrcType* src = (cb.useIndexBuffer != 0) ? reinterpret_cast<SrcType*>(srcBuffer->mapPtr()) : nullptr;
+    for (uint32_t idx = 0; idx < cb.primCount; idx++) {
+      generateIndices(idx, dst, src, cb);
+    }
+    ctx->writeToBuffer(dstSlice.buffer(), 0, cb.primCount * 3 * sizeof(uint16_t), dst);
+  }
+
   void RtxGeometryUtils::dispatchGenTriList(const Rc<DxvkContext>& ctx, const GenTriListArgs& cb, const DxvkBufferSlice& dstSlice, const RasterBuffer* srcBuffer) const {
     ScopedGpuProfileZone(ctx, "generateTriangleList");
-    const uint32_t kNumTrianglesToProcessOnCPU = 512;
-    const bool useGPU = ((srcBuffer != nullptr) && (srcBuffer->isPendingGpuWrite())) || cb.primCount > kNumTrianglesToProcessOnCPU;
+    constexpr uint32_t kNumTrianglesToProcessOnCPU = 512;
+    const bool useGPU = (cb.useUint32 != 0)
+      || ((srcBuffer != nullptr) && (srcBuffer->isPendingGpuWrite()))
+      || cb.primCount > kNumTrianglesToProcessOnCPU;
 
     if (useGPU) {
       ctx->bindResourceBuffer(GEN_TRILIST_BINDING_OUTPUT, dstSlice);
@@ -751,33 +765,12 @@ namespace dxvk {
       const VkExtent3D workgroups = util::computeBlockCount(VkExtent3D { cb.primCount, 1, 1 }, VkExtent3D { 128, 1, 1 });
       ctx->dispatch(workgroups.width, workgroups.height, workgroups.depth);
     } else {
-      uint32_t dst[kNumTrianglesToProcessOnCPU * 3];
-
-      // CPU path pre-widens 16-bit inputs so generateIndices sees uint32_t.
-      uint32_t srcWidened[kNumTrianglesToProcessOnCPU * 3];
-      const uint32_t* src = nullptr;
-
-      GenTriListArgs cpuArgs = cb;
-      cpuArgs.inputIsU16 = 0;  // Already widened on CPU side.
-
-      if (cb.useIndexBuffer != 0) {
-        const void* rawPtr = srcBuffer->mapPtr();
-        if (srcBuffer->indexType() == VK_INDEX_TYPE_UINT32) {
-          src = reinterpret_cast<const uint32_t*>(rawPtr);
-        } else {
-          const uint16_t* src16 = reinterpret_cast<const uint16_t*>(rawPtr);
-          const uint32_t maxIdx = cb.primCount * 3 + cb.firstIndex;
-          for (uint32_t i = 0; i < maxIdx; i++)
-            srcWidened[i] = src16[i];
-          src = srcWidened;
-        }
+      uint16_t dst[kNumTrianglesToProcessOnCPU * 3];
+      if (cb.srcUseUint32 != 0) {
+        dispatchGenTriListCpu<uint32_t>(ctx, cb, dstSlice, dst, srcBuffer);
+      } else {
+        dispatchGenTriListCpu<uint16_t>(ctx, cb, dstSlice, dst, srcBuffer);
       }
-
-      for (uint32_t idx = 0; idx < cpuArgs.primCount; idx++) {
-        generateIndices(idx, dst, src, cpuArgs);
-      }
-
-      ctx->writeToBuffer(dstSlice.buffer(), 0, cb.primCount * 3 * sizeof(uint32_t), dst);
     }
   }
 
@@ -885,7 +878,7 @@ namespace dxvk {
       args.normalStride = input.normalBuffer.stride() / 4;
       args.normalFormat = input.normalBuffer.vertexFormat();
       if (!interleaver::formatConversionFloatSupported(args.normalFormat)) {
-        ONCE(Logger::info(str::format("[rtx-interleaver] Unsupported normal buffer format (", args.normalFormat, "), skipping normals")));
+        ONCE(Logger::warn(str::format("[rtx-interleaver] Unsupported normal buffer format (", args.normalFormat, "), skipping normals")));
       }
     }
     args.hasTexcoord = input.texcoordBuffer.defined();
@@ -895,9 +888,8 @@ namespace dxvk {
       args.texcoordOffset = input.texcoordBuffer.offsetFromSlice() / 4;
       args.texcoordStride = input.texcoordBuffer.stride() / 4;
       args.texcoordFormat = input.texcoordBuffer.vertexFormat();
-      args.integerTexcoordScale = RtxOptions::integerTexcoordScale();
       if (!interleaver::formatConversionFloatSupported(args.texcoordFormat)) {
-        ONCE(Logger::info(str::format("[rtx-interleaver] Unsupported texcoord buffer format (", args.texcoordFormat, "), skipping texcoord")));
+        ONCE(Logger::warn(str::format("[rtx-interleaver] Unsupported texcoord buffer format (", args.texcoordFormat, "), skipping texcoord")));
       }
     }
     args.hasColor0 = input.color0Buffer.defined();
@@ -908,7 +900,7 @@ namespace dxvk {
       args.color0Stride = input.color0Buffer.stride() / 4;
       args.color0Format = input.color0Buffer.vertexFormat();
       if (!interleaver::formatConversionUintSupported(args.color0Format)) {
-        ONCE(Logger::info(str::format("[rtx-interleaver] Unsupported color0 buffer format (", args.color0Format, "), skipping color0")));
+        ONCE(Logger::warn(str::format("[rtx-interleaver] Unsupported color0 buffer format (", args.color0Format, "), skipping color0")));
       }
     }
 

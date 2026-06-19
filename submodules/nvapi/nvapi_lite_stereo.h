@@ -96,7 +96,7 @@ NVAPI_INTERFACE NvAPI_Stereo_Disable(void);
 //! \ingroup stereoapi
 ///////////////////////////////////////////////////////////////////////////////
 NVAPI_INTERFACE NvAPI_Stereo_IsEnabled(NvU8 *pIsStereoEnabled);
-#if defined(_D3D9_H_) || defined(__d3d10_h__) || defined(__d3d11_h__)|| defined(__d3d12_h__)
+#if defined(_D3D11_H_) || defined(__d3d10_h__) || defined(__d3d11_h__)|| defined(__d3d12_h__)
 
 ///////////////////////////////////////////////////////////////////////////////
 //
@@ -119,7 +119,7 @@ NVAPI_INTERFACE NvAPI_Stereo_IsEnabled(NvU8 *pIsStereoEnabled);
 //!
 //! \since Release: 180
 //!
-//! \param [in]     pDevice        Pointer to IUnknown interface that is IDirect3DDevice9* in DX9, ID3D10Device*.
+//! \param [in]     pDevice        Pointer to IUnknown interface that is IDirect3DDevice9* in DX11, ID3D10Device*.
 //! \param [out]    pStereoHandle  Pointer to the newly created stereo handle.
 //!
 //! \retval ::NVAPI_OK                       Stereo handle is created for given device interface.
@@ -132,7 +132,7 @@ NVAPI_INTERFACE NvAPI_Stereo_IsEnabled(NvU8 *pIsStereoEnabled);
 ///////////////////////////////////////////////////////////////////////////////
 NVAPI_INTERFACE NvAPI_Stereo_CreateHandleFromIUnknown(IUnknown *pDevice, StereoHandle *pStereoHandle);
 
-#endif // defined(_D3D9_H_) || defined(__d3d10_h__)
+#endif // defined(_D3D11_H_) || defined(__d3d10_h__)
 ///////////////////////////////////////////////////////////////////////////////
 //
 // FUNCTION NAME: NvAPI_Stereo_DestroyHandle

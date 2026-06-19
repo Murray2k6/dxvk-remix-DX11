@@ -31,6 +31,30 @@
 #include "rtx_ngx_wrapper.h"
 #include "rtx_matrix_helpers.h"
 
+// DX11_V225: the DLSS-D helper headers reference these DLSS-D "Alpha" parameter
+// names, but depending on which nvsdk_ngx_defs_dlssd.h wins the shared include
+// guard (NVSDK_NGX_DEFS_DLSSD_H) an older copy without them can be selected.
+// Define them defensively (identical string values, guarded) before any NGX
+// include so the DLSS-D helpers always resolve.
+#ifndef NVSDK_NGX_Parameter_DLSSD_Alpha
+#define NVSDK_NGX_Parameter_DLSSD_Alpha "DLSSD.Alpha"
+#endif
+#ifndef NVSDK_NGX_Parameter_DLSSD_OutputAlpha
+#define NVSDK_NGX_Parameter_DLSSD_OutputAlpha "DLSSD.OutputAlpha"
+#endif
+#ifndef NVSDK_NGX_Parameter_DLSSD_Alpha_Subrect_Base_X
+#define NVSDK_NGX_Parameter_DLSSD_Alpha_Subrect_Base_X "DLSSD.Alpha.Subrect.Base.X"
+#endif
+#ifndef NVSDK_NGX_Parameter_DLSSD_Alpha_Subrect_Base_Y
+#define NVSDK_NGX_Parameter_DLSSD_Alpha_Subrect_Base_Y "DLSSD.Alpha.Subrect.Base.Y"
+#endif
+#ifndef NVSDK_NGX_Parameter_DLSSD_OutputAlpha_Subrect_Base_X
+#define NVSDK_NGX_Parameter_DLSSD_OutputAlpha_Subrect_Base_X "DLSSD.OutputAlpha.Subrect.Base.X"
+#endif
+#ifndef NVSDK_NGX_Parameter_DLSSD_OutputAlpha_Subrect_Base_Y
+#define NVSDK_NGX_Parameter_DLSSD_OutputAlpha_Subrect_Base_Y "DLSSD.OutputAlpha.Subrect.Base.Y"
+#endif
+
 #include <nvsdk_ngx.h>
 #include <nvsdk_ngx_vk.h>
 #include <nvsdk_ngx_helpers.h>
@@ -98,11 +122,6 @@ namespace dxvk
       return true;
     }
 
-    // Don't retry after a permanent failure (e.g. non-NVIDIA hardware)
-    if (m_initFailed) {
-      return false;
-    }
-
     // Reset DLSS/DLSS-RR support flags
     // Note: This is done here so that if initialization fails before feature checking the support will be false as expected.
 
@@ -112,34 +131,7 @@ namespace dxvk
     const std::string exePath = env::getExePath();
     const std::string exeFolder = exePath.substr(0, exePath.find_last_of("\\/"));
     const auto logFolder = str::tows(exeFolder.c_str());
-
-    // In the separated-runtime deployment (/DEPENDENTLOADFLAG layout) the
-    // NGX snippet DLLs (nvngx_dlss.dll etc.) live next to the Remix runtime
-    // DLLs, not next to the game exe. NGX only searches the paths we hand
-    // it, so without the runtime module's own directory in the list, NGX
-    // initializes fine but reports SuperSampling_Available = 0 even on RTX
-    // hardware with a current driver. Resolve this module's directory and
-    // search it first, exe folder second.
-    std::wstring moduleFolder;
-    {
-      HMODULE selfModule = nullptr;
-      if (::GetModuleHandleExW(
-            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-            reinterpret_cast<LPCWSTR>(&NVSDK_NGX_AppLogCallback), &selfModule) && selfModule != nullptr) {
-        wchar_t modulePath[MAX_PATH] = {};
-        if (::GetModuleFileNameW(selfModule, modulePath, MAX_PATH) > 0) {
-          std::wstring path(modulePath);
-          const size_t lastSep = path.find_last_of(L"\\/");
-          if (lastSep != std::wstring::npos)
-            moduleFolder = path.substr(0, lastSep);
-        }
-      }
-    }
-    const wchar_t* ngxSearchPaths[] = {
-      moduleFolder.empty() ? logFolder.c_str() : moduleFolder.c_str(),
-      logFolder.c_str()
-    };
-
+    
     NVSDK_NGX_Result result = NVSDK_NGX_Result_Fail;
 
     VkDevice vkDevice = m_device->handle();
@@ -148,14 +140,11 @@ namespace dxvk
     auto instance = m_device->instance();
     VkInstance vkInstance = instance->handle();
 
-    // Always pass FeatureCommonInfo so the NGX snippet search paths include
-    // the runtime directory. Logging callbacks remain debug-only.
-    NVSDK_NGX_FeatureCommonInfo featureCommonInfo{};
-    featureCommonInfo.PathListInfo.Path = ngxSearchPaths;
-    featureCommonInfo.PathListInfo.Length = 2;
-#ifndef NDEBUG
     // Note: Enable DLSS logging for debugging in debug mode. Note this will disable all other DLSS logging sinks to ensure all logging
     // goes through the DXVK logging system.
+#ifndef NDEBUG
+    NVSDK_NGX_FeatureCommonInfo featureCommonInfo{};
+
     featureCommonInfo.LoggingInfo.LoggingCallback = &NVSDK_NGX_AppLogCallback;
     featureCommonInfo.LoggingInfo.MinimumLoggingLevel = NVSDK_NGX_LOGGING_LEVEL_ON;
     featureCommonInfo.LoggingInfo.DisableOtherLoggingSinks = true;
@@ -165,17 +154,20 @@ namespace dxvk
       RtxOptions::applicationId(), logFolder.c_str(),
       vkInstance, vkPhysicalDevice, vkDevice,
       nullptr, nullptr,
+#ifndef NDEBUG
       &featureCommonInfo
+#else
+      nullptr
+#endif
     );
 
     if (NVSDK_NGX_FAILED(result)) {
       if (result == NVSDK_NGX_Result_FAIL_FeatureNotSupported || result == NVSDK_NGX_Result_FAIL_PlatformError) {
-        Logger::info(str::format("NVIDIA NGX is not available on this hardware/platform: ", resultToString(result)));
+        Logger::err(str::format("NVIDIA NGX is not available on this hardware/platform: ", resultToString(result)));
       } else {
         Logger::err(str::format("Failed to initialize NGX: ", resultToString(result)));
       }
 
-      m_initFailed = true;
       return false;
     }
 
@@ -224,10 +216,8 @@ namespace dxvk
     // Check DLSS-RR Support
     NVSDK_NGX_FeatureCommonInfo ci = {};
     memset(&ci, 0, sizeof(ci));
-    // Reuse the runtime-first search paths; the previous list used the
-    // process CWD (L".") which is neither the runtime nor the exe folder
-    // when games set their own working directory.
-    ci.PathListInfo.Path = ngxSearchPaths;
+    const wchar_t* pathes[] = { logFolder.c_str(), L"." };
+    ci.PathListInfo.Path = pathes;
     ci.PathListInfo.Length = 2;
     ci.InternalData = nullptr;
     ci.LoggingInfo.LoggingCallback = nullptr;

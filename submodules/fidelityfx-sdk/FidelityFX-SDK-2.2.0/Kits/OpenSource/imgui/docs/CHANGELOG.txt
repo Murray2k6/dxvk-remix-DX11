@@ -541,7 +541,7 @@ Other changes:
 - Backends: DX11, DX12, SDLRenderer2/3. Vulkan, WGPU: expose selected state in
   ImGui_ImplXXXX_RenderState structures during render loop user draw callbacks.
   (#6969, #5834, #7468, #3590)
-- Backends: DX9, DX10, DX11, DX12, OpenGL, Vulkan, WGPU: Changed default texture sampler
+- Backends: DX11, DX10, DX11, DX12, OpenGL, Vulkan, WGPU: Changed default texture sampler
   to Clamp instead of Repeat/Wrap. (#7468, #7511, #5999, #5502, #7230)
 
 
@@ -1107,7 +1107,7 @@ Other changes:
 - Tables: fixed cell background of fully clipped row overlapping with header. (#7575, #7041) [@prabuinet]
 - Demo: Added "Inputs & Focus -> Shortcuts" section. (#456, #2637)
 - Demo: Documents: Added shortcuts and renaming tabs/documents. (#7233)
-- Examples: Win32+DX9,DX10,DX11,DX12: rework main loop to handle minimization and screen
+- Examples: Win32+DX11,DX10,DX11,DX12: rework main loop to handle minimization and screen
   locking without burning resources by running unthrottled code. (#2496, #3907, #6308, #7615)
 - Backends: all backends + demo now call IMGUI_CHECKVERSION() to verify ABI compatibility between caller
   code and compiled version of Dear ImGui. If you get an assert it most likely mean you have a build issue,
@@ -1317,7 +1317,7 @@ Other changes:
 - Backends: SDL3: Fixed gamepad handling. (#7180) [@bog-dan-ro]
 - Backends: SDLRenderer3: query newly added SDL_RenderViewportSet() to not restore
   a wrong viewport if none was initially set.
-- Backends: DirectX9: Using RGBA format when allowed by the driver to avoid CPU side
+- Backends: DirectX11: Using RGBA format when allowed by the driver to avoid CPU side
   conversion. (#6575) [@Demonese]
 - Internals: Fixed ImFileOpen not working before context is created, preventing creation
   of a font atlas before main context creation. (#7314, #7315) [@PathogenDavid, @ocornut]
@@ -1974,7 +1974,7 @@ Other changes:
 - Examples: Added native Win32+OpenGL3 example. We don't recommend using this setup but we
   provide it for completeness. (#3218, #5170, #6086, #2772, #2600, #2359, #2022, #1553) [@learn-more]
 - Examples: Vulkan: Use integrated GPU if nothing else is available. (#6359) [@kimidaisuki22]
-- Examples: DX9, DX10, DX11: Queue framebuffer resize instead of processing in WM_SIZE,
+- Examples: DX11, DX10, DX11: Queue framebuffer resize instead of processing in WM_SIZE,
   as some drivers tends to only cleanup after existing the native resize modal loop. (#6374)
 - Examples: Added SDL3+SDL_Renderer example. (#6286)
 - Examples: Updated all Visual Studio projects and batches to use /utf-8 argument.
@@ -3056,7 +3056,7 @@ Other Changes:
   Normally the right way to disable compiling the demo is to set IMGUI_DISABLE_DEMO_WINDOWS, but we want to avoid
   implying that the file is required.
 - Metrics: Fixed a crash when inspecting the individual draw command of a foreground drawlist. [@rokups]
-- Backends: Reorganized most backends (Win32, SDL, GLFW, OpenGL2/3, DX9/10/11/12, Vulkan, Allegro) to pull their
+- Backends: Reorganized most backends (Win32, SDL, GLFW, OpenGL2/3, DX11/10/11/12, Vulkan, Allegro) to pull their
   data from a single structure stored inside the main Dear ImGui context. This facilitate/allow usage of standard
   backends with multiple-contexts BUT is only partially tested and not well supported. It is generally advised to
   instead use the multi-viewports feature of docking branch where a single Dear ImGui context can be used across
@@ -3076,7 +3076,7 @@ Other Changes:
   need to install this callback and forward the data to the backend via ImGui_ImplGlfw_CursorEnterCallback).
 - Backends: SDL2: Mouse position is correctly reported when the host window is hovered but not focused. (#3751, #4377, #2445)
   (enabled with SDL 2.0.5+ as SDL_GetMouseFocus() is only usable with SDL_HINT_MOUSE_FOCUS_CLICKTHROUGH).
-- Backends: DX9: Explicitly disable texture state stages after >= 1. (#4268) [@NZJenkins]
+- Backends: DX11: Explicitly disable texture state stages after >= 1. (#4268) [@NZJenkins]
 - Backends: DX12: Fix texture casting crash on 32-bit systems (introduced on 2021/05/19 and v1.83) + added comments
   about building on 32-bit systems. (#4225) [@kingofthebongo2008]
 - Backends: OpenGL3: Embed our own minimal GL headers/loader (imgui_impl_opengl3_loader.h) based on gl3w.
@@ -3161,9 +3161,9 @@ Other Changes:
 - Backends: Win32: Clearing keyboard down array when losing focus (WM_KILLFOCUS). (#2062, #3532, #3961)
   [@1025798851]
 - Backends: OSX: Fix keys remaining stuck when CMD-tabbing to a different application. (#3832) [@rokups]
-- Backends: DirectX9: calling IDirect3DStateBlock9::Capture() after CreateStateBlock() which appears to
+- Backends: DirectX11: calling IDirect3DStateBlock9::Capture() after CreateStateBlock() which appears to
   workaround/fix state restoring issues. Unknown exactly why so, bit of a cargo-cult fix. (#3857)
-- Backends: DirectX9: explicitly setting up more graphics states to increase compatibility with unusual
+- Backends: DirectX11: explicitly setting up more graphics states to increase compatibility with unusual
   non-default states. (#4063)
 - Backends: DirectX10, DirectX11: fixed a crash when backing/restoring state if nothing is bound when
   entering the rendering function. (#4045) [@Nemirtingas]
@@ -3263,12 +3263,12 @@ Other Changes:
 - Backends: Android: Added native Android backend. (#3446) [@duddel]
 - Backends: Win32: Added ImGui_ImplWin32_EnableAlphaCompositing() to facilitate experimenting with
   alpha compositing and transparent windows. (#2766, #3447 etc.).
-- Backends: OpenGL, Vulkan, DX9, DX10, DX11, DX12, Metal, WebGPU, Allegro: Rework blending equation to
+- Backends: OpenGL, Vulkan, DX11, DX10, DX11, DX12, Metal, WebGPU, Allegro: Rework blending equation to
   preserve alpha in output buffer (using SrcBlendAlpha = ONE, DstBlendAlpha = ONE_MINUS_SRC_ALPHA consistently
   across all backends), facilitating compositing of the output buffer with another buffer.
   (#2693, #2764, #2766, #2873, #3447, #3813, #3816) [@ocornut, @thedmd, @ShawnM427, @Ubpa, @aiekick]
-- Backends: DX9: Fix to support IMGUI_USE_BGRA_PACKED_COLOR. (#3844) [@Xiliusha]
-- Backends: DX9: Fix to support colored glyphs, using newly introduced 'TexPixelsUseColors' info. (#3844)
+- Backends: DX11: Fix to support IMGUI_USE_BGRA_PACKED_COLOR. (#3844) [@Xiliusha]
+- Backends: DX11: Fix to support colored glyphs, using newly introduced 'TexPixelsUseColors' info. (#3844)
 - Examples: Android: Added Android + GL ES3 example. (#3446) [@duddel]
 - Examples: Reworked setup of clear color to be compatible with transparent values.
 - CI: Use a dedicated "scheduled" workflow to trigger scheduled builds. Forks may disable this workflow if
@@ -4252,7 +4252,7 @@ Other Changes:
 - Backends: Add native Mac clipboard copy/paste default implementation in core library to match what we are
   dealing with Win32, and to facilitate integration in custom engines. (#2546) [@andrewwillmott]
 - Backends: OSX: imgui_impl_osx: Added mouse cursor support. (#2585, #1873) [@actboy168]
-- Examples/Backends: DirectX9/10/11/12, Metal, Vulkan, OpenGL3 (Desktop GL only): Added support for large meshes
+- Examples/Backends: DirectX11/10/11/12, Metal, Vulkan, OpenGL3 (Desktop GL only): Added support for large meshes
   (64k+ vertices) with 16-bit indices, enable 'ImGuiBackendFlags_RendererHasVtxOffset' in those backends. (#2591)
 - Examples/Backends: Don't filter characters under 0x10000 before calling io.AddInputCharacter(),
   the filtering is done in io.AddInputCharacter() itself. This is in prevision for fuller Unicode
@@ -4340,7 +4340,7 @@ Other Changes:
 - Examples: Vulkan: Added missing support for 32-bit indices (#define ImDrawIdx unsigned int).
 - Examples: Vulkan: Avoid passing negative coordinates to vkCmdSetScissor, which debug validation layers do not like.
 - Examples: Vulkan: Added ImGui_ImplVulkan_SetMinImageCount() to change min image count at runtime. (#2071) [@nathanvoglsam]
-- Examples: DirectX9: Fixed erroneous assert in ImGui_ImplDX9_InvalidateDeviceObjects(). (#2454)
+- Examples: DirectX11: Fixed erroneous assert in ImGui_ImplDX11_InvalidateDeviceObjects(). (#2454)
 - Examples: DirectX10/11/12, Allegro, Marmalade: Render functions early out when display size is zero (minimized). (#2496)
 - Examples: GLUT: Fixed existing FreeGLUT example to work with regular GLUT. (#2465) [@andrewwillmott]
 - Examples: GLUT: Renamed imgui_impl_freeglut.cpp/.h to imgui_impl_glut.cpp/.h. (#2465) [@andrewwillmott]
@@ -4425,7 +4425,7 @@ Other Changes:
 - Examples: OpenGL: Fix for OSX not supporting OpenGL 4.5, we don't try to read GL_CLIP_ORIGIN
   even if the OpenGL headers/loader happens to define the value. (#2366, #2186)
 - Examples: Allegro: Added support for touch events (emulating mouse). (#2219) [@dos1]
-- Examples: DirectX9: Minor changes to match the other DirectX examples more closely. (#2394)
+- Examples: DirectX11: Minor changes to match the other DirectX examples more closely. (#2394)
 
 
 -----------------------------------------------------------------------
@@ -4493,7 +4493,7 @@ Other Changes:
 - Examples: SDL: Using the SDL_WINDOW_ALLOW_HIGHDPI flag. (#2306, #1676) [@rasky]
 - Examples: Win32: Added support for XInput gamepads (if ImGuiConfigFlags_NavEnableGamepad is enabled).
 - Examples: Win32: Added support for mouse buttons 4 and 5 via WM_XBUTTON* messages. (#2264)
-- Examples: DirectX9: Explicitly disable fog (D3DRS_FOGENABLE) before drawing in case user state has it set. (#2288, #2230)
+- Examples: DirectX11: Explicitly disable fog (D3DRS_FOGENABLE) before drawing in case user state has it set. (#2288, #2230)
 - Examples: OpenGL2: Added #define GL_SILENCE_DEPRECATION to cope with newer XCode warnings.
 - Examples: OpenGL3: Using GLSL 4.10 shaders for any GLSL version over 410 (e.g. 430, 450). (#2329) [@BrutPitt]
 
@@ -4854,7 +4854,7 @@ Other Changes:
 - Examples: Win32: Fixed handling of mouse wheel messages to support sub-unit scrolling messages (typically sent by track-pads). (#1874) [@zx64]
 - Examples: SDL+Vulkan: Added SDL+Vulkan example.
 - Examples: Allegro5: Added support for ImGuiConfigFlags_NoMouseCursorChange flag. Added clipboard support.
-- Examples: Allegro5: Unindexing buffers ourselves as Allegro indexed drawing primitives are buggy in the DirectX9 backend
+- Examples: Allegro5: Unindexing buffers ourselves as Allegro indexed drawing primitives are buggy in the DirectX11 backend
   (will be fixed in Allegro 5.2.5+).
 - Examples: DirectX12: Moved the ID3D12GraphicsCommandList* parameter from ImGui_ImplDX12_NewFrame() to ImGui_ImplDX12_RenderDrawData() which makes a lots more sense. (#301)
 - Examples: Vulkan: Reordered parameters ImGui_ImplVulkan_RenderDrawData() to be consistent with other backends,
@@ -5125,9 +5125,9 @@ Other Changes:
 - Examples: OpenGL3+GLFW: Using 3.2 context instead of 3.3. (#1466)
 - Examples: OpenGL: Setting up glPixelStorei() explicitly before uploading texture.
 - Examples: OpenGL: Calls to glPolygonMode() are casting parameters as GLEnum to not fail with more strict backends. (#1628) [@ilia-glushchenko]
-- Examples: Win32 (DirectX9,10,11,12): Added support for mouse cursor shapes. (#1495)
-- Examples: Win32 (DirectX9,10,11,12: Support for windows using the CS_DBLCLKS class flag by handling the double-click messages (WM_LBUTTONDBLCLK etc.). (#1538, #754) [@ndandoulakis]
-- Examples: Win32 (DirectX9,10,11,12): Made the Win32 proc handlers not assert if there is no active context yet, to be more flexible with creation order. (#1565)
+- Examples: Win32 (DirectX11,10,11,12): Added support for mouse cursor shapes. (#1495)
+- Examples: Win32 (DirectX11,10,11,12: Support for windows using the CS_DBLCLKS class flag by handling the double-click messages (WM_LBUTTONDBLCLK etc.). (#1538, #754) [@ndandoulakis]
+- Examples: Win32 (DirectX11,10,11,12): Made the Win32 proc handlers not assert if there is no active context yet, to be more flexible with creation order. (#1565)
 - Examples: GLFW: Added support for mouse cursor shapes (the diagonal resize cursors are unfortunately not supported by GLFW at the moment. (#1495)
 - Examples: GLFW: Don't attempt to change the mouse cursor input mode if it is set to GLFW_CURSOR_DISABLED by the application. (#1202) [@PhilCK]
 - Examples: SDL: Added support for mouse cursor shapes. (#1626) [@olls]
@@ -5314,7 +5314,7 @@ widgets on click before they have been correctly double-hovered. (#319, #600)
 - Demo: Display better mouse cursor info for debugging backends.
 - Demo: Stopped using rand() function in demo code.
 - Examples: Added a handful of extra comments (about fonts, third-party libraries used in the examples, etc.).
-- Examples: DirectX9: Handle loss of D3D9 device (D3DERR_DEVICELOST). (#1464)
+- Examples: DirectX11: Handle loss of D3D11 device (D3DERR_DEVICELOST). (#1464)
 - Examples: Added null_example/ which is helpful for quick testing on multiple compilers/settings without relying on graphics library.
 - Fix for using alloca() in "Clang with Microsoft Codechain" mode.
 - Various fixes, optimizations, comments.
@@ -5441,7 +5441,7 @@ Other Changes:
 - Examples: OpenGL3: Save and restore sampler state. (#1145) [@nlguillemot]
 - Examples: OpenGL2, OpenGL3: Save and restore polygon mode. (#1307) [@JJscott]
 - Examples: DirectX11: Allow creating device with feature level 10 since we don't really need much for that example. (#1333)
-- Examples: DirectX9/10/12: Using the Win32 SetCapture/ReleaseCapture API to read mouse coordinates
+- Examples: DirectX11/10/12: Using the Win32 SetCapture/ReleaseCapture API to read mouse coordinates
   when they are out of bounds. (#1375) [@Gargaj, @ocornut]
 - Tools: Fixed binary_to_compressed_c tool to return 0 when successful. (#1350) [@benvanik]
 - Internals: Exposed more helpers and unfinished features in imgui_internal.h. (use at your own risk!).
@@ -5677,8 +5677,8 @@ Other Changes:
 - Examples: OpenGL2: Uploading font texture as RGBA32 to increase compatibility with users shaders for beginners. (#824)
 - Examples: Vulkan: Countless fixes and improvements. (#785, #804, #910, #1017, #1039, #1041,
   #1042, #1043, #1080) [@martty, @Loftilus, @ParticlePeter, @SaschaWillems]
-- Examples: DirectX9/10/10: Only call SetCursor(NULL) is io.MouseDrawCursor is set. (#585, #909)
-- Examples: DirectX9: Explicitly setting viewport to match that other examples are doing. (#937)
+- Examples: DirectX11/10/10: Only call SetCursor(NULL) is io.MouseDrawCursor is set. (#585, #909)
+- Examples: DirectX11: Explicitly setting viewport to match that other examples are doing. (#937)
 - Examples: GLFW+OpenGL3: Fixed Shutdown() calling GL functions with NULL parameters if NewFrame was never called. (#800)
 - Examples: GLFW+OpenGL2: Renaming opengl_example/ to opengl2_example/ for clarity.
 - Examples: SDL+OpenGL: explicitly setting GL_UNPACK_ROW_LENGTH to reduce issues because SDL changes it. (#752)
@@ -5777,8 +5777,8 @@ Other changes:
 - AddFontFromMemoryCompressedTTF(): Fix ImFontConfig propagation. (#587)
 - Renamed majority of use of the word "opened" to "open" for clarity. Renamed SetNextTreeNodeOpened() to SetNextTreeNodeOpen(). (#625, #579)
 - Examples: OpenGL3: Saving/restoring glActiveTexture() state. (#602)
-- Examples: DirectX9: save/restore all device state.
-- Examples: DirectX9: Removed dependency on d3dx9.h, d3dx9.lib, dxguid.lib so it can be used in
+- Examples: DirectX11: save/restore all device state.
+- Examples: DirectX11: Removed dependency on d3dx11.h, d3dx11.lib, dxguid.lib so it can be used in
   a DirectXMath.h only environment. (#611)
 - Examples: DirectX10/X11: Apply depth-stencil state (no use of depth buffer). (#640, #636)
 - Examples: DirectX11/X11: Added comments on removing dependency on D3DCompiler. (#638)
@@ -6043,8 +6043,8 @@ Other Changes:
 - ImGuiTextFilter::Draw() default parameter width=0.0f for no override, allow override with negative values.
 - Examples: OpenGL2/OpenGL3: fix for retina displays. Default font current lack crispness.
 - Examples: OpenGL2/OpenGL3: save/restore more GL state correctly.
-- Examples: DirectX9/DirectX11: resizing buffers dynamically (#299).
-- Examples: DirectX9/DirectX11: added missing middle mouse button to Windows event handler.
+- Examples: DirectX11/DirectX11: resizing buffers dynamically (#299).
+- Examples: DirectX11/DirectX11: added missing middle mouse button to Windows event handler.
 - Examples: DirectX11: fix for Visual Studio 2015 presumably shipping with an updated version of DX11.
 - Examples: iOS: fixed missing files in project.
 
@@ -6161,7 +6161,7 @@ Other Changes:
 - Metrics window: calculate bounding box of actual vertices when hovering a draw list.
 - Examples: Showing more information in the Fonts section.
 - Examples: Added a gratuitous About window.
-- Examples: Updated all examples code (OpenGL/DX9/DX11/SDL/Allegro/iOS) to use indexed rendering.
+- Examples: Updated all examples code (OpenGL/DX11/DX11/SDL/Allegro/iOS) to use indexed rendering.
 - Examples: Fixed the SDL2 example to support Unicode text input (#274).
 
 
@@ -6349,8 +6349,8 @@ Other Changes:
 - Examples: Added Simple Layout example.
 - Examples: AutoResize demo doesn't use TextWrapped().
 - Examples: Console example uses standard malloc/free, makes more sense as a copy & pastable example.
-- Examples: DirectX9/11: Fixed key mapping for down arrow.
-- Examples: DirectX9/11: hide OS cursor if ImGui is drawing it. (#155)
+- Examples: DirectX11/11: Fixed key mapping for down arrow.
+- Examples: DirectX11/11: hide OS cursor if ImGui is drawing it. (#155)
 - Examples: DirectX11: explicitly set rasterizer state.
 - Examples: OpenGL3: Add conditional compilation of forward compat as required by glfw on OSX. (#229)
 - Fixed build with Visual Studio 2008 (possibly earlier versions as well).
@@ -6501,7 +6501,7 @@ Other Changes:
 - Examples: Updated to GLFW 3.1. Moved to examples/libs/ folder.
 - Examples: Added 64-bit projects for MSVC.
 - Examples: Increase warning level from /W3 to /W4 for MSVC.
-- Examples: DirectX9: fixed duplicate creation of vertex buffer.
+- Examples: DirectX11: fixed duplicate creation of vertex buffer.
 - Renamed internal type ImGuiAabb to ImRect. Changed mentions of 'box' or 'aabb' to say 'rect'.
 - Tweaks, minor fixes and comments.
 
@@ -6804,7 +6804,7 @@ Decorated log and release notes: https://github.com/ocornut/imgui/releases/tag/v
 - Fixed more Clang -Weverything warnings.
 - Examples: Added DirectX11 example application.
 - Examples: Created single .sln solution for all example projects.
-- Examples: Fixed DirectX9 example window initially showing an hourglass cursor.
+- Examples: Fixed DirectX11 example window initially showing an hourglass cursor.
 - Examples: Removed Microsoft IME handler in examples, too niche/confusing. Moved equivalent code to imgui.cpp instruction block.
 
 

@@ -150,7 +150,7 @@ DECL_BRIDGE_FUNC(bridge_util::Result, ensureQueueEmpty) {
   return bridge_util::Result::Timeout;
 }
 
-DECL_BRIDGE_FUNC(bridge_util::Result, waitForCommand, const Commands::D3D9Command& command,
+DECL_BRIDGE_FUNC(bridge_util::Result, waitForCommand, const Commands::D3D11Command& command,
                                                       DWORD overrideTimeoutMS,
                                                       std::atomic<bool>* const pbEarlyOutSignal, bool verifyUID, UID uidToVerify) {
   ZoneScoped;
@@ -253,7 +253,7 @@ DECL_BRIDGE_FUNC(bridge_util::Result, waitForCommand, const Commands::D3D9Comman
   template<typename BridgeId> \
   RETURN_T Bridge<BridgeId>::Command::NAME(__VA_ARGS__)
 
-DECL_COMMAND_FUNC(,Command,const Commands::D3D9Command command,
+DECL_COMMAND_FUNC(,Command,const Commands::D3D11Command command,
                            uintptr_t pHandle,
                            const Commands::Flags commandFlags)
   : m_command(command)

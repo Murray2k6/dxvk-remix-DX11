@@ -43,7 +43,6 @@
 #include "rtx_render/rtx_ngx_wrapper.h"
 #include "rtx_render/rtx_dlfg.h"
 #include "rtx_render/rtx_dlss.h"
-#include "rtx_render/rtx_fsr.h"
 #include "rtx_render/rtx_nis.h"
 #include "rtx_render/rtx_taa.h"
 #include "rtx_render/rtx_auto_exposure.h"
@@ -228,10 +227,6 @@ namespace dxvk {
       return m_xess.get();
     }
 
-    DxvkFSR& metaFSR() {
-      return m_fsr.get();
-    }
-
     CompositePass& metaComposite() {
       return m_composite.get();
     }
@@ -358,7 +353,6 @@ namespace dxvk {
     ImGUI              m_imgui;
     Rc<GameCapturer>   m_capturer;
 
-
     // RTX Shaders
     Active<RtxGlobalVolumetrics>            m_globalVolumetrics;
     Active<DxvkPathtracerGbuffer>           m_pathtracerGbuffer;
@@ -384,7 +378,6 @@ namespace dxvk {
     Active<DxvkNIS>                         m_nis;
     Active<DxvkTemporalAA>                  m_taa;
     Active<DxvkXeSS>                        m_xess;
-    Active<DxvkFSR>                         m_fsr;
     Active<CompositePass>                   m_composite;
     Active<DebugView>                       m_debug_view;
     Active<DxvkAutoExposure>                m_autoExposure;

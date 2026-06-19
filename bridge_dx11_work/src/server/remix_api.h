@@ -32,9 +32,9 @@ namespace remixapi {
   extern remixapi_Interface g_remix;
   extern bool g_remix_initialized;
   extern HMODULE g_remix_dll;
-  extern IDirect3DDevice9Ex* g_device;
+  extern ID3D11Device* g_device;
   extern std::mutex g_device_mutex;
-  extern IDirect3DDevice9Ex* getDevice();
+  extern ID3D11Device* getDevice();
   
   static inline remixapi_StructType pullSType() {
     return (remixapi_StructType) DeviceBridge::get_data();

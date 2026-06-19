@@ -161,7 +161,7 @@ namespace dxvk {
           const ExtensionSupportCapability& cap = caps[iCap];
           if (strcmp(extension, cap.name) == 0) {
             if (!cap.isSupported) {
-              Logger::info(str::format("[RTX Neural Radiance Cache] Required extension not supported: ", cap.name));
+              Logger::err(str::format("[RTX Neural Radiance Cache] Required extension not supported: ", cap.name));
               s_isNrcSupported = false;
             }
             break;

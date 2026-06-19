@@ -22,8 +22,8 @@
 #pragma once
 
 // this gets included from other modules, so use full path to external --- ugly!
-#include "../../../external/ngx_sdk_310_6_0/include/nvsdk_ngx.h"
-#include "../../../external/ngx_sdk_310_6_0/include/nvsdk_ngx_defs_dlssd.h"
+#include "../../../external/ngx_sdk_dldn/include/nvsdk_ngx.h"
+#include "../../../external/ngx_sdk_dldn/include/nvsdk_ngx_defs_dlssd.h"
 #include <memory>
 #include "../util/rc/util_rc_ptr.h"
 #include "rtx_semaphore.h"
@@ -111,7 +111,6 @@ namespace dxvk {
     DxvkDevice* m_device = nullptr;
 
     bool m_initialized = false;
-    bool m_initFailed = false;
     bool m_supportsDLSS = false;
     bool m_supportsDLFG = false;
     uint32_t m_dlfgMaxInterpolatedFrames = 0;

@@ -26,7 +26,6 @@
 #include "../../util/rc/util_rc_ptr.h"
 #include "dxvk_context.h"
 #include "dxvk_scoped_annotation.h"
-#include "../imgui/dxvk_imgui.h"
 #include <chrono>
 
 #include "rtx_asset_data_manager.h"
@@ -46,18 +45,6 @@ namespace dxvk {
   constexpr size_t Megabytes = 1024 * 1024;
 
   static size_t calcTextureMemoryBudget_Megabytes(DxvkDevice* device);
-
-  static uint32_t getTextureUiFeatureFlags(const Rc<DxvkImageView>& imageView) {
-    uint32_t textureFeatureFlags = ImGUI::kTextureFlagsDefault;
-
-    const VkImageUsageFlags usage = imageView->imageInfo().usage;
-    if ((usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) != 0 ||
-        (usage & VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT) != 0) {
-      textureFeatureFlags |= ImGUI::kTextureFlagsRenderTarget;
-    }
-
-    return textureFeatureFlags;
-  }
   
   // Returns current VRAM usage by material textures in bytes
   static size_t calcCurrentTextureUsageBytes(DxvkDevice* device) {
@@ -102,7 +89,7 @@ namespace dxvk {
     // So that the Vulkan thread would only call 'vkCmdCopyBufferToImage'.
     struct ReadyToCopy {
       Rc<ManagedTexture>          dstTexture;
-      std::vector<ReadyToCopyMip> mips;  // Fixed-size vector for mips to copy
+      std::vector<ReadyToCopyMip> mips; // TODO: fixed size instead of dynamic std::vector
       uint16_t                    mip_begin;
       uint16_t                    mip_end;
       RtxStagingRing*             stagingbuf;
@@ -490,7 +477,7 @@ namespace dxvk {
 
     dxvk::mutex               m_texturesToProcess_mutex;
     dxvk::condition_variable  m_texturesToProcess_cond;
-    std::unordered_set<Rc<ManagedTexture>, RcHasher> m_texturesToProcess;  // Set for efficient texture tracking
+    std::unordered_set<Rc<ManagedTexture>, RcHasher> m_texturesToProcess; // TODO: remove set?
 
     dxvk::mutex               m_readyTextures_mutex;
     dxvk::condition_variable  m_readyTextures_cond;
@@ -774,7 +761,7 @@ namespace dxvk {
 
     dxvk::mutex                     m_texturesToProcess_mutex;
     dxvk::condition_variable        m_texturesToProcess_cond;
-    std::unordered_set<Rc<ManagedTexture>, RcHasher> m_texturesToProcess;  // Set for efficient texture tracking
+    std::unordered_set<Rc<ManagedTexture>, RcHasher> m_texturesToProcess; // TODO: remove set?
     std::atomic<uint32_t>           m_texturesToProcess_count;
 
     dxvk::mutex                     m_waitingList_mutex;
@@ -937,12 +924,6 @@ namespace dxvk {
       return;
     }
 
-    const Rc<DxvkImageView> imageView = inputTexture.getImageViewRc();
-    const XXH64_hash_t textureHash = inputTexture.getImageHash();
-    if (imageView != nullptr && textureHash != 0) {
-      ImGUI::AddTexture(textureHash, imageView, getTextureUiFeatureFlags(imageView));
-    }
-
     // Track this texture to make a linear table for this frame
     textureIndexOut = m_textureCache.track(inputTexture);
 
@@ -974,13 +955,14 @@ namespace dxvk {
     tex->m_frameLastUsedForSamplerFeedback = curframe;
   }
 
-  void RtxTextureManager::releaseTexture(TextureRef& textureRef) {
-    const XXH64_hash_t textureHash = textureRef.getImageHash();
-    if (textureHash != 0) {
-      ImGUI::ReleaseTexture(textureHash);
+  void RtxTextureManager::keepTextureAlive(uint32_t textureIndex) {
+    if (textureIndex >= m_textureCache.getTotalCount()) {
+      return;
     }
-
-    m_textureCache.free(textureRef);
+    const Rc<ManagedTexture>& tex = m_textureCache.at(textureIndex).getManagedTexture();
+    if (tex != nullptr) {
+      tex->m_frameLastUsed = m_device->getCurrentFrameId();
+    }
   }
 
   void RtxTextureManager::clear() {
@@ -994,31 +976,6 @@ namespace dxvk {
     }
 
     m_textureCache.clear();
-
-    // Periodically shrink the texture cache's underlying containers to reclaim
-    // memory after eviction. This prevents monotonic memory growth during long
-    // play sessions where textures are loaded and demoted repeatedly.
-    const auto now = std::chrono::steady_clock::now();
-    if (now - m_lastShrinkToFitTime >= kShrinkToFitInterval) {
-      m_textureCache.shrink_to_fit();
-      m_lastShrinkToFitTime = now;
-    }
-
-    // Periodically evict stale entries from the asset hash map to prevent
-    // unbounded growth. Entries not accessed within the TTL are removed.
-    if (now - m_lastAssetHashEvictionTime >= kAssetHashEvictionInterval) {
-      auto l = std::unique_lock{ m_assetHashToTextures_mutex };
-      for (auto it = m_assetHashToTextures.begin(); it != m_assetHashToTextures.end();) {
-        auto accessIt = m_assetHashAccessTimes.find(it->first);
-        if (accessIt != m_assetHashAccessTimes.end() && (now - accessIt->second) >= kAssetHashEvictionTTL) {
-          m_assetHashAccessTimes.erase(accessIt);
-          it = m_assetHashToTextures.erase(it);
-        } else {
-          ++it;
-        }
-      }
-      m_lastAssetHashEvictionTime = now;
-    }
   }
 
   void RtxTextureManager::requestHotReload(const Rc<ManagedTexture>& tex) {
@@ -1349,7 +1306,7 @@ namespace dxvk {
         uint32_t mipc = m_sf.m_accumulatedMipcount[tex->m_samplerFeedbackStamp].mipcount;
         mipc = std::min(mipc, allmipcount);
 
-        // Calculate texture byte size for budget management
+        // TODO: potential bottleneck
         size_t byteSize = calcSizeForAsset(*tex->m_assetData, allmipcount - mipc, allmipcount);
 
         if (usedBytes + byteSize <= budgetBytes) {
@@ -1443,7 +1400,8 @@ namespace dxvk {
     return result;
   }
 
-  // Check if asset fits into staging buffer for streaming
+  // TODO: handle large textures that exceed STAGING_BUDGET (e.g. 8k textures),
+  //       at the moment, if this function returns true, the texture will not be considered for texture streaming
   bool WAR_doesAssetFitIntoFixedAllocator(const AssetData& assetData) {
     size_t byteSize = calcSizeForAsset(assetData, 0, assetData.info().mipLevels);
     if (byteSize <= stagingBufferSize_Bytes()) {
@@ -1477,14 +1435,11 @@ namespace dxvk {
       if (it != m_assetHashToTextures.end()) {
         // Is this truly the same asset?
         if (it->second->m_assetData->info().matches(assetData->info())) {
-          // Update access time for eviction tracking
-          m_assetHashAccessTimes[hash] = std::chrono::steady_clock::now();
           return it->second;
         }
 
         // Else, clear out the old
         m_assetHashToTextures.erase(it);
-        m_assetHashAccessTimes.erase(hash);
       }
     }
 
@@ -1526,7 +1481,8 @@ namespace dxvk {
         texture->m_samplerFeedbackStamp = m_sf.m_idToTexture_count.fetch_add(1);
         m_sf.m_idToTexture.push_back(texture);
       } else {
-        ONCE(Logger::warn("Sampler feedback stamp overflow: exceeded SAMPLER_FEEDBACK_MAX_TEXTURE_COUNT. New entry rejected gracefully."));
+        assert(0);
+        Logger::err("Sampler feedback stamp overflow!");
         texture->m_samplerFeedbackStamp = SAMPLER_FEEDBACK_INVALID;
       }
     }
@@ -1535,8 +1491,6 @@ namespace dxvk {
       FileWatch::get().watchTexture(texture);
 
       auto l = std::unique_lock{ m_assetHashToTextures_mutex };
-      // Record initial access time for eviction tracking
-      m_assetHashAccessTimes[hash] = std::chrono::steady_clock::now();
       return m_assetHashToTextures.emplace(hash, texture).first->second;
     }
   }
@@ -1570,19 +1524,6 @@ namespace dxvk {
         availableMemorySizeMib = std::max(memBudgetMib - memUsedMib, availableMemorySizeMib);
       }
     }
-    // Keep a safety margin under the driver budget. The budget shifts as
-    // other applications allocate, and non-texture allocations (BLAS,
-    // render targets) may be restricted to device-local memory with no
-    // host fallback - observed in the wild as a 900 MiB over-budget heap,
-    // a failed 20 MiB allocation, a CS-thread exception, and device loss.
-    {
-      const VkDeviceSize headroomMib =
-        static_cast<VkDeviceSize>(std::max(RtxOptions::TextureManager::budgetHeadroomMiB(), 0));
-      availableMemorySizeMib = availableMemorySizeMib > headroomMib
-        ? availableMemorySizeMib - headroomMib
-        : 0;
-    }
-
     if (!device->getCommon()->getResources().isResourceReady()) {
       // Reserve space for various non-texture GPU resources (buffers, etc)
 

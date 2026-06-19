@@ -1226,8 +1226,7 @@ namespace dxvk {
       "\n  vertexAttributeInstanceRateDivisor     : ", features.extVertexAttributeDivisor.vertexAttributeInstanceRateDivisor ? "1" : "0",
       "\n  vertexAttributeInstanceRateZeroDivisor : ", features.extVertexAttributeDivisor.vertexAttributeInstanceRateZeroDivisor ? "1" : "0",
       "\n", VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME,
-      "\n  vulkan12BufferDeviceAddress            : ", features.vulkan12Features.bufferDeviceAddress ? "1" : "0",
-      "\n  khrBufferDeviceAddress                 : ", features.khrBufferDeviceAddress.bufferDeviceAddress ? "1" : "0"));
+      "\n  bufferDeviceAddress                    : ", features.khrBufferDeviceAddress.bufferDeviceAddress));
   }
 
 

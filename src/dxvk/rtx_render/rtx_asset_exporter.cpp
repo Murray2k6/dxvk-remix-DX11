@@ -1,5 +1,5 @@
 /*
-* Copyright (c) 2021-2025, NVIDIA CORPORATION. All rights reserved.
+* Copyright (c) 2021-2026, NVIDIA CORPORATION. All rights reserved.
 *
 * Permission is hereby granted, free of charge, to any person obtaining a
 * copy of this software and associated documentation files (the "Software"),
@@ -80,8 +80,9 @@ namespace dxvk {
         Sleep(1);
       }
 
-      if (m_numExportsInFlight > 0)
+      if (m_numExportsInFlight > 0) {
         Logger::err(str::format("RTX: Timed-out waiting on all asset exports to complete"));
+      }
     }
   }
 
@@ -150,7 +151,7 @@ namespace dxvk {
     Rc<DxvkImage>* pBlitTemps = useBlit ? new Rc<DxvkImage>[numMipLevels] : nullptr;
     Rc<DxvkImage>* pBlitDests = new Rc<DxvkImage>[numMipLevels];
 
-    // Push a copy operation to the GPU; get that GPU data in CPU addressable space!
+    // Push a copy operation to the GPU; get that GPU data in CPU addressable space
     for (uint32_t level = 0; level < numMipLevels; ++level) {
       const VkImageSubresourceLayers srcSubresourceLayers = { imageFormatInfo(srcDesc.format)->aspectMask, level, 0, 1 };
       const VkImageSubresourceLayers dstSubresourceLayers = { imageFormatInfo(dstDesc.format)->aspectMask, 0,     0, 1 };
@@ -243,7 +244,7 @@ namespace dxvk {
     const uint64_t syncValue = ++m_signalValue;
     ctx->signal(m_readbackSignal, syncValue);
 
-    // Spawn a thread so we dont sync with the GPU here...(remember, GPU runs async with CPU!).
+    // Spawn a thread so we dont sync with the GPU here (GPU runs async with CPU)
     Future<void> result = getExporterThread()->Schedule([this, device = ctx->getDevice(), pBlitDests, pBlitTemps, syncValue, filename, outFormat, dstDesc, swizzle] {
       ScopedCpuProfileZoneN("Export Image Finalize");
       // Stall until the GPU has completed its copy to system memory (GPU->CPU)

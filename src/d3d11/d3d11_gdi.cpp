@@ -3,7 +3,59 @@
 #include "d3d11_gdi.h"
 
 #include "../util/util_gdi.h"
+
+#ifndef D3DDDIFMT_A8R8G8B8
+#define D3DDDIFMT_A8R8G8B8 21
+#endif
+// DX11_V219_SINGLE_AUTHORITATIVE_BUFFER_COOKIE_METHODS
+#if defined(_WIN32)
 
+#ifndef D3DDDIFMT_A8R8G8B8
+#define D3DDDIFMT_A8R8G8B8 21
+#endif
+#endif
+// DX11_V219_D3DDDIFMT_A8R8G8B8_FIX
+#ifndef D3DDDIFMT_A8R8G8B8
+#define D3DDDIFMT_A8R8G8B8 21
+#endif
+// DX11_V218_BRUTE_FORCE_BUFFER_COOKIE_SINGLE_METHODS
+#if defined(_WIN32)
+
+#ifndef D3DDDIFMT_A8R8G8B8
+#define D3DDDIFMT_A8R8G8B8 21
+#endif
+#endif
+// DX11_V218_D3DDDIFMT_A8R8G8B8_FIX
+#ifndef D3DDDIFMT_A8R8G8B8
+#define D3DDDIFMT_A8R8G8B8 21
+#endif
+// DX11_V216_IDENTIFY_AND_FIX_UNDECLARED_CONTENT_COOKIE
+#if defined(_WIN32)
+
+#ifndef D3DDDIFMT_A8R8G8B8
+#define D3DDDIFMT_A8R8G8B8 21
+#endif
+#endif
+// DX11_V216_D3DDDIFMT_A8R8G8B8_FIX
+#if defined(_WIN32)
+
+#ifndef D3DDDIFMT_A8R8G8B8
+#define D3DDDIFMT_A8R8G8B8 21
+#endif
+#endif
+// DX11_V215_D3DDDIFMT_A8R8G8B8_FIX
+#ifndef D3DDDIFMT_A8R8G8B8
+#define D3DDDIFMT_A8R8G8B8 21
+#endif
+// DX11_V215_GDI_NO_D3DUKMDT_AND_BUFFER_COOKIE_FIX
+
+#if defined(_WIN32)
+
+#ifndef D3DDDIFMT_A8R8G8B8
+#define D3DDDIFMT_A8R8G8B8 21
+#endif
+#endif
+// DX11_V214_D3DDDIFMT_A8R8G8B8_FIX
 namespace dxvk {
   
   D3D11GDISurface::D3D11GDISurface(
@@ -22,7 +74,8 @@ namespace dxvk {
     // Create GDI DC
     D3DKMT_CREATEDCFROMMEMORY desc;
     desc.pMemory     = m_data.data();
-    desc.Format      = D3DDDIFMT_A8R8G8B8;
+    // DX11_V225: util_gdi.h declares Format as DXGI_FORMAT; A8R8G8B8 maps to B8G8R8A8_UNORM.
+    desc.Format      = DXGI_FORMAT_B8G8R8A8_UNORM;
     desc.Width       = tex->Width;
     desc.Height      = tex->Height;
     desc.Pitch       = tex->Width * sizeof(uint32_t);

@@ -21,7 +21,7 @@
  */
 #pragma once
 
-#include <d3d9.h>
+#include <d3d11.h>
 
 namespace gdi {
   // ref: DXVK
@@ -31,7 +31,8 @@ namespace gdi {
   // Slightly modified definitions...
   struct D3DKMT_CREATEDCFROMMEMORY {
     void*         pMemory;
-    D3DFORMAT     Format;
+    // DX11_V225: DX11 bridge uses DXGI formats, not the legacy D3D11 D3DFORMAT.
+    DXGI_FORMAT   Format;
     UINT          Width;
     UINT          Height;
     UINT          Pitch;

@@ -1,15 +1,18 @@
 #include "rtx_gui_widgets.h"
 #include "rtx_imgui.h"
 
+#include <vector>
+
+namespace {
+  std::vector<float> g_labelColumnFixedWidthStack;
+}
+
 namespace ImGui {
   inline float GetFormLabelColumnWidth(float fallback_pixels = 7.0f * GetFontSize()) {
     ImGuiWindow* w = GetCurrentWindow();
     if (!w) {
       return fallback_pixels;
     } else {
-      ImGuiContext& g = *GImGui;
-      const ImGuiStyle& style = g.Style;
-
       // Remaining horizontal space on THIS line (accounts for SameLine/columns/tables/WorkRect edits).
       const float avail = GetContentRegionAvail().x;
       if (avail <= 0.0f) {
@@ -49,11 +52,10 @@ namespace ImGui {
       clipped_bb.Min.y += window->DC.CurrLineTextBaseOffset;
       clipped_bb.Max.y += window->DC.CurrLineTextBaseOffset;
 
+      // No label hover tooltip: RtxOption rows apply the full option tooltip in RtxOptionUxWrapper
+      // after the child widgets. A label-only SetTooltip() here would show the label and suppress
+      // that full tooltip (see tooltipAlreadyShown in ~RtxOptionUxWrapper).
       RenderTextEllipsis(GetWindowDrawList(), clipped_bb.Min, clipped_bb.Max, clipped_bb.Max.x, clipped_bb.Max.x, label, nullptr, nullptr);
-
-      if (IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
-        SetTooltip("%s", label);
-      }
     }
 
     window->DC.CursorPos = ImVec2(label_bb.Max.x, start.y - style.FramePadding.y);
@@ -82,7 +84,19 @@ namespace RemixGui {
     ImGuiContext& g = *GImGui;
     const ImGuiStyle& style = g.Style;
 
-    const float labelCol = ImGui::GetFormLabelColumnWidth();
+    float labelCol;
+    if (!g_labelColumnFixedWidthStack.empty()) {
+      labelCol = g_labelColumnFixedWidthStack.back();
+      const float needRowW = labelCol + style.ItemInnerSpacing.x + GetFrameHeight();
+      const float availRowW = window->WorkRect.Max.x - fr.rowStart.x;
+      if (needRowW > availRowW) {
+        const ImVec2 sz = GetWindowSize();
+        SetWindowSize(ImVec2(sz.x + (needRowW - availRowW), sz.y), ImGuiCond_Always);
+      }
+    } else {
+      labelCol = ImGui::GetFormLabelColumnWidth();
+    }
+
     ImGui::ItemLabelLeftClipped(label, labelCol);
 
     // Add horizontal padding between the label column and the field.
@@ -308,42 +322,26 @@ namespace RemixGui {
     return changed;
   }
 
+  void PushLabelColumnFixedWidth(float labelColumnWidthPixels) {
+    g_labelColumnFixedWidthStack.push_back(ImMax(1.0f, labelColumnWidthPixels));
+  }
+
+  void PopLabelColumnFixedWidth() {
+    IM_ASSERT(!g_labelColumnFixedWidthStack.empty() && "PushLabelColumnFixedWidth/PopLabelColumnFixedWidth mismatch");
+    g_labelColumnFixedWidthStack.pop_back();
+  }
+
   bool Checkbox(const char* label, bool* v, float boxScale /*=1.f*/) {
     if (shouldSkip()) {
       return false;
-    }
-
-    // Record the row start BEFORE beginFieldRow advances the cursor so
-    // we can extend the hit area to cover the entire row (label + box).
-    ImGuiWindow* window = GetCurrentWindow();
-    const ImVec2 rowStart = window->DC.CursorPos;
+    } 
 
     FieldRow fr = beginFieldRow(label);
     PushID(label);
     BeginGroup();
-    bool changed = checkboxCore("##v", v, boxScale);
+    const bool changed = checkboxCore("##v", v, boxScale);
     EndGroup();
     PopID();
-
-    // Full-row click-through: if the checkbox square itself wasn't
-    // clicked, accept clicks anywhere on the same row (over the label
-    // text) as a toggle.  This matches what users expect from most
-    // settings dialogs and is what the log showed was failing — clicks
-    // were landing on the label text and being ignored.
-    if (!changed) {
-      const float rowBottom = ImMax(window->DC.CursorPos.y, rowStart.y + GetFrameHeight());
-      const float rowRight  = window->WorkRect.Max.x;
-      const ImRect rowBb(rowStart, ImVec2(rowRight, rowBottom));
-
-      if (ImGui::IsMouseHoveringRect(rowBb.Min, rowBb.Max) &&
-          ImGui::IsMouseClicked(ImGuiMouseButton_Left) &&
-          !ImGui::IsAnyItemActive() &&
-          GImGui->HoveredWindow == window) {
-        *v = !*v;
-        changed = true;
-      }
-    }
-
     endFieldRowFromLastItem(fr);
     return changed;
   }
@@ -468,7 +466,7 @@ namespace RemixGui {
         const float fs = GetFontSize();
         const ImVec2 arrowPos(frameBb.Max.x - fs - style.FramePadding.x,
                               frameBb.Min.y + (frameBb.GetHeight() - fs) * 0.5f);
-        RenderArrowChevron(window->DrawList, arrowPos, textCol, isOpen ? ImGuiDir_Down : ImGuiDir_Up, 0.5f);
+        RenderArrowChevron(window->DrawList, arrowPos, textCol, isOpen ? ImGuiDir_Up : ImGuiDir_Down, 0.5f);
       }
 
       PopFont();
@@ -777,18 +775,24 @@ namespace RemixGui {
 
 
   bool Combo(const char* label, int* currentItem, const char* const items[], int itemsCount, int heightInItems) {
-    return Combo(label, currentItem, Items_ArrayGetter, (void*) items, itemsCount, heightInItems);
+    return withLabeledRow(label, [&]() {
+      SetNextItemWidth(GetRowFieldWidth());
+      return Combo("##v", currentItem, Items_ArrayGetter, (void*) items, itemsCount, heightInItems);
+    });
   }
 
   // Combo box helper allowing to pass all items in a single string literal holding multiple zero-terminated items "item1\0item2\0"
   bool Combo(const char* label, int* currentItem, const char* itemsSeparatedByZeros, int heightInItems) {
-    int itemsCount = 0;
-    const char* p = itemsSeparatedByZeros;
-    while (*p) {
-      p += strlen(p) + 1;
-      itemsCount++;
-    }
-    return Combo(label, currentItem, Items_SingleStringGetter, (void*) itemsSeparatedByZeros, itemsCount, heightInItems);
+    return withLabeledRow(label, [&]() {
+      SetNextItemWidth(GetRowFieldWidth());
+      int itemsCount = 0;
+      const char* p = itemsSeparatedByZeros;
+      while (*p) {
+        p += strlen(p) + 1;
+        itemsCount++;
+      }
+      return Combo("##v", currentItem, Items_SingleStringGetter, (void*) itemsSeparatedByZeros, itemsCount, heightInItems);
+    });
   }
 
   void Separator() {

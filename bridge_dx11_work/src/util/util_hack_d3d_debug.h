@@ -58,13 +58,13 @@ int __cdecl D3DRecordHRESULT(char* na) {
 #endif
 
 template <typename WinStrT>
-static uint32_t GetD3DRecordHRESULTPrivateFuncOffset(WinStrT d3d9SysPath) {
+static uint32_t GetD3DRecordHRESULTPrivateFuncOffset(WinStrT d3d11SysPath) {
   DWORD minorVersion = 0;
   DWORD rsvd = 0;
-  DWORD verSize = GetFileVersionInfoSize(d3d9SysPath, &rsvd);
+  DWORD verSize = GetFileVersionInfoSize(d3d11SysPath, &rsvd);
   assert(verSize > 0);
   LPSTR verData = new char[verSize];
-  if (GetFileVersionInfo(d3d9SysPath, rsvd, verSize, verData)) {
+  if (GetFileVersionInfo(d3d11SysPath, rsvd, verSize, verData)) {
     UINT size = 0;
     LPBYTE lpBuffer = NULL;
     if (VerQueryValue(verData, TEXT("\\"), (LPVOID*) &lpBuffer, &size)) {
@@ -79,7 +79,7 @@ static uint32_t GetD3DRecordHRESULTPrivateFuncOffset(WinStrT d3d9SysPath) {
       }
     }
   }
-  // Found this by comparing the base offset of the D3D9.DLL with the private function 'd3d9.dll!_D3DRecordHRESULT'
+  // Found this by comparing the base offset of the D3D11.DLL with the private function 'd3d11.dll!_D3DRecordHRESULT'
   switch (minorVersion) {
   case ((19041 << 16) | 1387): // 10.0.19041.1387
     return 0x5A26c;
@@ -95,18 +95,18 @@ static uint32_t GetD3DRecordHRESULTPrivateFuncOffset(WinStrT d3d9SysPath) {
 }
 
 template <typename WinStrT>
-static void FixD3DRecordHRESULT(WinStrT d3d9SysPath, HMODULE d3d9SysModule) {
+static void FixD3DRecordHRESULT(WinStrT d3d11SysPath, HMODULE d3d11SysModule) {
 #ifndef _WIN64 
 
 #ifdef HACK_D3D_DEBUG_MSG
 
-  const uint32_t offsetToD3DRecordHRESULT = GetD3DRecordHRESULTPrivateFuncOffset(d3d9SysPath);
+  const uint32_t offsetToD3DRecordHRESULT = GetD3DRecordHRESULTPrivateFuncOffset(d3d11SysPath);
   if (offsetToD3DRecordHRESULT == -1) {
-    bridge_util::Logger::warn("D3D9 debug outputs not supported on this version of D3D9.");
-    bridge_util::Logger::warn("Please find the d3d9.dll!_D3DRecordHRESULT private func offset and add to the table in 'util_hack_d3d_debug.h'");
+    bridge_util::Logger::warn("D3D11 debug outputs not supported on this version of D3D11.");
+    bridge_util::Logger::warn("Please find the d3d11.dll!_D3DRecordHRESULT private func offset and add to the table in 'util_hack_d3d_debug.h'");
     return;
   }
-  void* oldaddr = (void*) ((uint32_t) d3d9SysModule + offsetToD3DRecordHRESULT);
+  void* oldaddr = (void*) ((uint32_t) d3d11SysModule + offsetToD3DRecordHRESULT);
   JMPCODE shellcode;
   shellcode.jmp = 0xE9;
   shellcode.addr = (uint32_t) D3DRecordHRESULT - (uint32_t) oldaddr - 5u; // 5 is size of jmpcode + operand

@@ -399,9 +399,9 @@ OpenGL:
 - See ImGui_ImplOpenGL3_RenderDrawData() function in imgui_impl_opengl3.cpp
 ```
 ```cpp
-DirectX9:
+DirectX11:
 - ImTextureID should contain a 'LPDIRECT3DTEXTURE9' (pointer).
-- See ImGui_ImplDX9_RenderDrawData() function in imgui_impl_dx9.cpp
+- See ImGui_ImplDX11_RenderDrawData() function in imgui_impl_dx11.cpp
 ```
 ```cpp
 DirectX11:
@@ -436,7 +436,7 @@ Once you understand this design, you will understand that loading image files an
 This is by design and is a good thing because it means your code has full control over your data types and how you display them.
 If you want to display an image file (e.g. PNG file) on the screen, please refer to documentation and tutorials for the graphics API you are using.
 
-Refer to [Image Loading and Displaying Examples](https://github.com/ocornut/imgui/wiki/Image-Loading-and-Displaying-Examples) on the [Wiki](https://github.com/ocornut/imgui/wiki) to find simplified examples for loading textures with OpenGL, DirectX9 and DirectX11.
+Refer to [Image Loading and Displaying Examples](https://github.com/ocornut/imgui/wiki/Image-Loading-and-Displaying-Examples) on the [Wiki](https://github.com/ocornut/imgui/wiki) to find simplified examples for loading textures with OpenGL, DirectX11 and DirectX11.
 
 C/C++ tip: a u64 is 8 bytes. You may safely store any pointer or integer into it by casting your value to ImTextureID, and vice-versa.
 Because both end-points (user code and rendering function) are under your control, you know exactly what is stored inside the ImTextureID.

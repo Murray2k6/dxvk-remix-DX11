@@ -126,8 +126,8 @@ namespace dxvk {
 
         RW_TEXTURE2D(NRC_RESOLVE_BINDING_DEBUG_VIEW_TEXTURE_OUTPUT)
         RW_STRUCTURED_BUFFER(NRC_RESOLVE_BINDING_GPU_PRINT_BUFFER_OUTPUT)
-        END_PARAMETER()
-      };
+     END_PARAMETER()
+    };
 
     PREWARM_SHADER_PIPELINE(NrcResolveShader);
   }
@@ -285,6 +285,7 @@ namespace dxvk {
 
       RemixGui::Checkbox("Learn Irradiance", &NrcOptions::learnIrradianceObject());
       RemixGui::Checkbox("Include Direct Lighting", &NrcOptions::includeDirectLightingObject());
+      RemixGui::Checkbox("Boost Emissives", &NrcOptions::boostEmissivesObject());
       
       RemixGui::DragInt("Max Number of Training Iterations", &NrcOptions::maxNumTrainingIterationsObject(), 1.f, 1, 16, "%d", ImGuiSliderFlags_AlwaysClamp);
       RemixGui::DragInt("Target Number of Training Iterations", &NrcOptions::targetNumTrainingIterationsObject(), 1.f, 1, 16, "%d", ImGuiSliderFlags_AlwaysClamp);
@@ -488,6 +489,8 @@ namespace dxvk {
     }
 
     nrcArgs.trainingLuminanceClamp = NrcOptions::luminanceClampMultiplier() * NrcOptions::maxExpectedAverageRadianceValue();
+
+    nrcArgs.boostEmissives = NrcOptions::boostEmissives();
   }
 
   const Vector2& NeuralRadianceCache::getNumQueryPixelsPerTrainingPixel() const {
@@ -568,9 +571,7 @@ namespace dxvk {
   }
 
   bool NeuralRadianceCache::isEnabled() const {
-    return m_nrcCtx != nullptr
-      && checkIsSupported(m_nrcCtx->device())
-      && RtxOptions::integrateIndirectMode() == IntegrateIndirectMode::NeuralRadianceCache;
+    return RtxOptions::integrateIndirectMode() == IntegrateIndirectMode::NeuralRadianceCache;
   }
 
   void NeuralRadianceCache::onFrameBegin(
@@ -621,9 +622,11 @@ namespace dxvk {
         "  Max supported resolution: ", NRC_MAX_RAYTRACING_RESOLUTION_X, " x ", NRC_MAX_RAYTRACING_RESOLUTION_Y, "\n"
         "  Requested resolution: ", frameBeginCtx.downscaledExtent.width, " x ", frameBeginCtx.downscaledExtent.height)));
 
-      Logger::warn(str::format("[RTX Neural Radiance Cache] Neural Radiance Cache per frame setup failed. Switching to ReSTIR GI."));
-      if (RtxOptions::integrateIndirectMode() == IntegrateIndirectMode::NeuralRadianceCache)
-        RtxOptions::integrateIndirectMode.setDeferred(IntegrateIndirectMode::ReSTIRGI);
+      // Fallback to Basic mode if NRC setup failed.
+      // Note: it would be preferable to fallback to ReSTIRGI, but that would require delaying that change to the beginning of the next frame
+      // to ensure consistent mode state in the frame. That is something to consider in the future. For now this will do for the sake of simpler logic
+      Logger::warn(str::format("[RTX Neural Radiance Cache] Neural Radiance Cache per frame setup failed. Switching to importance sampled indirect illumination mode."));
+      RtxOptions::integrateIndirectMode.setDeferred(IntegrateIndirectMode::ImportanceSampled);
       
       return;
     }
@@ -778,17 +781,19 @@ namespace dxvk {
 
   bool NeuralRadianceCache::onActivation(Rc<DxvkContext>& ctx) {
 
+    // Fallback to Importance Sampled mode if NRC setup failed.
+    // Note: it would be preferable to fallback to ReSTIRGI, but that would require delaying that change to the beginning of the next frame
+    // to ensure consistent mode state in the frame. That is something to consider in the future. For now this will do for sake of simpler logic
+
     if (!checkIsSupported(ctx->getDevice().ptr())) {
-      ONCE(Logger::warn("[RTX Neural Radiance Cache] Neural Radiance Cache is not supported. Switching to ReSTIR GI."));
-      if (RtxOptions::integrateIndirectMode() == IntegrateIndirectMode::NeuralRadianceCache)
-        RtxOptions::integrateIndirectMode.setDeferred(IntegrateIndirectMode::ReSTIRGI);
+      ONCE(Logger::warn("[RTX Neural Radiance Cache] Neural Radiance Cache is not supported. Switching to importance sampled indirect illumination mode."));
+      RtxOptions::integrateIndirectMode.setDeferred(IntegrateIndirectMode::ImportanceSampled);
       return false;
     }
 
     if (!initialize(*ctx->getDevice())) {
-      Logger::err("[RTX Neural Radiance Cache] Neural Radiance Cache failed to get initialized. Switching to ReSTIR GI.");
-      if (RtxOptions::integrateIndirectMode() == IntegrateIndirectMode::NeuralRadianceCache)
-        RtxOptions::integrateIndirectMode.setDeferred(IntegrateIndirectMode::ReSTIRGI);
+      Logger::err("[RTX Neural Radiance Cache] Neural Radiance Cache failed to get initialized. Switching to importance sampled indirect illumination mode.");
+      RtxOptions::integrateIndirectMode.setDeferred(IntegrateIndirectMode::ImportanceSampled);
       return false;
     }
 
@@ -1052,9 +1057,6 @@ namespace dxvk {
 
     // Push constants
     NrcResolvePushConstants pushArgs = {};
-    pushArgs.resolution = uvec2 {
-      m_nrcCtxSettings->frameDimensions.x,
-      m_nrcCtxSettings->frameDimensions.y };
     pushArgs.addPathtracedRadiance = NrcOptions::resolveAddPathTracedRadiance();
     pushArgs.addNrcRadiance = NrcOptions::resolveAddNrcQueriedRadiance();
     pushArgs.resolveMode = NrcOptions::enableDebugResolveMode() ? NrcOptions::debugResolveMode() : NrcResolveMode::AddQueryResultToOutput;
@@ -1097,7 +1099,8 @@ namespace dxvk {
       m_nrcCtxSettings->frameDimensions.x,
       m_nrcCtxSettings->frameDimensions.y,
       1 };
-    VkExtent3D workgroups = util::computeBlockCount(numRaysExtent, VkExtent3D { 16, 8, 1 });
+    VkExtent3D workgroups = util::computeBlockCount(numRaysExtent, VkExtent3D { NRC_RESOLVE_THREADS_DISPATCH_WIDTH, NRC_RESOLVE_THREADS_DISPATCH_HEIGHT, 1 });
+
 
     ctx.bindShader(VK_SHADER_STAGE_COMPUTE_BIT, NrcResolveShader::getShader());
     ctx.dispatch(workgroups.width, workgroups.height, workgroups.depth);

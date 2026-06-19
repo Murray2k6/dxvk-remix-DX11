@@ -52,7 +52,7 @@ class RtxOptionManager;
 
 namespace dxvk {
   class DxvkDevice;
-  
+
   // RtxOption refers to a serializable option, which can be of a basic type (i.e. int) or a class type (i.e. vector hash value)
   // On initialization, it retrieves a value from a Config object and add itself to a global list so that all options can be serialized 
   // into a file when requested.
@@ -205,8 +205,7 @@ namespace dxvk {
     bool loadFromEnvironmentVariable(const RtxOptionLayer* envLayer, std::string* outValue = nullptr);
     void disableLayerValue(const RtxOptionLayer* layer);
     void updateLayerBlendStrength(const RtxOptionLayer& optionLayer);
-    void moveLayerValue(const RtxOptionLayer* sourceLayer, const RtxOptionLayer* destLayer,
-                        bool preserveDestinationValue = false);
+    void moveLayerValue(const RtxOptionLayer* sourceLayer, const RtxOptionLayer* destLayer);
     void clearFromStrongerLayers(const RtxOptionLayer* targetLayer = nullptr,
                                   std::optional<XXH64_hash_t> hash = std::nullopt);
     const RtxOptionLayer* getBlockingLayer(const RtxOptionLayer* targetLayer = nullptr,
@@ -230,27 +229,13 @@ namespace dxvk {
     bool isDirty() const;
     void invokeOnChangeCallback(DxvkDevice* device) const;
 
-    // User-override tracking for UI persistence
-    void markUserOverridden(const RtxOptionLayer* targetLayer = nullptr) {
-      m_userOverridden = true;
-      if (targetLayer) {
-        m_userOverrideLayerKey = targetLayer->getLayerKey();
-      } else if (const RtxOptionLayer* userLayer = RtxOptionLayer::getUserLayer()) {
-        m_userOverrideLayerKey = userLayer->getLayerKey();
-      } else {
-        m_userOverrideLayerKey = kRtxOptionLayerUserKey;
-      }
-    }
-    void clearUserOverridden() {
-      m_userOverridden = false;
-      m_userOverrideLayerKey = kRtxOptionLayerUserKey;
-    }
-    bool isUserOverridden() const { return m_userOverridden; }
-
     // Migrate all layer values from this option to another option.
     // The lambda does all type conversion (read from src, write to dest).
-    // bool isDestValueNew will be supplied to the transform indicating that the dest already has a value in its layer
-    // Returns true if all data was migrated successfully
+    // bool isDestValueNew will be supplied to the transform indicating that the dest already has a value in its layer.
+    // Returns true if at least one non-default layer value was migrated (i.e. the
+    // transform returned true for it). Returns false if there was nothing to migrate
+    // (no non-default layer values, or the transform declined every value) — callers
+    // should gate any "please re-save your rtx config" deprecation logging on this.
     bool migrateValuesTo(RtxOptionImpl* destOption, std::function<bool(const GenericValue& src, GenericValue& dest, bool isDestValueNew)> transform);
 
     // Static method for full name construction
@@ -280,12 +265,6 @@ namespace dxvk {
     std::function<void(DxvkDevice* device)> m_onChangeCallback;
     
     std::map<RtxOptionLayerKey, PrioritizedValue> m_optionLayerValueQueue;
-
-    // Tracks whether the user has explicitly overridden this option via the UI.
-    // When true, stronger layers (preset, quality, config-file, game-target) will
-    // skip re-populating their values for this option, so the user's UI change persists.
-    bool m_userOverridden = false;
-    RtxOptionLayerKey m_userOverrideLayerKey = kRtxOptionLayerUserKey;
 
     // Returns pointer to value in layer, creating a new entry if not found
     std::pair<GenericValue*, bool> getOrCreateGenericValue(const RtxOptionLayer* layer);
@@ -356,6 +335,7 @@ namespace dxvk {
     // Get the resolved value without acquiring the mutex.
     // IMPORTANT: Only call this when the mutex is already held by the calling context.
     const T& getValueNoLock() const {
+      assert(RtxOptionImpl::isInitialized() && "Trying to access an RtxOption before the config files have been loaded.");
       return *getResolvedValuePtr<T>();
     }
 
@@ -371,25 +351,12 @@ namespace dxvk {
     // Sets a value on a layer and immediately resolves it to be available this frame.
     // If layer is nullptr, uses the current target layer from RtxOptionLayerTarget.
     void setImmediately(const T& v, const RtxOptionLayer* layer = nullptr) {
+      assert(RtxOptionImpl::isInitialized() && "Trying to access an RtxOption before the config files have been loaded."); 
       std::lock_guard<std::mutex> lock(RtxOptionImpl::getUpdateMutex());
-      if (!RtxOptionImpl::isInitialized()) return;
       
       const RtxOptionLayer* targetLayer = getTargetLayer(layer);
       if (!targetLayer) {
         return;
-      }
-
-      // Preserve explicit UI edits against preset/runtime writes that target
-      // stronger layers. This mirrors setDeferred(), but is needed for preset
-      // code that uses setImmediately() to make values visible this frame.
-      if (m_userOverridden && targetLayer->getLayerKey() < m_userOverrideLayerKey) {
-        return;
-      }
-
-      const bool userLayerWrite = targetLayer == RtxOptionLayer::getUserLayer();
-      if (userLayerWrite) {
-        clearFromStrongerLayers(targetLayer);
-        markUserOverridden(targetLayer);
       }
       
       // Set the value on the layer (create if not present)
@@ -429,12 +396,6 @@ namespace dxvk {
       
       hashSet->add(value);
       targetLayer->onLayerValueChanged();
-
-      // Resolve immediately, mirroring the scalar setter above. Relying on
-      // the deferred dirty pass alone left the cached resolved set stale for
-      // consumers that read it before the pass ran - the renderer kept using
-      // the old set, so texture tags appeared to do nothing.
-      resolveValue(m_resolvedValue);
       markDirty();
     }
 
@@ -457,12 +418,6 @@ namespace dxvk {
       
       hashSet->remove(value);
       targetLayer->onLayerValueChanged();
-
-      // Resolve immediately, mirroring the scalar setter above. Relying on
-      // the deferred dirty pass alone left the cached resolved set stale for
-      // consumers that read it before the pass ran - the renderer kept using
-      // the old set, so texture tags appeared to do nothing.
-      resolveValue(m_resolvedValue);
       markDirty();
     }
 
@@ -490,9 +445,7 @@ namespace dxvk {
       if (hashSet->empty()) {
         disableLayerValue(targetLayer);
       }
-
-      // Resolve immediately, mirroring the scalar setter above.
-      resolveValue(m_resolvedValue);
+      
       markDirty();
     }
 
@@ -573,7 +526,7 @@ namespace dxvk {
       std::lock_guard<std::mutex> lock(RtxOptionImpl::getUpdateMutex());
       return getMinMaxValueHelper<T>(minValue);
     }
-    
+
     template<typename = std::enable_if_t<isClampable()>>
     void setMaxValue(const T& v) {
       std::lock_guard<std::mutex> lock(RtxOptionImpl::getUpdateMutex());
@@ -663,9 +616,7 @@ namespace dxvk {
 
     const T& getValue() const {
       std::lock_guard<std::mutex> lock(RtxOptionImpl::getUpdateMutex());
-      // Resolved value is initialized to the compiled-in default in the
-      // constructor, so reading before config parsing is safe — the caller
-      // just sees the default instead of the .conf value.
+      assert(RtxOptionImpl::isInitialized() && "Trying to access an RtxOption before the config files have been loaded."); 
 #if RTX_OPTION_DEBUG_LOGGING
       // Print out a warning whenever a dirty value is accessed.
       if (isDirty()) {
@@ -684,24 +635,11 @@ namespace dxvk {
     template <typename U, std::enable_if_t<std::is_same_v<U, T>, bool> = true>
     void setValue(const U& v, const RtxOptionLayer* layer = nullptr) {
       std::lock_guard<std::mutex> lock(RtxOptionImpl::getUpdateMutex());
-      if (!RtxOptionImpl::isInitialized()) return;
+      assert(RtxOptionImpl::isInitialized() && "Trying to access an RtxOption before the config files have been loaded.");
       
       const RtxOptionLayer* targetLayer = getTargetLayer(layer);
       if (!targetLayer) {
         return;
-      }
-
-      // If the user has explicitly overridden this option via the UI, skip writes
-      // from layers stronger than the User layer. This prevents config re-reads
-      // and preset re-population from overwriting the user's explicit UI change.
-      if (m_userOverridden && targetLayer->getLayerKey() < m_userOverrideLayerKey) {
-        return;
-      }
-
-      const bool userLayerWrite = targetLayer == RtxOptionLayer::getUserLayer();
-      if (userLayerWrite) {
-        clearFromStrongerLayers(targetLayer);
-        markUserOverridden(targetLayer);
       }
       
       T* valuePtr = getOrCreateValuePtr<T>(targetLayer);
@@ -815,7 +753,7 @@ namespace dxvk {
       } else {
         // For non-POD types (vectors, etc.), store as pointer
         if (!targetValue.has_value()) {
-          targetValue = std::optional<GenericValue>(GenericValue{});
+          targetValue = std::optional<GenericValue>(GenericValue {});
           // Note: This is a `new` with no matching `delete`. This is safe because the
           // RtxOptionImpl object is never destroyed, and follows the pattern used in the constructor.
           targetValue.value().pointer = new T();
@@ -832,7 +770,7 @@ namespace dxvk {
     std::optional<T> getMinMaxValueHelper(const std::optional<GenericValue>& sourceValue) const {
       if (!sourceValue.has_value()) {
         return std::nullopt;
-      } 
+      }
       if constexpr (std::is_pod_v<T>) {
         // For POD types (int, float, etc.), retrieve from the appropriate union member
         const GenericValue& gv = sourceValue.value();

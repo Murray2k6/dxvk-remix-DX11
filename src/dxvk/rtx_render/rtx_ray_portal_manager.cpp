@@ -26,7 +26,7 @@
 #include "rtx_ray_portal_manager.h"
 
 #include "rtx_context.h"
-#include "rtx_cb_types.h"
+#include "../d3d11/d3d11_state.h"
 #include "../util/util_vector.h"
 #include "../util/util_matrix.h"
 #include "rtx_intersection_test_helpers.h"
@@ -113,7 +113,7 @@ namespace dxvk {
     const GeometryBufferData bufferData(originalGeometryData);
 
     // Todo: Currently we do not have a great way of accessing the position and index 
-    // information on the CPU side here (though it is available further up when it is passed to the frontend). The functions
+    // information on the CPU side here (though it is available further up when it is passed to D3D11). The functions
     // to map these buffers I think may return nullptr if the buffer is not first copied to CPU memory, 
     // but these buffers may be host visible to begin with which is why it currently works without that.
     // In the future this should be improved though to avoid potential issues in other games though that

@@ -19,7 +19,8 @@
 * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 * DEALINGS IN THE SOFTWARE.
 */
-#pragma once
+#ifndef RTX_UTILITY_SHADER_TYPES_H_DX11V225
+#define RTX_UTILITY_SHADER_TYPES_H_DX11V225 // DX11_V225_GUARD
 
 #ifdef __cplusplus
 
@@ -248,3 +249,5 @@ inline int32_t floatBitsToInt(float x) {
 #include "rtx/utility/shader_types.slangh"
 
 #endif // __cplusplus
+
+#endif // RTX_UTILITY_SHADER_TYPES_H_DX11V225

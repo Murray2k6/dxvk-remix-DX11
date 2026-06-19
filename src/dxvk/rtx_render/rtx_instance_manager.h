@@ -21,6 +21,8 @@
 */
 #pragma once
 
+#include <cstddef>
+#include <deque>
 #include <mutex>
 #include <vector>
 #include <unordered_set>
@@ -49,9 +51,14 @@ public:
   RtInstance() = delete;
   RtInstance(const uint64_t id, uint32_t instanceVectorId);
   RtInstance(const RtInstance& src, uint64_t id, uint32_t instanceVectorId);
+#ifndef NDEBUG
+  static void operator delete(void* ptr) noexcept;
+  static void operator delete(void* ptr, std::size_t size) noexcept;
+#endif
 
   uint64_t getId() const { return m_id; }
   uint32_t getVectorIdx() const { return m_instanceVectorId; }
+  uint64_t getCacheIdentity() const { return m_cacheIdentity; }
   const VkAccelerationStructureInstanceKHR& getVkInstance() const { return m_vkInstance; }
   VkAccelerationStructureInstanceKHR& getVkInstance() { return m_vkInstance; }
   bool isObjectToWorldMirrored() const { return m_isObjectToWorldMirrored; }
@@ -67,15 +74,13 @@ public:
   Vector3 getWorldPosition() const { return Vector3{ m_vkInstance.transform.matrix[0][3], m_vkInstance.transform.matrix[1][3], m_vkInstance.transform.matrix[2][3] }; }
   const Vector3& getPrevWorldPosition() const { return surface.prevObjectToWorld.data[3].xyz(); }
 
-  void removeFromSpatialCache() {
-    if (m_isCreatedByRenderer || !m_linkedBlas || m_isUnlinkedForGC || m_spatialCacheHash == kEmptyHash) {
-      return;
-    }
-    m_linkedBlas->getSpatialMap().erase(m_spatialCacheHash);
-    m_spatialCacheHash = kEmptyHash;
-  }
-
   bool isCreatedThisFrame(uint32_t frameIndex) const { return frameIndex == m_frameCreated; }
+
+  // Syncs surface and material data from a reference instance.
+  // Preserves the persistent instance's identity (id, vector index) and lifecycle state.
+  // Set preserveTransforms when the caller applies an absolute corrected transform afterward.
+  // Leave it false before relative transforms, such as portal teleports.
+  void updateFromReference(const RtInstance& src, bool preserveTransforms = true);
 
   // Bind a BLAS object to this instance
   void setBlas(BlasEntry& blas);
@@ -98,9 +103,6 @@ public:
   uint32_t getFrameAge() const { return m_frameLastUpdated - m_frameCreated; }
   // Signal this object should be collected on the next GC pass
   void markForGarbageCollection() const;
-  void markAsUnlinkedFromBlasEntryForGarbageCollection() const;
-  void markAsInsideFrustum() const;
-  void markAsOutsideFrustum() const;
   // Returns true if a new camera type was registered
   bool registerCamera(CameraType::Enum cameraType, uint32_t frameIndex);
   bool isCameraRegistered(CameraType::Enum cameraType) const;
@@ -152,8 +154,16 @@ uint32_t getFirstBillboardIndex() const { return m_firstBillboard; }
   bool isViewModelReference() const;
   bool isViewModelVirtual() const;
   bool isSubsurface() const { return m_isSubsurface; }
+  bool isCreatedByRenderer() const { return m_isCreatedByRenderer; }
 
-  bool isUnlinkedForGC() const { return m_isUnlinkedForGC; }
+  // Returns true if this instance has been modified since the last BLAS build
+  // (transform, material, or geometry change).  New instances default to dirty.
+  bool isBlasDirty() const { return m_blasDirty; }
+  void clearBlasDirty() { m_blasDirty = false; }
+  bool isBillboardGeometryDirty() const { return m_billboardGeometryDirty; }
+  void clearBillboardGeometryDirty() { m_billboardGeometryDirty = false; }
+
+  bool isMarkedForGC() const { return m_isMarkedForGC; }
 
   PrimInstanceOwner& getPrimInstanceOwner() { return m_primInstanceOwner; }
   
@@ -167,6 +177,7 @@ private:
     }
     return surface.objectToWorld;
   }
+  void copyInstanceDataFrom(const RtInstance& src);
   void onTransformChanged();
   friend class InstanceManager;
 
@@ -175,10 +186,8 @@ private:
   // most notably the GameCapturer
   const uint64_t m_id;
   mutable uint32_t m_instanceVectorId; // Index within instance vector in instance manager
+  const uint64_t m_cacheIdentity; // Unique per allocation; used to detect raw-pointer ABA in acceleration-structure caches
 
-  mutable bool m_isMarkedForGC = false;
-  mutable bool m_isUnlinkedForGC = false;
-  mutable bool m_isInsideFrustum = true;
   mutable uint32_t m_frameLastUpdated = kInvalidFrameIndex;
   mutable uint32_t m_frameCreated = kInvalidFrameIndex;
 
@@ -190,16 +199,19 @@ private:
   uint32_t m_secondaryOpacityTextureIndex = kSurfaceMaterialInvalidTextureIndex;
   uint32_t m_secondarySamplerIndex = kSurfaceMaterialInvalidTextureIndex;
 
-  // Extra instance meta data needed for Opacity Micromap Manager, generally describes if animated spritesheets are in use
-  // on a given instance (though the applicability to OMMs are only relevant for Opaque and Ray Portal materials currently
-  // where cutout opacity can be animated, translucent materials do not have any relation right now to OMMs).
-  bool m_isAnimated = false;
+  uint32_t m_surfaceIndex;        // Material surface index for reordered surfaces by AccelManager
+  uint32_t m_previousSurfaceIndex;
+
   // Object with Opacity Micromap per-instance data maintained by Opacity Micromap Manager.
   // Stored in instance object to avoid indirection of looking it up for an instance
   OpacityMicromapInstanceData m_opacityMicromapInstanceData;
 
-  uint32_t m_surfaceIndex;        // Material surface index for reordered surfaces by AccelManager
-  uint32_t m_previousSurfaceIndex;
+  // Extra instance meta data needed for Opacity Micromap Manager, generally describes if animated spritesheets are in use
+// on a given instance (though the applicability to OMMs are only relevant for Opaque and Ray Portal materials currently
+// where cutout opacity can be animated, translucent materials do not have any relation right now to OMMs).
+  bool m_isAnimated = false;
+
+  mutable bool m_isMarkedForGC = false;
 
   bool m_isHidden = false;
   bool m_isPlayerModel = false;
@@ -208,6 +220,8 @@ private:
   bool m_isObjectToWorldMirrored = false;
   bool m_isCreatedByRenderer = false;
   bool m_isSubsurface = false;
+  bool m_blasDirty = true;  // Needs reprocessing in mergeInstancesIntoBlas; starts dirty for new instances
+  bool m_billboardGeometryDirty = true;  // Needs initial geometry info generation for billboard-derived layout
   BlasEntry* m_linkedBlas = nullptr;
   XXH64_hash_t m_materialHash = kEmptyHash;
   XXH64_hash_t m_materialDataHash = kEmptyHash;
@@ -220,7 +234,6 @@ private:
 
   CategoryFlags m_categoryFlags;
 
-  XXH64_hash_t m_spatialCacheHash = kEmptyHash;
 
   // This can be used to access all lights and instances that originate from the same draw call.
   // Left as nullptr if the draw call does not have replacement data.
@@ -283,7 +296,19 @@ public:
 
   // Returns the active number of instances in scene
   const uint32_t getActiveCount() const { return m_instances.size(); }
-  
+
+  // Returns a monotonically increasing token used only for equality checks by
+  // acceleration-structure caches.  It is bumped for changes that affect BLAS
+  // or TLAS membership/build inputs: instance add/remove, transform changes
+  // baked into merged BLASes, material or bucket-key changes, geometry/build
+  // range changes, and external systems invalidating AS bindings.
+  uint64_t getSceneGeneration() const { return m_sceneGeneration; }
+
+  // Notify that acceleration structures must be reconsidered.  Per-frame GPU
+  // surface-data refreshes (previous-frame indices/transforms, surface mapping,
+  // prefix sums) do not need this notification when BLAS/TLAS inputs are stable.
+  void notifySceneChanged() { ++m_sceneGeneration; }
+
   void onFrameEnd();
 
   // Optional notification callbacks that can be implemented to "opt-in" to InstanceManager events
@@ -307,6 +332,9 @@ public:
   // Binds a raytracing material to the specified instance.
   void bindMaterial(RtInstance& instance, const RtSurfaceMaterial& material);
 
+  // Copies buffer indices from the BlasEntry's geometry data to the instance's surface.
+  void processInstanceBuffers(const BlasEntry& blas, RtInstance& currentInstance) const;
+
   // Creates a copy of a reference instance and adds it to the instance pool
   // Temporary single frame instances generated every frame should disable valid id generation to avoid overflowing it
   RtInstance* createInstanceCopy(const RtInstance& reference, bool generateValidID = true);
@@ -329,7 +357,7 @@ public:
   void resetSurfaceIndices();
 
   const std::vector<IntersectionBillboard>& getBillboards() const { return m_billboards; }
-  
+
 private:
   ResourceCache* m_pResourceCache;
 
@@ -337,13 +365,13 @@ private:
   uint64_t m_nextInstanceId = 1;
 
   std::vector<RtInstance*> m_instances; 
+  uint64_t m_sceneGeneration = 0;
   std::vector<RtInstance*> m_viewModelCandidates;
   uint32_t m_viewModelCandidatesFrameId = kInvalidFrameIndex;
   std::vector<RtInstance*> m_playerModelInstances;
   uint32_t m_playerModelInstancesFrameId = kInvalidFrameIndex;
   std::vector<IntersectionBillboard> m_billboards;
 
-  bool m_previousViewModelState = false;
   RtInstance* targetInstance = nullptr;
 
   uint32_t m_decalSortOrderCounter = 0;  // monotonically incrementing value indicating the draw call order of this decal on the frame
@@ -352,16 +380,36 @@ private:
   // Negative values mean there is no portal that's close enough to the camera.
   int m_virtualInstancePortalIndex = 0;    
 
+  // Persistent renderer-created instances that survive across frames.
+  // Maps reference instance → derived instance.  Avoids create/destroy
+  // churn that would needlessly bump m_sceneGeneration every frame.
+  std::unordered_map<RtInstance*, RtInstance*> m_persistentViewModelInstances;
+  std::unordered_map<RtInstance*, RtInstance*> m_persistentVirtualViewModelInstances;
+  std::unordered_map<RtInstance*, RtInstance*> m_persistentPlayerModelClones;
+
+  // Removes persistent entries whose references are no longer active and
+  // marks the associated derived instances for GC.
+  void cleanupPersistentMap(std::unordered_map<RtInstance*, RtInstance*>& map,
+                            const std::unordered_set<RtInstance*>& activeReferences);
+
+  // Removes any persistent map entry (key or value) that references a
+  // dying instance.  Called from garbageCollection() before the instance
+  // is deleted to prevent dangling pointers.
+  void erasePersistentMapEntries(RtInstance* dying);
+
+#ifndef NDEBUG
+  std::deque<void*> m_destroyedInstanceQuarantine;
+
+  void releaseDestroyedInstanceQuarantine();
+#endif
+  void destroyInstanceAllocation(RtInstance* instance);
+
   std::vector<InstanceEventHandler> m_eventHandlers;
 
   // Handles the case of when two (or more) identical geometries+textures draw calls have been submitted in a single frame (typically used for two-pass rendering in FF)
   void mergeInstanceHeuristics(RtInstance& instanceToModify, const DrawCallState& drawCall, const RtSurface::AlphaState& alphaState) const;
 
-  // Finds the "closest" matching instance to a set of inputs, returns a pointer (can be null if not found) to closest instance
-  RtInstance* findSimilarInstance(BlasEntry& blas, const MaterialData& material, const Matrix4& firstInstanceObjectToWorld, CameraType::Enum cameraType, const RayPortalManager& rayPortalManager);
-
   RtInstance* addInstance(BlasEntry& blas);
-  void processInstanceBuffers(const BlasEntry& blas, RtInstance& currentInstance) const;
 
   void updateInstance(
     RtInstance& currentInstance, const CameraManager& cameraManager,
@@ -390,4 +438,3 @@ private:
 };
 
 }  // namespace dxvk
-

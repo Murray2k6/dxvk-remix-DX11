@@ -20,7 +20,6 @@
 * DEALINGS IN THE SOFTWARE.
 */
 #include "rtx_options.h"
-#include "../imgui/dxvk_imgui.h"
 
 #include <filesystem>
 #include <nvapi.h>
@@ -28,39 +27,23 @@
 #include "rtx_bridge_message_channel.h"
 #include "rtx_terrain_baker.h"
 #include "rtx_nee_cache.h"
-#include "rtx_xess.h"
 #include "rtx_rtxdi_rayquery.h"
 #include "rtx_restir_gi_rayquery.h"
 #include "rtx_composite.h"
 #include "rtx_demodulate.h"
 #include "rtx_neural_radiance_cache.h"
 #include "rtx_ray_reconstruction.h"
+#include "../util/util_global_time.h"
 
 #include "dxvk_device.h"
 #include "rtx_global_volumetrics.h"
-
-#include <algorithm>
+#include "rtx_scene_manager.h"
 
 namespace dxvk {
-
-  const char* getUpscalerTypeName(UpscalerType type) {
-    switch (type) {
-      case UpscalerType::None: return "Native";
-      case UpscalerType::DLSS: return "DLSS";
-      case UpscalerType::NIS: return "NIS";
-      case UpscalerType::TAAU: return "TAA-U";
-      case UpscalerType::XeSS: return "XeSS";
-      case UpscalerType::FSR4: return "FSR4";
-    }
-
-    return "Unknown";
-  }
-
   RtxOptions* RtxOptions::s_instance = nullptr;
   HashRule RtxOptions::s_geometryHashGenerationRule = 0;
   HashRule RtxOptions::s_geometryAssetHashRule = 0;
 
-  
   void RtxOptions::graphicsPresetOnChange(DxvkDevice* device) {
     // device will be nullptr during initial config loading.
     if (device == nullptr) {
@@ -75,10 +58,9 @@ namespace dxvk {
       const RtxOptionLayer* userLayer = RtxOptionLayer::getUserLayer();
       
       if (qualityLayer && userLayer) {
-        // Migrate ALL untouched Quality values to User layer (not just those with the flag).
-        // Preserve existing User values so the setting that triggered Custom does not snap back.
+        // Migrate ALL options from Quality layer to User layer (not just those with the flag)
         for (auto& [hash, optionPtr] : RtxOptionImpl::getGlobalOptionMap()) {
-          optionPtr->moveLayerValue(qualityLayer, userLayer, true);
+          optionPtr->moveLayerValue(qualityLayer, userLayer);
         }
         Logger::info("[Graphics Preset] Switched to Custom - Quality settings migrated to User layer");
       }
@@ -96,16 +78,28 @@ namespace dxvk {
   void RtxOptions::showUICursorOnChange(DxvkDevice* device) {
     if (ImGui::GetCurrentContext() != nullptr) {
       auto& io = ImGui::GetIO();
-      const bool uiOpen = dxvk::ImGUI::GetLastKnownMenuType() != UIType::None;
-      io.MouseDrawCursor = RtxOptions::showUICursor() && uiOpen;
+      io.MouseDrawCursor = RtxOptions::showUICursor() && RtxOptions::showUI() != UIType::None;
     }
   }
 
+  void RtxOptions::onAdvanceTimeChanged(DxvkDevice* device) {
+    GlobalTime::get().setAdvanceTime(RtxOptions::advanceTime());
+  }
+
   void RtxOptions::blockInputToGameInUIOnChange(DxvkDevice* device) {
-    const bool uiOpen = dxvk::ImGUI::GetLastKnownMenuType() != UIType::None;
-    const bool doBlock = RtxOptions::blockInputToGameInUI() && uiOpen;
+    const bool doBlock = RtxOptions::blockInputToGameInUI() && RtxOptions::showUI() != UIType::None;
 
     BridgeMessageChannel::get().send("UWM_REMIX_UIACTIVE_MSG", doBlock ? 1 : 0, 0);
+  }
+
+  void RtxOptions::ViewModel::enableOnChange(DxvkDevice* device) {
+    if (device) {
+      // applyPendingValues (which invokes this callback) runs after onFrameEnd,
+      // so no rendering is in flight and we can clear the scene immediately
+      // without a WFI or deferred clear.  Using a delayed clear here would cause
+      // a frame to render with the old scene but the new view model setting.
+      device->getCommon()->getSceneManager().clear(nullptr, false);
+    }
   }
 
   namespace {
@@ -150,10 +144,9 @@ namespace dxvk {
     }
   }
 
-  void RtxOptions::updateUpscalerFromDlssPreset(DxvkDevice* device) {
+  void RtxOptions::updateUpscalerFromDlssPreset() {
     // Code-driven changes for DLSS preset (automatically routes to User layer when preset is Custom)
     RtxOptionLayerTarget layerTarget(RtxOptionEditTarget::Derived);
-    (void) device;
 
     if (RtxOptions::Automation::disableUpdateUpscaleFromDlssPreset()) {
       return;
@@ -167,8 +160,6 @@ namespace dxvk {
         reflexMode.setImmediately(ReflexMode::None);
         break;
       case DlssPreset::On:
-        // Keep the manufacturer-authored DLSS mode selected. Runtime dispatch
-        // resolves to a compatible backend separately when DLSS is unavailable.
         upscalerType.setImmediately(UpscalerType::DLSS);
         qualityDLSS.setImmediately(DLSSProfile::Auto);
         reflexMode.setImmediately(ReflexMode::LowLatency); // Reflex uses ON under G (not Boost)
@@ -272,55 +263,6 @@ namespace dxvk {
       default:
         break;
     }
-  }
-
-  UpscalerType RtxOptions::getSupportedUpscalerForDevice(DxvkDevice* device, UpscalerType requestedUpscaler) {
-    auto supportsUpscaler = [&](UpscalerType upscaler) {
-      switch (upscaler) {
-        case UpscalerType::None:
-        case UpscalerType::NIS:
-        case UpscalerType::TAAU:
-          return true;
-        case UpscalerType::DLSS:
-          return device != nullptr && device->getCommon()->metaDLSS().supportsDLSS();
-        case UpscalerType::XeSS:
-          return device != nullptr && device->getCommon()->metaXeSS().supportsXeSS();
-        case UpscalerType::FSR4:
-          if (device != nullptr) {
-            device->getCommon()->metaFSR().logStatusOnce();
-            return device->getCommon()->metaFSR().supportsFSR4();
-          }
-          return false;
-      }
-
-      return false;
-    };
-
-    if (requestedUpscaler == UpscalerType::None || supportsUpscaler(requestedUpscaler)) {
-      return requestedUpscaler;
-    }
-
-    auto chooseFirstSupported = [&](std::initializer_list<UpscalerType> candidates) {
-      for (UpscalerType candidate : candidates) {
-        if (supportsUpscaler(candidate)) {
-          return candidate;
-        }
-      }
-
-      return UpscalerType::None;
-    };
-
-    return chooseFirstSupported({ UpscalerType::TAAU, UpscalerType::NIS, UpscalerType::XeSS, UpscalerType::DLSS, UpscalerType::FSR4 });
-  }
-
-  IntegrateIndirectMode RtxOptions::getSupportedIntegrateIndirectMode(DxvkDevice* device, IntegrateIndirectMode requestedMode) {
-    if (requestedMode != IntegrateIndirectMode::NeuralRadianceCache || device == nullptr) {
-      return requestedMode;
-    }
-
-    return NeuralRadianceCache::checkIsSupported(device)
-      ? requestedMode
-      : IntegrateIndirectMode::ReSTIRGI;
   }
 
   static bool queryNvidiaArchInfo(NV_GPU_ARCH_INFO& archInfo) {
@@ -454,37 +396,14 @@ namespace dxvk {
   }
     
   void RtxOptions::updateGraphicsPresets(DxvkDevice* device) {
-    // Guard against calls that arrive before RtxOptions has been constructed.
-    // rtx_initializer.cpp calls this once before applyPendingValues (no-op) and
-    // once after (the real run with a valid device for all GPU vendors).
-    if (!RtxOptionImpl::isInitialized()) {
-      return;
-    }
-
     // Code-driven changes for graphics preset (automatically routes to User layer when preset is Custom)
     RtxOptionLayerTarget layerTarget(RtxOptionEditTarget::Derived);
 
-    // graphicsPreset drives the Quality layer; it should never retain its own value there.
-    // A stale Quality-layer Auto entry will override the User layer and make the UI appear stuck.
-    RtxOptions::graphicsPreset.disableLayerValue(RtxOptionLayer::getQualityLayer());
-
-    GraphicsPreset effectiveGraphicsPreset = RtxOptions::graphicsPreset();
-
     // Handle Automatic Graphics Preset (From configuration/default)
 
-    if (effectiveGraphicsPreset == GraphicsPreset::Auto) {
+    if (RtxOptions::graphicsPreset() == GraphicsPreset::Auto) {
       const DxvkDeviceInfo& deviceInfo = device->adapter()->devicePropertiesExt();
       const uint32_t vendorID = deviceInfo.core.properties.vendorID;
-      UpscalerType preferredUpscaler = UpscalerType::TAAU;
-      auto getDeviceLocalMemorySize = [](const VkPhysicalDeviceMemoryProperties& memProps) {
-        VkDeviceSize result = 0;
-        for (uint32_t i = 0; i < memProps.memoryHeapCount; i++) {
-          if ((memProps.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) != 0) {
-            result = std::max(result, memProps.memoryHeaps[i].size);
-          }
-        }
-        return result;
-      };
       
       // Default updateGraphicsPresets value, don't want to hit this path intentionally or Low settings will be used
       assert(vendorID != 0);
@@ -500,200 +419,48 @@ namespace dxvk {
           // Pre-Turing
           Logger::info("NVIDIA architecture without HW RTX support detected, setting default graphics settings to Low, but your experience may not be optimal");
           preferredDefault = GraphicsPreset::Low;
-          RtxOptions::qualityDLSS.setDeferred(DLSSProfile::MaxPerf);
-          DxvkXeSS::XessOptions::preset.setDeferred(XeSSPreset::Performance);
-          RtxOptions::nisPreset.setDeferred(NisPreset::Performance);
-          RtxOptions::taauPreset.setDeferred(TaauPreset::Performance);
         } else if (archId < NV_GPU_ARCHITECTURE_GA100) {
           // Turing
           Logger::info("NVIDIA Turing architecture detected, setting default graphics settings to Low");
           preferredDefault = GraphicsPreset::Low;
-          RtxOptions::qualityDLSS.setDeferred(DLSSProfile::MaxPerf);
-          DxvkXeSS::XessOptions::preset.setDeferred(XeSSPreset::Performance);
-          RtxOptions::nisPreset.setDeferred(NisPreset::Performance);
-          RtxOptions::taauPreset.setDeferred(TaauPreset::Performance);
         } else if (archId < NV_GPU_ARCHITECTURE_AD100) {
           // Ampere
           Logger::info("NVIDIA Ampere architecture detected, setting default graphics settings to Medium");
           preferredDefault = GraphicsPreset::Medium;
-          RtxOptions::qualityDLSS.setDeferred(DLSSProfile::Balanced);
-          DxvkXeSS::XessOptions::preset.setDeferred(XeSSPreset::Balanced);
-          RtxOptions::nisPreset.setDeferred(NisPreset::Balanced);
-          RtxOptions::taauPreset.setDeferred(TaauPreset::Balanced);
         } else if (archId < NV_GPU_ARCHITECTURE_GB200) {
           // Ada
           Logger::info("NVIDIA Ada architecture detected, setting default graphics settings to High");
           preferredDefault = GraphicsPreset::High;
-          RtxOptions::qualityDLSS.setDeferred(DLSSProfile::Auto);
-          DxvkXeSS::XessOptions::preset.setDeferred(XeSSPreset::Quality);
-          RtxOptions::nisPreset.setDeferred(NisPreset::Quality);
-          RtxOptions::taauPreset.setDeferred(TaauPreset::Quality);
         } else {
           // Blackwell and beyond
           Logger::info("NVIDIA Blackwell architecture detected, setting default graphics settings to Ultra");
           preferredDefault = GraphicsPreset::Ultra;
-          RtxOptions::qualityDLSS.setDeferred(DLSSProfile::Auto);
-          DxvkXeSS::XessOptions::preset.setDeferred(XeSSPreset::Quality);
-          RtxOptions::nisPreset.setDeferred(NisPreset::Quality);
-          RtxOptions::taauPreset.setDeferred(TaauPreset::Quality);
-        }
-
-      } else if (vendorID == static_cast<uint32_t>(DxvkGpuVendor::Amd)) {
-        // AMD preset: architecture-generation detection with VRAM as a
-        // secondary modifier. Generation matters more than VRAM for path
-        // tracing: RDNA 2's RT throughput sits around NVIDIA Turing class,
-        // RDNA 3 improved it only modestly (an RX 7600 falls well behind an
-        // RTX 4060 once RT is enabled), while RDNA 4 brought a major RT
-        // uplift into Ampere/Ada territory. Parse the marketing name for the
-        // series digit; fall back to VRAM tiers when unrecognized.
-        const std::string amdName = device->adapter()->deviceProperties().deviceName;
-        const VkPhysicalDeviceMemoryProperties amdMemProps = device->adapter()->memoryProperties();
-        const VkDeviceSize amdVidMem = getDeviceLocalMemorySize(amdMemProps);
-
-        int radeonSeries = 0; // first digit after "RX " (6xxx / 7xxx / 9xxx)
-        {
-          const size_t rxPos = amdName.find("RX ");
-          if (rxPos != std::string::npos && rxPos + 3 < amdName.size()) {
-            const char c = amdName[rxPos + 3];
-            if (c >= '0' && c <= '9') {
-              radeonSeries = c - '0';
-            }
-          }
-        }
-
-        if (radeonSeries >= 9) {
-          // RDNA 4 (RX 9000): Ada-class RT uplift -> Medium for Remix path
-          // tracing (no SER / opacity micromaps, so one tier below NVIDIA Ada).
-          Logger::info(str::format("AMD RDNA4-class GPU detected (", amdName, "), setting preset to Medium"));
-          preferredDefault = GraphicsPreset::Medium;
-          DxvkXeSS::XessOptions::preset.setDeferred(XeSSPreset::Quality);
-          RtxOptions::nisPreset.setDeferred(NisPreset::Quality);
-          RtxOptions::taauPreset.setDeferred(TaauPreset::Balanced);
-        } else if (radeonSeries == 7 && amdVidMem >= 20ull * 1024 * 1024 * 1024) {
-          // High-end RDNA 3 (RX 7900 XT/XTX): enough raw throughput for Medium.
-          Logger::info(str::format("AMD high-end RDNA3 GPU detected (", amdName, "), setting preset to Medium"));
-          preferredDefault = GraphicsPreset::Medium;
-          DxvkXeSS::XessOptions::preset.setDeferred(XeSSPreset::Quality);
-          RtxOptions::nisPreset.setDeferred(NisPreset::Quality);
-          RtxOptions::taauPreset.setDeferred(TaauPreset::Balanced);
-        } else if (radeonSeries == 7 || radeonSeries == 6) {
-          // Mainstream RDNA 2/3: Turing-class RT throughput -> Low.
-          Logger::info(str::format("AMD RDNA2/3 GPU detected (", amdName, "), setting preset to Low"));
-          preferredDefault = GraphicsPreset::Low;
-          DxvkXeSS::XessOptions::preset.setDeferred(XeSSPreset::Balanced);
-          RtxOptions::nisPreset.setDeferred(NisPreset::Balanced);
-          RtxOptions::taauPreset.setDeferred(TaauPreset::Performance);
-          if (amdVidMem <= 8ull * 1024 * 1024 * 1024) {
-            // Budget RDNA with 8GB or less: halve ray-trace resolution to avoid TDRs.
-            RtxOptions::resolutionScale.setDeferred(0.5f);
-          }
-        } else if (amdVidMem >= 16ull * 1024 * 1024 * 1024) {
-          // Unrecognized name: fall back to the original VRAM tiers.
-          Logger::info(str::format("AMD GPU detected with ", amdVidMem / (1024*1024), " MB VRAM, setting preset to Medium"));
-          preferredDefault = GraphicsPreset::Medium;
-          DxvkXeSS::XessOptions::preset.setDeferred(XeSSPreset::Quality);
-          RtxOptions::nisPreset.setDeferred(NisPreset::Quality);
-          RtxOptions::taauPreset.setDeferred(TaauPreset::Balanced);
-        } else if (amdVidMem >= 8ull * 1024 * 1024 * 1024) {
-          Logger::info(str::format("AMD GPU detected with ", amdVidMem / (1024*1024), " MB VRAM, setting preset to Low"));
-          preferredDefault = GraphicsPreset::Low;
-          DxvkXeSS::XessOptions::preset.setDeferred(XeSSPreset::Balanced);
-          RtxOptions::nisPreset.setDeferred(NisPreset::Balanced);
-          RtxOptions::taauPreset.setDeferred(TaauPreset::Performance);
-        } else {
-          Logger::info(str::format("AMD GPU detected with ", amdVidMem / (1024*1024), " MB VRAM (budget), setting preset to Low"));
-          preferredDefault = GraphicsPreset::Low;
-          DxvkXeSS::XessOptions::preset.setDeferred(XeSSPreset::Performance);
-          RtxOptions::nisPreset.setDeferred(NisPreset::Performance);
-          RtxOptions::taauPreset.setDeferred(TaauPreset::Performance);
-          RtxOptions::resolutionScale.setDeferred(0.5f);
-        }
-
-      } else if (vendorID == static_cast<uint32_t>(DxvkGpuVendor::Intel)) {
-        // Intel preset: architecture-generation detection. Intel's RT
-        // hardware is strong for its class - Alchemist (A-series) matches
-        // NVIDIA Ampere (RTX 3060) in RT, and Battlemage (B-series) matches
-        // or beats an RTX 4060 with RT enabled - so a blanket half-resolution
-        // penalty is wrong for discrete Arc. Reserve it for iGPUs and
-        // low-VRAM Alchemist parts.
-        const std::string intelName = device->adapter()->deviceProperties().deviceName;
-        const VkPhysicalDeviceMemoryProperties intelMemProps = device->adapter()->memoryProperties();
-        const VkDeviceSize intelVidMem = getDeviceLocalMemorySize(intelMemProps);
-
-        char arcGen = 0; // 'A' = Alchemist, 'B' = Battlemage, 'C' = Celestial
-        {
-          const size_t arcPos = intelName.find("Arc");
-          if (arcPos != std::string::npos) {
-            for (size_t i = arcPos + 3; i + 1 < intelName.size(); ++i) {
-              const char c = intelName[i];
-              const char n = intelName[i + 1];
-              if ((c == 'A' || c == 'B' || c == 'C') && n >= '0' && n <= '9') {
-                arcGen = c;
-                break;
-              }
-            }
-          }
-        }
-
-        if (arcGen >= 'C') {
-          // Celestial and beyond: assume another generational RT uplift.
-          Logger::info(str::format("Intel Arc Celestial-class GPU detected (", intelName, "), setting preset to High"));
-          preferredDefault = GraphicsPreset::High;
-          DxvkXeSS::XessOptions::preset.setDeferred(XeSSPreset::Quality);
-          RtxOptions::nisPreset.setDeferred(NisPreset::Quality);
-          RtxOptions::taauPreset.setDeferred(TaauPreset::Quality);
-        } else if (arcGen == 'B') {
-          // Battlemage: Ada-class RT (B580 matches/beats RTX 4060 with RT on),
-          // minus SER/OMM -> Medium, full internal resolution.
-          Logger::info(str::format("Intel Arc Battlemage GPU detected (", intelName, "), setting preset to Medium"));
-          preferredDefault = GraphicsPreset::Medium;
-          DxvkXeSS::XessOptions::preset.setDeferred(XeSSPreset::Quality);
-          RtxOptions::nisPreset.setDeferred(NisPreset::Quality);
-          RtxOptions::taauPreset.setDeferred(TaauPreset::Balanced);
-        } else if (arcGen == 'A') {
-          // Alchemist: Ampere-class RT -> Low, half resolution only on low VRAM.
-          Logger::info(str::format("Intel Arc Alchemist GPU detected (", intelName, "), setting preset to Low"));
-          preferredDefault = GraphicsPreset::Low;
-          DxvkXeSS::XessOptions::preset.setDeferred(XeSSPreset::Balanced);
-          RtxOptions::nisPreset.setDeferred(NisPreset::Balanced);
-          RtxOptions::taauPreset.setDeferred(TaauPreset::Performance);
-          if (intelVidMem <= 8ull * 1024 * 1024 * 1024) {
-            RtxOptions::resolutionScale.setDeferred(0.5f);
-          }
-        } else if (intelVidMem >= 8ull * 1024 * 1024 * 1024) {
-          // Unrecognized discrete Intel GPU: VRAM-tier fallback.
-          Logger::info(str::format("Intel GPU detected with ", intelVidMem / (1024*1024), " MB VRAM, setting preset to Low"));
-          preferredDefault = GraphicsPreset::Low;
-          DxvkXeSS::XessOptions::preset.setDeferred(XeSSPreset::Balanced);
-          RtxOptions::nisPreset.setDeferred(NisPreset::Balanced);
-          RtxOptions::taauPreset.setDeferred(TaauPreset::Performance);
-        } else {
-          // Integrated or very low-VRAM Intel: Low preset at half resolution.
-          Logger::info(str::format("Integrated/low-VRAM Intel GPU detected (", intelName, "), setting preset to Low at 50% resolution"));
-          preferredDefault = GraphicsPreset::Low;
-          DxvkXeSS::XessOptions::preset.setDeferred(XeSSPreset::Performance);
-          RtxOptions::nisPreset.setDeferred(NisPreset::Performance);
-          RtxOptions::taauPreset.setDeferred(TaauPreset::Performance);
-          RtxOptions::resolutionScale.setDeferred(0.5f);
         }
       } else {
-        // Unknown vendor defaults to TAA-U, the broadest Vulkan-safe temporal upscaler.
-        Logger::info("Unknown GPU vendor detected, setting default graphics settings to Low with TAA-U upscaling");
+        // Default to low if we don't know the hardware
+        Logger::info("Non-NVIDIA architecture detected, setting default graphics settings to Low");
         preferredDefault = GraphicsPreset::Low;
 
-        DxvkXeSS::XessOptions::preset.setDeferred(XeSSPreset::Balanced);
+        // Setup some other known good defaults for other IHVs.
+        RtxOptions::resolutionScale.setDeferred(0.5f);
+        // Todo: Currently this code is needed to allow the the non-DLSS upscaling paths to reflect the
+        // resolution scale setting otherwise the resolution scale may be automatically updated to match
+        // some other preset whenever something like updateUpscalerFromTaauPreset is called. Ideally the
+        // resolution scale and these presets would not be so disconnected like this (or maybe
+        // updatePresetFromUpscaler just needs to be called in the right places).
         RtxOptions::nisPreset.setDeferred(NisPreset::Performance);
-        RtxOptions::taauPreset.setDeferred(TaauPreset::Balanced);
-        preferredUpscaler = UpscalerType::TAAU;
+        RtxOptions::taauPreset.setDeferred(TaauPreset::Performance);
       }
 
-      // Keep Auto on the universal Vulkan-safe temporal upscaler. Users can
-      // still pick DLSS, XeSS, FSR4, or NIS explicitly in the UI/config.
-      RtxOptions::upscalerType.setImmediately(preferredUpscaler, RtxOptionLayer::getDerivedLayer());
-
       // figure out how much vidmem we have
-      const VkPhysicalDeviceMemoryProperties memProps = device->adapter()->memoryProperties();
-      const VkDeviceSize vidMemSize = getDeviceLocalMemorySize(memProps);
+      VkPhysicalDeviceMemoryProperties memProps = device->adapter()->memoryProperties();
+      VkDeviceSize vidMemSize = 0;
+      for (uint32_t i = 0; i < memProps.memoryTypeCount; i++) {
+        if (memProps.memoryTypes[i].propertyFlags == VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) {
+          vidMemSize = memProps.memoryHeaps[memProps.memoryTypes[i].heapIndex].size;
+          break;
+        }
+      }
 
       // for 8GB GPUs we lower the quality even further.
       if (vidMemSize <= 8ull * 1024 * 1024 * 1024) {
@@ -704,41 +471,12 @@ namespace dxvk {
         RtxOptions::lowMemoryGpu.setDeferred(false);
       }
 
-      // Apply stability mode settings for improved compatibility across all engines
-      if (RtxOptions::enableStabilityMode()) {
-        Logger::info("Stability mode enabled, applying compatibility settings");
-        
-        // Reduce ray tracing resolution for better stability
-        if (RtxOptions::resolutionScale() > 0.75f) {
-          RtxOptions::resolutionScale.setDeferred(0.75f);
-        }
-        
-        // Reduce path bounces for better performance on complex scenes
-        if (RtxOptions::pathMaxBounces() > 4) {
-          RtxOptions::pathMaxBounces.setDeferred(4);
-        }
-        
-        // Enable conservative RTXDI settings for stability
-        DxvkRtxdiRayQuery::enableDenoiserConfidence.setDeferred(true);
-        DxvkRtxdiRayQuery::enableBestLightSampling.setDeferred(false);
-        DxvkRtxdiRayQuery::initialSampleCount.setDeferred(2);
-        DxvkRtxdiRayQuery::spatialSamples.setDeferred(1);
-        DxvkRtxdiRayQuery::disocclusionSamples.setDeferred(1);
-        
-        // For CPU-bound scenarios, reduce geometry processing overhead
-        // This helps with games that have complex geometry or many draw calls
-        // NOTE: enableAsyncAssetLoading option does not exist, so this line is removed.
-        
-        // Enable shader compilation optimization for better CPU performance
-        RtxOptions::Shader::enableAsyncCompilation.setDeferred(true);
-        RtxOptions::Shader::maxConcurrentShaderCompilations.setDeferred(4);
-      }
-
+      // graphicsPreset itself should go to User layer, not Quality layer
+      // (graphicsPreset controls what goes into Quality, it's not controlled BY Quality)
       {
         RtxOptionLayerTarget userTarget(RtxOptionEditTarget::User);
-        RtxOptions::graphicsPreset.setImmediately(preferredDefault, RtxOptionLayer::getUserLayer());
+        RtxOptions::graphicsPreset.setImmediately(preferredDefault);
       }
-      effectiveGraphicsPreset = RtxOptions::graphicsPreset();
     }
 
     auto common = device->getCommon();
@@ -765,56 +503,22 @@ namespace dxvk {
     };
 
     auto enableNrcPreset = [&](NeuralRadianceCache::QualityPreset nrcPreset) {
-      const IntegrateIndirectMode resolvedMode = getSupportedIntegrateIndirectMode(device, IntegrateIndirectMode::NeuralRadianceCache);
+      NeuralRadianceCache& nrc = device->getCommon()->metaNeuralRadianceCache();
       // TODO[REMIX-4105] trying to use NRC for a frame when it isn't supported will cause a crash, so this needs to be setImmediately.
-      // Should refactor this to use a separate global for the final state, and indicate user preference with the option.
-      RtxOptions::integrateIndirectMode.setImmediately(resolvedMode, RtxOptionLayer::getQualityLayer());
-      if (RtxOptions::integrateIndirectMode() != resolvedMode) {
-        RtxOptions::integrateIndirectMode.clearFromStrongerLayers(RtxOptionLayer::getQualityLayer());
-        RtxOptions::integrateIndirectMode.setImmediately(resolvedMode, RtxOptionLayer::getQualityLayer());
-      }
-
-      if (resolvedMode == IntegrateIndirectMode::NeuralRadianceCache) {
-        NeuralRadianceCache& nrc = device->getCommon()->metaNeuralRadianceCache();
+      // Should refactor this to use a separate global for the final state, and indicate user preference with the option. 
+      if (nrc.checkIsSupported(device)) {
+        RtxOptions::integrateIndirectMode.setImmediately(IntegrateIndirectMode::NeuralRadianceCache);
         nrc.setQualityPreset(nrcPreset);
-      }
-    };
-
-    auto enableLowCostIndirectPreset = [&]() {
-      RtxOptions::integrateIndirectMode.setImmediately(IntegrateIndirectMode::ImportanceSampled, RtxOptionLayer::getQualityLayer());
-      if (RtxOptions::integrateIndirectMode() != IntegrateIndirectMode::ImportanceSampled) {
-        Logger::info("[RtxOptions] integrateIndirectMode low-cost preset is blocked by a stronger layer. Clearing stronger layers and retrying.");
-        RtxOptions::integrateIndirectMode.clearFromStrongerLayers(RtxOptionLayer::getQualityLayer());
-        RtxOptions::integrateIndirectMode.setImmediately(IntegrateIndirectMode::ImportanceSampled, RtxOptionLayer::getQualityLayer());
-      }
-    };
-
-    // If Auto was not resolved by updateGraphicsPresets(), fall back to a
-    // safe default rather than crashing.  This can happen if the config file
-    // contains an invalid value or resolution runs before the GPU is known.
-    Logger::info(str::format("[RtxOptions] graphicsPreset after auto block = ", (int)effectiveGraphicsPreset));
-    if (effectiveGraphicsPreset == GraphicsPreset::Auto) {
-      Logger::info("RtxOptions: graphicsPreset is still Auto after resolution; defaulting to Low.");
-      // Write to User layer (matching the auto-resolution block above) so
-      // the value isn't shadowed by a lower-priority layer's Auto default.
-      {
-        RtxOptionLayerTarget userTarget(RtxOptionEditTarget::User);
-        graphicsPreset.clearFromStrongerLayers(RtxOptionLayer::getUserLayer());
-        graphicsPreset.setImmediately(GraphicsPreset::Low, RtxOptionLayer::getUserLayer());
-      }
-
-      effectiveGraphicsPreset = graphicsPreset();
-      if (effectiveGraphicsPreset == GraphicsPreset::Auto) {
-        Logger::info("[RtxOptions] graphicsPreset write is still blocked after fallback. Applying Low preset settings using a local effective preset for this run.");
-        effectiveGraphicsPreset = GraphicsPreset::Low;
       } else {
-        Logger::info(str::format("[RtxOptions] graphicsPreset after fallback write = ", (int)effectiveGraphicsPreset));
+        RtxOptions::integrateIndirectMode.setImmediately(IntegrateIndirectMode::ReSTIRGI);
       }
-    }
+    };
+
+    assert(graphicsPreset() != GraphicsPreset::Auto);
 
     RtxGlobalVolumetrics& volumetrics = device->getCommon()->metaGlobalVolumetrics();
 
-    if (effectiveGraphicsPreset == GraphicsPreset::Ultra) {
+    if (graphicsPreset() == GraphicsPreset::Ultra) {
       pathMinBounces.setDeferred(1);
       pathMaxBounces.setDeferred(4);
       enableTransmissionApproximationInIndirectRays.setDeferred(false);
@@ -836,7 +540,7 @@ namespace dxvk {
       enableNrcPreset(NeuralRadianceCache::QualityPreset::Ultra);
 
       DxvkRayReconstruction::model.setDeferred(DxvkRayReconstruction::RayReconstructionModel::Transformer);
-    } else if (effectiveGraphicsPreset == GraphicsPreset::High) {
+    } else if (graphicsPreset() == GraphicsPreset::High) {
       pathMinBounces.setDeferred(0);
       pathMaxBounces.setDeferred(2);
       enableTransmissionApproximationInIndirectRays.setDeferred(true);
@@ -858,7 +562,7 @@ namespace dxvk {
       enableNrcPreset(NeuralRadianceCache::QualityPreset::High);
 
       DxvkRayReconstruction::model.setDeferred(DxvkRayReconstruction::RayReconstructionModel::Transformer);
-    } else if (effectiveGraphicsPreset == GraphicsPreset::Medium) {
+    } else if (graphicsPreset() == GraphicsPreset::Medium) {
       lowGraphicsPresetCommonSettings();
 
       russianRouletteMaxContinueProbability.setDeferred(0.7f);
@@ -868,25 +572,21 @@ namespace dxvk {
       enableNrcPreset(NeuralRadianceCache::QualityPreset::Medium);
 
       DxvkRayReconstruction::model.setDeferred(DxvkRayReconstruction::RayReconstructionModel::CNN);
-    } else if (effectiveGraphicsPreset == GraphicsPreset::Low) {
+    } else if (graphicsPreset() == GraphicsPreset::Low) {
       lowGraphicsPresetCommonSettings();
-
-      pathMaxBounces.setDeferred(1);
-      resolutionScale.setDeferred(0.5f);
 
       russianRouletteMaxContinueProbability.setDeferred(0.7f);
       russianRoulette1stBounceMinContinueProbability.setDeferred(0.4f);
 
       volumetrics.setQualityLevel(RtxGlobalVolumetrics::Low);
-      enableLowCostIndirectPreset();
+      enableNrcPreset(NeuralRadianceCache::QualityPreset::Medium);
 
       DxvkRayReconstruction::model.setDeferred(DxvkRayReconstruction::RayReconstructionModel::CNN);
     }
 
-    // DLSS quality was set per-arch in the auto-detection block above.
-    // Only set Auto as fallback if the user explicitly selected Custom DLSS preset
-    // and hasn't provided their own qualityDLSS value.
-    if (dlssPreset() == DlssPreset::Custom && upscalerType() == UpscalerType::DLSS) {
+    // Ensure we are using auto DLSS profile since we will be relying on quality downgrades for Medium/Low settings
+    //  and if the user has specified a custom DLSS override, we should respect that.
+    if (dlssPreset() != DlssPreset::Custom) {
       qualityDLSS.setDeferred(DLSSProfile::Auto);
     }
 
@@ -899,77 +599,6 @@ namespace dxvk {
 
     if (RtxOptions::raytraceModePreset() == RaytraceModePreset::Auto) {
       Logger::info("Automatic Raytrace Mode Preset in use (Set rtx.raytraceModePreset to something other than Auto use a non-automatic preset)");
-
-      auto applyAutoQualityRaytraceMode = [](auto& option, auto preferredValue, const char* optionName) {
-        option.setImmediately(preferredValue, RtxOptionLayer::getQualityLayer());
-
-        if (option() == preferredValue)
-          return;
-
-        // If the user pinned this option (rtx.conf / user settings), the User
-        // layer legitimately outranks every layer auto-detection may write to.
-        // Respect the pin: escalating through Quality/Default/Derived writes
-        // can never win, and previously this path spammed warnings and a
-        // final error every launch while trying to bulldoze the user's own
-        // choice.
-        if (option.isUserOverridden()) {
-          Logger::info(str::format(
-            "[RtxOptions] ", optionName,
-            " is pinned by a user setting (value=",
-            static_cast<int>(option()),
-            "); auto-detected value (",
-            static_cast<int>(preferredValue),
-            ") not applied. Remove the option from rtx.conf to use auto-detection."));
-          return;
-        }
-
-        Logger::warn(str::format(
-          "[RtxOptions] ", optionName,
-          " auto-resolution is blocked by a stronger layer. Clearing stronger layers and retrying."));
-        option.clearFromStrongerLayers(RtxOptionLayer::getQualityLayer());
-        option.setImmediately(preferredValue, RtxOptionLayer::getQualityLayer());
-
-        if (option() != preferredValue) {
-          // Fallback: Quality layer write failed even after retry.
-          // Write to the Default layer instead, which is always present and has the lowest
-          // priority — but since no stronger layer holds a conflicting value (we just cleared
-          // them), the Default layer value will become the resolved value.
-          Logger::warn(str::format(
-            "[RtxOptions] ", optionName,
-            " Quality layer write failed after retry (current value=",
-            static_cast<int>(option()),
-            "). Falling back to Default layer write."));
-
-          option.setImmediately(preferredValue, RtxOptionLayer::getDefaultLayer());
-
-          if (option() == preferredValue) {
-            Logger::info(str::format(
-              "[RtxOptions] ", optionName,
-              " successfully set via Default layer fallback. Resolved value=",
-              static_cast<int>(option())));
-          } else {
-            // Last resort: try the Derived layer
-            Logger::warn(str::format(
-              "[RtxOptions] ", optionName,
-              " Default layer fallback also failed. Trying Derived layer."));
-
-            option.setImmediately(preferredValue, RtxOptionLayer::getDerivedLayer());
-
-            if (option() == preferredValue) {
-              Logger::info(str::format(
-                "[RtxOptions] ", optionName,
-                " successfully set via Derived layer fallback. Resolved value=",
-                static_cast<int>(option())));
-            } else {
-              Logger::err(str::format(
-                "[RtxOptions] ", optionName,
-                " all fallback attempts failed. Auto-detected raytrace mode could not be applied."
-                " Current resolved value=", static_cast<int>(option()),
-                ", expected=", static_cast<int>(preferredValue)));
-            }
-          }
-        }
-      };
 
       // Note: Left undefined as these values are initialized in all paths.
       DxvkPathtracerGbuffer::RaytraceMode preferredGBufferRaytraceMode;
@@ -988,119 +617,29 @@ namespace dxvk {
         }
 
         preferredIntegrateIndirectRaytraceMode = DxvkPathtracerIntegrateIndirect::RaytraceMode::TraceRay;
-      } else if (vendorID == static_cast<uint32_t>(DxvkGpuVendor::Amd)) {
-        // AMD proprietary driver: Ray Query is more stable than TraceRay
-        Logger::info("AMD GPU detected (proprietary driver), setting default raytrace modes to Ray Query");
-
-        preferredIntegrateIndirectRaytraceMode = DxvkPathtracerIntegrateIndirect::RaytraceMode::RayQuery;
       } else {
-        // Intel and other vendors: default to Ray Query
-        Logger::info("Non-NVIDIA/non-AMD architecture detected, setting default raytrace modes to Ray Query");
+        // Default to Ray Query on AMD/Intel
+        Logger::info("Non-NVIDIA architecture detected, setting default raytrace modes to Ray Query");
 
         preferredIntegrateIndirectRaytraceMode = DxvkPathtracerIntegrateIndirect::RaytraceMode::RayQuery;
       }
 
-      applyAutoQualityRaytraceMode(RtxOptions::renderPassGBufferRaytraceMode, preferredGBufferRaytraceMode, "renderPassGBufferRaytraceMode");
-      applyAutoQualityRaytraceMode(RtxOptions::renderPassIntegrateDirectRaytraceMode, preferredIntegrateDirectRaytraceMode, "renderPassIntegrateDirectRaytraceMode");
-      applyAutoQualityRaytraceMode(RtxOptions::renderPassIntegrateIndirectRaytraceMode, preferredIntegrateIndirectRaytraceMode, "renderPassIntegrateIndirectRaytraceMode");
+      RtxOptions::renderPassGBufferRaytraceMode.setDeferred(preferredGBufferRaytraceMode);
+      RtxOptions::renderPassIntegrateDirectRaytraceMode.setDeferred(preferredIntegrateDirectRaytraceMode);
+      RtxOptions::renderPassIntegrateIndirectRaytraceMode.setDeferred(preferredIntegrateIndirectRaytraceMode);
     }
-  }
-
-  void RtxOptions::detectEngineAndApplySettings(DxvkDevice* device) {
-    // Auto-detect game engine and apply appropriate settings
-    // This helps with compatibility across different engines and emulators
-    
-    // Get the current executable name for engine detection
-    std::string exeName = std::filesystem::path(getExePath()).filename().string();
-    std::transform(exeName.begin(), exeName.end(), exeName.begin(), ::tolower);
-    
-    // Detect common engines and apply engine-specific settings
-    bool isUnity = false;
-    bool isUnreal = false;
-    bool isSource2 = false;
-    bool isL4D2 = false;
-    
-    // Check for Unity engine
-    if (exeName.find("unity") != std::string::npos) {
-      isUnity = true;
-      Logger::info("[RtxOptions] Unity engine detected, applying Unity-specific settings");
-    }
-    
-    // Check for Unreal Engine
-    if (exeName.find("unreal") != std::string::npos || 
-        exeName.find("ue4") != std::string::npos ||
-        exeName.find("ue5") != std::string::npos ||
-        exeName.find("ue4game") != std::string::npos ||
-        exeName.find("win64-shipping") != std::string::npos ||
-        exeName.find("win32-shipping") != std::string::npos) {
-      isUnreal = true;
-      Logger::info("[RtxOptions] Unreal Engine detected, applying Unreal-specific settings");
-    }
-    
-    // Check for Source 2 engine (e.g., Left 4 Dead 2)
-    if (exeName.find("left4dead2") != std::string::npos ||
-        exeName.find("l4d2") != std::string::npos) {
-      isL4D2 = true;
-      isSource2 = true;
-      Logger::info("[RtxOptions] Source 2 engine (Left 4 Dead 2) detected, applying Source 2-specific settings");
-    }
-    
-    // Apply engine-specific settings
-    if (isUnity) {
-      // Unity-specific settings
-      // Unity often uses different UV coordinate systems
-      // Enable UV correction for Unity
-      RtxOptions::enableUvCorrection.setDeferred(true, RtxOptionLayer::getDerivedLayer());
-    }
-    
-    if (isUnreal) {
-      // Unreal-specific settings
-      // Unreal Engine has specific texture formats and hashing
-      RtxOptions::enableUnrealTextureFixes.setDeferred(true, RtxOptionLayer::getDerivedLayer());
-    }
-    
-    if (isSource2) {
-      // Source 2-specific settings
-      // Source 2 has specific geometry and texture handling
-      RtxOptions::enableSource2Fixes.setDeferred(true, RtxOptionLayer::getDerivedLayer());
-      
-      // Source 2 often uses specific texture formats - apply fixes
-      Logger::info("[RtxOptions] Source 2 engine detected, applying texture format fixes");
-    }
-    
-    // Apply general engine-agnostic settings for stability
-    // These settings work across all engines and improve stability
-    RtxOptions::enableStabilityMode.setDeferred(true, RtxOptionLayer::getDerivedLayer());
-    
-    Logger::info("[RtxOptions] Engine detection complete. Engine-specific settings applied.");
   }
 
   void RtxOptions::resetUpscaler() {
     // Code-driven changes for upscaler reset (automatically routes to User layer when preset is Custom)
     RtxOptionLayerTarget layerTarget(RtxOptionEditTarget::Derived);
     
-    RtxOptions::upscalerType.setDeferred(UpscalerType::TAAU);
-    reflexMode.setDeferred(ReflexMode::None);
+    RtxOptions::upscalerType.setDeferred(UpscalerType::DLSS);
+    reflexMode.setDeferred(ReflexMode::LowLatency);
   }
 
   std::string RtxOptions::getCurrentDirectory() {
     return std::filesystem::current_path().string();
-  }
-
-  std::string RtxOptions::getExePath() {
-    char path[MAX_PATH];
-    HMODULE hModule = nullptr;
-    
-    // Get the module handle for the current process
-    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                          reinterpret_cast<LPCSTR>(&getExePath), &hModule) != 0) {
-      if (GetModuleFileNameA(hModule, path, MAX_PATH) > 0) {
-        return std::string(path);
-      }
-    }
-    
-    // Fallback: return current directory
-    return getCurrentDirectory();
   }
 
   bool RtxOptions::needsMeshBoundingBox() {

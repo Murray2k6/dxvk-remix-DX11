@@ -69,11 +69,8 @@ namespace dxvk {
     DLSS,
     NIS,
     TAAU,
-    XeSS,
-    FSR4
+    XeSS
   };
-
-  const char* getUpscalerTypeName(UpscalerType type);
 
   enum class GraphicsPreset : int {
     Ultra = 0,
@@ -134,8 +131,7 @@ namespace dxvk {
 
   enum class TonemappingMode : int {
     Global = 0,
-    Local,
-    Direct  // Operator-only mode: skip dynamic tone curve, apply operator directly.
+    Local
   };
 
   enum class UIType : int {
@@ -293,14 +289,14 @@ namespace dxvk {
                   "Defines which asset hashes we need to generate via the geometry processing engine.",
                   args.onChangeCallback = &geometryGenerationHashRuleStringOnChange);
     public: static void geometryAssetHashRuleStringOnChange(DxvkDevice* device);
-    RTX_OPTION_ARGS("rtx", std::string, geometryAssetHashRuleString, "positions,indices,texcoords,geometrydescriptor,vertexlayout,vertexshader",
+    RTX_OPTION_ARGS("rtx", std::string, geometryAssetHashRuleString, "positions,indices,geometrydescriptor",
                   "Defines which hashes we need to include when sampling from replacements and doing USD capture.",
                   args.onChangeCallback = &geometryAssetHashRuleStringOnChange);
     RTX_OPTION("rtx", fast_unordered_set, raytracedRenderTargetTextures, {}, "DescriptorHashes for Render Targets. (Screens that should display the output of another camera).");
     RTX_OPTION("rtx", fast_unordered_set, particleEmitterTextures, {}, "Objects rendered with these textures will emit particles that inherit the material of the object itself.");
     RTX_OPTION("rtx", fast_unordered_set, smoothNormalsTextures, {},
                   "Textures on draw calls whose geometry should have smooth normals generated on the GPU.\n"
-                  "This is useful for older games where the geometry may be missing smooth normals, especially when using the VertexShader Capture mechanism.\n"
+                  "This is useful for older D3D11 games where the geometry may be missing smooth normals, especially when using the VertexShader Capture mechanism.\n"
                   "When a draw call matches, area-weighted smooth normals will be computed from the triangle mesh and used for ray tracing.");
     
   public:
@@ -312,6 +308,16 @@ namespace dxvk {
     RTX_OPTION("rtx", float, sceneScale, 1, "Defines the ratio of rendering unit (1cm) to game unit, i.e. sceneScale = 1cm / GameUnit.");
     RTX_OPTION("rtx", bool, zUp, false, "Indicates that the Z axis is the \"upward\" axis in the world when true, otherwise the Y axis when false.");
     RTX_OPTION("rtx", bool, leftHandedCoordinateSystem, false, "Indicates that the world space coordinate system is left-handed when true, otherwise right-handed when false.");
+    // DX11_V225: options consumed by the DX11 in-process draw-processing path.
+    RTX_OPTION("rtx", bool, significanceCulling, false, "DX11: enables distance-based significance culling of instanced draws when true.");
+    RTX_OPTION("rtx", uint32_t, maxInstanceSubmissions, 100000u, "DX11: maximum number of instances submitted per instanced draw call.");
+    RTX_OPTION("rtx", bool, forceInjection, false, "DX11: forces Remix injection for draws even when normal heuristics would skip them.");
+    RTX_OPTION("rtx", bool, useCBufferWorldMatrices, false, "DX11: derives world/view matrices from constant buffers when true.");
+    RTX_OPTION("rtx", bool, enableUnrealTextureFixes, false, "DX11: applies Unreal Engine specific texture-selection fixes when true.");
+    RTX_OPTION("rtx", bool, enableSource2Fixes, false, "DX11: applies Source 2 engine specific fixes when true.");
+    RTX_OPTION("rtx", bool, ignoreSecondaryTextures, false, "DX11: only consider the primary color texture per draw when true.");
+    RTX_OPTION("rtx", bool, taggableUntexturedDraws, false, "DX11: allows untextured color-writing draws to receive a placeholder texture when true.");
+    RTX_OPTION("rtx", bool, useInputAssemblerNormals, false, "DX11: sources vertex normals from the input assembler layout when true.");
     // Note: This time is in milliseconds, should be named something like millisecondDeltaBetweenFrames ideally, but keeping it as it is for now.
     RTX_OPTION_ENV("rtx", float, timeDeltaBetweenFrames, 0.f, "RTX_FRAME_TIME_DELTA_MS",
                    "Frame time delta in milliseconds to use for rendering.\n"
@@ -324,10 +330,6 @@ namespace dxvk {
                     "This value must always be greater than zero.",
                     args.flags = RtxOptionFlags::UserSetting);
     RTX_OPTION("rtx", bool, skipDrawCallsPostRTXInjection, false, "Ignores all draw calls recorded after RTX Injection, the location of which varies but is currently based on when tagged UI textures begin to draw.");
-    RTX_OPTION("rtx.dx11", bool, forceInjection, false, "Forces Remix injection every frame with a backbuffer, bypassing the camera/scene-draw validity gate in the DX11 bridge. The gate prevents loading screens and menus from being replaced with a black composite, but in games whose cameras never pass validation it permanently blocks both path tracing and the Remix UI. Enable as an escape hatch for such games.");
-    RTX_OPTION("rtx.dx11", bool, allowViewportFallbackAfterRealCamera, false, "Allows synthesized viewport-fallback projections to update the Main camera even after a real cbuffer projection has been seen. Default-off suppression protects temporal stability, but games that expose a real projection only briefly (e.g. during a cutscene or video) are otherwise locked out of the fallback path for the rest of the session.");
-    RTX_OPTION("rtx.dx11", bool, taggableUntexturedDraws, false, "OFF by default. When on, attaches a small neutral fallback material texture (hash derived from the pixel shader identity, stable across runs and GPUs) to draws that end up with no material texture, so they appear in the texture browser and can be picked/tagged (including ignore-tags that remove a screen-obstructing surface). Leave OFF for normal play: engines like Unity submit most world geometry with no bound texture, and attaching the fallback to all of it washes the whole scene toward the fallback color (observed as a white/gray-out in Granny). Turn ON only for a tagging session when you need to select an untextured surface.");
-    RTX_OPTION("rtx", float, integerTexcoordScale, 1024.0f, "Divisor applied when decoding integer (SINT/UINT) vertex texcoord formats to float UVs. Engines that store UVs as fixed-point integers bake an implicit scale into the values (Saints Row IV stores TEXCOORD0 as R16G16_SINT; the common Volition scale is 1024). If textures look tiled too small or too large in such games, try 2048 or 4096. Has no effect on float, UNORM, or SNORM texcoord formats.");
     RTX_OPTION_ARGS("rtx", DlssPreset, dlssPreset, DlssPreset::On, "Combined DLSS Preset for quickly controlling Upscaling, Frame Interpolation and Latency Reduction.",
                     args.environment = "RTX_DLSS_PRESET",
                     args.flags = RtxOptionFlags::UserSetting);
@@ -336,7 +338,7 @@ namespace dxvk {
     RTX_OPTION_ARGS("rtx", TaauPreset, taauPreset, TaauPreset::Balanced,  "Adjusts TAA-U scaling factor, trades quality for performance.",
                     args.flags = RtxOptionFlags::UserSetting);
     static void graphicsPresetOnChange(DxvkDevice* device);
-    RTX_OPTION_ARGS("rtx", GraphicsPreset, graphicsPreset, GraphicsPreset::Custom, "Overall rendering preset, higher presets result in higher image quality, lower presets result in better performance.",
+    RTX_OPTION_ARGS("rtx", GraphicsPreset, graphicsPreset, GraphicsPreset::Auto, "Overall rendering preset, higher presets result in higher image quality, lower presets result in better performance.",
                     args.environment = "DXVK_GRAPHICS_PRESET_TYPE",
                     args.onChangeCallback = &graphicsPresetOnChange,
                     args.flags = RtxOptionFlags::UserSetting);
@@ -403,13 +405,9 @@ namespace dxvk {
       RTX_OPTION("rtx.shader", bool, enableAsyncCompilationUI, true,
                  "Enables a UI message when async shader compilation is in progress to indicate the current compilation progress. Only takes effect when rtx.shader.enableAsyncCompilation is true.\n"
                  "This should usually be enabled as providing information to the user about the current progress of compilation is useful. May be disabled however for automated testing purposes if the nondeterministic behavior of the UI's rendered text interferes with testing.");
-      RTX_OPTION("rtx.shader", std::uint32_t, asyncCompilationThrottleMilliseconds, 6,
+      RTX_OPTION("rtx.shader", std::uint32_t, asyncCompilationThrottleMilliseconds, 33,
                  "Specifies a time in milliseconds to throttle each application frame when async shader compilation is in progress. Set to 0 to disable, and only takes effect when rtx.shader.enableAsyncCompilation is true.\n"
                  "This generally should be set to a value low enough to not impact the application framerate significantly (especially if non-ray traced visuals are capable of being displayed by the application while loading, e.g. an intro video), but also high enough to get the desired shader compilation performance (especially relevant if the application is fairly heavy on the CPU during async shader compilation, or on CPUs with few hardware threads).");
-      RTX_OPTION("rtx.shader", std::uint32_t, activeSceneCompilationThrottleMilliseconds, 1,
-                 "Maximum async shader compilation throttle to apply once Remix has a live scene/camera. Keeping this lower than the startup throttle lets shader prewarm use CPU time during launchers/loading screens without dragging down gameplay frames.");
-      RTX_OPTION("rtx.shader", std::uint32_t, maxConcurrentShaderCompilations, 4,
-                 "Maximum number of concurrent shader compilations. Lower values reduce CPU usage but may increase compilation time. Higher values increase CPU usage but may reduce compilation time. Stability mode sets this to 4 for better CPU performance.");
     } shader;
 
     struct RaytracedRenderTarget {
@@ -418,7 +416,9 @@ namespace dxvk {
 
     struct ViewModel {
       friend class ImGUI;
-      RTX_OPTION("rtx.viewModel", bool, enable, false, "If true, try to resolve view models (e.g. first-person weapons). World geometry doesn't have shadows / reflections / etc from the view models.");
+      public: static void enableOnChange(DxvkDevice* device);
+      RTX_OPTION_ARGS("rtx.viewModel", bool, enable, false, "If true, try to resolve view models (e.g. first-person weapons). World geometry doesn't have shadows / reflections / etc from the view models.",
+                       args.onChangeCallback = &enableOnChange);
       RTX_OPTION("rtx.viewModel", float, rangeMeters, 1.0f, "[meters] Max distance at which to find a portal for view model virtual instances. If rtx.viewModel.separateRays is true, this is also max length of view model rays.");
       RTX_OPTION("rtx.viewModel", float, scale, 1.0f, "Scale for view models. Minimize to prevent clipping.");
       RTX_OPTION("rtx.viewModel", bool, enableVirtualInstances, true, "If true, virtual instances are created to render the view models behind a portal.");
@@ -512,7 +512,7 @@ namespace dxvk {
                    "   while improving performance in scenarios where ray paths have 2 or more bounces on average.\n",
                    args.environment = "RTX_INTEGRATE_INDIRECT_MODE",
                    args.flags = RtxOptionFlags::UserSetting);
-    RTX_OPTION_ARGS("rtx", UpscalerType, upscalerType, UpscalerType::TAAU, "Upscaling boosts performance with varying degrees of image quality tradeoff depending on the type of upscaler and the quality mode/preset.",
+    RTX_OPTION_ARGS("rtx", UpscalerType, upscalerType, UpscalerType::DLSS, "Upscaling boosts performance with varying degrees of image quality tradeoff depending on the type of upscaler and the quality mode/preset.",
                     args.environment = "DXVK_UPSCALER_TYPE",
                     args.flags = RtxOptionFlags::UserSetting);
     RTX_OPTION_ARGS("rtx", bool, enableRayReconstruction, true, "Enables DLSS ray reconstruction, an AI-based denoiser designed for real time ray tracing.",
@@ -520,48 +520,6 @@ namespace dxvk {
                     args.flags = RtxOptionFlags::UserSetting);
 
     RTX_OPTION_ARGS("rtx", float, resolutionScale, 0.75f, "",
-                    args.flags = RtxOptionFlags::UserSetting);
-    RTX_OPTION_ARGS("rtx.performance", bool, adaptivePathTracingPerformance, true,
-                    "Automatically reduces optional path tracing workload when frame time is already very high. This does not change saved settings; it only clamps per-frame work until performance recovers.",
-                    args.flags = RtxOptionFlags::UserSetting);
-    RTX_OPTION_ARGS("rtx.performance", float, adaptivePathTracingFrameTimeMs, 75.0f,
-                    "Frame time threshold in milliseconds where adaptive path tracing performance mode starts shedding optional work.",
-                    args.minValue = 16.0f,
-                    args.maxValue = 1000.0f,
-                    args.flags = RtxOptionFlags::UserSetting);
-    RTX_OPTION_ARGS("rtx.performance", float, adaptivePathTracingSevereFrameTimeMs, 120.0f,
-                    "Frame time threshold in milliseconds where adaptive path tracing performance mode applies its strongest safe clamps.",
-                    args.minValue = 16.0f,
-                    args.maxValue = 1000.0f,
-                    args.flags = RtxOptionFlags::UserSetting);
-    RTX_OPTION_ARGS("rtx.performance", float, adaptivePathTracingEmergencyResolutionScale, 0.33f,
-                    "Lowest internal render scale adaptive path tracing performance mode may use when an upscaler is active.",
-                    args.minValue = 0.25f,
-                    args.maxValue = 1.0f,
-                    args.flags = RtxOptionFlags::UserSetting);
-    RTX_OPTION_ARGS("rtx.performance", bool, adaptivePathTracingClampBounces, true,
-                    "Clamp expensive secondary path depth and interaction counts while adaptive path tracing performance mode is active.",
-                    args.flags = RtxOptionFlags::UserSetting);
-    RTX_OPTION_ARGS("rtx.performance", uint8_t, adaptivePathTracingLowFpsMaxBounces, 2,
-                    "Maximum path bounces while adaptive path tracing performance mode is active but not severe.",
-                    args.minValue = static_cast<uint8_t>(0),
-                    args.maxValue = static_cast<uint8_t>(15),
-                    args.flags = RtxOptionFlags::UserSetting);
-    RTX_OPTION_ARGS("rtx.performance", uint8_t, adaptivePathTracingSevereMaxBounces, 1,
-                    "Maximum path bounces while adaptive path tracing performance mode is in severe mode.",
-                    args.minValue = static_cast<uint8_t>(0),
-                    args.maxValue = static_cast<uint8_t>(15),
-                    args.flags = RtxOptionFlags::UserSetting);
-    RTX_OPTION_ARGS("rtx.performance", uint8_t, adaptivePathTracingSecondaryRayMaxInteractions, 4,
-                    "Maximum secondary-ray resolver interactions while adaptive path tracing performance mode is active.",
-                    args.minValue = static_cast<uint8_t>(1),
-                    args.maxValue = std::numeric_limits<uint8_t>::max(),
-                    args.flags = RtxOptionFlags::UserSetting);
-    RTX_OPTION_ARGS("rtx.performance", bool, adaptivePathTracingSkipOptionalPasses, true,
-                    "Skip optional full-screen or auxiliary path tracing passes while adaptive path tracing performance mode is active.",
-                    args.flags = RtxOptionFlags::UserSetting);
-    RTX_OPTION_ARGS("rtx.performance", bool, adaptivePathTracingSkipPostFx, true,
-                    "Skip bloom and post effects while adaptive path tracing performance mode is active.",
                     args.flags = RtxOptionFlags::UserSetting);
     RTX_OPTION("rtx", bool, forceCameraJitter, false, "Force enables camera jitter frame to frame.");
     RTX_OPTION("rtx", uint32_t, cameraJitterSequenceLength, 64, "Sets a camera jitter sequence length [number of frames]. It will loop around once the length is reached.");
@@ -573,7 +531,7 @@ namespace dxvk {
                     "If this is too low, fast moving objects may flicker and have bad lighting.  If it's too high, repeated objects may flicker.\n"
                     "This does not account for sceneScale.", args.minValue = 0.f);
     
-    RTX_OPTION("rtx", bool, useNewGuiInputMethod, false, "Enables the newer overlay-based mouse/keyboard input path for the Remix UI. The legacy game-window input path remains the default because it is currently more stable across menu widgets and selection controls. This setting can't be changed at runtime, so it must be set in a .conf file.");
+    RTX_OPTION("rtx", bool, useNewGuiInputMethod, true, "Disables the previous method for getting mouse/keyboard input and enables a new method which should be more reliable.  If successful the old method will be deprecated.  This setting can't be changed at runtime, so it must be set in a .conf file.");
 
     RTX_OPTION_ARGS("rtx", UIType, showUI, UIType::None, "0 = Don't Show, 1 = Show Simple, 2 = Show Advanced.",
                     args.environment = "RTX_GUI_DISPLAY_UI",
@@ -588,11 +546,15 @@ namespace dxvk {
     public: static void blockInputToGameInUIOnChange(DxvkDevice* device);
     RTX_OPTION_ARGS("rtx", bool, blockInputToGameInUI, true,
                     "If true, input will not be passed to the game when the UI is active.\n"
-                    "Can be toggled with Alt + Backspace", args.onChangeCallback = &blockInputToGameInUIOnChange, args.flags = RtxOptionFlags::UserSetting);
+                    "Can be toggled with Alt + Backspace", args.onChangeCallback = &blockInputToGameInUIOnChange, args.flags = RtxOptionFlags::NoSave);
 
     RTX_OPTION_ARGS("rtx", bool, restoreCursorPosition, false,
                     "If true, the game's mouse cursor position will be restored when the Remix UI is closed.\n"
                     "This should fix the issue where the game camera suddenly turns when closing the UI.\n",
+                    args.flags = RtxOptionFlags::UserSetting);
+    RTX_OPTION_ARGS("rtx", bool, autoUnblockOptionEdits, false,
+                    "If true, editing an RtxOption in the Remix UI that is overridden by a stronger config layer clears the stronger value immediately instead of showing a confirmation dialog.",
+                    args.environment = "RTX_IMGUI_AUTO_UNBLOCK_OPTION_EDITS",
                     args.flags = RtxOptionFlags::UserSetting);
 
     inline static const VirtualKeys kDefaultRemixMenuKeyBinds{ VirtualKey{VK_MENU},VirtualKey{'X'} };
@@ -617,7 +579,7 @@ namespace dxvk {
                    args.environment = "DXVK_RENDER_PASS_INTEGRATE_DIRECT_RAYTRACE_MODE",
                    args.maxValue = RenderPassIntegrateDirectRaytraceMode(uint32_t(RenderPassIntegrateDirectRaytraceMode::Count) - 1),
                    args.flags = RtxOptionFlags::UserSetting);
-    RTX_OPTION_ARGS("rtx", RenderPassIntegrateIndirectRaytraceMode, renderPassIntegrateIndirectRaytraceMode, RenderPassIntegrateIndirectRaytraceMode::RayQuery,
+    RTX_OPTION_ARGS("rtx", RenderPassIntegrateIndirectRaytraceMode, renderPassIntegrateIndirectRaytraceMode, RenderPassIntegrateIndirectRaytraceMode::TraceRay,
                    "The ray tracing mode to use for the Indirect Lighting pass which applies lighting to the primary/secondary surfaces.",
                    args.environment = "DXVK_RENDER_PASS_INTEGRATE_INDIRECT_RAYTRACE_MODE",
                    args.maxValue = RenderPassIntegrateIndirectRaytraceMode(uint32_t(RenderPassIntegrateIndirectRaytraceMode::Count) - 1),
@@ -664,7 +626,7 @@ namespace dxvk {
     RTX_OPTION("rtx", uint32_t, numFramesToKeepInstances, 1, "");
     RTX_OPTION("rtx", uint32_t, numFramesToKeepBLAS, 1, "");
     RTX_OPTION("rtx", uint32_t, numFramesToKeepLights, 100, ""); // NOTE: This was the default we've had for a while, can probably be reduced...
-    RTX_OPTION("rtx", uint32_t, sceneKeepAliveFrames, 2, 
+    RTX_OPTION("rtx", uint32_t, sceneKeepAliveFrames, 0, 
                "Number of consecutive frames without valid camera or raytracing before clearing the scene."
                " Set to 0 to clear immediately (legacy behavior). Higher values prevent scene clearing during"
                " brief shader loading delays, camera cuts, etc.");
@@ -863,6 +825,12 @@ namespace dxvk {
     RTX_OPTION("rtx", bool, rngSeedWithFrameIndex, true,
                "Indicates that pseudo-random number generator should be seeded with the frame number of the application every frame, otherwise seed with 0.\n"
                "This should generally always be enabled as without the frame index each frame will typically be identical in the random values that are produced which will result in incorrect rendering. Only meant as a debugging tool.");
+    // declare onAdvanceTimeChanged
+    static void onAdvanceTimeChanged(DxvkDevice* device);
+    RTX_OPTION_ARGS("rtx", bool, advanceTime, true,
+                    "A flag to enable or disable advancing time used by Remix subsystems (particle effects, animations, etc.).\n",
+                    args.environment = "RTX_ADVANCE_TIME",
+                    args.onChangeCallback = &RtxOptions::onAdvanceTimeChanged);
     RTX_OPTION_ARGS("rtx", bool, enableFirstBounceLobeProbabilityDithering, true,
                "A flag to enable or disable screen-space probability dithering on the first indirect lobe sampled.\n"
                "Generally sampling a diffuse, specular or other lobe relies on a random number generated against the probability of sampling each lobe, effectively focusing more rays/paths on lobes which matter more.\n"
@@ -1000,13 +968,6 @@ namespace dxvk {
     RTX_OPTION("rtx", bool, useHighlightLegacyMode, false, "");
     RTX_OPTION("rtx", bool, useHighlightUnsafeAnchorMode, false, "");
     RTX_OPTION("rtx", bool, useHighlightUnsafeReplacementMode, false, "");
-    
-    // Engine-specific options for auto-detection and fixes
-    RTX_OPTION("rtx", bool, enableUvCorrection, false, "Enable UV coordinate correction for engines that use different UV coordinate systems (e.g., Unity).");
-    RTX_OPTION("rtx", bool, enableUnrealTextureFixes, false, "Enable texture handling fixes for Unreal Engine games.");
-    RTX_OPTION("rtx", bool, enableSource2Fixes, false, "Enable fixes for Source 2 engine games (e.g., Left 4 Dead 2).");
-    RTX_OPTION("rtx", bool, enableStabilityMode, false, "Enable stability mode for improved compatibility across all engines and emulators.");
-    
     RTX_OPTION("rtx", float, nativeMipBias, 0.0f,
                "Specifies a mipmapping level bias to add to all material texture filtering. Stacks with the upscaling mip bias.\n"
                "Mipmaps are determined based on how far away a texture is, using this can bias the desired level in a lower quality direction (positive bias), or a higher quality direction with potentially more aliasing (negative bias).\n"
@@ -1021,6 +982,7 @@ namespace dxvk {
     RTX_OPTION("rtx", float, maxAnisotropySamples, 8.0f,
                "The maximum number of samples to use when anisotropic filtering is enabled.\n"
                "The actual max anisotropy used will be the minimum between this value and the hardware's maximum. Higher values increase quality but will likely reduce performance.");
+    RTX_OPTION_ENV("rtx", bool, enableMultiStageTextureFactorBlending, true, "RTX_ENABLE_MULTI_STAGE_TEXTURE_FACTOR_BLENDING", "Support texture factor blending in stage 1~7. Currently only support 1 additional blending stage, more than 1 additional blending stages will be ignored.");
 
     // Developer Options
     RTX_OPTION_FLAG_ENV("rtx", bool, enableBreakIntoDebuggerOnPressingB, false, RtxOptionFlags::NoSave, "RTX_BREAK_INTO_DEBUGGER_ON_PRESSING_B",
@@ -1144,7 +1106,7 @@ namespace dxvk {
                "This value should only be changed to reflect the estimated amount of memory Remix itself consumes on the GPU (aside from texture loading, mostly from rendering-related buffers) and should not be changed otherwise.\n"
                "Only relevant when force high resolution replacement textures is disabled and adaptive resolution replacement textures is enabled. See asset estimated size parameter for more information.\n");
     RTX_OPTION("rtx", uint, limitedBonesPerVertex, 4,
-               "Limit the number of bone influences per vertex for replacement geometry.  Legacy games were limited to 4, which is the default.  In rare instances you may want to increase this based on your preference for replaced assets.  This config only takes affect when set on startup via the rtx.conf.");
+               "Limit the number of bone influences per vertex for replacement geometry.  D3D11 games were limited to 4, which is the default.  In rare instances you may want to increase this based on your preference for replaced assets.  This config only takes affect when set on startup via the rtx.conf.");
 
     struct TextureManager {
       RTX_OPTION("rtx.texturemanager", int, budgetPercentageOfAvailableVram, 50,
@@ -1154,7 +1116,6 @@ namespace dxvk {
                  "replacements assets are simply too large for the target GPUs available vid mem, we may end up going overbudget "
                  "regularly.  Defaults to 50% of the available VRAM.");
       RTX_OPTION("rtx.texturemanager", bool, fixedBudgetEnable, false, "If true, rtx.texturemanager.fixedBudgetMiB is used instead of rtx.texturemanager.budgetPercentageOfAvailableVram.");
-      RTX_OPTION("rtx.texturemanager", int, budgetHeadroomMiB, 768, "Memory reserved out of the driver-reported VRAM budget before computing the texture budget, in MiB. Driver budgets fluctuate as other applications allocate, and non-texture allocations (acceleration structures, render targets) often cannot fall back to system memory - running textures at 100% of the budget therefore causes over-budget allocation failures, CS-thread exceptions, and device-lost errors. The headroom keeps those allocations inside budget.");
       RTX_OPTION_ARGS("rtx.texturemanager", int, fixedBudgetMiB, 2048, "Fixed-size VRAM budget for replacement textures. In mebibytes. To use, set rtx.texturemanager.fixedBudgetEnable to True.",
                       args.minValue = 256,
                       args.maxValue = 1024 * 32);
@@ -1181,11 +1142,10 @@ namespace dxvk {
                "Should only be set to false for debugging purposes if the partial DDS loader's logic is suspected to be incorrect to compare against GLI's implementation.");
 
     RTX_OPTION("rtx", TonemappingMode, tonemappingMode, TonemappingMode::Local,
-               "The tonemapping type to use, 0 for Global, 1 for Local (Default), 2 for Direct.\n"
+               "The tonemapping type to use, 0 for Global, 1 for Local (Default).\n"
                "Global tonemapping tonemaps the image with respect to global parameters, usually based on statistics about the rendered image as a whole.\n"
                "Local tonemapping on the other hand uses more spatially-local parameters determined by regions of the rendered image rather than the whole image.\n"
-               "Local tonemapping can result in better preservation of highlights and shadows in scenes with high amounts of dynamic range whereas global tonemapping may have to comprimise between over or underexposure.\n"
-               "Direct mode skips the dynamic tone curve entirely and applies only the selected tonemap operator to the exposure-adjusted input.");
+               "Local tonemapping can result in better preservation of highlights and shadows in scenes with high amounts of dynamic range whereas global tonemapping may have to comprimise between over or underexposure.");
     RTX_OPTION("rtx", bool, useLegacyACES, true,
                "Use a luminance-only approximation of ACES that over-saturates the highlights. If false, use a refined ACES transform that converts between color spaces with more precision.");
     RTX_OPTION("rtx", bool, showLegacyACESOption, false,
@@ -1234,9 +1194,7 @@ namespace dxvk {
                "As such, this option should generally always be enabled when rendering with ray portals in the scene to have good denoising quality.");
     RTX_OPTION("rtx", bool, resetDenoiserHistoryOnSettingsChange, false, "");
 
-    RTX_OPTION("rtx", bool, volumetricFogSkipSky, false,
-               "When enabled, sky-tagged draw calls are excluded from volumetric fog parameter extraction.\n"
-               "Useful when sky geometry introduces incorrect fog values that bleed into the scene.");
+    RTX_OPTION("rtx", bool, fogIgnoreSky, false, "If true, sky draw calls will be skipped when searching for the D3D11 fog values.")
 
     RTX_OPTION("rtx", float, skyBrightness, 1.f, "");
     RTX_OPTION("rtx", bool, skyForceHDR, false, "By default sky will be rasterized in the color format used by the game. Set the checkbox to force sky to be rasterized in HDR intermediate format. This may be important when sky textures replaced with HDR textures.");
@@ -1269,33 +1227,12 @@ namespace dxvk {
 
     RTX_OPTION("rtx", FusedWorldViewMode, fusedWorldViewMode, FusedWorldViewMode::None, "Set if game uses a fused World-View transform matrix.");
 
-    RTX_OPTION("rtx", bool, useBuffersDirectly, true, "When enabled Remix will use the incoming vertex buffers directly where possible instead of copying data.");
+    RTX_OPTION("rtx", bool, useBuffersDirectly, true, "When enabled Remix will use the incoming vertex buffers directly where possible instead of copying data. Note: setting the d3d11.allowDiscard to False will disable this option.");
     RTX_OPTION("rtx", bool, alwaysCopyDecalGeometries, true, "When set to True tells the geometry processor to always copy decals geometry. This is an optimization flag to experiment with when rtx.useBuffersDirectly is True.");
 
-    // Vertex capture / pipeline classification
-    RTX_OPTION("rtx", bool, orthographicIsUI, true, "When enabled, draw calls that are orthographic will be considered as UI.");
-    RTX_OPTION("rtx", bool, allowCubemaps, false, "When enabled, cubemaps from the game are processed through Remix, but they may not render correctly.");
-    RTX_OPTION("rtx", bool, useVertexCapture, true, "When enabled, injects code into the original vertex shader to capture final shaded vertex positions. Useful for games using simple vertex shaders that still set legacy transform matrices.");
-    RTX_OPTION("rtx", bool, useInputAssemblerNormals, true,
-               "When enabled, vertex normals from the D3D11 input layout (NORMAL semantic) are extracted and used in raytracing.\n"
-               "Disable if a game provides garbage normals in its vertex buffers — Remix will regenerate normals instead.");
-    RTX_OPTION("rtx", bool, useCBufferWorldMatrices, true,
-               "When enabled, world/model matrices are extracted from D3D11 constant buffers for per-object transforms.\n"
-               "Disable if a game's CB layout causes incorrect world matrix detection (objects appear at wrong positions).");
-    RTX_OPTION("rtx", bool, ignoreSecondaryTextures, false,
-               "When enabled, only the highest-scoring texture SRV is used per draw call; secondary textures (lightmaps, detail maps) are discarded.\n"
-               "Enable if a game's secondary textures (e.g. lightmaps) interfere with material identification.");
-    RTX_OPTION("rtx", uint32_t, maxInstanceSubmissions, 128,
-               "Maximum number of instances submitted per instanced draw call.\n"
-               "Each D3D11 instance with a per-instance world matrix becomes a separate Remix draw. Lower values improve performance;\n"
-               "raise if distant instanced geometry (foliage, props) is visibly cut off. Set to 1 to disable instancing expansion entirely.");
-
-    RTX_OPTION("rtx", bool, significanceCulling, false,
-               "UE-style significance manager (default OFF). When a frame's scene draws exceed rtx.maxInstanceSubmissions, "
-               "keep the draws NEAREST the camera (importance by camera-space depth) instead of the ones the engine submitted first. "
-               "Targets draw-heavy open worlds (25k+ draws) where the per-frame budget would otherwise drop on-screen geometry in favor "
-               "of distant terrain/skybox. Uses a temporal squared-distance threshold (no hard popping) that arms only when demand exceeds "
-               "budget and disarms when the scene fits. Leave OFF unless a specific open world is draw-bound; it is a budgeting heuristic, not a fix.");
+    RTX_OPTION("rtx", bool, ignoreLastTextureStage, false, 
+               "Removes the last texture bound to a draw call, when using fixed-function pipeline. Primary textures are untouched.\n"
+               "Might be set to true, if a game applies a lightmap as last shading step, to omit the original lightmap data.");
 
     RTX_OPTION("rtx.terrain", bool, terrainAsDecalsEnabledIfNoBaker, false, "If terrain baker is disabled, attempt to blend with the decals.");
     RTX_OPTION("rtx.terrain", bool, terrainAsDecalsAllowOverModulate, false, "Set to true, if it's known that terrain layers with ModulateX2 / ModulateX4 flags do not contain a lighting info, but ModulateX2 / ModulateX4 are used only to blend layers.");
@@ -1308,7 +1245,7 @@ namespace dxvk {
       RTX_OPTION("rtx.eye", bool, showOptions, false, "Show eye options in the developer menu.");
       RTX_OPTION("rtx.eye", bool, enable, false, "Enable shader code for eye drawing (eyeball normals, iris blending).");
       RTX_OPTION("rtx.eye", bool, assumeViewTexgenModeAsEye, true, 
-                 "Used to detect eyes and its vectors, by assuming that a draw call with camera-space texcoord generation and a specific texture transform is an eye draw call.");
+                 "Used to detect eyes and its vectors, by assuming that a draw call with D3DTSS_TCI_CAMERASPACEPOSITION and specific texture transform is an eye draw call.");
       RTX_OPTION("rtx.eye", float, eyeballSphereOffset, 0.18F,
                  "How much to offset a sphere origin when calculating the eye normals on Whites. "
                  "The larger the value, the more pronounced the ambient shadowing is on an eyeball, to better ground the eyes on a face.");
@@ -1339,6 +1276,9 @@ namespace dxvk {
       RTX_OPTION_FLAG_ENV("rtx.automation", bool, suppressAssetLoadingErrors, false, RtxOptionFlags::NoSave, "RTX_AUTOMATION_SUPPRESS_ASSET_LOADING_ERRORS",
                           "Suppresses asset loading errors by turning them into warnings.\n"
                           "This option is typically meant for automation of tests for which acceptable asset loading issues are known.");
+      RTX_OPTION_FLAG_ENV("rtx.automation", bool, enableTestTrace, false, RtxOptionFlags::NoSave, "RTX_TEST_TRACE",
+                          "Enables opt-in frame trace artifacts for automation-driven image tests.\n"
+                          "When enabled, Remix records a bounded frame window around the configured screenshot frame, writes frame_trace.jsonl, and appends dxvk_trace_* summary fields to metrics.txt.");
     };
 
   public:
@@ -1370,8 +1310,6 @@ namespace dxvk {
     RTX_OPTION("rtx", uint32_t, applicationId, 102100511, "Used to uniquely identify the application to DLSS. Generally should not be changed without good reason.");
 
     static RtxOptions* s_instance;
-    inline static UpscalerType s_runtimeUpscalerType = UpscalerType::None;
-    inline static bool s_runtimeUpscalerTypeInitialized = false;
 
   public:
 
@@ -1418,7 +1356,7 @@ namespace dxvk {
     }
 
   public:
-    static void updateUpscalerFromDlssPreset(DxvkDevice* device = nullptr);
+    static void updateUpscalerFromDlssPreset();
     static void updateUpscalerFromNisPreset();
     static void updateUpscalerFromTaauPreset();
     static void updateUpscalerFromXeSSPreset();
@@ -1426,8 +1364,6 @@ namespace dxvk {
     static NV_GPU_ARCHITECTURE_ID getNvidiaArch();
     static NV_GPU_ARCH_IMPLEMENTATION_ID getNvidiaChipId();
     static void updateGraphicsPresets(DxvkDevice* device);
-    static UpscalerType getSupportedUpscalerForDevice(DxvkDevice* device, UpscalerType requestedUpscaler);
-    static IntegrateIndirectMode getSupportedIntegrateIndirectMode(DxvkDevice* device, IntegrateIndirectMode requestedMode);
     static void updateLightingSetting();
     static void updatePathTracerPreset(PathTracerPreset preset);
     static void updateRaytraceModePresets(const uint32_t vendorID, const VkDriverId driverID);
@@ -1487,33 +1423,6 @@ namespace dxvk {
     static bool isNISEnabled() { return upscalerType() == UpscalerType::NIS; }
     static bool isTAAEnabled() { return upscalerType() == UpscalerType::TAAU; }
     static bool isXeSSEnabled() { return upscalerType() == UpscalerType::XeSS; }
-    static bool isFSR4Enabled() { return upscalerType() == UpscalerType::FSR4; }
-
-    static void setRuntimeUpscalerType(UpscalerType type) {
-      s_runtimeUpscalerType = type;
-      s_runtimeUpscalerTypeInitialized = true;
-    }
-
-    static UpscalerType runtimeUpscalerType() {
-      return s_runtimeUpscalerTypeInitialized ? s_runtimeUpscalerType : upscalerType();
-    }
-
-    static bool isRuntimeRayReconstructionEnabled() {
-      return runtimeUpscalerType() == UpscalerType::DLSS && isRayReconstructionEnabled();
-    }
-
-    static bool isRuntimeDLSSEnabled() {
-      return runtimeUpscalerType() == UpscalerType::DLSS && !isRuntimeRayReconstructionEnabled();
-    }
-
-    static bool isRuntimeDLSSOrRayReconstructionEnabled() {
-      return runtimeUpscalerType() == UpscalerType::DLSS;
-    }
-
-    static bool isRuntimeNISEnabled() { return runtimeUpscalerType() == UpscalerType::NIS; }
-    static bool isRuntimeTAAEnabled() { return runtimeUpscalerType() == UpscalerType::TAAU; }
-    static bool isRuntimeXeSSEnabled() { return runtimeUpscalerType() == UpscalerType::XeSS; }
-    static bool isRuntimeFSR4Enabled() { return runtimeUpscalerType() == UpscalerType::FSR4; }
     
     static float getUniqueObjectDistanceSqr() { return uniqueObjectDistance() * uniqueObjectDistance(); }
     static uint32_t getNumFramesToPutLightsToSleep() { return numFramesToKeepLights() /2; }
@@ -1534,9 +1443,9 @@ namespace dxvk {
 #endif
     }
 
-    static bool getIsOpacityMicromapSupported() { return s_instance && s_instance->opacityMicromap.isSupported; }
-    static void setIsOpacityMicromapSupported(bool enabled) { if (s_instance) s_instance->opacityMicromap.isSupported = enabled; }
-    static bool getEnableOpacityMicromap() { return s_instance && s_instance->opacityMicromap.enable() && s_instance->opacityMicromap.isSupported; }
+    static bool getIsOpacityMicromapSupported() { return s_instance->opacityMicromap.isSupported; }
+    static void setIsOpacityMicromapSupported(bool enabled) { s_instance->opacityMicromap.isSupported = enabled; }
+    static bool getEnableOpacityMicromap() { return s_instance->opacityMicromap.enable() && s_instance->opacityMicromap.isSupported; }
 
     static bool getEnableAnyReplacements() { return enableReplacementAssets() && (enableReplacementLights() || enableReplacementMeshes() || enableReplacementMaterials()); }
     static bool getEnableReplacementLights() { return enableReplacementAssets() && enableReplacementLights(); }
@@ -1557,8 +1466,6 @@ namespace dxvk {
     }
     
     static std::string getCurrentDirectory();
-    static std::string getExePath();
-    static void detectEngineAndApplySettings(DxvkDevice* device);
 
     static float calcUserEVBias() {
       return (float(RtxOptions::userBrightness() - 50) / 100.f)

@@ -10945,10 +10945,10 @@ NVAPI_INTERFACE NvAPI_GSync_GetStatusParameters(NvGSyncDeviceHandle hNvGSyncDevi
 
 
 
-#if defined(_D3D9_H_)
+#if defined(_D3D11_H_)
 ///////////////////////////////////////////////////////////////////////////////
 //
-// FUNCTION NAME:   NvAPI_D3D9_RegisterResource
+// FUNCTION NAME:   NvAPI_D3D11_RegisterResource
 //
 //! DESCRIPTION:    This API binds a resource (surface/texture) so that it can be retrieved
 //!                 internally by NVAPI.
@@ -10961,13 +10961,13 @@ NVAPI_INTERFACE NvAPI_GSync_GetStatusParameters(NvGSyncDeviceHandle hNvGSyncDevi
 //!
 //! \ingroup dx
 ///////////////////////////////////////////////////////////////////////////////
-NVAPI_INTERFACE NvAPI_D3D9_RegisterResource(IDirect3DResource9* pResource);
-#endif //defined(_D3D9_H_)
+NVAPI_INTERFACE NvAPI_D3D11_RegisterResource(IDirect3DResource9* pResource);
+#endif //defined(_D3D11_H_)
 
-#if defined(_D3D9_H_)
+#if defined(_D3D11_H_)
 ///////////////////////////////////////////////////////////////////////////////
 //
-// FUNCTION NAME:   NvAPI_D3D9_UnregisterResource
+// FUNCTION NAME:   NvAPI_D3D11_UnregisterResource
 //
 //! DESCRIPTION:     This API unbinds a resource (surface/texture) after use.
 //!
@@ -10980,19 +10980,19 @@ NVAPI_INTERFACE NvAPI_D3D9_RegisterResource(IDirect3DResource9* pResource);
 //!
 //! \ingroup dx
 ///////////////////////////////////////////////////////////////////////////////
-NVAPI_INTERFACE NvAPI_D3D9_UnregisterResource(IDirect3DResource9* pResource);
+NVAPI_INTERFACE NvAPI_D3D11_UnregisterResource(IDirect3DResource9* pResource);
 
-#endif //defined(_D3D9_H_)
-
-
+#endif //defined(_D3D11_H_)
 
 
-#if defined(_D3D9_H_)
+
+
+#if defined(_D3D11_H_)
 ///////////////////////////////////////////////////////////////////////////////
 //
-// FUNCTION NAME: NvAPI_D3D9_AliasSurfaceAsTexture
+// FUNCTION NAME: NvAPI_D3D11_AliasSurfaceAsTexture
 //
-//! \fn NvAPI_D3D9_AliasSurfaceAsTexture(IDirect3DDevice9* pDev,
+//! \fn NvAPI_D3D11_AliasSurfaceAsTexture(IDirect3DDevice9* pDev,
 //!                                              IDirect3DSurface9* pSurface,
 //!                                              IDirect3DTexture9 **ppTexture,
 //!                                              DWORD dwFlag);
@@ -11022,7 +11022,7 @@ NVAPI_INTERFACE NvAPI_D3D9_UnregisterResource(IDirect3DResource9* pResource);
 
 
 //! \ingroup dx
-//! See NvAPI_D3D9_AliasSurfaceAsTexture().
+//! See NvAPI_D3D11_AliasSurfaceAsTexture().
 typedef enum {
     NVAPI_ALIAS_SURFACE_FLAG_NONE                     = 0x00000000,
     NVAPI_ALIAS_SURFACE_FLAG_USE_SUPER                = 0x00000001,  //!< Use the surface's msaa buffer directly as a texture, rather than resolving. (This is much slower, but potentially has higher quality.)
@@ -11031,16 +11031,16 @@ typedef enum {
 
 
 //! \ingroup dx
-NVAPI_INTERFACE NvAPI_D3D9_AliasSurfaceAsTexture(IDirect3DDevice9* pDev,
+NVAPI_INTERFACE NvAPI_D3D11_AliasSurfaceAsTexture(IDirect3DDevice9* pDev,
                                                  IDirect3DSurface9* pSurface,
                                                  IDirect3DTexture9 **ppTexture,
                                                  DWORD dwFlag);
-#endif //defined(_D3D9_H_)
+#endif //defined(_D3D11_H_)
 
-#if defined(_D3D9_H_)
+#if defined(_D3D11_H_)
 ///////////////////////////////////////////////////////////////////////////////
 //
-// FUNCTION NAME:   NvAPI_D3D9_StretchRectEx
+// FUNCTION NAME:   NvAPI_D3D11_StretchRectEx
 //
 //! DESCRIPTION:     This API copies the contents of the source resource to the destination
 //!                  resource.  This function can convert
@@ -11049,7 +11049,7 @@ NVAPI_INTERFACE NvAPI_D3D9_AliasSurfaceAsTexture(IDirect3DDevice9* pDev,
 //!                  from a depth/stencil surface to a texture.
 //!
 //!                  The source and destination resources *must* be registered
-//!                  with NvAPI before being used with NvAPI_D3D9_StretchRectEx().
+//!                  with NvAPI before being used with NvAPI_D3D11_StretchRectEx().
 //!
 //! SUPPORTED OS:  Windows 10 and higher
 //!
@@ -11069,19 +11069,19 @@ NVAPI_INTERFACE NvAPI_D3D9_AliasSurfaceAsTexture(IDirect3DDevice9* pDev,
 //!
 //! \ingroup dx
 ///////////////////////////////////////////////////////////////////////////////
-NVAPI_INTERFACE NvAPI_D3D9_StretchRectEx(IDirect3DDevice9 * pDevice,
+NVAPI_INTERFACE NvAPI_D3D11_StretchRectEx(IDirect3DDevice9 * pDevice,
                                          IDirect3DResource9 * pSourceResource,
                                          CONST RECT * pSourceRect,
                                          IDirect3DResource9 * pDestResource,
                                          CONST RECT * pDestRect,
                                          D3DTEXTUREFILTERTYPE Filter);
 
-#endif //defined(_D3D9_H_)
+#endif //defined(_D3D11_H_)
 
-#if defined(_D3D9_H_)
+#if defined(_D3D11_H_)
 ///////////////////////////////////////////////////////////////////////////////
 //
-// FUNCTION NAME:   NvAPI_D3D9_ClearRT
+// FUNCTION NAME:   NvAPI_D3D11_ClearRT
 //
 //! DESCRIPTION:     This API Clears the currently bound render target(s) with the 
 //!                  given color
@@ -11102,11 +11102,11 @@ NVAPI_INTERFACE NvAPI_D3D9_StretchRectEx(IDirect3DDevice9 * pDevice,
 //!
 //! \ingroup dx
 ///////////////////////////////////////////////////////////////////////////////
-NVAPI_INTERFACE NvAPI_D3D9_ClearRT(IDirect3DDevice9 * pDevice,
+NVAPI_INTERFACE NvAPI_D3D11_ClearRT(IDirect3DDevice9 * pDevice,
                                    NvU32 dwNumRects,
                                    CONST RECT * pRects,
                                    float r, float g, float b, float a);
-#endif //if defined(_D3D9_H_)
+#endif //if defined(_D3D11_H_)
 
 
 
@@ -11117,13 +11117,13 @@ NVAPI_INTERFACE NvAPI_D3D9_ClearRT(IDirect3DDevice9 * pDevice,
 
 
 
-#if defined(_D3D9_H_) && defined(__cplusplus)
+#if defined(_D3D11_H_) && defined(__cplusplus)
 //! SUPPORTED OS:  Windows 10 and higher
 //!
 
 ///////////////////////////////////////////////////////////////////////////////
 //
-// FUNCTION NAME: NvAPI_D3D9_GetSurfaceHandle
+// FUNCTION NAME: NvAPI_D3D11_GetSurfaceHandle
 //
 //!  This function gets the handle of a given surface. This handle uniquely 
 //!  identifies the surface through all NvAPI entries.
@@ -11137,12 +11137,12 @@ NVAPI_INTERFACE NvAPI_D3D9_ClearRT(IDirect3DDevice9 * pDevice,
 //! \return An int which could be an NvAPI status or DX HRESULT code
 //! \ingroup dx
 ///////////////////////////////////////////////////////////////////////////////
-NVAPI_INTERFACE NvAPI_D3D9_GetSurfaceHandle(IDirect3DSurface9 *pSurface, 
+NVAPI_INTERFACE NvAPI_D3D11_GetSurfaceHandle(IDirect3DSurface9 *pSurface, 
                                         NVDX_ObjectHandle *pHandle);
 
-#endif //defined(_D3D9_H_) && defined(__cplusplus)
+#endif //defined(_D3D11_H_) && defined(__cplusplus)
 
-#if defined(_D3D9_H_) && defined(__cplusplus)
+#if defined(_D3D11_H_) && defined(__cplusplus)
 //! SUPPORTED OS:  Windows 10 and higher
 //!
 //! \addtogroup dxvidcontrol
@@ -11150,9 +11150,9 @@ NVAPI_INTERFACE NvAPI_D3D9_GetSurfaceHandle(IDirect3DSurface9 *pSurface,
 
 ///////////////////////////////////////////////////////////////////////////////
 //
-// FUNCTION_NAME: NvAPI_D3D9_VideoSetStereoInfo
+// FUNCTION_NAME: NvAPI_D3D11_VideoSetStereoInfo
 //
-//! \fn NvAPI_D3D9_VideoSetStereoInfo(IDirect3DDevice9 *pDev,
+//! \fn NvAPI_D3D11_VideoSetStereoInfo(IDirect3DDevice9 *pDev,
 //!                                            NV_DX_VIDEO_STEREO_INFO *pStereoInfo);
 //! \code
 //!   DESCRIPTION: This api specifies the stereo format of a surface, so that the
@@ -11204,11 +11204,11 @@ typedef struct _NV_DX_VIDEO_STEREO_INFO {
 //! Macro for constructing the version field of ::NV_DX_VIDEO_STEREO_INFO
 #define NV_DX_VIDEO_STEREO_INFO_VER  MAKE_NVAPI_VERSION(NV_DX_VIDEO_STEREO_INFO,1)
 
-NVAPI_INTERFACE NvAPI_D3D9_VideoSetStereoInfo(IDirect3DDevice9 *pDev,
+NVAPI_INTERFACE NvAPI_D3D11_VideoSetStereoInfo(IDirect3DDevice9 *pDev,
                                               NV_DX_VIDEO_STEREO_INFO *pStereoInfo);
 
 //! @}
-#endif //defined(_D3D9_H_) && defined(__cplusplus)
+#endif //defined(_D3D11_H_) && defined(__cplusplus)
 
 
 #if defined(__cplusplus) && defined(__d3d10_h__)
@@ -11536,7 +11536,7 @@ NVAPI_INTERFACE NvAPI_D3D11_GetResourceHandle(ID3D11Device *pDev,
 
 #endif //defined(__cplusplus) && defined(__d3d11_h__)
 
-#if defined(_D3D9_H_) || defined(__d3d10_h__) || defined(__d3d10_1_h__) || defined(__d3d11_h__)
+#if defined(_D3D11_H_) || defined(__d3d10_h__) || defined(__d3d10_1_h__) || defined(__d3d11_h__)
 ///////////////////////////////////////////////////////////////////////////////
 //
 // FUNCTION NAME: NvAPI_D3D_SetFPSIndicatorState
@@ -11556,19 +11556,19 @@ NVAPI_INTERFACE NvAPI_D3D11_GetResourceHandle(ID3D11Device *pDev,
 /////////////////////////////////////////////////////////////////////////////// 
 NVAPI_INTERFACE NvAPI_D3D_SetFPSIndicatorState(IUnknown *pDev, NvU8 doEnable);
 
-#endif //if defined(_D3D9_H_) || defined(__d3d10_h__) || defined(__d3d10_1_h__) || defined(__d3d11_h__)
+#endif //if defined(_D3D11_H_) || defined(__d3d10_h__) || defined(__d3d10_1_h__) || defined(__d3d11_h__)
 
-#if defined(_D3D9_H_)
+#if defined(_D3D11_H_)
 ///////////////////////////////////////////////////////////////////////////////
 //
-// FUNCTION NAME: NvAPI_D3D9_Present
+// FUNCTION NAME: NvAPI_D3D11_Present
 //
 //! DESCRIPTION: This API presents the contents of the next buffer in the sequence of back buffers 
 //!              owned by a IDirect3DDevice9 device.
 //!              This Present operation supports using a SwapGroup and SwapBarrier on the SwapChain
 //!              that owns the back buffer to be presented.
 //!
-//!          NOTE: NvAPI_D3D9_Present is a wrapper of the method IDirect3DDevice9::Present which
+//!          NOTE: NvAPI_D3D11_Present is a wrapper of the method IDirect3DDevice9::Present which
 //!                additionally notifies the D3D driver of the SwapChain used by the runtime for
 //!                presentation, thus allowing the D3D driver to apply SwapGroup and SwapBarrier
 //!                functionality to that SwapChain.
@@ -11598,22 +11598,22 @@ NVAPI_INTERFACE NvAPI_D3D_SetFPSIndicatorState(IUnknown *pDev, NvU8 doEnable);
 //!
 //!\ingroup dx
 ///////////////////////////////////////////////////////////////////////////////
-NVAPI_INTERFACE NvAPI_D3D9_Present(IDirect3DDevice9 *pDevice,
+NVAPI_INTERFACE NvAPI_D3D11_Present(IDirect3DDevice9 *pDevice,
                                    IDirect3DSwapChain9 *pSwapChain,
                                    const RECT *pSourceRect,
                                    const RECT *pDestRect,
                                    HWND hDestWindowOverride,
                                    const RGNDATA *pDirtyRegion);
-#endif //if defined(_D3D9_H_)
+#endif //if defined(_D3D11_H_)
 
-#if defined(_D3D9_H_)
+#if defined(_D3D11_H_)
 ///////////////////////////////////////////////////////////////////////////////
 //
-// FUNCTION NAME: NvAPI_D3D9_QueryFrameCount
+// FUNCTION NAME: NvAPI_D3D11_QueryFrameCount
 //
 //!   DESCRIPTION: This API queries the universal framecounter of the Quadro-Sync master device.
 //!
-//! \param [in]   pDevice            The caller provides the DX9 device that has access to the Quadro-Sync device
+//! \param [in]   pDevice            The caller provides the DX11 device that has access to the Quadro-Sync device
 //! \param [out]  pFrameCount        The caller provides the storage space where the framecount is stored.
 //!
 //! SUPPORTED OS:  Windows 10 and higher
@@ -11626,18 +11626,18 @@ NVAPI_INTERFACE NvAPI_D3D9_Present(IDirect3DDevice9 *pDevice,
 //!
 //! \ingroup dx
 ///////////////////////////////////////////////////////////////////////////////
-NVAPI_INTERFACE NvAPI_D3D9_QueryFrameCount(IDirect3DDevice9 *pDevice,
+NVAPI_INTERFACE NvAPI_D3D11_QueryFrameCount(IDirect3DDevice9 *pDevice,
                                            NvU32 *pFrameCount);
-#endif //if defined(_D3D9_H_)
+#endif //if defined(_D3D11_H_)
 
-#if defined(_D3D9_H_)
+#if defined(_D3D11_H_)
 ///////////////////////////////////////////////////////////////////////////////
 //
-// FUNCTION NAME: NvAPI_D3D9_ResetFrameCount
+// FUNCTION NAME: NvAPI_D3D11_ResetFrameCount
 //
 //!   DESCRIPTION: This API resets the universal framecounter on the Quadro-Sync master device.
 //!
-//! \param [in]   pDevice            The caller provides the DX9 device that has access to the Quadro-Sync device
+//! \param [in]   pDevice            The caller provides the DX11 device that has access to the Quadro-Sync device
 //!
 //! SUPPORTED OS:  Windows 10 and higher
 //!
@@ -11649,13 +11649,13 @@ NVAPI_INTERFACE NvAPI_D3D9_QueryFrameCount(IDirect3DDevice9 *pDevice,
 //!
 //! \ingroup dx
 ///////////////////////////////////////////////////////////////////////////////
-NVAPI_INTERFACE NvAPI_D3D9_ResetFrameCount(IDirect3DDevice9 *pDevice);
-#endif //if defined(_D3D9_H_)
+NVAPI_INTERFACE NvAPI_D3D11_ResetFrameCount(IDirect3DDevice9 *pDevice);
+#endif //if defined(_D3D11_H_)
 
-#if defined(_D3D9_H_)
+#if defined(_D3D11_H_)
 ///////////////////////////////////////////////////////////////////////////////
 //
-// FUNCTION NAME: NvAPI_D3D9_QueryMaxSwapGroup
+// FUNCTION NAME: NvAPI_D3D11_QueryMaxSwapGroup
 //
 //!   DESCRIPTION: This API queries the number of supported SwapGroups and SwapBarriers in the graphics system.
 //!
@@ -11673,15 +11673,15 @@ NVAPI_INTERFACE NvAPI_D3D9_ResetFrameCount(IDirect3DDevice9 *pDevice);
 //!
 //! \ingroup dx
 ///////////////////////////////////////////////////////////////////////////////
-NVAPI_INTERFACE NvAPI_D3D9_QueryMaxSwapGroup(IDirect3DDevice9 *pDevice, 
+NVAPI_INTERFACE NvAPI_D3D11_QueryMaxSwapGroup(IDirect3DDevice9 *pDevice, 
                                              NvU32 *pMaxGroups, 
                                              NvU32 *pMaxBarriers); 
-#endif //if defined(_D3D9_H_)
+#endif //if defined(_D3D11_H_)
 
-#if defined(_D3D9_H_)
+#if defined(_D3D11_H_)
 ///////////////////////////////////////////////////////////////////////////////
 //
-// FUNCTION NAME: NvAPI_D3D9_QuerySwapGroup
+// FUNCTION NAME: NvAPI_D3D11_QuerySwapGroup
 //
 //!   DESCRIPTION: This API queries the current SwapGroup and SwapBarrier that a SwapChain of a specific client device is bound to.
 //!
@@ -11701,16 +11701,16 @@ NVAPI_INTERFACE NvAPI_D3D9_QueryMaxSwapGroup(IDirect3DDevice9 *pDevice,
 //!
 //! \ingroup dx
 ///////////////////////////////////////////////////////////////////////////////
-NVAPI_INTERFACE NvAPI_D3D9_QuerySwapGroup(IDirect3DDevice9 *pDevice, 
+NVAPI_INTERFACE NvAPI_D3D11_QuerySwapGroup(IDirect3DDevice9 *pDevice, 
                                           IDirect3DSwapChain9 *pSwapChain, 
                                           NvU32 *pSwapGroup, 
                                           NvU32 *pSwapBarrier); 
-#endif //if defined(_D3D9_H_)
+#endif //if defined(_D3D11_H_)
 
-#if defined(_D3D9_H_)
+#if defined(_D3D11_H_)
 ///////////////////////////////////////////////////////////////////////////////
 //
-// FUNCTION NAME: NvAPI_D3D9_JoinSwapGroup
+// FUNCTION NAME: NvAPI_D3D11_JoinSwapGroup
 //
 //!   DESCRIPTION: This API causes the SwapChain of a SwapGroup client to join or leave the specified SwapGroup.
 //!
@@ -11736,16 +11736,16 @@ NVAPI_INTERFACE NvAPI_D3D9_QuerySwapGroup(IDirect3DDevice9 *pDevice,
 //!
 //! \ingroup dx
 ///////////////////////////////////////////////////////////////////////////////
-NVAPI_INTERFACE NvAPI_D3D9_JoinSwapGroup(IDirect3DDevice9 *pDevice, 
+NVAPI_INTERFACE NvAPI_D3D11_JoinSwapGroup(IDirect3DDevice9 *pDevice, 
                                          IDirect3DSwapChain9 *pSwapChain, 
                                          NvU32 group,
                                          BOOL blocking); 
-#endif //if defined(_D3D9_H_)
+#endif //if defined(_D3D11_H_)
 
-#if defined(_D3D9_H_)
+#if defined(_D3D11_H_)
 ///////////////////////////////////////////////////////////////////////////////
 //
-// FUNCTION NAME: NvAPI_D3D9_BindSwapBarrier
+// FUNCTION NAME: NvAPI_D3D11_BindSwapBarrier
 //
 //!   DESCRIPTION: This API causes a SwapGroup to be bound to or released from the specified SwapBarrier.
 //!
@@ -11766,10 +11766,10 @@ NVAPI_INTERFACE NvAPI_D3D9_JoinSwapGroup(IDirect3DDevice9 *pDevice,
 //!
 //! \ingroup dx
 ///////////////////////////////////////////////////////////////////////////////
-NVAPI_INTERFACE NvAPI_D3D9_BindSwapBarrier(IDirect3DDevice9 *pDevice, 
+NVAPI_INTERFACE NvAPI_D3D11_BindSwapBarrier(IDirect3DDevice9 *pDevice, 
                                            NvU32 group, 
                                            NvU32 barrier); 
-#endif //if defined(_D3D9_H_)
+#endif //if defined(_D3D11_H_)
 
 //! \ingroup dx
 typedef enum
@@ -11784,7 +11784,7 @@ typedef enum
 } NVAPI_VSYNC_MODE;
 
 
-#if defined(_D3D9_H_) || defined(__d3d10_h__) || defined(__d3d10_1_h__) || defined(__d3d11_h__) || defined(__d3d12_h__)
+#if defined(_D3D11_H_) || defined(__d3d10_h__) || defined(__d3d10_1_h__) || defined(__d3d11_h__) || defined(__d3d12_h__)
 ///////////////////////////////////////////////////////////////////////////////
 //
 // FUNCTION NAME: NvAPI_D3D_SetVerticalSyncMode
@@ -11804,7 +11804,7 @@ typedef enum
 ///////////////////////////////////////////////////////////////////////////////
 NVAPI_INTERFACE NvAPI_D3D_SetVerticalSyncMode(__in IUnknown *pDevice, __in NVAPI_VSYNC_MODE vsyncMode); 
 
-#endif //if defined(_D3D9_H_) || defined(__d3d10_h__) || defined(__d3d10_1_h__) || defined(__d3d11_h__) || defined(__d3d12_h__)
+#endif //if defined(_D3D11_H_) || defined(__d3d10_h__) || defined(__d3d10_1_h__) || defined(__d3d11_h__) || defined(__d3d12_h__)
 
 #if defined(__d3d10_h__) || defined(__d3d10_1_h__) || defined(__d3d11_h__) || defined(__d3d12_h__)
 ///////////////////////////////////////////////////////////////////////////////
@@ -12381,7 +12381,7 @@ NVAPI_INTERFACE NvAPI_D3D11_CreateRasterizerState(__in ID3D11Device *pDevice,
 //! SUPPORTED OS:  Windows 10 and higher
 //!
 
-#if defined (__cplusplus) && (defined(_D3D9_H_) || defined(__d3d11_h__) || defined(__d3d11_1_h__) || defined(__d3d12_h__))
+#if defined (__cplusplus) && (defined(_D3D11_H_) || defined(__d3d11_h__) || defined(__d3d11_1_h__) || defined(__d3d12_h__))
 
 ///////////////////////////////////////////////////////////////////////////////
 //
@@ -12443,7 +12443,7 @@ typedef NVAPI_ANSEL_CONFIGURATION_STRUCT_V1 NVAPI_ANSEL_CONFIGURATION_STRUCT;
 NVAPI_INTERFACE NvAPI_D3D_ConfigureAnsel(__in IUnknown *pDevice,
                                          __in NVAPI_ANSEL_CONFIGURATION_STRUCT *pNLSConfig);
 
-#endif //defined (__cplusplus) && (defined(_D3D9_H_) || defined(__d3d11_h__) || defined(__d3d11_1_h__) || defined(__d3d12_h__))
+#endif //defined (__cplusplus) && (defined(_D3D11_H_) || defined(__d3d11_h__) || defined(__d3d11_1_h__) || defined(__d3d12_h__))
 
 //! SUPPORTED OS:  Windows 10 and higher
 //!
@@ -15499,14 +15499,14 @@ NVAPI_INTERFACE NvAPI_D3D12_GetOptimalThreadCountForMesh(__in  ID3D12Device *pDe
 #endif //defined (__cplusplus) && defined(__d3d12_h__)
 
 
-#if defined(_D3D9_H_) || defined(__d3d10_h__) || defined(__d3d11_h__)
+#if defined(_D3D11_H_) || defined(__d3d10_h__) || defined(__d3d11_h__)
 
 ///////////////////////////////////////////////////////////////////////////////
 //!
 //! FUNCTION NAME: NvAPI_D3D_IsGSyncCapable
 //!   DESCRIPTION: This API gets G-Sync capability for the given device context.
 //!                This is only reliable after the first present call has completed.
-//! \param [in]    pDeviceOrContext    The D3D9, D3D10, D3D11 device, or D3D11 device context
+//! \param [in]    pDeviceOrContext    The D3D11, D3D10, D3D11 device, or D3D11 device context
 //! \param [in]    NVDX_ObjectHandle   The handle of primary surface
 //! \param [out]   pIsGsyncCapable     if G-Sync can be enabled, *pIsGsyncCapable is true.
 //!
@@ -15519,11 +15519,11 @@ NVAPI_INTERFACE NvAPI_D3D12_GetOptimalThreadCountForMesh(__in  ID3D12Device *pDe
 //! \ingroup dx
 ///////////////////////////////////////////////////////////////////////////////
 NVAPI_INTERFACE NvAPI_D3D_IsGSyncCapable(__in IUnknown *pDeviceOrContext, __in NVDX_ObjectHandle primarySurface, __out BOOL *pIsGsyncCapable);
-#endif //if defined(_D3D9_H_) || defined(__d3d10_h__) || defined(__d3d11_h__)
+#endif //if defined(_D3D11_H_) || defined(__d3d10_h__) || defined(__d3d11_h__)
 
 
 
-#if defined(_D3D9_H_) || defined(__d3d10_h__) || defined(__d3d11_h__)
+#if defined(_D3D11_H_) || defined(__d3d10_h__) || defined(__d3d11_h__)
 
 ///////////////////////////////////////////////////////////////////////////////
 //!
@@ -15531,7 +15531,7 @@ NVAPI_INTERFACE NvAPI_D3D_IsGSyncCapable(__in IUnknown *pDeviceOrContext, __in N
 //!   DESCRIPTION: This API get the G-Sync state for the given device context.
 //!                This is only reliable after the first present call has completed.
 //!                As it is a bit time consuming, It should not be called per frame. 
-//! \param [in]    pDeviceOrContext    The D3D9, D3D10, D3D11 device, or D3D11 device context
+//! \param [in]    pDeviceOrContext    The D3D11, D3D10, D3D11 device, or D3D11 device context
 //! \param [in]    NVDX_ObjectHandle   The handle of primary surface
 //! \param [out]   pIsGsyncActive      if G-Sync is active, *pisGsyncActive is true.
 //!
@@ -15544,7 +15544,7 @@ NVAPI_INTERFACE NvAPI_D3D_IsGSyncCapable(__in IUnknown *pDeviceOrContext, __in N
 //! \ingroup dx
 ///////////////////////////////////////////////////////////////////////////////
 NVAPI_INTERFACE NvAPI_D3D_IsGSyncActive(__in IUnknown *pDeviceOrContext, __in NVDX_ObjectHandle primarySurface, __out BOOL *pIsGsyncActive);
-#endif //if defined(_D3D9_H_) || defined(__d3d10_h__) || defined(__d3d11_h__)
+#endif //if defined(_D3D11_H_) || defined(__d3d10_h__) || defined(__d3d11_h__)
 
 
 
@@ -15868,7 +15868,7 @@ typedef NV_QUERY_SINGLE_PASS_STEREO_SUPPORT_PARAMS_V1                 NV_QUERY_S
 #define NV_QUERY_SINGLE_PASS_STEREO_SUPPORT_PARAMS_VER                NV_QUERY_SINGLE_PASS_STEREO_SUPPORT_PARAMS_VER1
 #endif
 
-#if defined(__cplusplus) && (defined(_D3D9_H_) || defined(__d3d10_h__) || defined(__d3d10_1_h__) || defined(__d3d11_h__))
+#if defined(__cplusplus) && (defined(_D3D11_H_) || defined(__d3d10_h__) || defined(__d3d10_1_h__) || defined(__d3d11_h__))
 ///////////////////////////////////////////////////////////////////////////////
 //
 // FUNCTION NAME: NvAPI_D3D_QuerySinglePassStereoSupport
@@ -15890,9 +15890,9 @@ typedef NV_QUERY_SINGLE_PASS_STEREO_SUPPORT_PARAMS_V1                 NV_QUERY_S
 NVAPI_INTERFACE NvAPI_D3D_QuerySinglePassStereoSupport(__in IUnknown *pDevice,
                                                 __inout NV_QUERY_SINGLE_PASS_STEREO_SUPPORT_PARAMS *pQuerySinglePassStereoSupportedParams);
 
-#endif //defined(__cplusplus) && (defined(_D3D9_H_) || defined(__d3d10_h__) || defined(__d3d10_1_h__) || defined(__d3d11_h__))
+#endif //defined(__cplusplus) && (defined(_D3D11_H_) || defined(__d3d10_h__) || defined(__d3d10_1_h__) || defined(__d3d11_h__))
 
-#if defined(__cplusplus) && defined(_D3D9_H_) || defined(__d3d10_h__) || defined(__d3d10_1_h__) || defined(__d3d11_h__)
+#if defined(__cplusplus) && defined(_D3D11_H_) || defined(__d3d10_h__) || defined(__d3d10_1_h__) || defined(__d3d11_h__)
 ///////////////////////////////////////////////////////////////////////////////
 //
 // FUNCTION NAME: NvAPI_D3D_SetSinglePassStereoMode
@@ -15920,7 +15920,7 @@ NVAPI_INTERFACE NvAPI_D3D_QuerySinglePassStereoSupport(__in IUnknown *pDevice,
 /////////////////////////////////////////////////////////////////////////////// 
 NVAPI_INTERFACE NvAPI_D3D_SetSinglePassStereoMode(__in IUnknown *pDevOrContext, __in NvU32 numViews, __in NvU32 renderTargetIndexOffset, __in NvU8 independentViewportMaskEnable);
 
-#endif //defined(__cplusplus) && defined(_D3D9_H_) || defined(__d3d10_h__) || defined(__d3d10_1_h__) || defined(__d3d11_h__)
+#endif //defined(__cplusplus) && defined(_D3D11_H_) || defined(__d3d10_h__) || defined(__d3d10_1_h__) || defined(__d3d11_h__)
 
 #if defined(__cplusplus) && ( defined(__d3d12_h__))
 ///////////////////////////////////////////////////////////////////////////////
@@ -16001,7 +16001,7 @@ typedef NV_QUERY_MULTIVIEW_SUPPORT_PARAMS_V1                    NV_QUERY_MULTIVI
 #define NV_QUERY_MULTIVIEW_SUPPORT_PARAMS_VER                   NV_QUERY_MULTIVIEW_SUPPORT_PARAMS_VER1
 #define NV_MULTIVIEW_MAX_SUPPORTED_VIEWS                        4
 
-#if defined(__cplusplus) && (defined(_D3D9_H_) || defined(__d3d10_h__) || defined(__d3d10_1_h__) || defined(__d3d11_h__))
+#if defined(__cplusplus) && (defined(_D3D11_H_) || defined(__d3d10_h__) || defined(__d3d10_1_h__) || defined(__d3d11_h__))
 ///////////////////////////////////////////////////////////////////////////////
 //
 // FUNCTION NAME: NvAPI_D3D_QueryMultiViewSupport
@@ -16025,7 +16025,7 @@ typedef NV_QUERY_MULTIVIEW_SUPPORT_PARAMS_V1                    NV_QUERY_MULTIVI
 NVAPI_INTERFACE NvAPI_D3D_QueryMultiViewSupport(__in IUnknown *pDevice,
                                                 __inout NV_QUERY_MULTIVIEW_SUPPORT_PARAMS *pQueryMultiViewSupportedParams);
 
-#endif //defined(__cplusplus) && (defined(_D3D9_H_) || defined(__d3d10_h__) || defined(__d3d10_1_h__) || defined(__d3d11_h__))
+#endif //defined(__cplusplus) && (defined(_D3D11_H_) || defined(__d3d10_h__) || defined(__d3d10_1_h__) || defined(__d3d11_h__))
 
 //! SUPPORTED OS:  Windows 10 and higher
 //!
@@ -16043,7 +16043,7 @@ typedef NV_MULTIVIEW_PARAMS_V1                                       NV_MULTIVIE
 #define NV_MULTIVIEW_PARAMS_VER1                                     MAKE_NVAPI_VERSION(NV_MULTIVIEW_PARAMS_V1, 1)
 #define NV_MULTIVIEW_PARAMS_VER                                      NV_MULTIVIEW_PARAMS_VER1
 
-#if defined(__cplusplus) && defined(_D3D9_H_) || defined(__d3d10_h__) || defined(__d3d10_1_h__) || defined(__d3d11_h__)
+#if defined(__cplusplus) && defined(_D3D11_H_) || defined(__d3d10_h__) || defined(__d3d10_1_h__) || defined(__d3d11_h__)
 ///////////////////////////////////////////////////////////////////////////////
 //
 // FUNCTION NAME: NvAPI_D3D_SetMultiViewMode
@@ -16071,7 +16071,7 @@ typedef NV_MULTIVIEW_PARAMS_V1                                       NV_MULTIVIE
 /////////////////////////////////////////////////////////////////////////////// 
 NVAPI_INTERFACE NvAPI_D3D_SetMultiViewMode(__in IUnknown *pDevOrContext, __in NV_MULTIVIEW_PARAMS *pMultiViewParams);
 
-#endif //defined(__cplusplus) && defined(_D3D9_H_) || defined(__d3d10_h__) || defined(__d3d10_1_h__) || defined(__d3d11_h__)
+#endif //defined(__cplusplus) && defined(_D3D11_H_) || defined(__d3d10_h__) || defined(__d3d10_1_h__) || defined(__d3d11_h__)
 
 //! SUPPORTED OS:  Windows 10 and higher
 //!
@@ -16087,7 +16087,7 @@ typedef NV_QUERY_MODIFIED_W_SUPPORT_PARAMS_V1               NV_QUERY_MODIFIED_W_
 #define NV_QUERY_MODIFIED_W_SUPPORT_PARAMS_VER1             MAKE_NVAPI_VERSION(NV_QUERY_MODIFIED_W_SUPPORT_PARAMS_V1, 1)
 #define NV_QUERY_MODIFIED_W_SUPPORT_PARAMS_VER              NV_QUERY_MODIFIED_W_SUPPORT_PARAMS_VER1
 
-#if defined(__cplusplus) && (defined(_D3D9_H_) || defined(__d3d10_h__) || defined(__d3d10_1_h__) || defined(__d3d11_h__))
+#if defined(__cplusplus) && (defined(_D3D11_H_) || defined(__d3d10_h__) || defined(__d3d10_1_h__) || defined(__d3d11_h__))
 ///////////////////////////////////////////////////////////////////////////////
 //
 // FUNCTION NAME: NvAPI_D3D_QueryModifiedWSupport
@@ -16108,7 +16108,7 @@ typedef NV_QUERY_MODIFIED_W_SUPPORT_PARAMS_V1               NV_QUERY_MODIFIED_W_
 /////////////////////////////////////////////////////////////////////////////// 
 NVAPI_INTERFACE NvAPI_D3D_QueryModifiedWSupport(__in IUnknown *pDev,
                                             __inout NV_QUERY_MODIFIED_W_SUPPORT_PARAMS *pQueryModifiedWSupportedParams);
-#endif //defined(__cplusplus) && (defined(_D3D9_H_) || defined(__d3d10_h__) || defined(__d3d10_1_h__) || defined(__d3d11_h__))
+#endif //defined(__cplusplus) && (defined(_D3D11_H_) || defined(__d3d10_h__) || defined(__d3d10_1_h__) || defined(__d3d11_h__))
 
 //! SUPPORTED OS:  Windows 10 and higher
 //!
@@ -16138,7 +16138,7 @@ typedef NV_MODIFIED_W_PARAMS_V1      NV_MODIFIED_W_PARAMS;
 #define NV_MODIFIED_W_PARAMS_VER1    MAKE_NVAPI_VERSION(NV_MODIFIED_W_PARAMS_V1, 1)
 #define NV_MODIFIED_W_PARAMS_VER     NV_MODIFIED_W_PARAMS_VER1
 
-#if defined(__cplusplus) && (defined(_D3D9_H_) || defined(__d3d10_h__) || defined(__d3d10_1_h__) || defined(__d3d11_h__))
+#if defined(__cplusplus) && (defined(_D3D11_H_) || defined(__d3d10_h__) || defined(__d3d10_1_h__) || defined(__d3d11_h__))
 ///////////////////////////////////////////////////////////////////////////////
 //
 // FUNCTION NAME: NvAPI_D3D_SetModifiedWMode
@@ -16164,7 +16164,7 @@ typedef NV_MODIFIED_W_PARAMS_V1      NV_MODIFIED_W_PARAMS;
 /////////////////////////////////////////////////////////////////////////////// 
 NVAPI_INTERFACE NvAPI_D3D_SetModifiedWMode(__in IUnknown *pDevOrContext, __in NV_MODIFIED_W_PARAMS *psModifiedWParams);
 
-#endif //defined(__cplusplus) && (defined(_D3D9_H_) || defined(__d3d10_h__) || defined(__d3d10_1_h__) || defined(__d3d11_h__))
+#endif //defined(__cplusplus) && (defined(_D3D11_H_) || defined(__d3d10_h__) || defined(__d3d10_1_h__) || defined(__d3d11_h__))
 
 #if defined(__cplusplus) && ( defined(__d3d12_h__))
 ///////////////////////////////////////////////////////////////////////////////
@@ -16417,7 +16417,7 @@ NVAPI_INTERFACE NvAPI_D3D11_MultiDrawIndexedInstancedIndirect(__in ID3D11DeviceC
 
 //! SUPPORTED OS:  Windows 10 and higher
 //!
-#if defined (__cplusplus) && ( defined(_D3D9_H_) || defined(__d3d10_h__) || defined(__d3d10_1_h__) ||defined(__d3d11_h__) )
+#if defined (__cplusplus) && ( defined(_D3D11_H_) || defined(__d3d10_h__) || defined(__d3d10_1_h__) ||defined(__d3d11_h__) )
 ///////////////////////////////////////////////////////////////////////////////
 //
 // FUNCTION NAME:   NvAPI_D3D_ImplicitSLIControl
@@ -16442,7 +16442,7 @@ typedef enum _IMPLICIT_SLI_CONTROL
 //! \ingroup dx
 NVAPI_INTERFACE NvAPI_D3D_ImplicitSLIControl(__in IMPLICIT_SLI_CONTROL implicitSLIControl);
 
-#endif //defined (__cplusplus) && ( defined(_D3D9_H_) || defined(__d3d10_h__) || defined(__d3d10_1_h__) ||defined(__d3d11_h__) )
+#endif //defined (__cplusplus) && ( defined(_D3D11_H_) || defined(__d3d10_h__) || defined(__d3d10_1_h__) ||defined(__d3d11_h__) )
 
 
 #if defined (__cplusplus) && defined(__d3d12_h__)
@@ -17857,7 +17857,7 @@ typedef NV_GET_SLEEP_STATUS_PARAMS_V1            NV_GET_SLEEP_STATUS_PARAMS;
 #define NV_GET_SLEEP_STATUS_PARAMS_VER1          MAKE_NVAPI_VERSION(NV_GET_SLEEP_STATUS_PARAMS_V1, 1)
 #define NV_GET_SLEEP_STATUS_PARAMS_VER           NV_GET_SLEEP_STATUS_PARAMS_VER1
 
-#if defined(__cplusplus) && (defined(_D3D9_H_) || defined(__d3d10_h__) || defined(__d3d10_1_h__) || defined(__d3d11_h__) || defined(__d3d12_h__))
+#if defined(__cplusplus) && (defined(_D3D11_H_) || defined(__d3d10_h__) || defined(__d3d10_1_h__) || defined(__d3d11_h__) || defined(__d3d12_h__))
 ///////////////////////////////////////////////////////////////////////////////
 //
 // FUNCTION NAME: NvAPI_D3D_GetSleepStatus
@@ -17884,7 +17884,7 @@ typedef NV_GET_SLEEP_STATUS_PARAMS_V1            NV_GET_SLEEP_STATUS_PARAMS;
 //! \ingroup dx
 ///////////////////////////////////////////////////////////////////////////////
 NVAPI_INTERFACE NvAPI_D3D_GetSleepStatus(__in IUnknown *pDev, __in NV_GET_SLEEP_STATUS_PARAMS *pGetSleepStatusParams);
-#endif //defined(__cplusplus) && (defined(_D3D9_H_) || defined(__d3d10_h__) || defined(__d3d10_1_h__) || defined(__d3d11_h__) || defined(__d3d12_h__))
+#endif //defined(__cplusplus) && (defined(_D3D11_H_) || defined(__d3d10_h__) || defined(__d3d10_1_h__) || defined(__d3d11_h__) || defined(__d3d12_h__))
 
 //! SUPPORTED OS:  Windows 10 and higher
 //!
@@ -17904,7 +17904,7 @@ typedef NV_SET_SLEEP_MODE_PARAMS_V1            NV_SET_SLEEP_MODE_PARAMS;
 #define NV_SET_SLEEP_MODE_PARAMS_VER1          MAKE_NVAPI_VERSION(NV_SET_SLEEP_MODE_PARAMS_V1, 1)
 #define NV_SET_SLEEP_MODE_PARAMS_VER           NV_SET_SLEEP_MODE_PARAMS_VER1
 
-#if defined(__cplusplus) && (defined(_D3D9_H_) || defined(__d3d10_h__) || defined(__d3d10_1_h__) || defined(__d3d11_h__) || defined(__d3d12_h__))
+#if defined(__cplusplus) && (defined(_D3D11_H_) || defined(__d3d10_h__) || defined(__d3d10_1_h__) || defined(__d3d11_h__) || defined(__d3d12_h__))
 ///////////////////////////////////////////////////////////////////////////////
 //
 // FUNCTION NAME: NvAPI_D3D_SetSleepMode
@@ -17940,9 +17940,9 @@ typedef NV_SET_SLEEP_MODE_PARAMS_V1            NV_SET_SLEEP_MODE_PARAMS;
 //! \ingroup dx
 ///////////////////////////////////////////////////////////////////////////////
 NVAPI_INTERFACE NvAPI_D3D_SetSleepMode(__in IUnknown *pDev, __in NV_SET_SLEEP_MODE_PARAMS *pSetSleepModeParams);
-#endif //defined(__cplusplus) && (defined(_D3D9_H_) || defined(__d3d10_h__) || defined(__d3d10_1_h__) || defined(__d3d11_h__) || defined(__d3d12_h__))
+#endif //defined(__cplusplus) && (defined(_D3D11_H_) || defined(__d3d10_h__) || defined(__d3d10_1_h__) || defined(__d3d11_h__) || defined(__d3d12_h__))
 
-#if defined(__cplusplus) && (defined(_D3D9_H_) || defined(__d3d10_h__) || defined(__d3d10_1_h__) || defined(__d3d11_h__) || defined(__d3d12_h__))
+#if defined(__cplusplus) && (defined(_D3D11_H_) || defined(__d3d10_h__) || defined(__d3d10_1_h__) || defined(__d3d11_h__) || defined(__d3d12_h__))
 ///////////////////////////////////////////////////////////////////////////////
 //
 // FUNCTION NAME: NvAPI_D3D_Sleep
@@ -17971,7 +17971,7 @@ NVAPI_INTERFACE NvAPI_D3D_SetSleepMode(__in IUnknown *pDev, __in NV_SET_SLEEP_MO
 //! \ingroup dx
 ///////////////////////////////////////////////////////////////////////////////
 NVAPI_INTERFACE NvAPI_D3D_Sleep(__in IUnknown *pDev);
-#endif //defined(__cplusplus) && (defined(_D3D9_H_) || defined(__d3d10_h__) || defined(__d3d10_1_h__) || defined(__d3d11_h__) || defined(__d3d12_h__))
+#endif //defined(__cplusplus) && (defined(_D3D11_H_) || defined(__d3d10_h__) || defined(__d3d10_1_h__) || defined(__d3d11_h__) || defined(__d3d12_h__))
 
 //! SUPPORTED OS:  Windows 10 and higher
 //!
@@ -17993,7 +17993,7 @@ typedef NV_SET_REFLEX_SYNC_PARAMS_V1            NV_SET_REFLEX_SYNC_PARAMS;
 #define NV_SET_REFLEX_SYNC_PARAMS_VER1          MAKE_NVAPI_VERSION(NV_SET_REFLEX_SYNC_PARAMS_V1, 1)
 #define NV_SET_REFLEX_SYNC_PARAMS_VER           NV_SET_REFLEX_SYNC_PARAMS_VER1
 
-#if defined(__cplusplus) && (defined(_D3D9_H_) || defined(__d3d10_h__) || defined(__d3d10_1_h__) || defined(__d3d11_h__) || defined(__d3d12_h__))
+#if defined(__cplusplus) && (defined(_D3D11_H_) || defined(__d3d10_h__) || defined(__d3d10_1_h__) || defined(__d3d11_h__) || defined(__d3d12_h__))
 ///////////////////////////////////////////////////////////////////////////////
 //
 // FUNCTION NAME: NvAPI_D3D_SetReflexSync
@@ -18012,7 +18012,7 @@ typedef NV_SET_REFLEX_SYNC_PARAMS_V1            NV_SET_REFLEX_SYNC_PARAMS;
 //! \ingroup dx
 ///////////////////////////////////////////////////////////////////////////////
 NVAPI_INTERFACE NvAPI_D3D_SetReflexSync(__in IUnknown *pDev, __in NV_SET_REFLEX_SYNC_PARAMS *pSetReflexSyncParams);
-#endif //defined(__cplusplus) && (defined(_D3D9_H_) || defined(__d3d10_h__) || defined(__d3d10_1_h__) || defined(__d3d11_h__) || defined(__d3d12_h__))
+#endif //defined(__cplusplus) && (defined(_D3D11_H_) || defined(__d3d10_h__) || defined(__d3d10_1_h__) || defined(__d3d11_h__) || defined(__d3d12_h__))
 
 //! SUPPORTED OS:  Windows 10 and higher
 //!
@@ -18048,7 +18048,7 @@ typedef NV_LATENCY_RESULT_PARAMS_V1            NV_LATENCY_RESULT_PARAMS;
 #define NV_LATENCY_RESULT_PARAMS_VER1          MAKE_NVAPI_VERSION(NV_LATENCY_RESULT_PARAMS_V1, 1)
 #define NV_LATENCY_RESULT_PARAMS_VER           NV_LATENCY_RESULT_PARAMS_VER1
 
-#if defined(__cplusplus) && (defined(_D3D9_H_) || defined(__d3d10_h__) || defined(__d3d10_1_h__) || defined(__d3d11_h__) || defined(__d3d12_h__))
+#if defined(__cplusplus) && (defined(_D3D11_H_) || defined(__d3d10_h__) || defined(__d3d10_1_h__) || defined(__d3d11_h__) || defined(__d3d12_h__))
 ///////////////////////////////////////////////////////////////////////////////
 //
 // FUNCTION NAME: NvAPI_D3D_GetLatency
@@ -18074,7 +18074,7 @@ typedef NV_LATENCY_RESULT_PARAMS_V1            NV_LATENCY_RESULT_PARAMS;
 //! \ingroup dx
 ///////////////////////////////////////////////////////////////////////////////
 NVAPI_INTERFACE NvAPI_D3D_GetLatency(__in IUnknown *pDev, __out NV_LATENCY_RESULT_PARAMS *pGetLatencyParams);
-#endif //defined(__cplusplus) && (defined(_D3D9_H_) || defined(__d3d10_h__) || defined(__d3d10_1_h__) || defined(__d3d11_h__) || defined(__d3d12_h__))
+#endif //defined(__cplusplus) && (defined(_D3D11_H_) || defined(__d3d10_h__) || defined(__d3d10_1_h__) || defined(__d3d11_h__) || defined(__d3d12_h__))
 
 //! SUPPORTED OS:  Windows 10 and higher
 //!
@@ -18114,7 +18114,7 @@ typedef NV_LATENCY_MARKER_PARAMS_V1            NV_LATENCY_MARKER_PARAMS;
 #define NV_LATENCY_MARKER_PARAMS_VER1          MAKE_NVAPI_VERSION(NV_LATENCY_MARKER_PARAMS_V1, 1)
 #define NV_LATENCY_MARKER_PARAMS_VER           NV_LATENCY_MARKER_PARAMS_VER1
 
-#if defined(__cplusplus) && (defined(_D3D9_H_) || defined(__d3d10_h__) || defined(__d3d10_1_h__) || defined(__d3d11_h__) || defined(__d3d12_h__))
+#if defined(__cplusplus) && (defined(_D3D11_H_) || defined(__d3d10_h__) || defined(__d3d10_1_h__) || defined(__d3d11_h__) || defined(__d3d12_h__))
 ///////////////////////////////////////////////////////////////////////////////
 //
 // FUNCTION NAME: NvAPI_D3D_SetLatencyMarker
@@ -18145,7 +18145,7 @@ typedef NV_LATENCY_MARKER_PARAMS_V1            NV_LATENCY_MARKER_PARAMS;
 //! \ingroup dx
 ///////////////////////////////////////////////////////////////////////////////
 NVAPI_INTERFACE NvAPI_D3D_SetLatencyMarker(__in IUnknown *pDev, __in NV_LATENCY_MARKER_PARAMS* pSetLatencyMarkerParams);
-#endif //defined(__cplusplus) && (defined(_D3D9_H_) || defined(__d3d10_h__) || defined(__d3d10_1_h__) || defined(__d3d11_h__) || defined(__d3d12_h__))
+#endif //defined(__cplusplus) && (defined(_D3D11_H_) || defined(__d3d10_h__) || defined(__d3d10_1_h__) || defined(__d3d11_h__) || defined(__d3d12_h__))
 
 //! SUPPORTED OS:  Windows 10 and higher
 //!
@@ -22665,7 +22665,7 @@ NVAPI_INTERFACE NvAPI_VIO_EnumDataFormats(NvVioHandle            hVioHandle,
 typedef enum _NV_StereoRegistryProfileType
 {
     NVAPI_STEREO_DEFAULT_REGISTRY_PROFILE, //!< Default registry configuration profile.
-    NVAPI_STEREO_DX9_REGISTRY_PROFILE,     //!< Separate registry configuration profile for a DirectX 9 executable.
+    NVAPI_STEREO_DX11_REGISTRY_PROFILE,     //!< Separate registry configuration profile for a DirectX 9 executable.
     NVAPI_STEREO_DX10_REGISTRY_PROFILE     //!< Separate registry configuration profile for a DirectX 10 executable.
 } NV_STEREO_REGISTRY_PROFILE_TYPE;
 
@@ -23301,14 +23301,14 @@ NVAPI_INTERFACE NvAPI_D3D1x_CreateSwapChain(StereoHandle hStereoHandle,
 #endif //if defined(__d3d10_h__) || defined(__d3d10_1_h__) || defined(__d3d11_h__)
 
 
-#if defined(_D3D9_H_) //NvAPI_D3D9_CreateSwapChain
+#if defined(_D3D11_H_) //NvAPI_D3D11_CreateSwapChain
 ///////////////////////////////////////////////////////////////////////////////
 //
-// FUNCTION NAME: NvAPI_D3D9_CreateSwapChain
+// FUNCTION NAME: NvAPI_D3D11_CreateSwapChain
 //
 //! DESCRIPTION: This API allows the user to create a mono or a stereo swap chain.
 //!
-//!          NOTE: NvAPI_D3D9_CreateSwapChain is a wrapper of the method IDirect3DDevice9::CreateAdditionalSwapChain which
+//!          NOTE: NvAPI_D3D11_CreateSwapChain is a wrapper of the method IDirect3DDevice9::CreateAdditionalSwapChain which
 //!                additionally notifies the D3D driver if the swap chain creation mode must be stereo or mono.
 //!
 //!
@@ -23330,11 +23330,11 @@ NVAPI_INTERFACE NvAPI_D3D1x_CreateSwapChain(StereoHandle hStereoHandle,
 //!
 //!\ingroup stereoapi
 ///////////////////////////////////////////////////////////////////////////////
-NVAPI_INTERFACE NvAPI_D3D9_CreateSwapChain(StereoHandle hStereoHandle,
+NVAPI_INTERFACE NvAPI_D3D11_CreateSwapChain(StereoHandle hStereoHandle,
                                            D3DPRESENT_PARAMETERS *pPresentationParameters,
                                            IDirect3DSwapChain9 **ppSwapChain,
                                            NV_STEREO_SWAPCHAIN_MODE mode);
-#endif //if defined(_D3D9_H_) //NvAPI_D3D9_CreateSwapChain
+#endif //if defined(_D3D11_H_) //NvAPI_D3D11_CreateSwapChain
 
 
 
