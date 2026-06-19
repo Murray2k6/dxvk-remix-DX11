@@ -23,6 +23,7 @@
 
 #include "rtx_initializer.h"
 #include "rtx_options.h"
+#include "../../util/log/log.h"
 #include "../../util/thread.h"
 #include "dxvk_context.h"
 #include "dxvk_device.h"
@@ -84,12 +85,15 @@ namespace dxvk {
     ShaderManager::getInstance()->addGlobalExtraLayout(pCommon->getSceneManager().getBindlessResourceManager().getGlobalBindlessTableLayout(BindlessResourceManager::Samplers));
 
     // Need to promote all of the hardware support Options before prewarming shaders.
+    Logger::info("[Remix-DX11][init] applying pending RtxOptions...");
     RtxOptionManager::applyPendingValues(m_device, /* forceOnChange */ true);
 
     // Kick off shader prewarming
+    Logger::info("[Remix-DX11][init] starting shader prewarm...");
     startPrewarmShaders();
 
     // Load assets (if any) as early as possible
+    Logger::info("[Remix-DX11][init] loading assets...");
     if (RtxOptions::asyncAssetLoading()) {
       // Async asset loading (USD)
       m_asyncAssetLoadThread = dxvk::thread([this] {
@@ -99,13 +103,26 @@ namespace dxvk {
     } else {
       loadAssets();
     }
-    pCommon->metaDLSS(); // Lazy allocator triggers init in ctor
-    pCommon->metaDLFG();
+
+    // DX11_V227_CROSS_VENDOR: DLSS and DLSS Frame Generation are NVIDIA NGX features.
+    // Their lazy allocators run real initialization in the constructor, which can crash
+    // at launch on Intel/AMD GPUs where NGX is unavailable. Only eagerly construct them
+    // when NGX actually reports DLSS support; otherwise they stay un-allocated (and any
+    // later use is already gated by supportsDLSS()), so path tracing still runs on any GPU.
+    if (pCommon->metaNGXContext().supportsDLSS()) {
+      Logger::info("[Remix-DX11][init] NGX/DLSS supported; initializing DLSS + DLFG.");
+      pCommon->metaDLSS(); // Lazy allocator triggers init in ctor
+      pCommon->metaDLFG();
+    } else {
+      Logger::info("[Remix-DX11][init] NGX/DLSS unsupported on this GPU; skipping DLSS + DLFG init (cross-vendor path).");
+    }
 
     if (!asyncShaderFinalizing()) {
       // Wait for all prewarming to complete before calling "RTX initialized"
+      Logger::info("[Remix-DX11][init] waiting for shader prewarm...");
       waitForShaderPrewarm();
     }
+    Logger::info("[Remix-DX11][init] RtxInitializer::initialize() complete.");
   }
 
   void RtxInitializer::release() {

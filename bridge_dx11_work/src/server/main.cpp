@@ -48,7 +48,8 @@
 #include "config/config.h"
 #include "config/global_options.h"
 #include "server_options.h"
-#include "../client/client_options.h"
+// DX11_V227: removed stale unused include of the old D3D11 client's client_options.h
+// (that client dir was deleted; the server never references ClientOptions).
 
 #include "../tracy/tracy.hpp"
 #include <iostream>
@@ -484,10 +485,12 @@ void ProcessDeviceCommandQueue() {
 
         auto bridgeHandle = DeviceBridge::get_data();
         remixapi_MaterialHandle remixApiHandle = nullptr;
-        if(remixapi::g_remix.CreateMaterial(&matInfo, &remixApiHandle) == REMIXAPI_ERROR_CODE_SUCCESS) {
+        // DX11_V227_BRIDGE_REMIX_INIT: null-guard so a failed Remix init never crashes the server.
+        if(remixapi::g_remix_initialized && remixapi::g_remix.CreateMaterial && remixapi::g_remix.CreateMaterial(&matInfo, &remixApiHandle) == REMIXAPI_ERROR_CODE_SUCCESS) {
           MaterialHandle(bridgeHandle, remixApiHandle);
         } else {
-          Logger::err("[RemixApi_CreateMaterial] Remix API call failed!");
+          static bool s_warnedCreateMaterial = false;
+          if (!s_warnedCreateMaterial) { s_warnedCreateMaterial = true; Logger::err("[RemixApi_CreateMaterial] Remix API unavailable or call failed!"); }
         }
         
         break;
@@ -525,10 +528,12 @@ void ProcessDeviceCommandQueue() {
 
         auto bridgeHandle = DeviceBridge::get_data();
         remixapi_MeshHandle remixApiHandle = nullptr;
-        if(remixapi::g_remix.CreateMesh(&meshInfo, &remixApiHandle) == REMIXAPI_ERROR_CODE_SUCCESS) {
+        // DX11_V227_BRIDGE_REMIX_INIT: null-guard so a failed Remix init never crashes the server.
+        if(remixapi::g_remix_initialized && remixapi::g_remix.CreateMesh && remixapi::g_remix.CreateMesh(&meshInfo, &remixApiHandle) == REMIXAPI_ERROR_CODE_SUCCESS) {
           MeshHandle handle(bridgeHandle, remixApiHandle);
         } else {
-          Logger::err("[RemixApi_CreateMesh] Remix API call failed!");
+          static bool s_warnedCreateMesh = false;
+          if (!s_warnedCreateMesh) { s_warnedCreateMesh = true; Logger::err("[RemixApi_CreateMesh] Remix API unavailable or call failed!"); }
         }
 
         break;
@@ -619,8 +624,12 @@ void ProcessDeviceCommandQueue() {
           bInstExtExists = remixapi::pullBool();
         }
 
-        if(remixapi::g_remix.DrawInstance(&instInfo) != REMIXAPI_ERROR_CODE_SUCCESS) {
-          Logger::err("[RemixApi_DrawInstance] Remix API call failed!");
+        // DX11_V227_BRIDGE_REMIX_INIT: null-guard so a failed Remix init never crashes the server.
+        if(remixapi::g_remix_initialized && remixapi::g_remix.DrawInstance) {
+          if(remixapi::g_remix.DrawInstance(&instInfo) != REMIXAPI_ERROR_CODE_SUCCESS) {
+            static bool s_warnedDrawInstance = false;
+            if (!s_warnedDrawInstance) { s_warnedDrawInstance = true; Logger::err("[RemixApi_DrawInstance] Remix API call failed!"); }
+          }
         }
 
         break;
@@ -5690,7 +5699,28 @@ int WINAPI wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance, 
   RegisterMessageChannel();
 
   // (2) Load d3d11.dll, which could be original system, dxvk-remix, or something else...
-  wchar_t dx11BridgeModeBuf[16] = {}; const bool dx11BridgeMode = GetEnvironmentVariableW(L"DX11_BRIDGE_MODE", dx11BridgeModeBuf, 16) > 0; if (dx11BridgeMode) { Logger::info("DX11 bridge mode active: skipping D3D11 InitializeD3D."); } else { Logger::info("Initializing D3D11..."); if (!InitializeD3D()) { return 1; } }
+  wchar_t dx11BridgeModeBuf[16] = {}; const bool dx11BridgeMode = GetEnvironmentVariableW(L"DX11_BRIDGE_MODE", dx11BridgeModeBuf, 16) > 0;
+  if (dx11BridgeMode) {
+    // DX11_V227_BRIDGE_REMIX_INIT: the DX11 capture bridge streams RemixApi_* scene
+    // commands (meshes/materials/lights/instances). The server MUST have a live Remix
+    // API interface (remixapi::g_remix) to replay them; otherwise the RemixApi handlers
+    // would invoke null function pointers and crash the server (taking the game down with
+    // it on the next captured draw). Initialize the Remix runtime here directly, without
+    // the client-side exposeRemixApi gate which does not apply to the bridge server host.
+    Logger::info("DX11 bridge mode active: initializing Remix runtime for capture->Remix scene streaming.");
+    if (!remixapi::g_remix_initialized) {
+      const remixapi_ErrorCode status = remixapi_lib_loadRemixDllAndInitialize(L"d3d11.dll", &remixapi::g_remix, &remixapi::g_remix_dll);
+      if (status != REMIXAPI_ERROR_CODE_SUCCESS) {
+        Logger::err(format_string("DX11 bridge mode: Remix API init failed: %d; capture->Remix rendering will be unavailable (handlers are null-guarded so the server stays alive).", status));
+      } else {
+        remixapi::g_remix_initialized = true;
+        Logger::info("DX11 bridge mode: Remix API initialized for capture->Remix streaming.");
+      }
+    }
+  } else {
+    Logger::info("Initializing D3D11...");
+    if (!InitializeD3D()) { return 1; }
+  }
 
   // (3) Send ACK to Client. Connection has been established
   Logger::info("Sync request received, sending ACK response...");
