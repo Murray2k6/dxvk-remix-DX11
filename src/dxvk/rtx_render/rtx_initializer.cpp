@@ -24,6 +24,9 @@
 #include "rtx_initializer.h"
 #include "rtx_options.h"
 #include "../../util/log/log.h"
+#include "../../util/util_env.h"
+#include "../../util/util_string.h"
+#include <cctype>
 #include "../../util/thread.h"
 #include "dxvk_context.h"
 #include "dxvk_device.h"
@@ -79,6 +82,30 @@ namespace dxvk {
       }
     }
 
+    // DX11_V228_ALBEDO_SELECTION: the generic albedo texture-selection reinforcement
+    // (rtx.enableUnrealTextureFixes - boost strong-albedo mipmapped textures, demote scene/intermediate
+    // surfaces) now defaults ON for ANY game/engine, so real textures get picked over the neutral
+    // untextured placeholder without per-game config. Detect a few engines from the exe name and enable
+    // their additional quirk fixes; log everything for diagnostics. Explicit user/config still wins.
+    {
+      std::string exeLower = env::getExeName();
+      for (char& ch : exeLower) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+      const bool isUnreal = exeLower.find("-shipping") != std::string::npos
+                         || exeLower.find("unrealengine") != std::string::npos;
+      const bool isSource2 = exeLower.find("source2") != std::string::npos
+                          || exeLower.find("dota2") != std::string::npos
+                          || exeLower.find("hl_vr") != std::string::npos
+                          || exeLower.find("csgo") != std::string::npos
+                          || exeLower.find("cs2") != std::string::npos;
+      if (isSource2 && !RtxOptions::enableSource2Fixes()) {
+        RtxOptions::enableSource2Fixes.setDeferred(true);
+      }
+      const char* engine = isUnreal ? "Unreal" : (isSource2 ? "Source2" : "generic");
+      Logger::info(str::format("[Remix-DX11][init] game='", env::getExeName(), "' engine=", engine,
+        " albedoTexFixes=", RtxOptions::enableUnrealTextureFixes() ? "on" : "off",
+        " source2Fixes=", (RtxOptions::enableSource2Fixes() || isSource2) ? "on" : "off"));
+    }
+
     // Configure shader manager to understand bindless layouts
     ShaderManager::getInstance()->addGlobalExtraLayout(pCommon->getSceneManager().getBindlessResourceManager().getGlobalBindlessTableLayout(BindlessResourceManager::Buffers));
     ShaderManager::getInstance()->addGlobalExtraLayout(pCommon->getSceneManager().getBindlessResourceManager().getGlobalBindlessTableLayout(BindlessResourceManager::Textures));
@@ -104,18 +131,13 @@ namespace dxvk {
       loadAssets();
     }
 
-    // DX11_V227_CROSS_VENDOR: DLSS and DLSS Frame Generation are NVIDIA NGX features.
-    // Their lazy allocators run real initialization in the constructor, which can crash
-    // at launch on Intel/AMD GPUs where NGX is unavailable. Only eagerly construct them
-    // when NGX actually reports DLSS support; otherwise they stay un-allocated (and any
-    // later use is already gated by supportsDLSS()), so path tracing still runs on any GPU.
-    if (pCommon->metaNGXContext().supportsDLSS()) {
-      Logger::info("[Remix-DX11][init] NGX/DLSS supported; initializing DLSS + DLFG.");
-      pCommon->metaDLSS(); // Lazy allocator triggers init in ctor
-      pCommon->metaDLFG();
-    } else {
-      Logger::info("[Remix-DX11][init] NGX/DLSS unsupported on this GPU; skipping DLSS + DLFG init (cross-vendor path).");
-    }
+    // DX11_V227: The DLSS / DLSS Frame Generation lazy allocators are load-bearing
+    // for the present + frame-generation path, so they MUST be constructed here on
+    // every GPU. (A previous attempt to skip them on non-NGX GPUs broke device/
+    // swapchain initialization across all vendors with error 0x00000008 - reverted.)
+    Logger::info("[Remix-DX11][init] initializing DLSS + DLFG lazy allocators...");
+    pCommon->metaDLSS(); // Lazy allocator triggers init in ctor
+    pCommon->metaDLFG();
 
     if (!asyncShaderFinalizing()) {
       // Wait for all prewarming to complete before calling "RTX initialized"
@@ -155,9 +177,20 @@ namespace dxvk {
   void RtxInitializer::startPrewarmShaders() {
     // If we want to run without shader prewarming, then pipelines will be built inline with other GPU work on first use (typically means
     // long stutters whenever a yet to be compiled pipeline comes into use).
-    if (!asyncShaderPrewarming()
-        // WAR: Shader prewarming caused a deadlock on AMD in the past so it is forcibly disabled, should re-evaluate this at some point.
-        || m_device->properties().core.properties.vendorID == static_cast<uint32_t>(DxvkGpuVendor::Amd)) {
+    // DX11_V228_CROSS_VENDOR: bulk RT-pipeline shader prewarming crashes/deadlocks at LAUNCH across
+    // every GPU vendor in this DX11 fork - AMD: long-standing deadlock (original WAR below); Intel Arc
+    // (Battlemage B580) AND NVIDIA: launch crash inside startPrewarmShaders(), confirmed via the
+    // [Remix-DX11][init] markers (the init log stops right after "starting shader prewarm..." with no
+    // further step). Since all three IHVs fail here, disable prewarming unconditionally; the RT
+    // pipelines then compile inline on first use (minor first-use stutter, but the game boots and
+    // path tracing runs on any GPU). Re-evaluate per-vendor once the prewarm path is fixed.
+    const uint32_t vendorId = m_device->properties().core.properties.vendorID;
+    const bool knownVendor =
+         vendorId == static_cast<uint32_t>(DxvkGpuVendor::Amd)
+      || vendorId == static_cast<uint32_t>(DxvkGpuVendor::Intel)
+      || vendorId == static_cast<uint32_t>(DxvkGpuVendor::Nvidia);
+    if (!asyncShaderPrewarming() || knownVendor) {
+      Logger::info("[Remix-DX11][init] shader prewarm disabled (cross-vendor launch-crash WAR); pipelines compile inline on first use.");
       return;
     }
 

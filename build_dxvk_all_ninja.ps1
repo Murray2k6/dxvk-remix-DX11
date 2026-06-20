@@ -940,7 +940,7 @@ function Patch-BridgeServerRegisterD3D11 {
 
   if ($text -ne $original) {
     if (!(Test-Path -LiteralPath "$mainCpp.v219.before")) {
-      Copy-Item -LiteralPath $mainCpp -Destination "$mainCpp.v219.before" -Force
+      # DX11: backup-file creation disabled -- Copy-Item -LiteralPath $mainCpp -Destination "$mainCpp.v219.before" -Force
     }
     Write-TextNoBom -Path $mainCpp -Text $text
     Log "V219 stripped stale dxvk_RegisterD3D11Device server helper/calls for Remix 1.5 API compatibility."
@@ -1938,7 +1938,7 @@ static inline remixapi_ErrorCode BridgeSkipLegacyD3D9RegisterForDx11HeaderV219()
 
   if ($text -ne $original) {
     if (!(Test-Path -LiteralPath "$mainCpp.v219.before")) {
-      Copy-Item -LiteralPath $mainCpp -Destination "$mainCpp.v219.before" -Force
+      # DX11: backup-file creation disabled -- Copy-Item -LiteralPath $mainCpp -Destination "$mainCpp.v219.before" -Force
     }
     Write-TextNoBom -Path $mainCpp -Text $text
     Log "V219 patched server main.cpp: removed legacy dxvk_RegisterD3D9Device calls while keeping real IPC server."
@@ -3280,7 +3280,7 @@ function Patch-RuntimeMesonNgxDebugLibFallbackV219 {
 
     if ($text -ne $orig) {
       if (!(Test-Path -LiteralPath "$t.v219.before")) {
-        Copy-Item -LiteralPath $t -Destination "$t.v219.before" -Force
+        # DX11: backup-file creation disabled -- Copy-Item -LiteralPath $t -Destination "$t.v219.before" -Force
       }
       Write-TextNoBom -Path $t -Text $text
       Log "V219 patched imported Remix 1.5 Meson NGX debug lib fallback in: $t"
@@ -3365,7 +3365,7 @@ endif
   }
 
   if (!(Test-Path -LiteralPath "$dxvkMeson.v219.before")) {
-    Copy-Item -LiteralPath $dxvkMeson -Destination "$dxvkMeson.v219.before" -Force
+    # DX11: backup-file creation disabled -- Copy-Item -LiteralPath $dxvkMeson -Destination "$dxvkMeson.v219.before" -Force
   }
 
   Write-TextNoBom -Path $dxvkMeson -Text $newText
@@ -3678,7 +3678,7 @@ message('DX11_V219_REAL_NGX_IMPORT_LIBRARY: using real staged NVIDIA NGX import 
   }
 
   if (!(Test-Path -LiteralPath "$dxvkMeson.v219.before")) {
-    Copy-Item -LiteralPath $dxvkMeson -Destination "$dxvkMeson.v219.before" -Force
+    # DX11: backup-file creation disabled -- Copy-Item -LiteralPath $dxvkMeson -Destination "$dxvkMeson.v219.before" -Force
   }
 
   Write-TextNoBom -Path $dxvkMeson -Text $text
@@ -3762,7 +3762,7 @@ function Patch-RuntimeMesonRemoveNgxExtraEndifV219 {
 
   if ($text -ne $orig) {
     if (!(Test-Path -LiteralPath "$dxvkMeson.v219.before")) {
-      Copy-Item -LiteralPath $dxvkMeson -Destination "$dxvkMeson.v219.before" -Force
+      # DX11: backup-file creation disabled -- Copy-Item -LiteralPath $dxvkMeson -Destination "$dxvkMeson.v219.before" -Force
     }
     Write-TextNoBom -Path $dxvkMeson -Text $text
     Log "V219 removed stale NGX endif from src\dxvk\meson.build."
@@ -4375,7 +4375,7 @@ namespace dxvk::env {
   $text = $text.TrimEnd() + "`r`n" + $helper + "`r`n"
 
   if (!(Test-Path -LiteralPath "$h.v219.before")) {
-    Copy-Item -LiteralPath $h -Destination "$h.v219.before" -Force
+    # DX11: backup-file creation disabled -- Copy-Item -LiteralPath $h -Destination "$h.v219.before" -Force
   }
 
   Write-TextNoBom -Path $h -Text $text
@@ -4547,7 +4547,7 @@ $1sampleThreshold = half4(sampleThresholdFloatV219);
 
   if ($text -ne $orig) {
     if (!(Test-Path -LiteralPath "$h.v219.before")) {
-      Copy-Item -LiteralPath $h -Destination "$h.v219.before" -Force
+      # DX11: backup-file creation disabled -- Copy-Item -LiteralPath $h -Destination "$h.v219.before" -Force
     }
     Write-TextNoBom -Path $h -Text $text
     Log "V219 patched RTXDI portal l-value casts with real float/float4 temporaries."
@@ -4613,7 +4613,7 @@ $1attenuation = half3(attenuationTemporalFloatV219);
 
   if ($text -ne $orig) {
     if (!(Test-Path -LiteralPath "$h.v219.before")) {
-      Copy-Item -LiteralPath $h -Destination "$h.v219.before" -Force
+      # DX11: backup-file creation disabled -- Copy-Item -LiteralPath $h -Destination "$h.v219.before" -Force
     }
     Write-TextNoBom -Path $h -Text $text
     Log "V219 patched RTXDI volume visibility with real attenuation float3 l-value temporaries."
@@ -5051,8 +5051,8 @@ function Sync-RealRemix15RayTracingSubmodulesV219 {
   }
 
   $stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
-  $backupRoot = Join-Path $Root ("_dx11_v219_before_real_rtx_submodule_sync_" + $stamp)
-  New-Item -ItemType Directory -Path $backupRoot -Force | Out-Null
+  # DX11: submodule backup-dir disabled -- $backupRoot = Join-Path $Root ("_dx11_v219_before_real_rtx_submodule_sync_" + $stamp)
+  # DX11: submodule backup-dir disabled -- New-Item -ItemType Directory -Path $backupRoot -Force | Out-Null
 
   $submods = @('rtxdi', 'rtxcr')
   foreach ($s in $submods) {
@@ -5065,10 +5065,10 @@ function Sync-RealRemix15RayTracingSubmodulesV219 {
     }
 
     if (Test-Path -LiteralPath $dst -PathType Container) {
-      $bak = Join-Path $backupRoot ('submodules\' + $s)
-      $bakParent = Split-Path -Parent $bak
-      if (!(Test-Path -LiteralPath $bakParent -PathType Container)) { New-Item -ItemType Directory -Path $bakParent -Force | Out-Null }
-      Copy-Item -LiteralPath $dst -Destination $bak -Recurse -Force
+      # DX11: submodule backup-dir disabled -- $bak = Join-Path $backupRoot ('submodules\' + $s)
+      # DX11: submodule backup-dir disabled -- $bakParent = Split-Path -Parent $bak
+      # DX11: submodule backup-dir disabled -- if (!(Test-Path -LiteralPath $bakParent -PathType Container)) { New-Item -ItemType Directory -Path $bakParent -Force | Out-Null }
+      # DX11: submodule backup-dir disabled -- Copy-Item -LiteralPath $dst -Destination $bak -Recurse -Force
     }
 
     if (Test-Path -LiteralPath $dst -PathType Container) {
@@ -6104,7 +6104,7 @@ function Invoke-BoundedDx11OnlyNoDx9ScrubV219 {
       # wording, but do not leave source paths that would build DX9.
       if ($newText -ne $text) {
         if (!(Test-Path -LiteralPath "$full.v219.before")) {
-          Copy-Item -LiteralPath $full -Destination "$full.v219.before" -Force
+          # DX11: backup-file creation disabled -- Copy-Item -LiteralPath $full -Destination "$full.v219.before" -Force
         }
         Write-TextNoBom -Path $full -Text $newText
         $rewritten++
@@ -6235,7 +6235,7 @@ function Invoke-BoundedDx11OnlyNoDx9ScrubV219 {
     $u = [regex]::Replace($u, '#\s*include\s*[<"]\.\.\\d3d9\\d3d9_caps\.h[>"]', '#include "../d3d11/d3d11_dxso_caps.h"')
     if ($u -ne $origU) {
       if (!(Test-Path -LiteralPath "$dxsoUtil.v219.before")) {
-        Copy-Item -LiteralPath $dxsoUtil -Destination "$dxsoUtil.v219.before" -Force
+        # DX11: backup-file creation disabled -- Copy-Item -LiteralPath $dxsoUtil -Destination "$dxsoUtil.v219.before" -Force
       }
       Write-TextNoBom -Path $dxsoUtil -Text $u
       $lines.Add(('OK: patched dxso_util.h caps include: {0}' -f $dxsoUtil))
@@ -6456,7 +6456,7 @@ function Repair-UtilGdiDxgiFormatV219 {
 
     if ($text -ne $orig) {
       if (!(Test-Path -LiteralPath "$file.v219.before")) {
-        Copy-Item -LiteralPath $file -Destination "$file.v219.before" -Force
+        # DX11: backup-file creation disabled -- Copy-Item -LiteralPath $file -Destination "$file.v219.before" -Force
       }
       Write-TextNoBom -Path $file -Text $text
       $lines.Add(('PATCHED: {0}' -f $file))
@@ -7264,7 +7264,7 @@ function Patch-RtxdiDlssEnhancementGeometryNormalCompatV219 {
   }
 
   if (!(Test-Path -LiteralPath "$dlss.v219.before" -PathType Leaf)) {
-    Copy-Item -LiteralPath $dlss -Destination "$dlss.v219.before" -Force
+    # DX11: backup-file creation disabled -- Copy-Item -LiteralPath $dlss -Destination "$dlss.v219.before" -Force
   }
 
   # Remove declarations whose only purpose is feeding the missing normal gate.
@@ -7407,7 +7407,7 @@ function Patch-BoostBindGlobalPlaceholdersV219 {
             $nt = [regex]::Replace($t, '#\s*include\s*[<"]boost/bind\.hpp[>"]', "#include <boost/bind/bind.hpp>`r`nusing namespace boost::placeholders;")
             if ($nt -ne $t) {
               if (!(Test-Path -LiteralPath "$p.v219.before" -PathType Leaf)) {
-                Copy-Item -LiteralPath $p -Destination "$p.v219.before" -Force
+                # DX11: backup-file creation disabled -- Copy-Item -LiteralPath $p -Destination "$p.v219.before" -Force
               }
               Write-TextNoBom -Path $p -Text $nt
               $patched++
@@ -7460,7 +7460,7 @@ function Patch-SlangVecAliasesInLightHeaderV219 {
 
     if ($nt -ne $t) {
       if (!(Test-Path -LiteralPath "$p.v219.before" -PathType Leaf)) {
-        Copy-Item -LiteralPath $p -Destination "$p.v219.before" -Force
+        # DX11: backup-file creation disabled -- Copy-Item -LiteralPath $p -Destination "$p.v219.before" -Force
       }
       Write-TextNoBom -Path $p -Text $nt
       $patched++
@@ -7678,7 +7678,7 @@ function Force-UtilGdiDxgiFormatHeaderV219 {
 
     if ($text -ne $orig) {
       if (!(Test-Path -LiteralPath "$file.v219.before")) {
-        Copy-Item -LiteralPath $file -Destination "$file.v219.before" -Force
+        # DX11: backup-file creation disabled -- Copy-Item -LiteralPath $file -Destination "$file.v219.before" -Force
       }
       Write-TextNoBom -Path $file -Text $text
       $lines.Add(('PATCHED: {0}' -f $file))
@@ -7744,7 +7744,7 @@ function Patch-SlangLightAxisIdentifierV219 {
 
     if ($text -ne $orig) {
       if (!(Test-Path -LiteralPath "$file.v219.before")) {
-        Copy-Item -LiteralPath $file -Destination "$file.v219.before" -Force
+        # DX11: backup-file creation disabled -- Copy-Item -LiteralPath $file -Destination "$file.v219.before" -Force
       }
       Write-TextNoBom -Path $file -Text $text
       $lines.Add(('PATCHED: {0}' -f $file))
@@ -7821,7 +7821,7 @@ function Patch-SlangLightExplicitVectorTypesV219 {
 
     if ($text -ne $orig) {
       if (!(Test-Path -LiteralPath "$file.v219.before")) {
-        Copy-Item -LiteralPath $file -Destination "$file.v219.before" -Force
+        # DX11: backup-file creation disabled -- Copy-Item -LiteralPath $file -Destination "$file.v219.before" -Force
       }
       Write-TextNoBom -Path $file -Text $text
       $lines.Add(('PATCHED: {0}' -f $file))
@@ -7900,7 +7900,7 @@ function Patch-CylinderLightLightAxisUsesV219 {
 
     if ($text -ne $orig) {
       if (!(Test-Path -LiteralPath "$file.v219.before")) {
-        Copy-Item -LiteralPath $file -Destination "$file.v219.before" -Force
+        # DX11: backup-file creation disabled -- Copy-Item -LiteralPath $file -Destination "$file.v219.before" -Force
       }
       Write-TextNoBom -Path $file -Text $text
       $lines.Add(('PATCHED: {0}' -f $file))
@@ -7972,7 +7972,7 @@ function Patch-LightFloatNSymbolSyntaxSyncV219 {
     $text = $text.Replace('lightlightAxis', 'lightAxis')
     if ($text -ne $orig) {
       if (!(Test-Path -LiteralPath "$file.v219.before")) {
-        Copy-Item -LiteralPath $file -Destination "$file.v219.before" -Force
+        # DX11: backup-file creation disabled -- Copy-Item -LiteralPath $file -Destination "$file.v219.before" -Force
       }
       Write-TextNoBom -Path $file -Text $text
       $lines.Add(('PATCHED ACTIVE: {0}' -f $file))
@@ -8070,7 +8070,7 @@ function Patch-CylinderLightAxisLengthOverRenameV219 {
 
     if ($text -ne $orig) {
       if (!(Test-Path -LiteralPath "$file.v219.before")) {
-        Copy-Item -LiteralPath $file -Destination "$file.v219.before" -Force
+        # DX11: backup-file creation disabled -- Copy-Item -LiteralPath $file -Destination "$file.v219.before" -Force
       }
       Write-TextNoBom -Path $file -Text $text
       $lines.Add(('PATCHED ACTIVE: {0}' -f $file))
@@ -8248,7 +8248,7 @@ function Patch-UtilGdiConcreteDxgiFormatV219 {
 
     if ($text -ne $orig) {
       if (!(Test-Path -LiteralPath "$file.v219.before")) {
-        Copy-Item -LiteralPath $file -Destination "$file.v219.before" -Force
+        # DX11: backup-file creation disabled -- Copy-Item -LiteralPath $file -Destination "$file.v219.before" -Force
       }
       Write-TextNoBom -Path $file -Text $text
       $lines.Add(('PATCHED: {0}' -f $file))
@@ -8553,7 +8553,7 @@ function Ensure-WindowsSdkD3D11IncludesV219 {
       $text = $text.Replace('"d3d11types.h"', '<d3d11.h>')
       if ($text -ne $orig) {
         if (!(Test-Path -LiteralPath "$file.v219.before")) {
-          Copy-Item -LiteralPath $file -Destination "$file.v219.before" -Force
+          # DX11: backup-file creation disabled -- Copy-Item -LiteralPath $file -Destination "$file.v219.before" -Force
         }
         Write-TextNoBom -Path $file -Text $text
         $lines.Add(('PATCHED include d3d11types.h -> d3d11.h: {0}' -f $file))
@@ -8807,7 +8807,7 @@ function Remove-LateMesonProjectArgumentsV219 {
 
   if ($text -ne $orig) {
     if (!(Test-Path -LiteralPath "$mesonRoot.v219.before")) {
-      Copy-Item -LiteralPath $mesonRoot -Destination "$mesonRoot.v219.before" -Force
+      # DX11: backup-file creation disabled -- Copy-Item -LiteralPath $mesonRoot -Destination "$mesonRoot.v219.before" -Force
     }
     Write-TextNoBom -Path $mesonRoot -Text $text
     $lines.Add(('PATCHED: removed late add_project_arguments block from {0}' -f $mesonRoot))
@@ -12240,7 +12240,7 @@ Repair-RemixApiLine79Line130Corruption $Root
   $buildNinja = Join-Path $buildDir 'build.ninja'
   if (!(Test-Path $buildNinja)) {
     Log 'Configuring x64 DX11+USD runtime.'
-    $mesonArgs = @('setup','--buildtype=release','--backend=ninja','-Denable_dxgi=true','-Denable_d3d11=true','-Denable_tests=false','-Denable_tracy=false','-Dskip_packman_fetch=true',$buildDir,$Root)
+    $mesonArgs = @('setup','--buildtype=release','--backend=ninja','-Denable_dxgi=true','-Denable_d3d11=true','-Denable_tests=false','-Denable_tracy=true','-Dskip_packman_fetch=true',$buildDir,$Root)
   Ensure-WindowsSdkD3D11IncludesV219
   Ensure-UsdPXRIncludeEnvV219
   Remove-LateMesonProjectArgumentsV219
@@ -14277,7 +14277,7 @@ function Build-DX11ClientMesonV63([string]$VsInstall, [string]$BridgeWork, [stri
   $buildNinja = Join-Path $b32 'build.ninja'
   if (!(Test-Path $buildNinja)) {
 Log 'Configuring x86 DX11 bridge client with Meson/Ninja and NVIDIA IPC utilities.'
-    Invoke-Logged -Label 'bridge-client-meson-x86' -Exe $Meson -CommandArgs @('setup','--buildtype=release','--backend=ninja','-Dwerror=false','-Denable_tests=false',$b32,$BridgeWork) -WorkingDirectory $BridgeWork -AllowIfFileExists $buildNinja | Out-Null
+    Invoke-Logged -Label 'bridge-client-meson-x86' -Exe $Meson -CommandArgs @('setup','--buildtype=release','--backend=ninja','-Dwerror=false','-Denable_tests=false','-Denable_tracy=true',$b32,$BridgeWork) -WorkingDirectory $BridgeWork -AllowIfFileExists $buildNinja | Out-Null
   }
   Log 'Building x86 DX11 bridge client with Meson/Ninja.'
   Invoke-Logged -Label 'bridge-client-ninja-x86' -Exe $Ninja -CommandArgs (Get-DX11FastNinjaArgsV219 $b32) -WorkingDirectory $BridgeWork | Out-Null
@@ -14353,7 +14353,7 @@ Patch-BridgeServerRemoveLegacyD3D9RegistrationV219 -BridgeWork $BridgeWork
     $buildNinja = Join-Path $b64 'build.ninja'
 # V219_REAL_BRIDGE_SERVER_ACK: removed V90 dummy DX11 server rewrite; keep real bridge server so Bridge_Ack is sent.
     Log 'Building official x64 bridge server from source.'
-    if (!(Test-Path $buildNinja)) { Invoke-Logged -Label 'bridge-server-meson-x64' -Exe $Meson -CommandArgs @('setup','--buildtype=release','--backend=ninja','-Dwerror=false','-Denable_tests=false',$b64,$BridgeWork) -WorkingDirectory $BridgeWork -AllowIfFileExists $buildNinja | Out-Null }
+    if (!(Test-Path $buildNinja)) { Invoke-Logged -Label 'bridge-server-meson-x64' -Exe $Meson -CommandArgs @('setup','--buildtype=release','--backend=ninja','-Dwerror=false','-Denable_tests=false','-Denable_tracy=true',$b64,$BridgeWork) -WorkingDirectory $BridgeWork -AllowIfFileExists $buildNinja | Out-Null }
     Invoke-Logged -Label 'bridge-server-ninja-x64' -Exe $Ninja -CommandArgs (Get-DX11FastNinjaArgsV219 $b64) -WorkingDirectory $BridgeWork | Out-Null
   }
   $clientOut = Build-DX11ClientMesonV63 $VsInstall $BridgeWork $Meson $Ninja

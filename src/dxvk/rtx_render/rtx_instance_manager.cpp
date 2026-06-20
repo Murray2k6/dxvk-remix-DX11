@@ -1282,6 +1282,46 @@ namespace dxvk {
         }
       }
 
+      // DX11_V229_SIGNIFICANCE_CULLING: optionally drop instances whose projected on-screen
+      // size is sub-pixel, and/or cap the per-frame instance count, to cut path-tracer load.
+      // Default-off (rtx.significanceCulling) so ALL geometry is present by default, and
+      // fail-safe: only culls when the world bounding box is valid (an unready/zero bbox keeps
+      // the instance), never the player model / view model / sky, and only when the projected
+      // size is below significanceCullingMinScreenFraction (sub-pixel = already invisible).
+      if (RtxOptions::significanceCulling() && !currentInstance.m_isHidden &&
+          drawCall.cameraType == CameraType::Main && !currentInstance.m_isPlayerModel) {
+        const uint32_t sigFrameId = m_device->getCurrentFrameId();
+        if (sigFrameId != m_significanceFrameId) {
+          m_significanceFrameId = sigFrameId;
+          m_significanceKeptThisFrame = 0;
+        }
+
+        const AxisAlignedBoundingBox& obb = blas.input.getGeometryData().boundingBox;
+        if (obb.isValid()) {
+          const Vector3 ext = obb.maxPos - obb.minPos;
+          const float objDiag = std::sqrt(ext.x * ext.x + ext.y * ext.y + ext.z * ext.z);
+          const Matrix4& o2w = currentInstance.surface.objectToWorld;
+          auto axisLen = [](const Vector4& v) { return std::sqrt(v.x * v.x + v.y * v.y + v.z * v.z); };
+          const float scale = std::max(axisLen(o2w[0]), std::max(axisLen(o2w[1]), axisLen(o2w[2])));
+          const float worldSize = objDiag * scale;
+          const Vector3 camPos = cameraManager.getMainCamera().getPosition(false);
+          const Vector3 d = Vector3(o2w[3].x, o2w[3].y, o2w[3].z) - camPos;
+          const float dist = std::sqrt(d.x * d.x + d.y * d.y + d.z * d.z);
+          if (worldSize > 0.0f && dist > 0.0f &&
+              (worldSize / dist) < RtxOptions::significanceCullingMinScreenFraction()) {
+            currentInstance.m_isHidden = true;
+          }
+        }
+
+        // Hard per-frame instance cap (default 100000 => inert). Kept instances count up.
+        if (!currentInstance.m_isHidden) {
+          if (m_significanceKeptThisFrame >= RtxOptions::maxInstanceSubmissions())
+            currentInstance.m_isHidden = true;
+          else
+            ++m_significanceKeptThisFrame;
+        }
+      }
+
       if (currentInstance.m_isHidden)
         mask = 0;
 

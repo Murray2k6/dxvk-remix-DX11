@@ -370,6 +370,10 @@ private:
   uint32_t m_viewModelCandidatesFrameId = kInvalidFrameIndex;
   std::vector<RtInstance*> m_playerModelInstances;
   uint32_t m_playerModelInstancesFrameId = kInvalidFrameIndex;
+
+  // DX11_V229: per-frame state for significance culling / maxInstanceSubmissions cap.
+  uint32_t m_significanceFrameId = kInvalidFrameIndex;
+  uint32_t m_significanceKeptThisFrame = 0;
   std::vector<IntersectionBillboard> m_billboards;
 
   RtInstance* targetInstance = nullptr;

@@ -4199,6 +4199,28 @@ namespace dxvk {
       ImGui::Unindent();
     }
 
+    // DX11_V229: GPU Scene significance culling - a performance lever that reduces the
+    // number of instances the path tracer builds/traces each frame. Grouped next to
+    // Anti-Culling since it is the inverse operation (drop insignificant instances).
+    if (RemixGui::CollapsingHeader("GPU Scene (Significance Culling)", collapsingHeaderClosedFlags)) {
+      ImGui::Indent();
+      ImGui::TextWrapped("Performance: drops scene instances whose projected on-screen size is sub-pixel, "
+                         "so the path tracer builds and traces fewer instances. Disabled by default so ALL "
+                         "geometry is always present; when enabled it is fail-safe and only removes already-"
+                         "invisible geometry (it skips the player model, sky, and any instance whose bounding "
+                         "box is not yet known).");
+      RemixGui::Checkbox("Enable Significance Culling", &RtxOptions::significanceCullingObject());
+      if (RtxOptions::significanceCulling()) {
+        RemixGui::DragFloat("Min On-Screen Size (object world-size / camera distance)",
+                            &RtxOptions::significanceCullingMinScreenFractionObject(), 0.0001f, 0.0f, 0.05f, "%.4f");
+        ImGui::TextWrapped("0.0003 is sub-pixel even at 4K. Higher = cull more aggressively (may pop small "
+                           "objects). 0 = keep everything.");
+        RemixGui::InputInt("Max Instances Per Frame (hard cap)",
+                           &RtxOptions::maxInstanceSubmissionsObject(), 1000, 10000, 0);
+      }
+      ImGui::Unindent();
+    }
+
     ImGui::PopItemWidth();
   }
 
