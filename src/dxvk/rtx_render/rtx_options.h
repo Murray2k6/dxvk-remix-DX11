@@ -309,11 +309,12 @@ namespace dxvk {
     RTX_OPTION("rtx", bool, zUp, false, "Indicates that the Z axis is the \"upward\" axis in the world when true, otherwise the Y axis when false.");
     RTX_OPTION("rtx", bool, leftHandedCoordinateSystem, false, "Indicates that the world space coordinate system is left-handed when true, otherwise right-handed when false.");
     // DX11_V225: options consumed by the DX11 in-process draw-processing path.
-    RTX_OPTION("rtx", bool, significanceCulling, false, "DX11: enables distance-based significance culling of instanced draws when true.");
-    RTX_OPTION("rtx", uint32_t, maxInstanceSubmissions, 100000u, "DX11: maximum number of instances submitted per instanced draw call.");
+    RTX_OPTION("rtx", bool, significanceCulling, false, "Performance (opt-in): drops scene instances whose projected on-screen size is below significanceCullingMinScreenFraction, reducing the instance count the path tracer must build/trace each frame. Defaults OFF so ALL geometry is always present; when enabled it is fail-safe (only culls when the world bounding box is valid and the projected size is sub-pixel, i.e. already-invisible geometry).");
+    RTX_OPTION("rtx", float, significanceCullingMinScreenFraction, 0.0003f, "Performance: minimum projected on-screen size (object world-size / camera distance, an angular fraction) below which significanceCulling drops an instance. 0.0003 is sub-pixel even at 4K; raise for more aggressive culling, lower (or 0) to keep everything.");
+    RTX_OPTION("rtx", uint32_t, maxInstanceSubmissions, 100000u, "Performance: hard cap on the number of (non-culled) main-camera scene instances submitted to the path tracer per frame. Default 100000 effectively means no cap; lower it to bound worst-case instance counts in pathological scenes.");
     RTX_OPTION("rtx", bool, forceInjection, false, "DX11: forces Remix injection for draws even when normal heuristics would skip them.");
     RTX_OPTION("rtx", bool, useCBufferWorldMatrices, false, "DX11: derives world/view matrices from constant buffers when true.");
-    RTX_OPTION("rtx", bool, enableUnrealTextureFixes, false, "DX11: applies Unreal Engine specific texture-selection fixes when true.");
+    RTX_OPTION("rtx", bool, enableUnrealTextureFixes, true, "DX11: applies generic albedo texture-selection reinforcement (boost strong-albedo mipmapped textures, demote scene/intermediate surfaces). Despite the legacy name this is engine-agnostic and helps any game/engine, so it defaults ON; set false to disable.");
     RTX_OPTION("rtx", bool, enableSource2Fixes, false, "DX11: applies Source 2 engine specific fixes when true.");
     RTX_OPTION("rtx", bool, ignoreSecondaryTextures, false, "DX11: only consider the primary color texture per draw when true.");
     RTX_OPTION("rtx", bool, taggableUntexturedDraws, false, "DX11: allows untextured color-writing draws to receive a placeholder texture when true.");

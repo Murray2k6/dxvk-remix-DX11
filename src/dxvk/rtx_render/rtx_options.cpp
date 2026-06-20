@@ -647,7 +647,10 @@ namespace dxvk {
            AntiCulling::isLightAntiCullingEnabled() ||
            TerrainBaker::needsTerrainBaking() ||
            enableAlwaysCalculateAABB() ||
-           NeeCachePass::enable();
+           NeeCachePass::enable() ||
+           // DX11_V229: significance culling projects per-instance world bounds, so
+           // it needs the mesh bounding boxes computed (only when it is enabled).
+           significanceCulling();
   }
 
   void RtxOptions::resolveTransparencyThresholdOnChange(DxvkDevice* device) {
