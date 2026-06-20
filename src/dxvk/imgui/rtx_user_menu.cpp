@@ -358,7 +358,9 @@ namespace dxvk {
     // but only when DLSS is actually supported.
     // Note: This is stored as a bool and applied in a SetDisabled per-section so that the section labels do not get disabled
     // (as this changes the color of the line and text which is undesirable).
-    const bool disableNonPresetSettings = RtxOptions::dlssPreset() != DlssPreset::Custom && dlssSupported;
+    // DX11: never lock the upscaling/latency settings behind a non-Custom DLSS preset.
+    // Every Basic-menu setting must stay fully interactive on any preset / any GPU.
+    const bool disableNonPresetSettings = false;
 
     // Upscaling Settings
 
@@ -526,8 +528,8 @@ namespace dxvk {
     ImGui::TextSeparator("Path Tracing Settings");
 
     {
-      // Note: Disabled flags should match preset mapping above to prevent changing settings when a preset overrides them.
-      ImGui::BeginDisabled(RtxOptions::graphicsPreset() != GraphicsPreset::Custom);
+      // DX11: path-tracing settings stay fully editable on every preset (no preset lock).
+      ImGui::BeginDisabled(false);
 
       minPathBouncesCombo.getKey(&RtxOptions::pathMinBouncesObject());
       maxPathBouncesCombo.getKey(&RtxOptions::pathMaxBouncesObject());
@@ -563,8 +565,8 @@ namespace dxvk {
     {
       // Volumetrics being enabled/disabled is not controlled by the graphics preset, so show the user settings regardless of preset.
       RemixGui::Checkbox("Enable Volumetric Lighting", &RtxGlobalVolumetrics::enableObject());
-      // Volumetrics quality settings are set by the graphics preset, so only show the user settings if the preset is Custom and the volumetrics are enabled.
-      ImGui::BeginDisabled(!RtxGlobalVolumetrics::enable() || RtxOptions::graphicsPreset() != GraphicsPreset::Custom);
+      // DX11: volumetric quality settings stay editable on any preset (only greyed when volumetrics itself is off).
+      ImGui::BeginDisabled(!RtxGlobalVolumetrics::enable());
       ImGui::Indent(static_cast<float>(subItemIndent));
       common->metaGlobalVolumetrics().showImguiUserSettings();
       ImGui::EndDisabled();
@@ -578,15 +580,14 @@ namespace dxvk {
 
     {
       {
-        // Note: All presets aside from Custom will overwrite this, so only enable for Custom.
-        ImGui::BeginDisabled(RtxOptions::graphicsPreset() != GraphicsPreset::Custom);
+        // DX11: post-effect enable stays editable on any preset.
+        ImGui::BeginDisabled(false);
         RemixGui::Checkbox("Enable Post Effects", &postFx.enableObject());
         ImGui::EndDisabled();
       }
 
-      // Note: Medium and Low presets disable all post effects, so no value in changing the individual settings.
-      // High and Ultra allow these to be changed without requiring Custom, so leave enabled for those.
-      ImGui::BeginDisabled(RtxOptions::graphicsPreset() == GraphicsPreset::Medium || RtxOptions::graphicsPreset() == GraphicsPreset::Low);
+      // DX11: individual post-effect toggles stay editable on every preset (only greyed when Post Effects is off).
+      ImGui::BeginDisabled(false);
       {
         ImGui::PushItemWidth(static_cast<float>(subItemWidth));
         ImGui::Indent(static_cast<float>(subItemIndent));

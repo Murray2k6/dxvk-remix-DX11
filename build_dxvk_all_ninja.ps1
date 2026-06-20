@@ -9950,8 +9950,21 @@ namespace {
   struct CachedBuffer {
     std::vector<uint8_t> data;
     uint32_t bindFlags = 0;
+    uint64_t version = 1;     // bumped on every content change (Create/Unmap/UpdateSubresource)
   };
   std::unordered_map<ID3D11Buffer*, CachedBuffer> g_buffers;
+
+  // Mesh dedup cache: geometry+material identity key -> already-created Remix mesh uid.
+  // Lets repeated (static) draws skip the per-draw vertex decode + FNV hash + serialize +
+  // IPC re-send entirely; only a fresh DrawInstance (carrying the current transform) is
+  // emitted on a cache hit. This is THE bridge frame-rate fix: previously every draw
+  // re-streamed its full mesh over the shared-memory bridge every frame.
+  std::unordered_map<uint64_t, uint32_t> g_meshCache;
+
+  inline uint64_t mixKey(uint64_t h, uint64_t v) {
+    h ^= v + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);
+    return h;
+  }
 
   // Resource -> mapped CPU pointer (between Map and Unmap).
   std::unordered_map<ID3D11Resource*, void*> g_mapped;
@@ -10201,10 +10214,24 @@ namespace {
                   const StreamRef streams[D3D11_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT],
                   const uint8_t* ibData, uint32_t ibSize, bool ib32,
                   uint32_t indexCount, uint32_t startIndex, int32_t baseVertex,
-                  bool sequential, uint32_t seqStart) {
+                  bool sequential, uint32_t seqStart, uint64_t geomKey) {
     if (indexCount < 3) return;
     if (indexCount > 24'000'000u) return;
 
+    // Material identity is part of the mesh-cache key: the same geometry drawn with a
+    // different bound texture must map to a distinct Remix mesh (the material is baked
+    // onto the surface at CreateMesh time).
+    const uint32_t materialUid = ensureMaterial(boundTextureHash(ctx));
+    const uint64_t cacheKey = geomKey ? mixKey(geomKey, materialUid) : 0;
+
+    uint32_t meshUid = 0;
+    bool haveMesh = false;
+    if (cacheKey) {
+      auto cit = g_meshCache.find(cacheKey);
+      if (cit != g_meshCache.end()) { meshUid = cit->second; haveMesh = true; }
+    }
+
+    if (!haveMesh) {
     // Locate the attribute elements we care about.
     std::vector<uint32_t> elemOffsets;
     resolveElementOffsets(elems, elemOffsets);
@@ -10282,8 +10309,6 @@ namespace {
       }
     }
 
-    const uint32_t materialUid = ensureMaterial(boundTextureHash(ctx));
-
     uint64_t hash = fnv1a(verts.data(), verts.size() * sizeof(remixapi_HardcodedVertex));
     hash = fnv1a(indices.data(), indices.size() * sizeof(uint32_t), hash);
 
@@ -10311,13 +10336,29 @@ namespace {
       sendUid(c, meshHandle.uid);
     }
 
-    // ---- DrawInstance ----
+      meshUid = meshHandle.uid;
+      if (cacheKey) {
+        // Bound to avoid unbounded growth from genuinely dynamic geometry (a fresh
+        // content-version produces a fresh key every frame). Clearing just forces those
+        // to be re-streamed; static geometry repopulates immediately.
+        if (g_meshCache.size() > 262144) g_meshCache.clear();
+        g_meshCache[cacheKey] = meshUid;
+      }
+
+      const uint64_t n = ++g_meshesStreamed;
+      if (n <= 16 || (n % 2000) == 0) {
+        logf("capture", "DX11_V226_CAPTURE_TO_REMIX: streamed mesh #%llu (verts=%u, indices=%u) to Remix.",
+             (unsigned long long) n, vertexCount, indexCount);
+      }
+    } // end if(!haveMesh): cache miss built+streamed a new mesh
+
+    // ---- DrawInstance ---- (always emitted: carries the current per-draw transform)
     {
       remixapi_InstanceInfo instInfo = {};
       instInfo.sType = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO;
       instInfo.pNext = nullptr;
       instInfo.categoryFlags = 0;
-      instInfo.mesh = reinterpret_cast<remixapi_MeshHandle>((uintptr_t) meshHandle.uid);
+      instInfo.mesh = reinterpret_cast<remixapi_MeshHandle>((uintptr_t) meshUid);
       memset(&instInfo.transform, 0, sizeof(instInfo.transform));
       instInfo.transform.matrix[0][0] = 1.0f;
       instInfo.transform.matrix[1][1] = 1.0f;
@@ -10328,12 +10369,6 @@ namespace {
       ClientMessage c(Commands::RemixApi_DrawInstance);
       serializeAndSend<serialize::InstanceInfo>(c, instInfo);
       sendBool(c, false);
-    }
-
-    const uint64_t n = ++g_meshesStreamed;
-    if (n <= 16 || (n % 2000) == 0) {
-      logf("capture", "DX11_V226_CAPTURE_TO_REMIX: streamed mesh #%llu (verts=%u, indices=%u) to Remix.",
-           (unsigned long long) n, vertexCount, indexCount);
     }
   }
 
@@ -10353,6 +10388,7 @@ void RecordBufferCreate(ID3D11Buffer* buffer, const void* pInitialData,
   cb.data.resize(byteWidth);
   if (pInitialData) memcpy(cb.data.data(), pInitialData, byteWidth);
   else memset(cb.data.data(), 0, byteWidth);
+  ++cb.version;
 }
 
 void RecordBufferRelease(ID3D11Buffer* buffer) {
@@ -10379,6 +10415,7 @@ void RecordUnmap(ID3D11Resource* resource, uint32_t subresource) {
   auto it = g_buffers.find(reinterpret_cast<ID3D11Buffer*>(resource));
   if (it != g_buffers.end() && src && !it->second.data.empty()) {
     memcpy(it->second.data.data(), src, it->second.data.size());
+    ++it->second.version;
   }
 }
 
@@ -10389,6 +10426,7 @@ void RecordUpdateSubresource(ID3D11Resource* resource, uint32_t dstSubresource,
   auto it = g_buffers.find(reinterpret_cast<ID3D11Buffer*>(resource));
   if (it != g_buffers.end() && !it->second.data.empty()) {
     memcpy(it->second.data.data(), pSrcData, it->second.data.size());
+    ++it->second.version;
   }
 }
 
@@ -10453,6 +10491,10 @@ void CaptureDrawIndexed(ID3D11DeviceContext* context, uint32_t indexCount,
     const CachedBuffer* ibc = findBuffer(ib);
     if (lit != g_layouts.end() && ibc && ibOffset < ibc->data.size()) {
       StreamRef streams[D3D11_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT] = {};
+      // Cheap geometry-identity key (no byte hashing): bound buffer pointers + their
+      // content-versions + offsets/strides + draw params. Stable frame-to-frame for
+      // static geometry, so streamDraw can skip the decode/serialize/IPC re-send.
+      uint64_t geomKey = mixKey(0xC0FFEEull, reinterpret_cast<uintptr_t>(layout));
       for (uint32_t s = 0; s < D3D11_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT; ++s) {
         if (!vbs[s]) continue;
         const CachedBuffer* vbc = findBuffer(vbs[s]);
@@ -10460,12 +10502,20 @@ void CaptureDrawIndexed(ID3D11DeviceContext* context, uint32_t indexCount,
           streams[s].data = vbc->data.data() + offsets[s];
           streams[s].size = (uint32_t)(vbc->data.size() - offsets[s]);
           streams[s].stride = strides[s];
+          geomKey = mixKey(geomKey, ((uint64_t) s << 56) ^ reinterpret_cast<uintptr_t>(vbs[s]));
+          geomKey = mixKey(geomKey, ((uint64_t) strides[s] << 32) | offsets[s]);
+          geomKey = mixKey(geomKey, vbc->version);
         }
       }
+      geomKey = mixKey(geomKey, reinterpret_cast<uintptr_t>(ib));
+      geomKey = mixKey(geomKey, ((uint64_t) ibFormat << 32) | ibOffset);
+      geomKey = mixKey(geomKey, ibc->version);
+      geomKey = mixKey(geomKey, ((uint64_t) indexCount << 32) | startIndexLocation);
+      geomKey = mixKey(geomKey, (uint64_t)(uint32_t) baseVertexLocation);
       streamDraw(context, lit->second, streams,
                  ibc->data.data() + ibOffset, (uint32_t)(ibc->data.size() - ibOffset),
                  ibFormat == DXGI_FORMAT_R32_UINT,
-                 indexCount, startIndexLocation, baseVertexLocation, false, 0);
+                 indexCount, startIndexLocation, baseVertexLocation, false, 0, geomKey);
     }
   }
 
@@ -10494,6 +10544,9 @@ void CaptureDraw(ID3D11DeviceContext* context, uint32_t vertexCount,
     auto lit = g_layouts.find(layout);
     if (lit != g_layouts.end()) {
       StreamRef streams[D3D11_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT] = {};
+      // Cheap geometry-identity key (sequential/non-indexed variant; distinct seed so it
+      // never collides with the indexed path).
+      uint64_t geomKey = mixKey(0xBEEFull, reinterpret_cast<uintptr_t>(layout));
       for (uint32_t s = 0; s < D3D11_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT; ++s) {
         if (!vbs[s]) continue;
         const CachedBuffer* vbc = findBuffer(vbs[s]);
@@ -10501,10 +10554,14 @@ void CaptureDraw(ID3D11DeviceContext* context, uint32_t vertexCount,
           streams[s].data = vbc->data.data() + offsets[s];
           streams[s].size = (uint32_t)(vbc->data.size() - offsets[s]);
           streams[s].stride = strides[s];
+          geomKey = mixKey(geomKey, ((uint64_t) s << 56) ^ reinterpret_cast<uintptr_t>(vbs[s]));
+          geomKey = mixKey(geomKey, ((uint64_t) strides[s] << 32) | offsets[s]);
+          geomKey = mixKey(geomKey, vbc->version);
         }
       }
+      geomKey = mixKey(geomKey, ((uint64_t) vertexCount << 32) | startVertexLocation);
       streamDraw(context, lit->second, streams, nullptr, 0, false,
-                 vertexCount, 0, 0, true, startVertexLocation);
+                 vertexCount, 0, 0, true, startVertexLocation, geomKey);
     }
   }
 
