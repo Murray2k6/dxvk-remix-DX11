@@ -331,7 +331,12 @@ namespace dxvk {
                     "This value must always be greater than zero.",
                     args.flags = RtxOptionFlags::UserSetting);
     RTX_OPTION("rtx", bool, skipDrawCallsPostRTXInjection, false, "Ignores all draw calls recorded after RTX Injection, the location of which varies but is currently based on when tagged UI textures begin to draw.");
-    RTX_OPTION_ARGS("rtx", DlssPreset, dlssPreset, DlssPreset::On, "Combined DLSS Preset for quickly controlling Upscaling, Frame Interpolation and Latency Reduction.",
+    // DX11: default to Custom (not On). DlssPreset::On forces upscalerType=DLSS in
+    // updateUpscalerFromDlssPreset(), which would override the TAAU default below and
+    // leave non-NVIDIA GPUs (AMD/Intel, and pre-Turing NVIDIA) with no working upscaler
+    // -> native-res path tracing -> ~2 fps. Custom is the no-op case, so the upscaler
+    // default is honored on every vendor.
+    RTX_OPTION_ARGS("rtx", DlssPreset, dlssPreset, DlssPreset::Custom, "Combined DLSS Preset for quickly controlling Upscaling, Frame Interpolation and Latency Reduction.",
                     args.environment = "RTX_DLSS_PRESET",
                     args.flags = RtxOptionFlags::UserSetting);
     RTX_OPTION_ARGS("rtx", NisPreset, nisPreset, NisPreset::Balanced, "Adjusts NIS scaling factor, trades quality for performance.",
@@ -513,7 +518,10 @@ namespace dxvk {
                    "   while improving performance in scenarios where ray paths have 2 or more bounces on average.\n",
                    args.environment = "RTX_INTEGRATE_INDIRECT_MODE",
                    args.flags = RtxOptionFlags::UserSetting);
-    RTX_OPTION_ARGS("rtx", UpscalerType, upscalerType, UpscalerType::DLSS, "Upscaling boosts performance with varying degrees of image quality tradeoff depending on the type of upscaler and the quality mode/preset.",
+    // DX11: default to TAAU, not DLSS. TAA-Upscaling is vendor-agnostic (works on NVIDIA,
+    // AMD and Intel), so resolutionScale upscaling is always active and every GPU gets the
+    // perf win. DLSS is still selectable in the UI on supported NVIDIA RTX hardware.
+    RTX_OPTION_ARGS("rtx", UpscalerType, upscalerType, UpscalerType::TAAU, "Upscaling boosts performance with varying degrees of image quality tradeoff depending on the type of upscaler and the quality mode/preset.",
                     args.environment = "DXVK_UPSCALER_TYPE",
                     args.flags = RtxOptionFlags::UserSetting);
     RTX_OPTION_ARGS("rtx", bool, enableRayReconstruction, true, "Enables DLSS ray reconstruction, an AI-based denoiser designed for real time ray tracing.",

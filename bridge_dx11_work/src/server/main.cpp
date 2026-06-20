@@ -5709,7 +5709,22 @@ int WINAPI wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance, 
     // the client-side exposeRemixApi gate which does not apply to the bridge server host.
     Logger::info("DX11 bridge mode active: initializing Remix runtime for capture->Remix scene streaming.");
     if (!remixapi::g_remix_initialized) {
-      const remixapi_ErrorCode status = remixapi_lib_loadRemixDllAndInitialize(L"d3d11.dll", &remixapi::g_remix, &remixapi::g_remix_dll);
+      // DX11_V228_BRIDGE_REMIX_INIT_DIR_NOT_SYSTEM: the Remix runtime d3d11.dll lives in the
+      // .trex DIRECTORY alongside this NvRemixBridge.exe. d3d11.dll is a Windows KnownDLL, so a
+      // relative LoadLibraryW(L"d3d11.dll") resolves to System32\d3d11.dll (no remixapi export)
+      // instead of the .trex runtime. Build the FULL path from our own module directory so the
+      // Remix runtime is loaded from the DIR, not the SYSTEM, KnownDLL.
+      wchar_t remixD3D11Path[MAX_PATH] = {};
+      if (GetModuleFileNameW(nullptr, remixD3D11Path, _countof(remixD3D11Path)) == 0) {
+        Logger::err("DX11 bridge mode: could not resolve NvRemixBridge.exe path for .trex d3d11.dll; aborting Remix init.");
+        return 1;
+      }
+      if (wchar_t* lastSlash = wcsrchr(remixD3D11Path, L'\\')) {
+        lastSlash[1] = 0;
+      }
+      wcscat_s(remixD3D11Path, _countof(remixD3D11Path), L"d3d11.dll");
+      Logger::info(format_string("DX11 bridge mode: loading Remix runtime from .trex DIR (not System32): %ls", remixD3D11Path));
+      const remixapi_ErrorCode status = remixapi_lib_loadRemixDllAndInitialize(remixD3D11Path, &remixapi::g_remix, &remixapi::g_remix_dll);
       if (status != REMIXAPI_ERROR_CODE_SUCCESS) {
         Logger::err(format_string("DX11 bridge mode: Remix API init failed: %d; capture->Remix rendering will be unavailable (handlers are null-guarded so the server stays alive).", status));
       } else {
