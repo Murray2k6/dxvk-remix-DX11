@@ -80,7 +80,10 @@ namespace dxvk {
     RTX_OPTION("rtx.autoExposure", float, autoExposureSpeed, 5.f, "Average exposure changing speed (in units per second) when the image changes.");
     RTX_OPTION("rtx.autoExposure", float, evMinValue, -2.0f, "Min/Max values tuned by moving from bright/dark locations in game, and adjusting until they look correct.");
     RTX_OPTION("rtx.autoExposure", float, evMaxValue, 5.f, "Min/Max values tuned by moving from bright/dark locations in game, and adjusting until they look correct.");
-    RTX_OPTION("rtx.autoExposure", bool,  exposureCenterMeteringEnabled, false, "Gives higher weight to pixels around the screen center.");
+    // Default ON: median metering of a mostly-black path-traced scene drives exposure to evMax and blows
+    // the few lit pixels to pure white (observed on DX11 captures). Center-weighting the metering keeps
+    // exposure anchored on the gameplay center, preventing the all-or-nothing blowout. Safe for any game.
+    RTX_OPTION("rtx.autoExposure", bool,  exposureCenterMeteringEnabled, true, "Gives higher weight to pixels around the screen center.");
     RTX_OPTION("rtx.autoExposure", float, centerMeteringSize, 0.5f, "The importance of pixels around the screen center.");
     RTX_OPTION("rtx.autoExposure", ExposureAverageMode, exposureAverageMode, ExposureAverageMode::Median, "Average mode. Valid values: <Mean=0, Median=1>. The mean mode averages exposures across pixels. The median mode is more stable for extreme pixel values.");
     RTX_OPTION("rtx.autoExposure", bool, useExposureCompensation, false, "Uses a curve to determine the importance of different exposure levels when calculating average exposure.");

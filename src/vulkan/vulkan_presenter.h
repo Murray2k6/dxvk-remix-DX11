@@ -260,7 +260,7 @@ namespace dxvk::vk {
      * \returns \c true if the presenter has a swap chain.
      */
     bool hasSwapChain() const {
-      return m_swapchain;
+      return m_swapchain || m_interop; // DX11_V238: interop present has no VkSwapchain but is "ready"
     }
 
     /**
@@ -308,6 +308,11 @@ namespace dxvk::vk {
     uint32_t m_frameIndex = 0;
 
     VkResult m_acquireStatus = VK_NOT_READY;
+
+    // DX11_V238_D3D12_INTEROP_PRESENT: on Intel the Vulkan WSI present is broken, so we present the
+    // RTX frame via a real D3D12/DXGI swapchain. Opaque pimpl (defined in vulkan_presenter.cpp) holding
+    // the D3D12 device/queue/swapchain + GPU-shared present images. Non-null only in interop mode.
+    void* m_interop = nullptr;
 
     FpsLimiter m_fpsLimiter;
 

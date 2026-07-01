@@ -29,6 +29,7 @@
 #include <array>
 #include <limits>
 #include <vector>
+#include <set>
 
 namespace dxvk {
 
@@ -679,6 +680,43 @@ namespace dxvk {
         || format == VK_FORMAT_R32G32B32_SFLOAT
         || format == VK_FORMAT_R32G32B32A32_SFLOAT
         || format == static_cast<VkFormat>(97);
+  }
+
+  // Byte size of one position element for the formats isPositionFormat accepts.
+  // Used to bounds-check reads when computing the mesh bounding box.
+  static uint32_t positionElementBytes(VkFormat format) {
+    switch (format) {
+      case VK_FORMAT_R32G32B32A32_SFLOAT:   return 16;
+      case VK_FORMAT_R32G32B32_SFLOAT:      return 12;
+      case VK_FORMAT_R32G32_SFLOAT:         return 8;
+      case static_cast<VkFormat>(97):       return 8; // R16G16B16A16_SFLOAT (half4)
+      default:                              return 0;
+    }
+  }
+
+  // Decode an object-space position for bounding-box computation. Mirrors the
+  // formats accepted by isPositionFormat. Returns false for unsupported formats
+  // or non-finite data, in which case the caller leaves the bbox invalid so the
+  // instance is kept (fail-safe: never drop geometry on a decode failure).
+  static bool decodePositionForBounds(const uint8_t* src, VkFormat format, float out[3]) {
+    switch (format) {
+      case VK_FORMAT_R32G32B32_SFLOAT:
+      case VK_FORMAT_R32G32B32A32_SFLOAT: {
+        const float* f = reinterpret_cast<const float*>(src);
+        out[0] = f[0]; out[1] = f[1]; out[2] = f[2];
+      } break;
+      case VK_FORMAT_R32G32_SFLOAT: {
+        const float* f = reinterpret_cast<const float*>(src);
+        out[0] = f[0]; out[1] = f[1]; out[2] = 0.0f;
+      } break;
+      case static_cast<VkFormat>(97): { // R16G16B16A16_SFLOAT (half4)
+        const uint16_t* h = reinterpret_cast<const uint16_t*>(src);
+        out[0] = decodeFloat16(h[0]); out[1] = decodeFloat16(h[1]); out[2] = decodeFloat16(h[2]);
+      } break;
+      default:
+        return false;
+    }
+    return std::isfinite(out[0]) && std::isfinite(out[1]) && std::isfinite(out[2]);
   }
 
   static bool isNormalFormat(VkFormat format) {
@@ -1387,6 +1425,47 @@ namespace dxvk {
     uint32_t projSlot   = m_projSlot;
     size_t   projOffset = m_projOffset;
     int      projStage  = m_projStage;
+
+    // DX11_V240 TRANSFORM DIAGNOSTIC: the path tracer renders black on all GPUs because we extract
+    // only the projection (view/world stay identity), so geometry collapses to object space and the
+    // RT camera is wrong. Dump every distinct candidate 4x4 matrix in the VS/GS/etc cbuffers (each
+    // stage+slot+offset logged once) so we can see where the game stores world / view / projection
+    // and fix the extraction. Captures both the menu and the 3D-scene matrices as they first appear.
+    {
+      static std::set<uint64_t> s_dumpedMatrixLocs;
+      static uint32_t s_dumpLogged = 0;
+      if (s_dumpLogged < 64) {
+        for (int si = 0; si < kNumStages; ++si) {
+          const auto& cbsD = *stageCbs[si];
+          for (uint32_t slot = 0; slot < D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT; ++slot) {
+            const auto& cbD = cbsD[slot];
+            if (cbD.buffer == nullptr) continue;
+            const auto mappedD = cbD.buffer->GetMappedSlice();
+            const uint8_t* ptrD = reinterpret_cast<const uint8_t*>(mappedD.mapPtr);
+            if (!ptrD) continue;
+            const size_t bufSizeD = cbD.buffer->Desc()->ByteWidth;
+            auto [baseD, endD] = cbRange(cbD);
+            for (size_t off = baseD; off + 64 <= endD && s_dumpLogged < 64; off += 16) {
+              Matrix4 m = readCbMatrix(ptrD, off, bufSizeD);
+              if (isIdentityExact(m)) continue;
+              const bool rowAffine = std::abs(m[0][3]) < 0.01f && std::abs(m[1][3]) < 0.01f && std::abs(m[2][3]) < 0.01f && std::abs(m[3][3] - 1.0f) < 0.01f;
+              const bool colAffine = std::abs(m[3][0]) < 0.01f && std::abs(m[3][1]) < 0.01f && std::abs(m[3][2]) < 0.01f && std::abs(m[3][3] - 1.0f) < 0.01f;
+              const bool persp     = classifyPerspective(m) != 0;
+              if (!rowAffine && !colAffine && !persp) continue;
+              const uint64_t key = (uint64_t(si) << 40) | (uint64_t(slot) << 32) | uint64_t(off);
+              if (!s_dumpedMatrixLocs.insert(key).second) continue;
+              ++s_dumpLogged;
+              Logger::info(str::format("[D3D11Rtx][mtxdump] stage=", kStageNames[si], " slot=", slot, " off=", off,
+                (persp ? " PERSP" : ""), (rowAffine ? " rowAff" : ""), (colAffine ? " colAff" : ""),
+                " r0=", m[0][0], ",", m[0][1], ",", m[0][2], ",", m[0][3],
+                " r1=", m[1][0], ",", m[1][1], ",", m[1][2], ",", m[1][3],
+                " r2=", m[2][0], ",", m[2][1], ",", m[2][2], ",", m[2][3],
+                " r3=", m[3][0], ",", m[3][1], ",", m[3][2], ",", m[3][3]));
+            }
+          }
+        }
+      }
+    }
 
     // --- PROJECTION: first-draw scan (cache miss) ---
     // Single pass across all stages â€” classifyPerspective handles both layouts.
@@ -3323,13 +3402,32 @@ namespace dxvk {
       return;
     }
 
+    // D3D11 draws address the vertex buffer through BaseVertexLocation (indexed
+    // draws) or StartVertexLocation (non-indexed draws), and indexed draws read
+    // the index buffer starting at StartIndexLocation. Remix does none of this:
+    // it reads indices from the start of the bound slice and fetches vertices by
+    // the raw index value (no base added) - see RtxGeometryUtils::cacheIndexData
+    // OnGPU and RasterGeometry::printDebugInfo. So the base/start offsets must be
+    // folded into the buffer slices here. Without it, engines that pack many
+    // sub-meshes into one shared vertex/index buffer (the DX11 norm) resolve
+    // every non-zero-base draw to the wrong vertices, which makes the geometry
+    // collapse toward one point and stretch into spikes when ray traced.
+    const int64_t vertexStartIndex = indexed ? int64_t(base) : int64_t(start);
+
     auto makeVertexBuffer = [&](const D3D11RtxSemantic* sem) -> RasterBuffer {
       if (!sem)
         return RasterBuffer();
       const auto& vb = m_context->m_state.ia.vertexBuffers[sem->inputSlot];
       if (vb.buffer == nullptr)
         return RasterBuffer();
-      DxvkBufferSlice slice = vb.buffer->GetBufferSlice(vb.offset);
+      // Advance the slice to the first vertex this draw touches. Per-slot stride
+      // is used so multi-stream layouts stay correct. A negative BaseVertexLocation
+      // that would move the slice before the buffer start cannot be represented,
+      // so skip the attribute (the draw is dropped when this is the position).
+      const int64_t sliceOffset = int64_t(vb.offset) + vertexStartIndex * int64_t(vb.stride);
+      if (sliceOffset < 0)
+        return RasterBuffer();
+      DxvkBufferSlice slice = vb.buffer->GetBufferSlice(static_cast<VkDeviceSize>(sliceOffset));
       return RasterBuffer(slice, sem->byteOffset, vb.stride, sem->format);
     };
 
@@ -3383,7 +3481,14 @@ namespace dxvk {
                           ? VK_INDEX_TYPE_UINT32
                           : VK_INDEX_TYPE_UINT16;
       uint32_t idxStride = (idxType == VK_INDEX_TYPE_UINT32) ? 4 : 2;
-      idxBuffer = RasterBuffer(ib.buffer->GetBufferSlice(ib.offset), 0, idxStride, idxType);
+      // Skip StartIndexLocation indices so element 0 of the slice is the first
+      // index this draw consumes (Remix always reads from the slice start).
+      const VkDeviceSize idxSliceOffset = VkDeviceSize(ib.offset) + VkDeviceSize(start) * idxStride;
+      idxBuffer = RasterBuffer(ib.buffer->GetBufferSlice(idxSliceOffset), 0, idxStride, idxType);
+      if (!idxBuffer.defined()) {
+        ++m_submitRejectStats.noIndexBuffer;
+        return;
+      }
     }
 
     VkPrimitiveTopology vkTopology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
@@ -3426,33 +3531,118 @@ namespace dxvk {
     }
 
     // Compute vertex count â€” must cover the highest vertex index accessed by
-    // this draw so Remix doesn't read out of bounds when building BLAS.
-    // geo.vertexCount is the buffer capacity; the hash uses a tighter subrange.
+    // this draw so Remix doesn't read out of bounds when building the BLAS.
+    // The position slice now starts at the draw's first vertex (base/start folded
+    // in above), so all counts below are relative to that origin.
     const uint32_t maxVBVertices = posBuffer.stride() > 0
       ? static_cast<uint32_t>(posBuffer.length() / posBuffer.stride())
       : count;
     uint32_t drawVertexCount;
-    uint32_t hashStart, hashCount;
+    uint32_t hashStart = 0;
+    uint32_t hashCount;
     if (!indexed) {
-      // Non-indexed Draw(count, start): vertices [start, start+count) accessed.
-      drawVertexCount = std::min(start + count, maxVBVertices);
-      hashStart = std::min(start, maxVBVertices);
-      hashCount = std::min(count, maxVBVertices - hashStart);
+      // Non-indexed: relative vertices [0, count) after the start offset.
+      drawVertexCount = std::min(count, maxVBVertices);
+      hashCount = drawVertexCount;
     } else {
-      // Indexed DrawIndexed(indexCount, startIndex, base): vertex = index + base.
-      // Without scanning the IB we don't know max(index), so use base + indexCount
-      // as a conservative upper bound.
-      const uint32_t baseU = static_cast<uint32_t>(std::max(base, 0));
-      drawVertexCount = std::min(baseU + count, maxVBVertices);
-      hashStart = std::min(baseU, maxVBVertices);
-      hashCount = std::min(count, maxVBVertices - hashStart);
+      // Indexed: index values are relative to the base vertex, so the highest
+      // one referenced determines how many vertices Remix must copy. Scan the
+      // (CPU-visible) index range for the exact maximum; fall back to the whole
+      // remaining vertex buffer when the indices can't be read here or the draw
+      // is too large to scan cheaply on the submit thread.
+      uint32_t maxIndexPlusOne = 0;
+      const uint32_t idxStrideBytes = std::max(idxBuffer.stride(), 1u);
+      const void* idxScan = idxBuffer.defined() ? idxBuffer.mapPtr(0) : nullptr;
+      const uint32_t idxAvail = idxBuffer.defined()
+        ? static_cast<uint32_t>(idxBuffer.length() / idxStrideBytes)
+        : 0u;
+      const uint32_t scanCount = std::min(count, idxAvail);
+      static constexpr uint32_t kMaxIndexScan = 1u << 20; // cap submit-thread work
+      if (idxScan && scanCount > 0 && scanCount <= kMaxIndexScan) {
+        if (idxBuffer.indexType() == VK_INDEX_TYPE_UINT32) {
+          const uint32_t* ip = static_cast<const uint32_t*>(idxScan);
+          for (uint32_t i = 0; i < scanCount; ++i)
+            maxIndexPlusOne = std::max(maxIndexPlusOne, ip[i] + 1u);
+        } else {
+          const uint16_t* ip = static_cast<const uint16_t*>(idxScan);
+          for (uint32_t i = 0; i < scanCount; ++i)
+            maxIndexPlusOne = std::max(maxIndexPlusOne, uint32_t(ip[i]) + 1u);
+        }
+      }
+      // When the exact maximum is known, size to it. Otherwise fall back to the
+      // index count: a well-formed indexed mesh references at most indexCount
+      // distinct vertices, so this bounds the copy without ballooning to the
+      // whole (possibly huge, shared) vertex buffer.
+      drawVertexCount = (maxIndexPlusOne > 0)
+        ? std::min(maxIndexPlusOne, maxVBVertices)
+        : std::min(count, maxVBVertices);
+      hashCount = std::min(drawVertexCount, count);
     }
     if (drawVertexCount == 0)
-      drawVertexCount = count;
+      drawVertexCount = std::min(count, maxVBVertices > 0 ? maxVBVertices : count);
     if (hashCount == 0)
       hashCount = std::min(count, maxVBVertices);
     hashCount = std::min(hashCount, kMaxHashedVertices);
     geo.vertexCount = drawVertexCount;
+
+    // Object-space mesh bounding box. The D3D11 capture path never produced one,
+    // so every feature that depends on it silently no-oped on all GPUs:
+    // GPU Scene (significance culling projects the world bounds vs the sub-pixel
+    // threshold) and Anti-Culling (keeps off-screen bounds in the frustum). Both
+    // are enabled/available here, so compute the AABB - vendor-agnostic CPU
+    // min/max over the drawn vertex range - only when a feature needs it. The
+    // instance manager reads geo.boundingBox directly, and finalizeGeometry
+    // BoundingBox() leaves it untouched unless a futureBoundingBox was scheduled,
+    // so setting it here is sufficient. Fail-safe: an unmapped/unsupported/empty
+    // position buffer leaves the bbox invalid, which keeps the instance.
+    if (RtxOptions::needsMeshBoundingBox() && posBuffer.stride() > 0 && drawVertexCount > 0) {
+      const VkFormat posFmt = posBuffer.vertexFormat();
+      const uint32_t elemBytes = positionElementBytes(posFmt);
+      const uint8_t* posBase = elemBytes > 0
+        ? reinterpret_cast<const uint8_t*>(posBuffer.mapPtr(posBuffer.offsetFromSlice()))
+        : nullptr;
+      if (posBase != nullptr) {
+        const uint32_t stride = posBuffer.stride();
+        const size_t posLen = posBuffer.length();
+        // Sample evenly across the whole vertex range so the extent is captured
+        // without iterating millions of vertices on the submit thread. Kept modest
+        // because this runs per accepted draw.
+        static constexpr uint32_t kMaxBBoxSampleVertices = 1024u;
+        const uint32_t sampleCount = std::min(drawVertexCount, kMaxBBoxSampleVertices);
+        float mn[3] = { std::numeric_limits<float>::max(), std::numeric_limits<float>::max(), std::numeric_limits<float>::max() };
+        float mx[3] = { -std::numeric_limits<float>::max(), -std::numeric_limits<float>::max(), -std::numeric_limits<float>::max() };
+        bool anyValid = false;
+        for (uint32_t i = 0; i < sampleCount; ++i) {
+          const uint32_t v = (sampleCount >= drawVertexCount || sampleCount <= 1)
+            ? i
+            : static_cast<uint32_t>(uint64_t(i) * uint64_t(drawVertexCount - 1) / uint64_t(sampleCount - 1));
+          const size_t byteOff = size_t(v) * stride;
+          if (byteOff + elemBytes > posLen)
+            continue;
+          float p[3];
+          if (!decodePositionForBounds(posBase + byteOff, posFmt, p))
+            break; // unsupported format: give up, leave bbox invalid (keep geometry)
+          for (int c = 0; c < 3; ++c) {
+            mn[c] = std::min(mn[c], p[c]);
+            mx[c] = std::max(mx[c], p[c]);
+          }
+          anyValid = true;
+        }
+        if (anyValid) {
+          // Bias the sampled extent outward a hair so under-sampling a large mesh
+          // can never shrink an object below the sub-pixel cull threshold and drop
+          // visible geometry. Symmetric about the centroid.
+          for (int c = 0; c < 3; ++c) {
+            const float center = 0.5f * (mn[c] + mx[c]);
+            const float half = std::max(0.0f, 0.5f * (mx[c] - mn[c])) * 1.05f;
+            mn[c] = center - half;
+            mx[c] = center + half;
+          }
+          geo.boundingBox.minPos = Vector3(mn[0], mn[1], mn[2]);
+          geo.boundingBox.maxPos = Vector3(mx[0], mx[1], mx[2]);
+        }
+      }
+    }
 
     if (nrmBuffer.defined() && bwSem && biSem) {
       RasterBuffer nativeWeightBuffer = makeVertexBuffer(bwSem);
@@ -4435,20 +4625,69 @@ namespace dxvk {
       }
       return;
     }
-    if (dcs.transformData.texgenMode == TexGenMode::None) {
-        dcs.transformData.texgenMode = TexGenMode::ViewPositions;
+
+      // DX11_V126 NO-TEXCOORD ALBEDO FIX:
+      // These textured draws have no TEXCOORD semantic in the input layout, so
+      // the previous code forced TexGenMode::ViewPositions, which synthesizes
+      // UVs from each vertex's camera-relative view-space position
+      // (surface_interaction.slangh: mul(worldToView, worldPos)). The resulting
+      // UVs span enormous ranges across a triangle and swim with every camera
+      // move, so the texture is sampled at essentially random texels -> the
+      // garbled-smear / black / blown-white surfaces observed in Granny's main
+      // geometry (the count=273 draws).
+      //
+      // There is no correct UV to recover here (the layout genuinely has none),
+      // and synthesized UVs can only be wrong. Instead, leave texgen OFF and
+      // force a flat neutral albedo through the existing TFactor + SelectArg1
+      // path: the shader picks the material's albedo from tFactor (a constant
+      // register) and never depends on valid texture coordinates, so the
+      // surface renders as solid geometry lit by the path tracer rather than
+      // as a garbled texture smear. This is a strict improvement over the
+      // swimming-texgen artifact and over simply dropping the draw.
+      if (dcs.transformData.texgenMode == TexGenMode::None) {
+        // Prefer the draw's own vertex colors when present: they are real
+        // per-vertex data that needs no texture coordinates, so they make a
+        // faithful flat albedo. Only fall back to the neutral TFactor constant
+        // when there are no vertex colors either.
+        const RtTextureArgSource albedoSource =
+          geo.color0Buffer.defined() ? RtTextureArgSource::VertexColor0
+                                     : RtTextureArgSource::TFactor;
+        dcs.materialData.textureColorArg1Source  = albedoSource;
+        dcs.materialData.textureColorOperation   = DxvkRtTextureOperation::SelectArg1;
+        dcs.materialData.textureColorArg2Source  = RtTextureArgSource::None;
+        dcs.materialData.textureAlphaArg1Source  = albedoSource;
+        dcs.materialData.textureAlphaOperation   = DxvkRtTextureOperation::SelectArg1;
+        dcs.materialData.textureAlphaArg2Source  = RtTextureArgSource::None;
+        // tFactor is ARGB packed; the shader decodes it as .bgra. 0xffffffff =
+        // opaque white (1,1,1,1), a neutral albedo: the surface is shaded purely
+        // by the path tracer's lighting/GI with no baked color bias. This is the
+        // least surprising default for geometry whose real texture we cannot
+        // sample correctly.
+        dcs.materialData.tFactor = 0xffffffffu;
+        dcs.materialData.updateCachedHash();
         ++m_submitRejectStats.texcoordGenerated;
 
         static uint32_t sTexcoordFallbackLogCount = 0;
         if (sTexcoordFallbackLogCount < 12) {
           ++sTexcoordFallbackLogCount;
+          // Prove the bound texture is still captured/indexed despite the flat
+          // albedo override: the image hash is what the Remix dev-menu texture
+          // browser and all per-texture settings (ignore/hide/sky/decal/...)
+          // key on, so reporting it here confirms the asset pipeline is intact
+          // for these no-UV draws. A hash of 0 means FillMaterialData found no
+          // usable color texture candidate for this draw (a separate issue).
+          const XXH64_hash_t texHash = dcs.materialData.getColorTexture().getImageHash();
           Logger::info(str::format(
-            "[D3D11Rtx] Textured draw has no TEXCOORD semantic; using Remix view-position texgen so material textures stay visible (count=",
+            "[D3D11Rtx] Textured draw has no TEXCOORD semantic; using flat albedo (",
+            geo.color0Buffer.defined() ? "vertex color" : "TFactor white",
+            ") instead of view-position texgen (count=",
             count,
             ", indexed=",
             indexed ? 1 : 0,
             ", fallbackCamera=",
             dcs.transformData.usedViewportFallbackProjection ? 1 : 0,
+            ", textureHash=0x", std::hex, texHash, std::dec,
+            ", textureCaptured=", texHash != 0 ? 1 : 0,
             ")"));
         }
       }

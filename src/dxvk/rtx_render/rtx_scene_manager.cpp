@@ -490,6 +490,29 @@ namespace dxvk {
   void SceneManager::onFrameEnd(Rc<DxvkContext> ctx, bool raytracedThisFrame) {
     ScopedCpuProfileZone();
 
+    // DX11_V234_VRAM_LEAK_DIAG: periodic per-category resource census to locate the unbounded
+    // VRAM growth reported across all GPUs. Logs the counts that, if climbing, pinpoint the leaking
+    // subsystem (instances vs cached geometry) plus actual Vulkan device-local memory used. Cheap
+    // (every 200 frames). If a number climbs monotonically over a session, that's the leak.
+    {
+      const uint32_t fid = m_device->getCurrentFrameId();
+      if (fid != 0 && (fid % 200) == 0) {
+        VkDeviceSize usedBytes = 0, budgetBytes = 0;
+        const DxvkAdapterMemoryInfo mem = m_device->adapter()->getMemoryHeapInfo();
+        for (uint32_t i = 0; i < mem.heapCount; ++i) {
+          if (mem.heaps[i].heapFlags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) {
+            usedBytes   += mem.heaps[i].memoryAllocated;
+            budgetBytes += mem.heaps[i].memoryBudget;
+          }
+        }
+        Logger::info(str::format("[Remix-DX11][vram] frame=", fid,
+          " instances=", m_instanceManager.getActiveCount(),
+          " geoEntries=", m_drawCallCache.getEntries().size(),
+          " vramUsedMiB=", usedBytes / (1024ull * 1024ull),
+          " vramBudgetMiB=", budgetBytes / (1024ull * 1024ull)));
+      }
+    }
+
     manageTextureVram();
 
     if (m_enqueueDelayedClear || m_pReplacer->checkForChanges(ctx)) {

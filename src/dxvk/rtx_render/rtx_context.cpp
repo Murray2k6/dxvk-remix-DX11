@@ -143,6 +143,14 @@ namespace dxvk {
 
   RtxContext::RtxContext(const Rc<DxvkDevice>& device)
     : DxvkContext(device) {
+    // DX11_V229_RTXOPTIONS_NULL_GUARD: guarantee the RtxOptions singleton exists before this
+    // constructor touches any option. setIsOpacityMicromapSupported() (and other raw setters
+    // below) dereference RtxOptions::s_instance directly with no lazy-init; if this RtxContext
+    // is constructed before DxvkInstance's RtxOptions::Create() ran, s_instance is null and the
+    // write faults (0xc0000005 at s_instance+8) at launch on every GPU/game. Create() is
+    // idempotent (no-op when the singleton already exists), so this is safe and load-bearing.
+    RtxOptions::Create();
+
     // Note: This may not be the best place to check for these features/properties, they ideally would be specified as
     // required upfront, but there's no good place to do that for this RTX extension (the D3D11 stuff does it before device
     // creation), so instead we just check for what is needed.

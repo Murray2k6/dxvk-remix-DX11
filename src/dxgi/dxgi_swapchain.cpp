@@ -268,6 +268,8 @@ namespace dxvk {
 
     try {
       HRESULT hr = m_presenter->Present(SyncInterval, PresentFlags, nullptr);
+      if (hr != S_OK && !(PresentFlags & DXGI_PRESENT_TEST))
+        Logger::warn(str::format("[Remix-DX11][swapdiag] Present1 returned non-S_OK hr=0x", std::hex, (uint32_t)hr, " sync=", SyncInterval, " flags=", PresentFlags));
       if (hr == S_OK && !(PresentFlags & DXGI_PRESENT_TEST))
         m_presentCount++;
       return hr;
@@ -291,6 +293,8 @@ namespace dxvk {
           UINT        Height,
           DXGI_FORMAT NewFormat,
           UINT        SwapChainFlags) {
+    Logger::info(str::format("[Remix-DX11][swapdiag] ResizeBuffers count=", BufferCount, " ", Width, "x", Height,
+      " fmt=", (uint32_t)NewFormat, " flags=", SwapChainFlags));
     if (!IsWindow(m_window))
       return DXGI_ERROR_INVALID_CALL;
 
@@ -336,6 +340,9 @@ namespace dxvk {
 
 
   HRESULT STDMETHODCALLTYPE DxgiSwapChain::ResizeTarget(const DXGI_MODE_DESC* pNewTargetParameters) {
+    if (pNewTargetParameters)
+      Logger::info(str::format("[Remix-DX11][swapdiag] ResizeTarget ", pNewTargetParameters->Width, "x",
+        pNewTargetParameters->Height, " windowed=", (int)m_descFs.Windowed));
     std::lock_guard<dxvk::recursive_mutex> lock(m_lockWindow);
 
     if (pNewTargetParameters == nullptr)
@@ -401,6 +408,8 @@ namespace dxvk {
   HRESULT STDMETHODCALLTYPE DxgiSwapChain::SetFullscreenState(
           BOOL          Fullscreen,
           IDXGIOutput*  pTarget) {
+    Logger::info(str::format("[Remix-DX11][swapdiag] SetFullscreenState Fullscreen=", (int)Fullscreen,
+      " curWindowed=", (int)m_descFs.Windowed));
     std::lock_guard<dxvk::recursive_mutex> lock(m_lockWindow);
 
     if (!Fullscreen && pTarget)
