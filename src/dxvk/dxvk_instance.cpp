@@ -560,6 +560,17 @@ namespace dxvk {
   }
 
   VkInstance DxvkInstance::createInstance() {
+    // DX11_V232_STEAM_OVERLAY_VK_LAYER_DEADLOCK: the Steam Overlay Vulkan layer
+    // (SteamOverlayVulkanLayer64.dll) inserts itself on top of vkCreateSwapchainKHR. Combined with the
+    // Intel Arc driver this deadlocks swapchain (re)creation on the render thread while the window's
+    // main thread is blocked waiting on that present (confirmed via two live cdb hang captures: render
+    // thread parked forever inside igvk64!...->vkCreateSwapchainKHR, main thread in WaitForSingleObject
+    // not pumping window messages). Disable ONLY the overlay's Vulkan layer via its documented
+    // disable_environment key so it is never added to our instance; the rest of the Steam overlay is
+    // unaffected. This is a code-side fix that holds regardless of the user's Steam overlay setting.
+    // The Vulkan loader reads this env var when vkCreateInstance runs below.
+    env::setEnvVar("DISABLE_VK_LAYER_VALVE_steam_overlay_1", "1");
+
     const auto areValidationLayersEnabled = RtxOptions::areValidationLayersEnabled();
     const auto enableValidationLayerExtendedValidation = RtxOptions::enableValidationLayerExtendedValidation();
 

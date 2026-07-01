@@ -25,6 +25,9 @@
 #include "d3d11_texture.h"
 #include "d3d11_video.h"
 
+// DX11_V230: for RtxOptions::Create() (root singleton init before DxvkDevice construction)
+#include "../dxvk/rtx_render/rtx_options.h"
+
 namespace dxvk {
   
   constexpr uint32_t D3D11DXGIDevice::DefaultFrameLatency;
@@ -3446,6 +3449,15 @@ namespace dxvk {
 
   Rc<DxvkDevice> D3D11DXGIDevice::CreateDevice(D3D_FEATURE_LEVEL FeatureLevel) {
     std::lock_guard lock(g_sharedDeviceMutex);
+
+    // DX11_V230_RTXOPTIONS_ROOT_CREATE: the RtxOptions singleton (RtxOptions::s_instance) is a
+    // per-module static; d3d11.dll has its own copy and, unlike dxgi.dll, never runs DxvkInstance's
+    // early Create() before building the device. DxvkDevice's member-init list constructs DxvkObjects
+    // (which contains ImGUI) and the immediate context constructs RtxContext - BOTH read RtxOptions
+    // in their constructors (ImGUI::setupStyle -> largeUiMode(), RtxContext -> setIsOpacityMicromap...).
+    // If s_instance is still null there it's a null-pointer deref / crash at launch. Create it here,
+    // before the DxvkDevice (and all its option-reading sub-objects) is constructed. Idempotent.
+    RtxOptions::Create();
 
     if (g_sharedDevice != nullptr) {
       g_sharedDeviceRefCount++;

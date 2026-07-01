@@ -22,6 +22,8 @@
 #include "log.h"
 
 #include <iostream>
+#include <filesystem>
+#include <process.h>   // _getpid - per-process log filenames
 
 #include "../util_env.h"
 #include "../util_filesys.h"
@@ -167,14 +169,22 @@ namespace dxvk {
     // NV-DXVK start: Use std::filesystem::path helpers + RtxFileSys
     auto path = util::RtxFileSys::path(util::RtxFileSys::Logs);
 
-    // Note: If no path is specified to store log files in, simply use the current directory by returning
-    // the specified log file name directly.
+    // Per-process log filenames: a game that re-execs itself on first launch (and any concurrent
+    // instance) would otherwise reuse the same fixed filename and overwrite the earlier run's log,
+    // destroying the evidence of why the first launch failed. Inject the PID before the extension:
+    //   remix-dxvk.log -> remix-dxvk.<pid>.log    dxgi.log -> dxgi.<pid>.log
+    // This lets the FIRST (often the failing) launch's log survive the relaunch.
+    std::filesystem::path fn(fileName);
+    const std::string pidName =
+      fn.stem().string() + "." + std::to_string(_getpid()) + fn.extension().string();
+
+    // Note: If no path is specified to store log files in, simply use the current directory.
     if (path.empty()) {
-      return fileName;
+      return pidName;
     }
 
-    // Append the specified log file name to the logging directory.
-    path /= fileName;
+    // Append the per-process log file name to the logging directory.
+    path /= pidName;
 
     return path.string();
     // NV-DXVK end

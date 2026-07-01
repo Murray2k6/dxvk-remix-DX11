@@ -1,6 +1,8 @@
 #include <cmath>
 #include <cstring>
 
+#include "../util/xxHash/xxhash.h"
+
 #include "d3d11_context.h"
 #include "d3d11_device.h"
 #include "d3d11_query.h"
@@ -3760,6 +3762,50 @@ namespace dxvk {
       pSrcData, SrcRowPitch, SrcDepthPitch, 0, 0,
       pDstTexture->GetVkImageType(), extent, 1,
       formatInfo, formatInfo->aspectMask);
+
+    // NV-DXVK start: eager content hash for uploaded game textures.
+    // The Remix capture/replace pipeline keys entirely on the color texture's
+    // image hash (material hash == color texture image hash, asserted in
+    // rtx_types.cpp). DxvkImage::m_hash defaults to 0 and was never populated
+    // for game-uploaded textures, so every material collapsed to hash 0 and the
+    // dev-menu / replacement system could not distinguish them. Compute a
+    // content-derived, run/vendor-stable hash here, at the upload chokepoint
+    // where both the CPU texels and the destination DxvkImage are available.
+    //
+    // Hash the packed staging bytes (the exact bytes bound for the GPU), capped
+    // for performance on large textures, and mix in format/extent/subresource
+    // so different textures with coincidentally identical sampled bytes don't
+    // collide. Only full-subresource uploads (no pDstBox) establish/mix the
+    // identity: partial box updates are streaming region fills, not the
+    // texture's identity. Depth/stencil aspects are skipped.
+    if ((formatInfo->aspectMask & VK_IMAGE_ASPECT_COLOR_BIT)
+     && pDstBox == nullptr) {
+      Rc<DxvkImage> dstImage = pDstTexture->GetImage();
+      if (dstImage != nullptr) {
+        // Cap the bytes hashed per upload for performance (mirrors the capped
+        // geometry-index hash in rtx_hashing.cpp). 64 KiB is enough entropy for
+        // stable identity while bounding CPU cost on large BC textures.
+        constexpr size_t kMaxTexelHashBytes = 65536;
+        const void* hashData = stagingSlice.mapPtr(0);
+        const size_t hashLen = std::min(stagingSlice.length(), kMaxTexelHashBytes);
+
+        XXH64_hash_t contentHash = XXH3_64bits(hashData, hashLen);
+        contentHash = XXH3_64bits_withSeed(&packedFormat, sizeof(packedFormat), contentHash);
+        contentHash = XXH3_64bits_withSeed(&extent, sizeof(extent), contentHash);
+        contentHash = XXH3_64bits_withSeed(&DstSubresource, sizeof(DstSubresource), contentHash);
+
+        const XXH64_hash_t existing = dstImage->getHash();
+        if (existing == 0u) {
+          // First (typically mip 0) upload: this is the texture's identity.
+          dstImage->setHash(contentHash != 0u ? contentHash : 1u);
+        } else {
+          // Subsequent full-subresource uploads (other mips/layers): mix in so
+          // the identity reflects the full texture, not just the first slice.
+          dstImage->setHash(XXH64(&contentHash, sizeof(contentHash), existing));
+        }
+      }
+    }
+    // NV-DXVK end
 
     UpdateImage(pDstTexture, &subresource,
       offset, extent, std::move(stagingSlice));

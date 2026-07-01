@@ -72,6 +72,15 @@ namespace dxvk {
     if (s_creating)
       return forwardToSystemDxgi(Flags, exportName, riid, ppFactory);
 
+    // DX11_V238_INTEROP_DXGI_PASSTHROUGH: the Intel D3D11/D3D12-interop present path needs a REAL DXGI
+    // factory (the present runs on a real D3D12 device that bypasses the broken Intel Vulkan WSI).
+    // D3D12CreateDevice internally calls CreateDXGIFactory2 by name, which resolves to THIS (our Remix)
+    // dxgi.dll and would loop back into DXVK/Vulkan. While the interop sets this env flag (only around
+    // its own D3D12 device/swapchain creation), forward to the real system dxgi so the present device
+    // gets real DXGI. The game's own DXGI calls (flag clear) still go through DXVK/Remix as normal.
+    if (env::getEnvVar("DXVK_REMIX_DXGI_PASSTHROUGH") == "1")
+      return forwardToSystemDxgi(Flags, exportName, riid, ppFactory);
+
     s_creating = true;
     HRESULT hr;
     try {

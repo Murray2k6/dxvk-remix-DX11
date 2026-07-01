@@ -1325,8 +1325,29 @@ namespace dxvk {
   }
 
 
+  // Close a handle without ever letting a c0000008 (STATUS_INVALID_HANDLE) propagate. Games that enable
+  // strict handle checking (PROCESS_MITIGATION_STRICT_HANDLE_CHECK_POLICY - Unity titles do) turn any
+  // close of an invalid/stale handle into a fatal exception that terminates the process. DXVK closing a
+  // bookkeeping handle must never be able to kill the game, so we swallow that exception. SEH lives in
+  // this standalone helper (no C++ objects to unwind) so it composes with /EHsc cleanly.
+  static void SafeCloseHandle(HANDLE h) {
+    if (!h)
+      return;
+    __try {
+      ::CloseHandle(h);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+      // handle was already closed / invalid under strict handle checking - ignore
+    }
+  }
+
   void D3D11SwapChain::DestroyFrameLatencyEvent() {
-    CloseHandle(m_frameLatencyEvent);
+    // Only the FRAME_LATENCY_WAITABLE_OBJECT swapchain ever creates this handle; a non-waitable
+    // swapchain leaves it null. Close it through SafeCloseHandle and null it so teardown can never
+    // close a null/stale handle and terminate the process. Affects every game that recreates or
+    // releases its swapchain (resolution/fullscreen changes - i.e. the menu->gameplay transition).
+    HANDLE h = m_frameLatencyEvent;
+    m_frameLatencyEvent = nullptr;
+    SafeCloseHandle(h);
   }
 
 
@@ -1396,6 +1417,19 @@ namespace dxvk {
           VkPresentModeKHR*         pDstModes) {
     uint32_t n = 0;
 
+    // DX11_V236_INTEL_FIFO_NO_TEARING_BYPASS: on Intel Arc, IMMEDIATE (tearing) present on a WINDOWED
+    // surface forces the driver's DWM-bypass path, whose vkCreateSwapchainKHR internally calls OpenGL
+    // ChoosePixelFormat/wglChoosePixelFormat and stalls indefinitely - the game never renders (verified
+    // via live captures; persists on the latest Arc driver). FIFO presents THROUGH the DWM compositor
+    // and never touches that GL path. Force FIFO on Intel so the swapchain is actually created and the
+    // game renders. Trade-off: vsync-capped/no-tearing on Intel, which is correct vs. "doesn't render".
+    if (DxvkGpuVendor(m_device->properties().core.properties.vendorID) == DxvkGpuVendor::Intel) {
+      if (m_parent->GetOptions()->tearFree == Tristate::False)
+        pDstModes[n++] = VK_PRESENT_MODE_FIFO_RELAXED_KHR;
+      pDstModes[n++] = VK_PRESENT_MODE_FIFO_KHR;
+      return n;
+    }
+
     if (Vsync) {
       if (m_parent->GetOptions()->tearFree == Tristate::False)
         pDstModes[n++] = VK_PRESENT_MODE_FIFO_RELAXED_KHR;
@@ -1418,6 +1452,20 @@ namespace dxvk {
 
 
   VkFullScreenExclusiveEXT D3D11SwapChain::PickFullscreenMode() {
+    // DX11_V237_INTEL_FORCE_FSE: on Intel Arc the WINDOWED Vulkan present path is broken inside the
+    // driver (IMMEDIATE -> OpenGL ChoosePixelFormat stall; FIFO -> D3D12CreateDevice CPU-runaway), so a
+    // windowed swapchain never renders. Real fullscreen-exclusive presents via direct scanout and
+    // avoids that interop entirely. Force application-controlled FSE on Intel so the swapchain acquires
+    // exclusive fullscreen (DXVK calls vkAcquireFullScreenExclusiveModeEXT) and can actually present.
+    // The FSE feature is kept enabled on Intel (see vulkan_presenter.cpp V237) and the V233 pump
+    // services the FSE window messaging.
+    // ALLOWED (not APPLICATION_CONTROLLED): with ALLOWED the driver may acquire FSE DURING
+    // vkCreateSwapchainKHR, so the create goes straight to exclusive scanout and skips the broken
+    // windowed (GL/D3D12) setup. APPLICATION_CONTROLLED creates windowed first then acquires, which
+    // still hits the broken path. Pairs with the window being forced foreground in recreateSwapChain.
+    if (DxvkGpuVendor(m_device->properties().core.properties.vendorID) == DxvkGpuVendor::Intel)
+      return VK_FULL_SCREEN_EXCLUSIVE_ALLOWED_EXT;
+
     if (!RtxOptions::allowFSE())
       return VK_FULL_SCREEN_EXCLUSIVE_DISALLOWED_EXT;
 
