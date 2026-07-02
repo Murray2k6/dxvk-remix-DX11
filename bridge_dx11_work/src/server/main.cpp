@@ -775,6 +775,80 @@ void ProcessDeviceCommandQueue() {
         break;
       }
 
+      // DX11_V251_BRIDGE_PRESENT_LOOP: these three commands close the loop that
+      // makes the server-hosted Remix runtime actually render: Startup creates
+      // the Remix device + Vulkan swapchain on the game's window (HWNDs are
+      // system-global, so the x64 server can present into the x86 game's
+      // window), SetupCamera feeds the per-frame view/projection captured by
+      // the client, and Present kicks the path-traced frame.
+      case RemixApi_Startup:
+      {
+        void* ptr = nullptr;
+        const uint32_t size = DeviceBridge::getReaderChannel().data->pull(&ptr);
+        uint64_t hwnd64 = 0;
+        if (ptr != nullptr && size >= sizeof(uint64_t)) {
+          memcpy(&hwnd64, ptr, sizeof(uint64_t));
+        }
+        static bool s_startupDone = false;
+        if (!s_startupDone && hwnd64 != 0 && remixapi::g_remix_initialized && remixapi::g_remix.Startup) {
+          remixapi_StartupInfo info = {};
+          info.sType = REMIXAPI_STRUCT_TYPE_STARTUP_INFO;
+          info.hwnd = reinterpret_cast<remixapi_HWND>(static_cast<uintptr_t>(hwnd64));
+          const remixapi_ErrorCode status = remixapi::g_remix.Startup(&info);
+          if (status == REMIXAPI_ERROR_CODE_SUCCESS) {
+            s_startupDone = true;
+            Logger::info("[RemixApi_Startup] Remix runtime started on the game window (cross-process HWND).");
+          } else {
+            static bool s_warnedStartup = false;
+            if (!s_warnedStartup) {
+              s_warnedStartup = true;
+              Logger::err(format_string("[RemixApi_Startup] remixapi Startup failed: %d", (int) status));
+            }
+          }
+        }
+        break;
+      }
+
+      case RemixApi_SetupCamera:
+      {
+        void* ptr = nullptr;
+        const uint32_t size = DeviceBridge::getReaderChannel().data->pull(&ptr);
+        if (ptr != nullptr && size >= 32u * sizeof(float)
+         && remixapi::g_remix_initialized && remixapi::g_remix.SetupCamera) {
+          const float* f = reinterpret_cast<const float*>(ptr);
+          remixapi_CameraInfo cam = {};
+          cam.sType = REMIXAPI_STRUCT_TYPE_CAMERA_INFO;
+          cam.type = REMIXAPI_CAMERA_TYPE_WORLD;
+          memcpy(cam.view, f, 16 * sizeof(float));
+          memcpy(cam.projection, f + 16, 16 * sizeof(float));
+          if (remixapi::g_remix.SetupCamera(&cam) != REMIXAPI_ERROR_CODE_SUCCESS) {
+            static bool s_warnedCamera = false;
+            if (!s_warnedCamera) { s_warnedCamera = true; Logger::err("[RemixApi_SetupCamera] remixapi SetupCamera failed!"); }
+          }
+        }
+        break;
+      }
+
+      case RemixApi_Present:
+      {
+        void* ptr = nullptr;
+        const uint32_t size = DeviceBridge::getReaderChannel().data->pull(&ptr);
+        uint64_t hwnd64 = 0;
+        if (ptr != nullptr && size >= sizeof(uint64_t)) {
+          memcpy(&hwnd64, ptr, sizeof(uint64_t));
+        }
+        if (remixapi::g_remix_initialized && remixapi::g_remix.Present) {
+          remixapi_PresentInfo info = {};
+          info.sType = REMIXAPI_STRUCT_TYPE_PRESENT_INFO;
+          info.hwndOverride = reinterpret_cast<remixapi_HWND>(static_cast<uintptr_t>(hwnd64));
+          if (remixapi::g_remix.Present(&info) != REMIXAPI_ERROR_CODE_SUCCESS) {
+            static bool s_warnedPresent = false;
+            if (!s_warnedPresent) { s_warnedPresent = true; Logger::err("[RemixApi_Present] remixapi Present failed!"); }
+          }
+        }
+        break;
+      }
+
       case RemixApi_CreateD3D11:
       {
         Logger::err("[RemixApi_CreateD3D11] Not yet supported. Device used by Remix API defaults to "

@@ -309,14 +309,45 @@ namespace dxvk::vk {
       si.waitSemaphoreCount = 1; si.pWaitSemaphores = &sync.present; si.pWaitDstStageMask = &waitStage;
       si.commandBufferCount = 1; si.pCommandBuffers = &cmd;
       m_vkd->vkResetFences(m_vkd->device(), 1, &ip->vkFence);
-      m_vkd->vkQueueSubmit(m_device.queue, 1, &si, ip->vkFence);
-      m_vkd->vkWaitForFences(m_vkd->device(), 1, &ip->vkFence, VK_TRUE, UINT64_MAX);
+      const VkResult submitRes = m_vkd->vkQueueSubmit(m_device.queue, 1, &si, ip->vkFence);
 
-      presentInterop(ip);
+      // DX11_V247_NO_INFINITE_WAITS: this used to be vkWaitForFences(..., UINT64_MAX).
+      // When the GPU hangs under the RT workload (TDR / VK_ERROR_DEVICE_LOST - observed
+      // at the end of real game logs), an unbounded wait freezes the render thread
+      // forever; the game's main thread is typically blocked on Present -> the whole
+      // process turns into a black, non-responding window. Bound the wait and handle
+      // failure: timeout skips this present (frame indices still advance so the loop
+      // cannot wedge), device-lost propagates so DXVK/DXGI report device removal
+      // instead of hanging.
+      VkResult waitRes = submitRes;
+      if (submitRes == VK_SUCCESS) {
+        constexpr uint64_t kReadbackFenceTimeoutNs = 2'000'000'000ull; // 2 s ≈ TDR window
+        waitRes = m_vkd->vkWaitForFences(m_vkd->device(), 1, &ip->vkFence, VK_TRUE, kReadbackFenceTimeoutNs);
+      }
+
+      if (waitRes == VK_SUCCESS) {
+        presentInterop(ip);
+      } else {
+        static uint32_t s_interopWaitFailLog = 0;
+        if (s_interopWaitFailLog < 16) {
+          ++s_interopWaitFailLog;
+          Logger::err(str::format("[Remix-DX11][interop] present readback ",
+            submitRes != VK_SUCCESS ? "submit" : "fence wait",
+            " failed: ", waitRes, " - skipping this present"));
+        }
+      }
+
       m_frameIndex = (m_frameIndex + 1) % std::max<size_t>(m_semaphores.size(), size_t(1));
       m_imageIndex = m_frameIndex;
       m_fpsLimiter.delay(true);
-      return VK_SUCCESS;
+
+      // Timeout: the GPU may still be executing (heavy frame) - report success and
+      // let the next frame retry; if the device is truly lost the driver will fail
+      // a later call with DEVICE_LOST which then propagates. Real errors propagate
+      // now so DXVK's device-loss path runs instead of an eternal black hang.
+      if (waitRes == VK_TIMEOUT)
+        return VK_SUCCESS;
+      return waitRes;
     }
 
     VkPresentInfoKHR info;

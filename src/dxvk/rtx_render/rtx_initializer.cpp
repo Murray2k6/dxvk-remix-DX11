@@ -227,9 +227,25 @@ namespace dxvk {
       return;
     }
 
-    // Wait for all shader prewarming to complete
+    // DX11_V247_NO_INFINITE_WAITS: this wait used to be unbounded. If a pipeline
+    // compile wedges in the driver (the historical reason prewarm was disabled on
+    // AMD/Intel), the game hangs at startup as a black, non-responding window.
+    // Bound the wait generously - normal prewarm finishes well within this - and
+    // on timeout continue launching: remaining pipelines compile inline on first
+    // use, which at worst stutters instead of hanging the process.
+    constexpr uint64_t kPrewarmTimeoutMs = 120000; // 2 minutes
+    const uint64_t startMs = ::GetTickCount64();
+    bool timedOut = false;
     while (m_device->getCommon()->pipelineManager().isCompilingShaders()) {
+      if (::GetTickCount64() - startMs >= kPrewarmTimeoutMs) {
+        timedOut = true;
+        break;
+      }
       Sleep(1);
+    }
+
+    if (timedOut) {
+      Logger::err("[Remix-DX11][init] shader prewarm did not finish within 120s - continuing launch; remaining pipelines compile inline on first use.");
     }
 
     DxvkRaytracingPipeline::releaseFinalizer();

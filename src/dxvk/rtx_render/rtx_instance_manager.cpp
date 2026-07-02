@@ -1322,6 +1322,36 @@ namespace dxvk {
         }
       }
 
+      // DX11_V248_TLAS_FIREWALL: a single poisoned instance transform (NaN/Inf
+      // from a misread cbuffer, or runaway magnitudes from a wrong matrix pick)
+      // inflates the TLAS bounds toward infinity and can hang the GPU in ray
+      // traversal (TDR -> VK_ERROR_DEVICE_LOST -> black, non-responding game).
+      // Validate here because every scene instance funnels through this point
+      // regardless of which capture path produced it. The magnitude bound is
+      // deliberately enormous (1e12) so no legitimate game scale is ever hidden;
+      // it only rejects values that are already numerically meaningless.
+      {
+        const Matrix4& o2w = currentInstance.surface.objectToWorld;
+        bool transformPoisoned = false;
+        for (int col = 0; col < 4 && !transformPoisoned; ++col) {
+          for (int row = 0; row < 4; ++row) {
+            const float v = o2w[col][row];
+            if (!std::isfinite(v) || std::abs(v) > 1.0e12f) {
+              transformPoisoned = true;
+              break;
+            }
+          }
+        }
+        if (transformPoisoned) {
+          mask = 0;
+          static uint32_t s_poisonedTransformLog = 0;
+          if (s_poisonedTransformLog < 8) {
+            ++s_poisonedTransformLog;
+            Logger::warn("[RTX] TLAS firewall: hiding instance with non-finite or runaway objectToWorld transform (would risk a GPU hang).");
+          }
+        }
+      }
+
       if (currentInstance.m_isHidden)
         mask = 0;
 

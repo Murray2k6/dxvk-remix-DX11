@@ -4233,6 +4233,14 @@ namespace dxvk {
 
     if (m_overlayWin.ptr() != nullptr) {
       m_overlayWin->update(gameHwnd);
+
+      // DX11_V246_RAW_INPUT_HANDOFF: the overlay may only hold the process's
+      // raw-input registration while the Remix menu is open; otherwise games
+      // that read input via WM_INPUT receive nothing (registration is
+      // per-process, last writer wins). Idempotent, so syncing every frame is
+      // cheap and also self-heals the boot case where the menu opens before
+      // the overlay window exists.
+      m_overlayWin->setInputCapture(isMenuOpen());
     }
 
     m_lastRenderVsyncStatus = vsync;

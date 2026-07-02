@@ -80,8 +80,13 @@ GameOverlay::GameOverlay(const char* className, ImGUI* pImgui)
 }
 
 GameOverlay::~GameOverlay() {
+  // Give the game its raw-input registrations back before tearing down the
+  // overlay window, otherwise a menu-open shutdown would leave the process
+  // with a registration targeting a destroyed window.
+  setInputCapture(false);
+
   m_running.store(false);
-  
+
   if (m_hwnd) {
     PostMessageW(m_hwnd, WM_CLOSE, 0, 0);
   }
@@ -89,6 +94,96 @@ GameOverlay::~GameOverlay() {
   if (m_thread.joinable()) {
     m_thread.join();
   }
+}
+
+void GameOverlay::setInputCapture(bool enable) {
+  std::lock_guard<std::mutex> lock(m_ridMutex);
+
+  if (enable == m_rawInputCaptured) {
+    return;
+  }
+
+  if (enable) {
+    HWND target = m_hwnd.load();
+    if (!target) {
+      // Overlay window not created yet; the per-frame sync from ImGUI::render
+      // retries until it exists, so simply skip this attempt.
+      return;
+    }
+
+    // Snapshot whatever mouse/keyboard registrations the game currently holds
+    // so they can be restored exactly when the menu closes.
+    m_savedGameRid.clear();
+    UINT count = 0;
+    if (::GetRegisteredRawInputDevices(nullptr, &count, sizeof(RAWINPUTDEVICE)) == 0 && count > 0) {
+      std::vector<RAWINPUTDEVICE> all(count);
+      const UINT got = ::GetRegisteredRawInputDevices(all.data(), &count, sizeof(RAWINPUTDEVICE));
+      if (got != UINT(-1)) {
+        all.resize(got);
+        for (const auto& rid : all) {
+          if (rid.usUsagePage == 0x01 && (rid.usUsage == 0x02 || rid.usUsage == 0x06)) {
+            m_savedGameRid.push_back(rid);
+          }
+        }
+      }
+    }
+
+    RAWINPUTDEVICE rid[2] {};
+    // Mouse
+    rid[0].usUsagePage = 0x01;
+    rid[0].usUsage = 0x02;
+    rid[0].dwFlags = RIDEV_INPUTSINK;
+    rid[0].hwndTarget = target;
+    // Keyboard. INPUTSINK only - never RIDEV_NOLEGACY, which would suppress
+    // WM_KEYDOWN/WM_KEYUP/WM_CHAR process-wide and cut off legacy-input games.
+    rid[1].usUsagePage = 0x01;
+    rid[1].usUsage = 0x06;
+    rid[1].dwFlags = RIDEV_INPUTSINK;
+    rid[1].hwndTarget = target;
+
+    if (!::RegisterRawInputDevices(rid, 2, sizeof(RAWINPUTDEVICE))) {
+      Logger::err(str::format("Failed to register raw input for overlay window: ", m_className));
+      m_savedGameRid.clear();
+      return;
+    }
+
+    m_rawInputCaptured = true;
+    Logger::info(str::format("[RemixOverlay] raw input captured for menu (saved ",
+      m_savedGameRid.size(), " game registration(s))"));
+    return;
+  }
+
+  // Release: restore the game's registrations captured above. For a usage the
+  // game never registered, remove ours entirely (RIDEV_REMOVE requires a null
+  // hwndTarget) so the process returns to its pre-capture state.
+  bool restoredMouse = false;
+  bool restoredKeyboard = false;
+  for (RAWINPUTDEVICE rid : m_savedGameRid) {
+    if (::RegisterRawInputDevices(&rid, 1, sizeof(RAWINPUTDEVICE))) {
+      if (rid.usUsage == 0x02) restoredMouse = true;
+      if (rid.usUsage == 0x06) restoredKeyboard = true;
+    } else {
+      Logger::warn(str::format("[RemixOverlay] failed to restore game raw-input registration (usage=0x",
+        std::hex, rid.usUsage, std::dec, ")"));
+    }
+  }
+
+  auto removeUsage = [](USHORT usage) {
+    RAWINPUTDEVICE rid {};
+    rid.usUsagePage = 0x01;
+    rid.usUsage = usage;
+    rid.dwFlags = RIDEV_REMOVE;
+    rid.hwndTarget = nullptr;
+    ::RegisterRawInputDevices(&rid, 1, sizeof(RAWINPUTDEVICE));
+  };
+  if (!restoredMouse)
+    removeUsage(0x02);
+  if (!restoredKeyboard)
+    removeUsage(0x06);
+
+  m_savedGameRid.clear();
+  m_rawInputCaptured = false;
+  Logger::info("[RemixOverlay] raw input released back to the game");
 }
 
 void GameOverlay::show() {
@@ -472,32 +567,15 @@ void GameOverlay::windowThreadMain() {
 
   show();
 
-  RAWINPUTDEVICE rid[2] {};
-  // Mouse
-  rid[0].usUsagePage = 0x01;
-  rid[0].usUsage = 0x02;
-  rid[0].dwFlags = RIDEV_INPUTSINK;
-  rid[0].hwndTarget = m_hwnd;
-  // Keyboard.
-  // RIDEV_INPUTSINK lets the overlay observe keyboard raw input even when it is
-  // not the foreground window, which is what the ImGui dev menu needs.
-  //
-  // RIDEV_NOLEGACY must NOT be set here: it suppresses legacy keyboard messages
-  // (WM_KEYDOWN/WM_KEYUP/WM_CHAR) process-wide for the keyboard device. Because
-  // Remix runs injected inside the game's own process, that suppression blocks
-  // the game itself from ever receiving keyboard input through the standard
-  // window-message path - the "input is blocked / Remix takes over" symptom.
-  // Observing raw input (INPUTSINK) does not require stealing legacy messages
-  // from the game, so leave legacy delivery intact.
-  rid[1].usUsagePage = 0x01;
-  rid[1].usUsage = 0x06;
-  rid[1].dwFlags = RIDEV_INPUTSINK;
-  rid[1].hwndTarget = m_hwnd;
-
-  if (!RegisterRawInputDevices(rid, 2, sizeof(RAWINPUTDEVICE))) {
-    Logger::err(str::format("Failed to register raw input for overlay window: ", m_className));
-    return;
-  }
+  // DX11_V246_RAW_INPUT_HANDOFF: raw input is intentionally NOT registered here.
+  // Windows keeps one raw-input registration per (usagePage, usage) per process,
+  // last writer wins. Registering mouse+keyboard at overlay startup permanently
+  // redirected all WM_INPUT away from games that read input through raw input
+  // (Unity, Unreal, Minecraft, ...) - the "Remix eats game input" bug, present
+  // even without RIDEV_NOLEGACY. The registration is now acquired only while
+  // the Remix menu is open (setInputCapture, driven from ImGUI::render) and the
+  // game's own registrations are restored when it closes. Menu-open detection
+  // while unregistered is handled by the swapchain's GetAsyncKeyState Alt+X poll.
 
   MSG msg {};
   while (m_running.load()) {
