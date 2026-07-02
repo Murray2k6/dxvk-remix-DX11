@@ -3603,7 +3603,13 @@ namespace dxvk {
         : nullptr;
       if (posBase != nullptr) {
         const uint32_t stride = posBuffer.stride();
-        const size_t posLen = posBuffer.length();
+        // posBase points at offsetFromSlice() within the slice, so the readable
+        // span from it is length() minus that attribute offset. Bounds-check reads
+        // against this (not the full slice length) to avoid running off the buffer.
+        const uint32_t posSliceOff = posBuffer.offsetFromSlice();
+        const size_t posLen = posBuffer.length() > posSliceOff
+          ? posBuffer.length() - posSliceOff
+          : 0;
         // Sample evenly across the whole vertex range so the extent is captured
         // without iterating millions of vertices on the submit thread. Kept modest
         // because this runs per accepted draw.

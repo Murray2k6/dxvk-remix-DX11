@@ -505,8 +505,19 @@ namespace dxvk {
     auto enableNrcPreset = [&](NeuralRadianceCache::QualityPreset nrcPreset) {
       NeuralRadianceCache& nrc = device->getCommon()->metaNeuralRadianceCache();
       // TODO[REMIX-4105] trying to use NRC for a frame when it isn't supported will cause a crash, so this needs to be setImmediately.
-      // Should refactor this to use a separate global for the final state, and indicate user preference with the option. 
-      if (nrc.checkIsSupported(device)) {
+      // Should refactor this to use a separate global for the final state, and indicate user preference with the option.
+      //
+      // DX11_V244_NRC_OPT_IN: the graphics presets used to FORCE NRC on every GPU
+      // that merely reports support. On the DX11 path NRC crashes on first use
+      // (observed on NVIDIA RTX 4060 Laptop / Minecraft: the log ends immediately
+      // after "NRC Context successfully initialized", on the first NRC-integrated
+      // frame - the REMIX-4105 class of bug). So do NOT auto-enable NRC from a
+      // preset; default to the robust ReSTIR GI path (the same path non-NRC GPUs
+      // already use). NRC remains available as an explicit opt-in via
+      // DXVK_REMIX_ENABLE_NRC=1 or rtx.conf rtx.integrateIndirectMode=2 so it can
+      // be re-tried without a rebuild once it is stable.
+      const bool nrcOptIn = env::getEnvVar("DXVK_REMIX_ENABLE_NRC") == "1";
+      if (nrcOptIn && nrc.checkIsSupported(device)) {
         RtxOptions::integrateIndirectMode.setImmediately(IntegrateIndirectMode::NeuralRadianceCache);
         nrc.setQualityPreset(nrcPreset);
       } else {

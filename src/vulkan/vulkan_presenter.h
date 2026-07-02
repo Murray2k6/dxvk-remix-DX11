@@ -314,6 +314,12 @@ namespace dxvk::vk {
     // the D3D12 device/queue/swapchain + GPU-shared present images. Non-null only in interop mode.
     void* m_interop = nullptr;
 
+    // DX11_V243: one-shot request to fall back to the GDI-blit interop present when
+    // native Vulkan WSI cannot create a swapchain (e.g. VK_ERROR_NATIVE_WINDOW_IN_USE
+    // when a game makes a second swapchain on the same window - Minecraft does this).
+    // recreateSwapChain sets it, then re-enters itself once forcing the interop path.
+    bool m_gdiFallback = false;
+
     FpsLimiter m_fpsLimiter;
 
     VkResult getSupportedFormats(
