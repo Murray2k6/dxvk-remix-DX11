@@ -372,6 +372,11 @@ namespace dxvk::vk {
     if (m_swapchain)
       destroySwapchain();
 
+    // True when this invocation is the one-shot GDI fallback re-entry (see the
+    // native-WSI failure path below). Bounds the fallback to a single retry so a
+    // double failure can never recurse forever.
+    const bool inGdiFallbackAttempt = m_gdiFallback;
+
     // DX11_V237_FORCE_FOREGROUND_FOR_FSE: bring the swapchain window visible + foreground before
     // creating the swapchain. On Intel we force FSE (ALLOWED) and the driver only acquires exclusive
     // fullscreen DURING vkCreateSwapchainKHR when the window is foreground and covers the output - so we
@@ -401,6 +406,12 @@ namespace dxvk::vk {
           useGdiInterop = true;
         else if (forcedPresent == "0")
           useGdiInterop = false;
+        // A prior native-WSI attempt in this call chain asked to fall back to GDI
+        // (e.g. the window is already owned by another swapchain). Honor it once.
+        if (m_gdiFallback) {
+          useGdiInterop = true;
+          m_gdiFallback = false;
+        }
         Logger::info(str::format("[Remix-DX11][interop] present path: ",
           useGdiInterop ? "GDI blit" : "native Vulkan WSI",
           " (vendorID=0x", std::hex, adapterProps.vendorID, std::dec,
@@ -665,6 +676,19 @@ namespace dxvk::vk {
 
         if ((status = createSwapchainDeadlockSafe(swapInfo)) != VK_SUCCESS) {
           Logger::err(str::format("Presenter: vkCreateSwapchainKHR failed again, error code: ", status, ". Giving up."));
+
+          // DX11_V243: native Vulkan WSI could not create a swapchain for this
+          // window (commonly VK_ERROR_NATIVE_WINDOW_IN_USE_KHR when a game creates
+          // a second swapchain on a window that already owns one - Minecraft). The
+          // GDI-blit interop present has no such per-window limit, so fall back to
+          // it once instead of failing swapchain creation (which would throw
+          // "Failed to create swap chain" back to the game). One-shot guarded by
+          // inGdiFallbackAttempt so a double failure returns the error normally.
+          if (!inGdiFallbackAttempt && m_window) {
+            Logger::info("Presenter: falling back to GDI interop present after native WSI failure");
+            m_gdiFallback = true;
+            return recreateSwapChain(desc);
+          }
 
           return status;
         }

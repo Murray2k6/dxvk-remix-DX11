@@ -506,7 +506,11 @@ namespace dxvk {
     RTX_OPTION_ENV("rtx", bool, useRTXDI, true, "DXVK_USE_RTXDI",
                    "A flag indicating if RTXDI should be used, true enables RTXDI, false disables it and falls back on simpler light sampling methods.\n"
                    "RTXDI provides improved direct light sampling quality over traditional methods and should generally be enabled for improved direct lighting quality at the cost of some performance.");
-    RTX_OPTION_ARGS("rtx", IntegrateIndirectMode, integrateIndirectMode, IntegrateIndirectMode::NeuralRadianceCache,
+    // DX11_V244_NRC_OPT_IN: default to ReSTIR GI, NOT NRC. NRC crashes on first use on
+    // the DX11 path (REMIX-4105 class), so it must be an explicit opt-in rather than the
+    // baseline default used when no graphics preset forces a mode. Set to 2 (or env
+    // DXVK_REMIX_ENABLE_NRC=1) to opt back into NRC.
+    RTX_OPTION_ARGS("rtx", IntegrateIndirectMode, integrateIndirectMode, IntegrateIndirectMode::ReSTIRGI,
                    "Indirect integration mode:\n"
                    "0: Importance Sampled. Importance sampled mode uses typical GI sampling and it is not recommended for general use as it provides the noisiest output.\n"
                    "   It serves as a reference integration mode for validation of other indirect integration modes.\n"

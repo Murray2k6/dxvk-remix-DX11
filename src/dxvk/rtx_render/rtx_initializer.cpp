@@ -184,15 +184,30 @@ namespace dxvk {
     // further step). Since all three IHVs fail here, disable prewarming unconditionally; the RT
     // pipelines then compile inline on first use (minor first-use stutter, but the game boots and
     // path tracing runs on any GPU). Re-evaluate per-vendor once the prewarm path is fixed.
+    // DX11_V245_NVIDIA_PREWARM: the earlier blanket disable lumped NVIDIA in with the
+    // vendors whose prewarm genuinely fails - AMD (long-standing deadlock) and Intel Arc
+    // (Battlemage launch crash). NVIDIA prewarms correctly, and it NEEDS prewarm: without
+    // it the large RGS ray-tracing pipelines (NVIDIA's default indirect-integrate path)
+    // compile INLINE on the first ray-traced frame, causing long stutters and a first-frame
+    // crash risk (matches the RTX 4060 / Minecraft crash that lands right at the first RT
+    // frame). So prewarm on NVIDIA and keep it disabled on AMD/Intel. Escape hatch:
+    // DXVK_REMIX_PREWARM = "0" forces off, "1" forces on, on any vendor.
     const uint32_t vendorId = m_device->properties().core.properties.vendorID;
-    const bool knownVendor =
+    const bool prewarmUnsafeVendor =
          vendorId == static_cast<uint32_t>(DxvkGpuVendor::Amd)
-      || vendorId == static_cast<uint32_t>(DxvkGpuVendor::Intel)
-      || vendorId == static_cast<uint32_t>(DxvkGpuVendor::Nvidia);
-    if (!asyncShaderPrewarming() || knownVendor) {
-      Logger::info("[Remix-DX11][init] shader prewarm disabled (cross-vendor launch-crash WAR); pipelines compile inline on first use.");
+      || vendorId == static_cast<uint32_t>(DxvkGpuVendor::Intel);
+    bool doPrewarm = !prewarmUnsafeVendor; // NVIDIA (and unknown vendors) prewarm; AMD/Intel do not
+    const std::string prewarmOverride = env::getEnvVar("DXVK_REMIX_PREWARM");
+    if (prewarmOverride == "0")
+      doPrewarm = false;
+    else if (prewarmOverride == "1")
+      doPrewarm = true;
+
+    if (!asyncShaderPrewarming() || !doPrewarm) {
+      Logger::info("[Remix-DX11][init] shader prewarm disabled (AMD deadlock / Intel Arc launch-crash WAR); pipelines compile inline on first use.");
       return;
     }
+    Logger::info("[Remix-DX11][init] shader prewarm ENABLED (prewarming RT pipelines up front to avoid first-frame inline-compile stutter/crash).");
 
     DxvkObjects* pCommon = m_device->getCommon();
 
