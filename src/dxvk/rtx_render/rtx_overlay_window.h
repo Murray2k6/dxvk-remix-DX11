@@ -26,6 +26,9 @@
 #include "../../util/rc/util_rc_ptr.h"
 #include "rtx_common_object.h"
 
+#include <mutex>
+#include <vector>
+
 namespace dxvk {
   class GameOverlay : public RcObject {
   public:
@@ -37,6 +40,16 @@ namespace dxvk {
     HWND hwnd() const {  return m_hwnd; }
 
     void update(HWND gameHwnd);
+
+    // DX11_V246_RAW_INPUT_HANDOFF: acquire or release the process's raw-input
+    // registration for mouse+keyboard. Windows keeps ONE registration per
+    // (usagePage, usage) per process - last writer wins - so while the overlay
+    // is registered, a game that reads input via WM_INPUT (Unity, Unreal,
+    // Minecraft, ...) receives nothing. Therefore the overlay only holds the
+    // registration while the Remix menu is open; on release it re-registers
+    // whatever the game had at capture time. Idempotent and cheap when the
+    // state does not change, so it is safe to call every frame.
+    void setInputCapture(bool enable);
 
     void gameWndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
     LRESULT overlayWndProc(HWND, UINT, WPARAM, LPARAM);
@@ -74,5 +87,12 @@ namespace dxvk {
     bool  m_debugDraw = false;
     BYTE  m_debugAlpha = 96;
     RECT  m_lastRect { 0,0,0,0 };
+
+    // Raw-input capture state (see setInputCapture). m_savedGameRid holds the
+    // game's mouse/keyboard registrations snapshotted at capture time so they
+    // can be restored exactly when the menu closes.
+    std::mutex m_ridMutex;
+    bool m_rawInputCaptured = false;
+    std::vector<RAWINPUTDEVICE> m_savedGameRid;
   };
 }

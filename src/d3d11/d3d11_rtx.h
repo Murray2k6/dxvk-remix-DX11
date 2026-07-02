@@ -162,6 +162,12 @@ namespace dxvk {
       uint32_t screenSpaceGarbageSkip = 0;
       uint32_t geometryHashScheduleFailed = 0;
       uint32_t forceInjectionIdle = 0;
+      // DX11_V249: draws dropped because their position stream cannot be made
+      // safe for the interleaver/BLAS (unconvertible format, all-garbage data,
+      // or an index range whose vertex extent cannot be bounded).
+      uint32_t positionFormatRejected = 0;
+      uint32_t poisonedPositions = 0;
+      uint32_t vertexRangeRejected = 0;
     };
 
     SubmitRejectStats                    m_submitRejectStats;

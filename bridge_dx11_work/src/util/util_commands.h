@@ -49,6 +49,12 @@ namespace Commands {
     RemixApi_SetConfigVariable,
     RemixApi_CreateD3D11,
     RemixApi_RegisterDevice,
+    // DX11_V251_BRIDGE_PRESENT_LOOP: device startup on the game window, per-frame
+    // camera, and frame presentation - the commands that actually make the
+    // server-hosted Remix runtime render into the game.
+    RemixApi_Startup,
+    RemixApi_SetupCamera,
+    RemixApi_Present,
 
     Bridge_SharedHeap_AddSeg,
     Bridge_SharedHeap_Alloc,
@@ -487,6 +493,9 @@ namespace Commands {
     case RemixApi_SetConfigVariable: return "RemixApi_SetConfigVariable";
     case RemixApi_CreateD3D11: return "RemixApi_CreateD3D11";
     case RemixApi_RegisterDevice: return "RemixApi_RegisterDevice";
+    case RemixApi_Startup: return "RemixApi_Startup";
+    case RemixApi_SetupCamera: return "RemixApi_SetupCamera";
+    case RemixApi_Present: return "RemixApi_Present";
 
     case Bridge_SharedHeap_AddSeg: return "SharedHeap_AddSeg";
     case Bridge_SharedHeap_Alloc: return "SharedHeap_Alloc";

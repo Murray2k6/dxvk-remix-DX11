@@ -83,9 +83,19 @@ namespace dxvk {
         return;
       }
 
-      s_setOnAdd.wait(lock, [hash] {
+      // DX11_V248: bounded wait. The unbounded wait deadlocked permanently when
+      // the OMM twin of this pipeline was never queued for compilation (e.g.
+      // prewarm disabled and the OMM variant never requested) - the compiling
+      // thread then waited forever on a condition that could never become true.
+      // On timeout proceed with the compile: the WAR only matters on ancient
+      // NVIDIA drivers (< 528.75), and risking the original driver quirk is
+      // strictly better than a guaranteed hang.
+      const bool signaled = s_setOnAdd.wait_for(lock, std::chrono::seconds(60), [hash] {
         return s_setOMM.find(hash) != s_setOMM.end();
       });
+      if (!signaled) {
+        Logger::warn("WAR4000939: timed out waiting for the OMM pipeline twin; compiling without the ordering workaround.");
+      }
     }
 
     static void addOMMPipeline(const DxvkRaytracingPipelineShaders& shaders) {
@@ -192,6 +202,35 @@ namespace dxvk {
       return m_pipeline;
     }
 
+    // DX11_V248_NONBLOCKING_RT_PIPELINES: never compile in-place on the render
+    // thread when async compilation is enabled. Ray tracing pipelines take tens
+    // of seconds to minutes to build; compiling them inline at dispatch time
+    // freezes the frame loop and, because the game's main thread is typically
+    // blocked in Present, turns the whole process into a black non-responding
+    // window on ANY vendor in ANY game whose pipeline was not prewarmed.
+    //
+    // Instead, enqueue the compile onto the state-cache shader-compilation
+    // workers (registerRaytracingShaders dedups by hash, so repeated calls are
+    // cheap no-ops) and return VK_NULL_HANDLE. The caller chain already skips
+    // the dispatch cleanly on a null handle (updateRaytracingPipelineState ->
+    // commitRaytracingState -> traceRays), and RtxContext holds off ray tracing
+    // while remixShaderCompilationCount() > 0, so rendering simply resumes when
+    // the compile lands. Prewarm becomes an optimization, not a requirement.
+    if (RtxOptions::Shader::enableAsyncCompilation()) {
+      m_pipeMgr->registerRaytracingShaders(m_shaders);
+
+      static uint32_t s_asyncRequestLog = 0;
+      if (s_asyncRequestLog < 8) {
+        ++s_asyncRequestLog;
+        Logger::info(str::format("Raytracing pipeline not ready, compiling asynchronously: ",
+          m_shaders.debugName ? m_shaders.debugName : "<unnamed>"));
+      }
+
+      return VK_NULL_HANDLE;
+    }
+
+    // Async compilation explicitly disabled: preserve the original synchronous
+    // in-place compile (deterministic behavior for debugging).
     compilePipeline();
 
     return m_pipeline;

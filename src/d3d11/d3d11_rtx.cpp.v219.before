@@ -3609,7 +3609,7 @@ namespace dxvk {
     // LATER draw or a recycled slice - so every dynamic-buffer mesh reads
     // someone else's vertices or zeros. Zeros collapse the mesh to a single
     // point; foreign data renders as garbage. The rtx.useBuffersDirectly=false
-    // copy path was never ported from D3D11 (the option has no consumer in this
+    // copy path was never ported from D3D9 (the option has no consumer in this
     // fork), so implement the snapshot here: host-visible (renameable) sources
     // are copied at submit time, while their contents are the ones this draw
     // actually used. Device-local buffers cannot be CPU-renamed and stay
