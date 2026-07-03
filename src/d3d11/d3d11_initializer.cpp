@@ -79,6 +79,17 @@ namespace dxvk {
     (pTexture->GetMapMode() == D3D11_COMMON_TEXTURE_MAP_MODE_DIRECT)
       ? InitHostVisibleTexture(pTexture, pInitialData)
       : InitDeviceLocalTexture(pTexture, pInitialData);
+
+    // NV-DXVK start: DX11_V258_TEXTURE_HASH_STABILITY
+    // Textures created with initial data (IMMUTABLE/DEFAULT + pInitialData -
+    // how games create nearly all material textures) previously never got an
+    // image hash: only the UpdateSubresource chokepoint hashed, so most
+    // materials collapsed to hash 0 and replacements/tags could not key on
+    // them. Establish the content-derived identity here, at creation, where
+    // the CPU texels are guaranteed available.
+    if (pInitialData != nullptr && pInitialData->pSysMem != nullptr)
+      InitTextureContentHash(pTexture, pInitialData);
+    // NV-DXVK end
   }
 
 
@@ -99,6 +110,73 @@ namespace dxvk {
 
     FlushImplicit();
   }
+
+
+  // NV-DXVK start: DX11_V258_TEXTURE_HASH_STABILITY
+  void D3D11Initializer::InitTextureContentHash(
+          D3D11CommonTexture*         pTexture,
+    const D3D11_SUBRESOURCE_DATA*     pInitialData) {
+    // Only sampled color textures can become Remix material textures.
+    const auto& desc = *pTexture->Desc();
+    if (!(desc.BindFlags & D3D11_BIND_SHADER_RESOURCE))
+      return;
+
+    Rc<DxvkImage> image = pTexture->GetImage();
+    if (image == nullptr || image->getHash() != 0ull)
+      return;
+
+    const VkFormat packedFormat = m_parent->LookupPackedFormat(
+      desc.Format, pTexture->GetFormatMode()).Format;
+    const auto* formatInfo = imageFormatInfo(packedFormat);
+    if (!(formatInfo->aspectMask & VK_IMAGE_ASPECT_COLOR_BIT))
+      return;
+
+    // Hash mip 0 of each array layer: cube faces differ from each other,
+    // while lower mips derive from mip 0 and add no identity. Reads are
+    // sized conservatively against the application's row/slice pitches so
+    // they never leave the caller's allocation, and capped per layer to
+    // bound creation-time cost on huge textures. The result is identical
+    // every run on every GPU vendor for the same source texture.
+    constexpr size_t   kMaxLayerHashBytes = 32768;
+    constexpr uint32_t kMaxHashedLayers   = 16;
+
+    const VkExtent3D mip0   = pTexture->MipLevelExtent(0);
+    const VkExtent3D blocks = util::computeBlockCount(mip0, formatInfo->blockSize);
+    const size_t rowBytes   = size_t(blocks.width) * formatInfo->elementSize;
+    if (rowBytes == 0)
+      return;
+
+    XXH64_hash_t contentHash = 0ull;
+    const uint32_t layerCount = std::min<uint32_t>(desc.ArraySize, kMaxHashedLayers);
+    for (uint32_t layer = 0; layer < layerCount; layer++) {
+      const auto& sr = pInitialData[D3D11CalcSubresource(0, layer, desc.MipLevels)];
+      if (sr.pSysMem == nullptr)
+        continue;
+      const size_t pitch      = sr.SysMemPitch      ? sr.SysMemPitch      : rowBytes;
+      const size_t slicePitch = sr.SysMemSlicePitch ? sr.SysMemSlicePitch : pitch * blocks.height;
+      size_t total = blocks.height > 0 ? pitch * (blocks.height - 1) + rowBytes : rowBytes;
+      if (blocks.depth > 1)
+        total += slicePitch * (blocks.depth - 1);
+      const size_t hashLen = std::min(total, kMaxLayerHashBytes);
+      const XXH64_hash_t layerHash = XXH3_64bits(sr.pSysMem, hashLen);
+      contentHash = XXH3_64bits_withSeed(&layerHash, sizeof(layerHash), contentHash);
+    }
+
+    // Mix in structure so textures with coincidentally identical sampled
+    // bytes but different dimensions/format/mip chains do not collide.
+    contentHash = XXH3_64bits_withSeed(&packedFormat, sizeof(packedFormat), contentHash);
+    contentHash = XXH3_64bits_withSeed(&mip0, sizeof(mip0), contentHash);
+    contentHash = XXH3_64bits_withSeed(&desc.MipLevels, sizeof(desc.MipLevels), contentHash);
+    contentHash = XXH3_64bits_withSeed(&desc.ArraySize, sizeof(desc.ArraySize), contentHash);
+
+    image->setHash(contentHash != 0ull ? contentHash : 1ull);
+
+    // Creation data is the texture's identity for its whole lifetime;
+    // runtime uploads (UpdateSubresource/Unmap/Copy chokepoints) must not
+    // re-mix it or streamed sub-rect updates would churn the hash.
+    pTexture->MarkAllSubresourcesHashed();
+  }
+  // NV-DXVK end
 
 
   void D3D11Initializer::InitDeviceLocalBuffer(

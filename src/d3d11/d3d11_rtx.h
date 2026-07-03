@@ -43,6 +43,8 @@ namespace dxvk {
     RTX_OPTION("rtx", bool, useWorldMatricesForShaders, true, "Use captured world/view matrices when reconstructing transforms for programmable-shader draws.");
     RTX_OPTION("rtx", bool, allowCubemaps, false, "Allow cubemap render targets/draws to be considered for ray tracing.");
     RTX_OPTION("rtx", bool, orthographicIsUI, true, "Treat draws with an orthographic projection as UI and skip them from the ray traced scene.");
+    RTX_OPTION("rtx", float, integerTexcoordScale, 1.0f / 2048.0f, "Scale applied when decoding fixed-point integer (SINT/UINT) texcoord vertex formats to floating point UVs. Engines that store UVs as 16-bit integers use an engine-specific divisor; 1/2048 fits common fixed-point conventions (Saints Row IV: TEXCOORD0 = R16G16_SINT). Adjust per game in rtx.conf if textures tile incorrectly.");
+    RTX_OPTION("rtx", float, fallbackCameraFovDegrees, 60.0f, "Vertical field of view (degrees) of the synthesized fallback camera used when no projection matrix is found in any constant buffer. Tune per game in rtx.conf when the traced image looks zoomed relative to the raster view. Clamped to [20, 140].");
 
     void Initialize();
     void OnDraw(UINT vertexCount, UINT startVertex);
@@ -84,6 +86,16 @@ namespace dxvk {
     size_t                               m_viewOffset = SIZE_MAX;
     int                                  m_viewStage  = -1;
     bool                                 m_viewColumnMajor = false;
+    // DX11_V260_PRECISE_CAMERA: the cached view location was confirmed by
+    // matching candidateView x rawProjection against a stored ViewProj block
+    // in the same cbuffer - decisive, because rigid-body checks alone cannot
+    // tell the camera view from shadow-light views, mirror cameras, bone
+    // matrices, or a stored camera-to-world.
+    bool                                 m_viewConfirmed = false;
+    // The confirmed location stores camera-to-world; invert on each re-read.
+    bool                                 m_viewInverted = false;
+    // Throttles late-session confirmation attempts to once per frame.
+    uint32_t                             m_lastViewConfirmFrame = UINT32_MAX;
 
     // Cached world matrix cbuffer location — reduces per-draw scanning.
     // World matrices change every draw but often live at the same (stage, slot, offset).

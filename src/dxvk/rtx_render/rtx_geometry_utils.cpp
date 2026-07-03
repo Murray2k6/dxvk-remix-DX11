@@ -879,6 +879,10 @@ namespace dxvk {
       args.normalFormat = input.normalBuffer.vertexFormat();
       if (!interleaver::formatConversionFloatSupported(args.normalFormat)) {
         ONCE(Logger::warn(str::format("[rtx-interleaver] Unsupported normal buffer format (", args.normalFormat, "), skipping normals")));
+        // DX11_V252: actually skip it. Leaving hasNormals set ran the decoder
+        // on a format its switch has no case for - undefined behavior on the
+        // CPU path (observed hard crash at the first accepted scene draw).
+        args.hasNormals = false;
       }
     }
     args.hasTexcoord = input.texcoordBuffer.defined();
@@ -890,6 +894,7 @@ namespace dxvk {
       args.texcoordFormat = input.texcoordBuffer.vertexFormat();
       if (!interleaver::formatConversionFloatSupported(args.texcoordFormat)) {
         ONCE(Logger::warn(str::format("[rtx-interleaver] Unsupported texcoord buffer format (", args.texcoordFormat, "), skipping texcoord")));
+        args.hasTexcoord = false; // DX11_V252: see normals note - never decode unsupported formats
       }
     }
     args.hasColor0 = input.color0Buffer.defined();
@@ -901,6 +906,7 @@ namespace dxvk {
       args.color0Format = input.color0Buffer.vertexFormat();
       if (!interleaver::formatConversionUintSupported(args.color0Format)) {
         ONCE(Logger::warn(str::format("[rtx-interleaver] Unsupported color0 buffer format (", args.color0Format, "), skipping color0")));
+        args.hasColor0 = false; // DX11_V252: see normals note - never decode unsupported formats
       }
     }
 

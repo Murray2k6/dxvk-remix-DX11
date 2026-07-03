@@ -181,7 +181,15 @@ static HRESULT STDMETHODCALLTYPE HCreateBuffer(ID3D11Device* self, const D3D11_B
 
 static HRESULT STDMETHODCALLTYPE HCreateTexture2D(ID3D11Device* self, const D3D11_TEXTURE2D_DESC* desc, const D3D11_SUBRESOURCE_DATA* data, ID3D11Texture2D** out) {
   V219NotifyResource("ID3D11Device::CreateTexture2D");
-  return oCreateTexture2D ? oCreateTexture2D(self, desc, data, out) : E_FAIL;
+  HRESULT hr_cap = oCreateTexture2D ? oCreateTexture2D(self, desc, data, out) : E_FAIL;
+  // DX11_V258_BRIDGE_TEXTURE_CONTENT_HASH: record a content-derived identity so
+  // material hashes are identical across runs (pointer hashes are ASLR-random).
+  if (SUCCEEDED(hr_cap) && desc && out && *out) {
+    dx11_capture::RecordTexture2DCreate(*out, data ? data->pSysMem : nullptr,
+      data ? data->SysMemPitch : 0u, desc->Width, desc->Height,
+      (uint32_t) desc->Format, desc->MipLevels, desc->ArraySize, desc->BindFlags);
+  }
+  return hr_cap;
 }
 
 static HRESULT STDMETHODCALLTYPE HCreateSRV(ID3D11Device* self, ID3D11Resource* resource, const D3D11_SHADER_RESOURCE_VIEW_DESC* desc, ID3D11ShaderResourceView** out) {

@@ -51,8 +51,19 @@ namespace dxvk {
       // the Remix UI (the UI renders inside the injected composite). When
       // rtx.dx11.forceInjection is enabled in dxvk.conf, inject every frame
       // that has a backbuffer.
-      if (RtxOptions::forceInjection())
+      //
+      // DX11_V253_MENU_PASSTHROUGH: even with forceInjection, a frame with no
+      // scene draws, no camera and no prior scene is a pure-UI frame (title
+      // screen / menu / loading built from screen-space quads). Injecting
+      // replaces it with an empty composite - the "menu renders black" bug.
+      // Pass such frames through so the game's own raster shows, EXCEPT while
+      // the Remix menu is open, since that menu renders inside the composite.
+      if (RtxOptions::forceInjection()) {
+        const bool remixUiOpen = RtxOptions::showUI() != UIType::None;
+        if (!hasGameSceneDraws && !hasValidCamera && !previousSceneAvailable && !remixUiOpen)
+          return false;
         return true;
+      }
 
       // First-time RTX injection needs a real scene camera. Otherwise loading
       // screens, menus, and weak viewport-fallback candidates can replace the
@@ -227,9 +238,18 @@ namespace dxvk {
     // Force the fallback light to Always so the scene is lit even if there are
     // no Remix USD light assets placed yet. Keep it moderate so it prevents
     // black scenes without blowing captured materials to flat white.
+    // Kept at Always per user requirement: DX11 games never provide explicit
+    // lights to Remix, and the scene must never go black. If a game with real
+    // Remix lights (USD mods) over-brightens, set rtx.fallbackLightMode=1
+    // (NoLightsPresent) in that game's rtx.conf instead of changing this default.
     LightManager::fallbackLightModeObject().setDeferred(LightManager::FallbackLightMode::Always, defaults);
     LightManager::fallbackLightTypeObject().setDeferred(LightManager::FallbackLightType::Distant, defaults);
-    LightManager::fallbackLightRadianceObject().setDeferred(Vector3(2.0f, 2.0f, 2.0f), defaults);
+    // DX11_V257_FALLBACK_RADIANCE: the light stays Always-on (hard user
+    // requirement - scenes must never go black), but 2.0 radiance stacked on
+    // games' own emissive/baked lighting blew scenes out to white. 1.0 keeps
+    // everything clearly visible while leaving auto-exposure headroom. Tune
+    // per game via rtx.fallbackLightRadiance in rtx.conf if a title reads dim.
+    LightManager::fallbackLightRadianceObject().setDeferred(Vector3(1.0f, 1.0f, 1.0f), defaults);
     LightManager::fallbackLightDirectionObject().setDeferred(Vector3(-0.3f, -1.0f, 0.5f), defaults);
     LightManager::fallbackLightAngleObject().setDeferred(5.0f, defaults);
 
@@ -942,10 +962,16 @@ namespace dxvk {
       score += 1000;
     else if (semanticNameStartsWith(semantic, "ATTRIBUTE"))
       score += 100;
+    // DX11_V259: tangent-frame streams share the normal formats but are NOT
+    // shading normals - picking one bends lighting on every lightmapped mesh.
+    // Remix regenerates normals when absent, so rejecting is strictly safer.
     else if (semanticNameStartsWith(semantic, "POSITION")
           || semanticNameStartsWith(semantic, "TEXCOORD")
           || semanticNameStartsWith(semantic, "COLOR")
-          || semanticNameStartsWith(semantic, "BLEND"))
+          || semanticNameStartsWith(semantic, "BLEND")
+          || semanticNameStartsWith(semantic, "TANGENT")
+          || semanticNameStartsWith(semantic, "BINORMAL")
+          || semanticNameStartsWith(semantic, "BITANGENT"))
       return std::numeric_limits<int>::min();
 
     if (semantic.componentCount >= 3)
@@ -975,10 +1001,16 @@ namespace dxvk {
       score += 1000;
     else if (semanticNameStartsWith(semantic, "ATTRIBUTE"))
       score += 80;
+    // DX11_V259: packed UBYTE4 tangent frames share COLOR0's format - misread
+    // as vertex color they tint/darken every surface (worst with
+    // vertexColorIsBakedLighting, where they masquerade as baked lighting).
     else if (semanticNameStartsWith(semantic, "POSITION")
           || semanticNameStartsWith(semantic, "TEXCOORD")
           || semanticNameStartsWith(semantic, "NORMAL")
-          || semanticNameStartsWith(semantic, "BLEND"))
+          || semanticNameStartsWith(semantic, "BLEND")
+          || semanticNameStartsWith(semantic, "TANGENT")
+          || semanticNameStartsWith(semantic, "BINORMAL")
+          || semanticNameStartsWith(semantic, "BITANGENT"))
       return std::numeric_limits<int>::min();
 
     switch (semantic.format) {
@@ -991,6 +1023,19 @@ namespace dxvk {
     return score;
   }
 
+  // DX11_V259_SKINNING_NAME_GATE: only explicitly skinning-named semantics may
+  // become bone weights/indices. The old heuristics accepted ANY unrecognized
+  // semantic name (only POSITION/TEXCOORD/NORMAL/COLOR/BLEND* were excluded),
+  // and the accepted formats overlap ordinary vertex data: lightmap UV
+  // channels with custom names (LIGHTMAPUV, LM_UV, UV1...) are float2,
+  // TANGENT/BINORMAL frames are float4/UBYTE4, and lightmap atlas page
+  // indices are UINT - all of which passed as "bone weights"/"bone indices"
+  // on static lightmapped world geometry. That flipped numBonesPerVertex >= 2
+  // and the skinning path deformed the mesh with garbage "bone matrices"
+  // scanned from the constant buffers, smearing broken copies over the scene.
+  // The harm is asymmetric: a false positive destroys static geometry, while
+  // a false negative merely skips skinning replication for a mesh the game
+  // still renders. So: strict name allow-list, no generic-name fallback.
   static int scoreBlendWeightSemantic(const D3D11RtxSemantic& semantic) {
     if (semantic.perInstance || semantic.systemValue != DxbcSystemValue::None || !isBlendWeightFormat(semantic.format))
       return std::numeric_limits<int>::min();
@@ -998,13 +1043,11 @@ namespace dxvk {
     int score = 0;
     if (semanticNameStartsWith(semantic, "BLENDWEIGHT"))
       score += 1000;
-    else if (semanticNameStartsWith(semantic, "ATTRIBUTE"))
-      score += 60;
-    else if (semanticNameStartsWith(semantic, "POSITION")
-          || semanticNameStartsWith(semantic, "TEXCOORD")
-          || semanticNameStartsWith(semantic, "NORMAL")
-          || semanticNameStartsWith(semantic, "COLOR")
-          || semanticNameStartsWith(semantic, "BLENDINDICES"))
+    else if (semanticNameStartsWith(semantic, "BONEWEIGHT")
+          || semanticNameStartsWith(semantic, "SKINWEIGHT")
+          || semanticNameStartsWith(semantic, "WEIGHT"))
+      score += 500;
+    else
       return std::numeric_limits<int>::min();
 
     if (semantic.componentCount >= 1)
@@ -1018,15 +1061,16 @@ namespace dxvk {
       return std::numeric_limits<int>::min();
 
     int score = 0;
-    if (semanticNameStartsWith(semantic, "BLENDINDICES"))
+    if (semanticNameStartsWith(semantic, "BLENDINDICES")
+     || semanticNameStartsWith(semantic, "BLENDINDEX"))
       score += 1000;
-    else if (semanticNameStartsWith(semantic, "ATTRIBUTE"))
-      score += 60;
-    else if (semanticNameStartsWith(semantic, "POSITION")
-          || semanticNameStartsWith(semantic, "TEXCOORD")
-          || semanticNameStartsWith(semantic, "NORMAL")
-          || semanticNameStartsWith(semantic, "COLOR")
-          || semanticNameStartsWith(semantic, "BLENDWEIGHT"))
+    else if (semanticNameStartsWith(semantic, "BONEINDICES")
+          || semanticNameStartsWith(semantic, "BONEINDEX")
+          || semanticNameStartsWith(semantic, "SKININDICES")
+          || semanticNameStartsWith(semantic, "SKININDEX")
+          || semanticNameStartsWith(semantic, "BONES"))
+      score += 500;
+    else
       return std::numeric_limits<int>::min();
 
     if (semantic.componentCount >= 1)
@@ -1503,6 +1547,16 @@ namespace dxvk {
       }
     }
 
+    // DX11_V260_PRECISE_CAMERA: the projection exactly as the engine stored it
+    // (convention-normalized, but BEFORE jitter strip and orientation
+    // canonicalization). Compositions against engine-stored ViewProj blocks
+    // must use these bytes: the engine multiplied with the original matrix,
+    // so inverting/composing the canonicalized one is off by the jitter terms
+    // and, worse, by a whole axis flip when canonicalization fired - a flipped
+    // "view" still passes the rigid-body test and mirrors the camera.
+    Matrix4 rawProjNormalized;
+    bool haveRawProjNormalized = false;
+
     // --- PROJECTION: validate cached location, re-scan on stale ---
     if (projSlot != UINT32_MAX && projStage >= 0 && projStage < kNumStages) {
       const auto& cbs = *stageCbs[projStage];
@@ -1553,6 +1607,9 @@ namespace dxvk {
       }
 
       if (projSlot != UINT32_MAX) {
+        rawProjNormalized = proj;
+        haveRawProjNormalized = true;
+
         // Strip TAA jitter â€” Remix does its own TAA.
         proj[2][0] = 0.0f;
         proj[2][1] = 0.0f;
@@ -1719,7 +1776,11 @@ namespace dxvk {
 
         if (acceptViewportFallback) {
           const float aspect = candidateAspect > 0.0f ? candidateAspect : fallbackReferenceAspect;
-          const float fovY   = 60.0f * (3.14159265f / 180.0f);
+          // DX11_V260: per-game tunable (rtx.fallbackCameraFovDegrees) - a
+          // fixed guess can never match every engine, and a wrong FOV makes
+          // the traced image zoom-mismatch the raster view.
+          const float fovDegrees = std::max(20.0f, std::min(140.0f, fallbackCameraFovDegrees()));
+          const float fovY   = fovDegrees * (3.14159265f / 180.0f);
           const float nearZ  = 0.1f;
           const float farZ   = 10000.0f;
           const float yScale = 1.0f / std::tan(fovY * 0.5f);
@@ -1785,8 +1846,120 @@ namespace dxvk {
           Matrix4 c = readMatrixWithConvention(ptr, m_viewOffset, cb.buffer->Desc()->ByteWidth, m_viewColumnMajor);
           Matrix4 resolvedView;
           if (resolveViewMatrixCandidate(c, resolvedView)) {
-            transforms.worldToView = resolvedView;
-            viewCacheHit = true;
+            // DX11_V260_PRECISE_CAMERA: a confirmed camera-to-world location
+            // stores the inverse of the view - flip it back on every re-read.
+            if (m_viewInverted) {
+              const Matrix4 inv = inverseAffine(resolvedView);
+              if (isFiniteMatrix(inv)) {
+                transforms.worldToView = inv;
+                viewCacheHit = true;
+              }
+            } else {
+              transforms.worldToView = resolvedView;
+              viewCacheHit = true;
+            }
+          }
+        }
+      }
+    }
+
+    // --- VIEW CONFIRMATION AGAINST A STORED VIEWPROJ (DX11_V260_PRECISE_CAMERA) ---
+    // The rigid-body test alone cannot tell the main camera view from shadow-
+    // light views, mirror/reflection cameras, bone matrices, or a stored
+    // camera-to-world (an inverse view is exactly as rigid). Engines routinely
+    // upload View, Projection AND their ViewProj product in the same cbuffer,
+    // which gives a decisive test: only the true view composed with the RAW
+    // projection reproduces the stored ViewProj. On a match, lock the location
+    // (m_viewConfirmed) so the heuristic scans can never displace it, and
+    // remember whether the stored matrix needs inversion. Both composition
+    // orders and both matrix conventions are tried, so this is layout-proof.
+    if (!m_viewConfirmed && haveRawProjNormalized
+     && projSlot != UINT32_MAX && projStage >= 0 && projStage < kNumStages) {
+      const uint32_t curFrame = m_context->m_device->getCurrentFrameId();
+      // Early session: try on every draw (the camera cbuffer may only be bound
+      // on some draws). Later: once per frame, so games that never store a
+      // ViewProj do not pay the scan forever.
+      const bool mayAttempt = curFrame < 3600u || m_lastViewConfirmFrame != curFrame;
+      const auto& cb = (*stageCbs[projStage])[projSlot];
+      if (mayAttempt && cb.buffer != nullptr) {
+        m_lastViewConfirmFrame = curFrame;
+        const auto mapped = cb.buffer->GetMappedSlice();
+        const uint8_t* ptr = reinterpret_cast<const uint8_t*>(mapped.mapPtr);
+        if (ptr) {
+          const size_t bufSize = cb.buffer->Desc()->ByteWidth;
+          auto [cfBase, cfEnd] = cbRange(cb);
+
+          auto matricesNearlyEqual = [](const Matrix4& a, const Matrix4& b) -> bool {
+            float maxRef = 1.0f;
+            float maxDiff = 0.0f;
+            for (int r = 0; r < 4; ++r) {
+              for (int c = 0; c < 4; ++c) {
+                if (!std::isfinite(a[r][c]) || !std::isfinite(b[r][c]))
+                  return false;
+                maxRef = std::max(maxRef, std::abs(b[r][c]));
+                maxDiff = std::max(maxDiff, std::abs(a[r][c] - b[r][c]));
+              }
+            }
+            return maxDiff <= 0.02f * maxRef;
+          };
+
+          // Collect rigid candidates from this cbuffer, plus each candidate's
+          // inverse (the stored matrix may be camera-to-world).
+          struct ViewCandidate {
+            Matrix4 view;
+            size_t offset;
+            bool columnMajor;
+            bool inverted;
+          };
+          ViewCandidate cands[16];
+          uint32_t candCount = 0;
+          for (size_t off = cfBase; off + 64 <= cfEnd && candCount + 2 <= 16; off += 16) {
+            if (off == projOffset) continue;
+            Matrix4 resolvedView;
+            bool resolvedColumnMajor = false;
+            if (!resolveViewAt(ptr, off, bufSize, m_columnMajor, true, resolvedView, resolvedColumnMajor))
+              continue;
+            cands[candCount++] = { resolvedView, off, resolvedColumnMajor, false };
+            const Matrix4 inv = inverseAffine(resolvedView);
+            if (isFiniteMatrix(inv))
+              cands[candCount++] = { inv, off, resolvedColumnMajor, true };
+          }
+
+          bool locked = false;
+          for (size_t off = cfBase; off + 64 <= cfEnd && candCount > 0 && !locked; off += 16) {
+            if (off == projOffset) continue;
+            for (int convIdx = 0; convIdx < 2 && !locked; ++convIdx) {
+              const Matrix4 stored = readMatrixWithConvention(
+                ptr, off, bufSize, convIdx == 0 ? m_columnMajor : !m_columnMajor);
+              // A ViewProj is a full matrix - never affine.
+              if (!isFiniteMatrix(stored) || isAffineMatrix(stored))
+                continue;
+              for (uint32_t ci = 0; ci < candCount && !locked; ++ci) {
+                if (cands[ci].offset == off) continue;
+                if (matricesNearlyEqual(cands[ci].view * rawProjNormalized, stored)
+                 || matricesNearlyEqual(rawProjNormalized * cands[ci].view, stored)) {
+                  transforms.worldToView = cands[ci].view;
+                  m_viewStage = projStage;
+                  m_viewSlot = projSlot;
+                  m_viewOffset = cands[ci].offset;
+                  m_viewColumnMajor = cands[ci].columnMajor;
+                  m_viewInverted = cands[ci].inverted;
+                  m_viewConfirmed = true;
+                  viewCacheHit = true;
+                  locked = true;
+                  static bool s_viewConfirmedLogged = false;
+                  if (!s_viewConfirmedLogged) {
+                    s_viewConfirmedLogged = true;
+                    Logger::info(str::format(
+                      "[D3D11Rtx] View matrix CONFIRMED against stored ViewProj: stage=",
+                      kStageNames[projStage], " slot=", projSlot,
+                      " viewOff=", cands[ci].offset, " vpOff=", off,
+                      cands[ci].inverted ? " [stored as camera-to-world]" : "",
+                      cands[ci].columnMajor ? " [column-major]" : " [row-major]"));
+                  }
+                }
+              }
+            }
           }
         }
       }
@@ -1956,6 +2129,47 @@ namespace dxvk {
       }
     }
 
+    // --- VIEW MATRIX: full scan of the projection's own cbuffer ---
+    // DX11_V256_VIEW_IN_PROJ_CBUFFER: engines commonly pack the whole camera
+    // block [Proj | View | inverses | ...] into ONE cbuffer, with the view at
+    // an arbitrary offset (Saints Row IV: proj at slot 2 off 0, column-major
+    // view at off 352). The broad view scan above only runs when NO projection
+    // was found, so such views were missed entirely (log: "view=NO") and the
+    // RT camera sat at the origin. Scan every offset of the projection's
+    // cbuffer, both matrix conventions, skipping the projection itself.
+    if (isIdentityExact(transforms.worldToView)
+     && projSlot != UINT32_MAX && projStage >= 0 && projStage < kNumStages) {
+      const auto& cb = (*stageCbs[projStage])[projSlot];
+      if (cb.buffer != nullptr) {
+        const auto mapped = cb.buffer->GetMappedSlice();
+        const uint8_t* ptr = reinterpret_cast<const uint8_t*>(mapped.mapPtr);
+        if (ptr) {
+          const size_t bufSize = cb.buffer->Desc()->ByteWidth;
+          auto [scanBase, scanEnd] = cbRange(cb);
+          for (size_t off = scanBase; off + 64 <= scanEnd; off += 16) {
+            if (off == projOffset) continue;
+            Matrix4 resolvedView;
+            bool resolvedColumnMajor = false;
+            if (resolveViewAt(ptr, off, bufSize, m_columnMajor, true, resolvedView, resolvedColumnMajor)) {
+              transforms.worldToView = resolvedView;
+              m_viewStage = projStage;
+              m_viewSlot = projSlot;
+              m_viewOffset = off;
+              m_viewColumnMajor = resolvedColumnMajor;
+              static bool s_projCbViewLogged = false;
+              if (!s_projCbViewLogged) {
+                s_projCbViewLogged = true;
+                Logger::info(str::format("[D3D11Rtx] View matrix found in projection cbuffer: stage=",
+                  kStageNames[projStage], " slot=", projSlot, " off=", off,
+                  resolvedColumnMajor ? " [column-major]" : " [row-major]"));
+              }
+              break;
+            }
+          }
+        }
+      }
+    }
+
     // --- VIEW MATRIX: ViewProj decomposition fallback ---
     // Many engines store a pre-multiplied ViewProj (= View * Proj) instead
     // of separate View and Projection matrices.  When we found a valid P but
@@ -1963,7 +2177,13 @@ namespace dxvk {
     //   V_candidate = M * inverse(P)
     // yield a valid view?  If so, M is ViewProj and V_candidate is our view.
     if (isIdentityExact(transforms.worldToView) && projSlot != UINT32_MAX) {
-      Matrix4 projInv = inverse(transforms.viewToProjection);
+      // DX11_V260_PRECISE_CAMERA: invert the projection AS THE ENGINE STORED
+      // IT. The engine built its ViewProj with the original matrix; inverting
+      // the jitter-stripped, orientation-canonicalized copy is off by the
+      // jitter terms and - when canonicalization flipped an axis - produces a
+      // mirrored "view" that still passes the rigid-body test.
+      Matrix4 projInv = inverse(haveRawProjNormalized ? rawProjNormalized
+                                                      : transforms.viewToProjection);
       // Sanity: inverse succeeded (non-degenerate projection).
       bool invOk = std::isfinite(projInv[0][0]) && std::isfinite(projInv[1][1])
                 && std::isfinite(projInv[2][2]) && std::isfinite(projInv[3][3]);
@@ -2020,6 +2240,15 @@ namespace dxvk {
           }
         }
       }
+    }
+
+    // DX11_V260_PRECISE_CAMERA: if a heuristic scan just cached a fresh view
+    // location (viewCacheHit false but a view was found), it was a direct,
+    // unconfirmed read - only the confirmation pass may set the inverted
+    // flag, and a re-discovered location must re-earn confirmed status.
+    if (!viewCacheHit && !isIdentityExact(transforms.worldToView)) {
+      m_viewConfirmed = false;
+      m_viewInverted = false;
     }
 
     // --- AXIS AUTO-DETECTION (camera-backed projection-derived) ---
@@ -2436,6 +2665,7 @@ namespace dxvk {
         " m[2][3]=", p[2][3],
         m_columnMajor ? " [column-major]" : " [row-major]",
         " view=", hasView ? "yes" : "NO",
+        " viewConfirmed=", m_viewConfirmed ? "yes" : "no",
         " world=", hasWorld ? "yes" : "NO"));
     }
 
@@ -3789,8 +4019,19 @@ namespace dxvk {
           : 0;
 
         // Decode a UV pair for the formats with well-defined semantics.
-        auto decodeUv = [srcFmt](const uint8_t* src, float& u, float& v) -> bool {
+        // Integer formats use rtx.integerTexcoordScale - fixed-point UVs with an
+        // engine-specific divisor (Saints Row IV: TEXCOORD0 = R16G16_SINT).
+        const float intUvScale = integerTexcoordScale();
+        auto decodeUv = [srcFmt, intUvScale](const uint8_t* src, float& u, float& v) -> bool {
           switch (srcFmt) {
+            case VK_FORMAT_R16G16_SINT: {
+              const int16_t* s = reinterpret_cast<const int16_t*>(src);
+              u = s[0] * intUvScale; v = s[1] * intUvScale;
+            } return true;
+            case VK_FORMAT_R16G16_UINT: {
+              const uint16_t* s = reinterpret_cast<const uint16_t*>(src);
+              u = s[0] * intUvScale; v = s[1] * intUvScale;
+            } return true;
             case static_cast<VkFormat>(97): { // R16G16B16A16_SFLOAT -> xy
               const uint16_t* h = reinterpret_cast<const uint16_t*>(src);
               u = decodeFloat16(h[0]); v = decodeFloat16(h[1]);
@@ -3819,7 +4060,8 @@ namespace dxvk {
 
         const uint32_t uvBytes =
           (srcFmt == VK_FORMAT_R8G8_UNORM || srcFmt == VK_FORMAT_R8G8_SNORM) ? 2u :
-          (srcFmt == VK_FORMAT_R16G16_UNORM || srcFmt == VK_FORMAT_R16G16_SNORM) ? 4u : 8u;
+          (srcFmt == VK_FORMAT_R16G16_UNORM || srcFmt == VK_FORMAT_R16G16_SNORM
+           || srcFmt == VK_FORMAT_R16G16_SINT || srcFmt == VK_FORMAT_R16G16_UINT) ? 4u : 8u;
 
         float probeU = 0.f, probeV = 0.f;
         if (srcBase != nullptr && srcStride > 0 && srcLen >= uvBytes
@@ -3854,6 +4096,51 @@ namespace dxvk {
           // same result reached less predictably.
           geo.texcoordBuffer = RasterBuffer();
           tcBuffer = RasterBuffer();
+        }
+      }
+
+      // --- COLOR0 ---
+      // The interleaver's uint path accepts ONLY B8G8R8A8_UNORM; the capture
+      // also admits R8G8B8A8_UNORM. Games that bake lighting into vertex colors
+      // (Saints Row IV: rtx.vertexColorIsBakedLighting) lose their lighting when
+      // the channel is dropped, so swizzle R/B into the interleaver-native
+      // layout instead.
+      if (geo.color0Buffer.defined()
+       && geo.color0Buffer.vertexFormat() == VK_FORMAT_R8G8B8A8_UNORM) {
+        bool colorConverted = false;
+        const uint8_t* srcBase = reinterpret_cast<const uint8_t*>(
+          geo.color0Buffer.mapPtr(geo.color0Buffer.offsetFromSlice()));
+        const uint32_t srcStride = geo.color0Buffer.stride();
+        const uint32_t srcSliceOff = geo.color0Buffer.offsetFromSlice();
+        const size_t srcLen = geo.color0Buffer.length() > srcSliceOff
+          ? geo.color0Buffer.length() - srcSliceOff
+          : 0;
+
+        if (srcBase != nullptr && srcStride > 0
+         && drawVertexCount > 0 && drawVertexCount <= kMaxFormatConvertVertices) {
+          const VkDeviceSize dstSize = VkDeviceSize(drawVertexCount) * 4u;
+          Rc<DxvkBuffer> dst = createHostVisibleHelperBuffer(m_context->m_device, dstSize, "d3d11 rtx color0 rgba->bgra");
+          uint8_t* out = dst != nullptr ? reinterpret_cast<uint8_t*>(dst->mapPtr(0)) : nullptr;
+          if (out != nullptr) {
+            for (uint32_t v = 0; v < drawVertexCount; ++v) {
+              const size_t off = size_t(v) * srcStride;
+              uint8_t r = 255, g = 255, b = 255, a = 255;
+              if (off + 4 <= srcLen) {
+                r = srcBase[off + 0]; g = srcBase[off + 1]; b = srcBase[off + 2]; a = srcBase[off + 3];
+              }
+              out[v * 4 + 0] = b; out[v * 4 + 1] = g; out[v * 4 + 2] = r; out[v * 4 + 3] = a;
+            }
+            geo.color0Buffer = RasterBuffer(DxvkBufferSlice(dst, 0, dstSize), 0, 4u, VK_FORMAT_B8G8R8A8_UNORM);
+            colBuffer = geo.color0Buffer;
+            colorConverted = true;
+          }
+        }
+
+        if (!colorConverted) {
+          // Cannot convert (unmapped/huge): drop the channel so the interleaver
+          // never sees a format it cannot decode. White fallback, never corrupt.
+          geo.color0Buffer = RasterBuffer();
+          colBuffer = RasterBuffer();
         }
       }
     }
@@ -5236,6 +5523,30 @@ namespace dxvk {
 
   void D3D11Rtx::EndFrame(const Rc<DxvkImage>& backbuffer, VkExtent2D remixViewportExtent) {
     UpdateTrackedExtents(backbuffer, remixViewportExtent);
+
+    // DX11_V255_FULLRES_TARGET_GUARD: the ray tracer's output resolution is the
+    // extent of the image injected into (injectRTX sizes everything from
+    // targetImage->info().extent). Games create helper/dummy swapchains (2x2
+    // observed in Saints Row IV) and small intermediate targets; if one of those
+    // ever reaches this point as the injection target, the whole path-traced
+    // frame renders at that tiny size instead of the monitor resolution. Never
+    // inject into a target dramatically smaller than the established output
+    // extent - skip the frame and let the full-resolution primary drive RT.
+    if (backbuffer != nullptr
+     && m_lastOutputExtent.width > 0u && m_lastOutputExtent.height > 0u) {
+      const VkExtent3D targetExtent = backbuffer->info().extent;
+      if (targetExtent.width * 2u < m_lastOutputExtent.width
+       || targetExtent.height * 2u < m_lastOutputExtent.height) {
+        static uint32_t sSmallTargetSkipLog = 0;
+        if (sSmallTargetSkipLog < 8) {
+          ++sSmallTargetSkipLog;
+          Logger::info(str::format("[D3D11Rtx] Skipping RTX injection into undersized target ",
+            targetExtent.width, "x", targetExtent.height, " (output is ",
+            m_lastOutputExtent.width, "x", m_lastOutputExtent.height, ")"));
+        }
+        return;
+      }
+    }
 
     // Let the real-camera latch decay after extended absence so menu and
     // loading-screen draws (viewport-fallback reliant) are not permanently

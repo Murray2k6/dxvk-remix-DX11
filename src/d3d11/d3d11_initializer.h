@@ -68,7 +68,13 @@ namespace dxvk {
     void InitHostVisibleTexture(
             D3D11CommonTexture*         pTexture,
       const D3D11_SUBRESOURCE_DATA*     pInitialData);
-    
+
+    // NV-DXVK start: DX11_V258_TEXTURE_HASH_STABILITY
+    void InitTextureContentHash(
+            D3D11CommonTexture*         pTexture,
+      const D3D11_SUBRESOURCE_DATA*     pInitialData);
+    // NV-DXVK end
+
     void FlushImplicit();
     void FlushInternal();
 

@@ -369,7 +369,25 @@ namespace dxvk {
         }
       }
     }
-    
+
+    // DX11_V254_MIGRATION_PERSISTS: migration used to only move values in
+    // memory. If the source layer was then saved (e.g. on exit) but the
+    // destination layer was not, the migrated option vanished from disk
+    // entirely - observed as rtx.fallbackLightMode silently dropping out of
+    // user.conf without appearing in rtx.conf. Persist both ends of the move
+    // here so no caller ordering can lose configuration.
+    if (migratedCount > 0) {
+      if (hasSaveableConfigFile()) {
+        save();
+      }
+      RtxOptionLayer* destinations[] = { s_userLayer, getRtxConfLayer() };
+      for (RtxOptionLayer* dest : destinations) {
+        if (dest != nullptr && dest != this && dest->hasSaveableConfigFile()) {
+          dest->save();
+        }
+      }
+    }
+
     return migratedCount;
   }
 
