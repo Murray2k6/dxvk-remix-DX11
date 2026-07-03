@@ -1876,10 +1876,13 @@ namespace dxvk {
     if (!m_viewConfirmed && haveRawProjNormalized
      && projSlot != UINT32_MAX && projStage >= 0 && projStage < kNumStages) {
       const uint32_t curFrame = m_context->m_device->getCurrentFrameId();
-      // Early session: try on every draw (the camera cbuffer may only be bound
-      // on some draws). Later: once per frame, so games that never store a
-      // ViewProj do not pay the scan forever.
-      const bool mayAttempt = curFrame < 3600u || m_lastViewConfirmFrame != curFrame;
+      // STRICTLY once per frame. The first version ran on every draw for the
+      // session's first 3600 frames; multiplied by in-game draw counts
+      // (hundreds+) that ground gameplay to seconds per frame the moment the
+      // player left the menu - "ray tracing freezes the game". One bounded
+      // attempt per frame confirms within seconds on engines that store a
+      // ViewProj and costs a fixed sliver on engines that never do.
+      const bool mayAttempt = m_lastViewConfirmFrame != curFrame;
       const auto& cb = (*stageCbs[projStage])[projSlot];
       if (mayAttempt && cb.buffer != nullptr) {
         m_lastViewConfirmFrame = curFrame;
@@ -1887,7 +1890,10 @@ namespace dxvk {
         const uint8_t* ptr = reinterpret_cast<const uint8_t*>(mapped.mapPtr);
         if (ptr) {
           const size_t bufSize = cb.buffer->Desc()->ByteWidth;
-          auto [cfBase, cfEnd] = cbRange(cb);
+          auto [cfBase, cfEndFull] = cbRange(cb);
+          // Camera blocks live in the first few KB of a camera cbuffer;
+          // never pay the emulator-sized deep-scan window here.
+          const size_t cfEnd = std::min(cfEndFull, cfBase + size_t(8192));
 
           auto matricesNearlyEqual = [](const Matrix4& a, const Matrix4& b) -> bool {
             float maxRef = 1.0f;
@@ -1903,17 +1909,17 @@ namespace dxvk {
             return maxDiff <= 0.02f * maxRef;
           };
 
-          // Collect rigid candidates from this cbuffer, plus each candidate's
-          // inverse (the stored matrix may be camera-to-world).
+          // Pass 1: rigid candidates from this cbuffer, plus each candidate's
+          // inverse (the stored matrix may be camera-to-world). Capped.
           struct ViewCandidate {
             Matrix4 view;
             size_t offset;
             bool columnMajor;
             bool inverted;
           };
-          ViewCandidate cands[16];
+          ViewCandidate cands[8];
           uint32_t candCount = 0;
-          for (size_t off = cfBase; off + 64 <= cfEnd && candCount + 2 <= 16; off += 16) {
+          for (size_t off = cfBase; off + 64 <= cfEnd && candCount + 2 <= 8; off += 16) {
             if (off == projOffset) continue;
             Matrix4 resolvedView;
             bool resolvedColumnMajor = false;
@@ -1925,15 +1931,37 @@ namespace dxvk {
               cands[candCount++] = { inv, off, resolvedColumnMajor, true };
           }
 
-          bool locked = false;
-          for (size_t off = cfBase; off + 64 <= cfEnd && candCount > 0 && !locked; off += 16) {
+          // Pass 2: ViewProj-shaped blocks (finite, non-affine, not a pure
+          // projection, enough non-zero structure to be a real composition),
+          // capped - then match candidates against ONLY those. This keeps the
+          // multiply count fixed instead of offsets x candidates.
+          struct VpBlock {
+            Matrix4 m;
+            size_t offset;
+          };
+          VpBlock vps[12];
+          uint32_t vpCount = 0;
+          for (size_t off = cfBase; off + 64 <= cfEnd && candCount > 0 && vpCount < 12; off += 16) {
             if (off == projOffset) continue;
-            for (int convIdx = 0; convIdx < 2 && !locked; ++convIdx) {
+            for (int convIdx = 0; convIdx < 2 && vpCount < 12; ++convIdx) {
               const Matrix4 stored = readMatrixWithConvention(
                 ptr, off, bufSize, convIdx == 0 ? m_columnMajor : !m_columnMajor);
-              // A ViewProj is a full matrix - never affine.
-              if (!isFiniteMatrix(stored) || isAffineMatrix(stored))
+              if (!isFiniteMatrix(stored) || isAffineMatrix(stored) || classifyPerspective(stored) != 0)
                 continue;
+              uint32_t nonZero = 0;
+              for (int r = 0; r < 4; ++r)
+                for (int c = 0; c < 4; ++c)
+                  nonZero += stored[r][c] != 0.0f ? 1u : 0u;
+              if (nonZero < 8)
+                continue;  // padding / vectors / mostly-zero garbage
+              vps[vpCount++] = { stored, off };
+            }
+          }
+
+          bool locked = false;
+          for (uint32_t vi = 0; vi < vpCount && !locked; ++vi) {
+            const Matrix4& stored = vps[vi].m;
+            const size_t off = vps[vi].offset;
               for (uint32_t ci = 0; ci < candCount && !locked; ++ci) {
                 if (cands[ci].offset == off) continue;
                 if (matricesNearlyEqual(cands[ci].view * rawProjNormalized, stored)
@@ -1959,7 +1987,6 @@ namespace dxvk {
                   }
                 }
               }
-            }
           }
         }
       }
