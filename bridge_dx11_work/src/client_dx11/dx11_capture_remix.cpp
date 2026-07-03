@@ -258,6 +258,12 @@ namespace {
   // Material cache keyed by bound-texture identity hash.
   std::unordered_map<uint64_t, uint32_t> g_materials;
 
+  // DX11_V258_BRIDGE_TEXTURE_CONTENT_HASH: texture resource -> content-derived
+  // identity hash, recorded at CreateTexture2D. Pointer address reuse after a
+  // release self-heals because a new texture at the same address re-records
+  // its entry at the only place a texture can come into existence.
+  std::unordered_map<ID3D11Resource*, uint64_t> g_textureHashes;
+
   std::atomic<uint64_t> g_meshesStreamed { 0 };
 
   // ===================================================================== //
@@ -300,6 +306,11 @@ namespace {
 
   // Hash the identity of the texture bound to pixel-shader SRV slot 0 so that each
   // distinct source texture maps to a distinct, stable Remix material.
+  //
+  // DX11_V258_BRIDGE_TEXTURE_CONTENT_HASH: the identity is the content hash
+  // recorded at CreateTexture2D. The old code hashed the resource POINTER,
+  // which ASLR randomizes every launch and the heap recycles within a run,
+  // so material hashes were garbled and replacements could never key on them.
   uint64_t boundTextureHash(ID3D11DeviceContext* ctx) {
     ID3D11ShaderResourceView* srv = nullptr;
     ctx->PSGetShaderResources(0, 1, &srv);
@@ -308,7 +319,25 @@ namespace {
       ID3D11Resource* res = nullptr;
       srv->GetResource(&res);
       if (res) {
-        h = fnv1a(&res, sizeof(res)); // pointer identity is stable for a resource's lifetime
+        {
+          std::lock_guard<std::recursive_mutex> lock(g_mutex);
+          auto it = g_textureHashes.find(res);
+          if (it != g_textureHashes.end()) h = it->second;
+        }
+        if (h == 0) {
+          // Texture created before our hooks installed: fall back to a
+          // desc-derived hash - weaker (same-shape textures collide) but
+          // stable across runs, unlike the pointer.
+          ID3D11Texture2D* tex2d = nullptr;
+          if (SUCCEEDED(res->QueryInterface(__uuidof(ID3D11Texture2D), (void**) &tex2d)) && tex2d) {
+            D3D11_TEXTURE2D_DESC td = {};
+            tex2d->GetDesc(&td);
+            uint32_t meta[6] = { td.Width, td.Height, (uint32_t) td.Format,
+                                 td.MipLevels, td.ArraySize, td.SampleDesc.Count };
+            h = fnv1a(meta, sizeof(meta));
+            tex2d->Release();
+          }
+        }
         res->Release();
       }
       srv->Release();
@@ -721,6 +750,44 @@ void RecordInputLayoutRelease(ID3D11InputLayout* layout) {
   if (!layout) return;
   std::lock_guard<std::recursive_mutex> lock(g_mutex);
   g_layouts.erase(layout);
+}
+
+// DX11_V258_BRIDGE_TEXTURE_CONTENT_HASH
+void RecordTexture2DCreate(ID3D11Resource* texture, const void* pMip0Data,
+                           uint32_t rowPitchBytes, uint32_t width, uint32_t height,
+                           uint32_t format, uint32_t mipLevels, uint32_t arraySize,
+                           uint32_t bindFlags) {
+  if (!texture) return;
+  // Only textures the game can sample can become Remix materials.
+  if ((bindFlags & D3D11_BIND_SHADER_RESOURCE) == 0) return;
+
+  uint64_t h = 0;
+  if (pMip0Data && rowPitchBytes) {
+    // Conservative row count: block-compressed formats store height/4 rows of
+    // blocks while plain formats store `height` rows, so height/4 rows is a
+    // safe lower bound for both - the read can never leave the caller's
+    // allocation. Capped to bound creation-time cost on huge textures.
+    const uint32_t safeRows = height >= 4 ? height / 4 : 1;
+    uint64_t total = (uint64_t) rowPitchBytes * safeRows;
+    const uint64_t kMaxHashBytes = 65536;
+    if (total > kMaxHashBytes) total = kMaxHashBytes;
+    h = fnv1a(pMip0Data, (size_t) total);
+  }
+  // Mix in structure so same-bytes/different-shape textures don't collide,
+  // and so no-initial-data textures still get a stable (if weaker, desc-only)
+  // identity instead of an ASLR-random pointer hash.
+  const uint32_t meta[5] = { width, height, format, mipLevels, arraySize };
+  h = fnv1a(meta, sizeof(meta), h ? h : 1469598103934665603ull);
+  if (h == 0) h = 1;
+
+  std::lock_guard<std::recursive_mutex> lock(g_mutex);
+  g_textureHashes[texture] = h;
+}
+
+void RecordTexture2DRelease(ID3D11Resource* texture) {
+  if (!texture) return;
+  std::lock_guard<std::recursive_mutex> lock(g_mutex);
+  g_textureHashes.erase(texture);
 }
 
 void RecordVertexShaderCreate(ID3D11VertexShader* shader, const void* bytecode, size_t length) {

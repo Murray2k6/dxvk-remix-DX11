@@ -65,6 +65,16 @@ namespace dx11_capture {
   void RecordUpdateSubresource(ID3D11Resource* resource, uint32_t dstSubresource,
                                const void* pSrcData, uint32_t srcRowPitch);
 
+  // DX11_V258_BRIDGE_TEXTURE_CONTENT_HASH: record a content-derived identity
+  // for a texture at creation so material hashes are identical across runs
+  // and GPUs. The old material key hashed the resource POINTER, which ASLR
+  // randomizes every launch - replacements could never key on it.
+  void RecordTexture2DCreate(ID3D11Resource* texture, const void* pMip0Data,
+                             uint32_t rowPitchBytes, uint32_t width, uint32_t height,
+                             uint32_t format, uint32_t mipLevels, uint32_t arraySize,
+                             uint32_t bindFlags);
+  void RecordTexture2DRelease(ID3D11Resource* texture);
+
   // Input layouts: cache the element array so draws can decode every vertex stream.
   void RecordInputLayoutCreate(ID3D11InputLayout* layout,
                                const D3D11_INPUT_ELEMENT_DESC* descs, uint32_t numElements);

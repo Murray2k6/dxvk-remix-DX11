@@ -4,6 +4,10 @@
 #include "d3d11_fence.h"
 #include "d3d11_texture.h"
 
+// NV-DXVK start: DX11_V258_TEXTURE_HASH_STABILITY
+#include "../util/xxHash/xxhash.h"
+// NV-DXVK end
+
 constexpr static uint32_t MinFlushIntervalUs = 750;
 constexpr static uint32_t IncFlushIntervalUs = 250;
 constexpr static uint32_t MaxPendingSubmits  = 6;
@@ -629,6 +633,38 @@ namespace dxvk {
       // we need to copy its contents into the image
       VkImageAspectFlags aspectMask = imageFormatInfo(pResource->GetPackedFormat())->aspectMask;
       VkImageSubresource subresource = pResource->GetSubresourceFromIndex(aspectMask, Subresource);
+
+      // NV-DXVK start: DX11_V258_TEXTURE_HASH_STABILITY
+      // Dynamic textures filled through Map/Unmap never pass the
+      // UpdateSubresource hash chokepoint, so they kept image hash 0 and the
+      // Remix material system could not key on them. Establish the identity
+      // from the first mapped upload of each subresource; later re-maps
+      // (video frames, atlas streaming) leave the hash untouched so it stays
+      // stable across frames.
+      Rc<DxvkImage> image = pResource->GetImage();
+      if (image != nullptr
+       && (aspectMask & VK_IMAGE_ASPECT_COLOR_BIT)
+       && pResource->TryMarkSubresourceHashed(Subresource)) {
+        const DxvkBufferSliceHandle mappedSlice = pResource->GetMappedSlice(Subresource);
+        if (mappedSlice.mapPtr != nullptr) {
+          constexpr size_t kMaxTexelHashBytes = 65536;
+          const size_t hashLen = std::min<size_t>(size_t(mappedSlice.length), kMaxTexelHashBytes);
+          const VkFormat packedFormat = pResource->GetPackedFormat();
+          const VkExtent3D extent = pResource->MipLevelExtent(subresource.mipLevel);
+
+          XXH64_hash_t contentHash = XXH3_64bits(mappedSlice.mapPtr, hashLen);
+          contentHash = XXH3_64bits_withSeed(&packedFormat, sizeof(packedFormat), contentHash);
+          contentHash = XXH3_64bits_withSeed(&extent, sizeof(extent), contentHash);
+          contentHash = XXH3_64bits_withSeed(&Subresource, sizeof(Subresource), contentHash);
+
+          const XXH64_hash_t existing = image->getHash();
+          if (existing == 0ull)
+            image->setHash(contentHash != 0ull ? contentHash : 1ull);
+          else
+            image->setHash(XXH64(&contentHash, sizeof(contentHash), existing));
+        }
+      }
+      // NV-DXVK end
 
       UpdateImage(pResource, &subresource, VkOffset3D { 0, 0, 0 },
         pResource->MipLevelExtent(subresource.mipLevel),

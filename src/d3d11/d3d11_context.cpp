@@ -3468,6 +3468,74 @@ namespace dxvk {
     bool dstIsImage = pDstTexture->GetMapMode() != D3D11_COMMON_TEXTURE_MAP_MODE_STAGING;
     bool srcIsImage = pSrcTexture->GetMapMode() != D3D11_COMMON_TEXTURE_MAP_MODE_STAGING;
 
+    // NV-DXVK start: DX11_V258_TEXTURE_HASH_STABILITY
+    // The staging-upload pattern (Map a STAGING texture, fill it, CopyResource
+    // into the DEFAULT texture) never passes the UpdateSubresource or Unmap
+    // hash chokepoints, so those destination textures kept image hash 0 and
+    // the Remix material system could not key on them. Establish the identity
+    // here on the first full-subresource copy into each destination
+    // subresource: from the source image's content hash when it has one, or
+    // from the staging texture's CPU-visible packed texels. Later copies into
+    // an already-hashed subresource never re-mix, keeping the hash stable
+    // across frames for render-to-texture and streaming patterns.
+    if (dstIsImage
+     && (dstFormatInfo->aspectMask & VK_IMAGE_ASPECT_COLOR_BIT)
+     && DstOffset.x == 0 && DstOffset.y == 0 && DstOffset.z == 0
+     && dstExtent.width  == dstMipExtent.width
+     && dstExtent.height == dstMipExtent.height
+     && dstExtent.depth  == dstMipExtent.depth) {
+      Rc<DxvkImage> dstImage = pDstTexture->GetImage();
+      if (dstImage != nullptr) {
+        const Rc<DxvkImage> srcImage = srcIsImage ? pSrcTexture->GetImage() : nullptr;
+        const XXH64_hash_t srcImageHash = srcImage != nullptr ? srcImage->getHash() : 0ull;
+        constexpr size_t kMaxTexelHashBytes = 32768;
+        const VkFormat dstFormat = pDstTexture->GetPackedFormat();
+
+        const uint32_t hashLayerCount = std::max(1u, pDstLayers->layerCount);
+        for (uint32_t layer = 0; layer < hashLayerCount; layer++) {
+          const UINT dstSubresource = D3D11CalcSubresource(pDstLayers->mipLevel,
+            pDstLayers->baseArrayLayer + layer, pDstTexture->Desc()->MipLevels);
+
+          XXH64_hash_t contentHash;
+          if (srcIsImage) {
+            // Image-to-image: inherit the source's content identity. A source
+            // with hash 0 (render target, unhashed intermediate) offers no
+            // stable identity - leave the subresource unmarked so a later
+            // copy from a hashed source can still establish it.
+            if (srcImageHash == 0ull)
+              continue;
+            if (!pDstTexture->TryMarkSubresourceHashed(dstSubresource))
+              continue;
+            contentHash = srcImageHash;
+          } else {
+            // Staging-to-image: hash the CPU-visible packed texels the copy
+            // will read. The packed layout is computed by DXVK from
+            // format/extent, so the bytes are identical across runs/vendors.
+            const UINT srcSubresource = D3D11CalcSubresource(pSrcLayers->mipLevel,
+              pSrcLayers->baseArrayLayer + layer, pSrcTexture->Desc()->MipLevels);
+            const DxvkBufferSliceHandle srcSlice = pSrcTexture->GetMappedSlice(srcSubresource);
+            if (srcSlice.mapPtr == nullptr)
+              continue;
+            if (!pDstTexture->TryMarkSubresourceHashed(dstSubresource))
+              continue;
+            contentHash = XXH3_64bits(srcSlice.mapPtr,
+              std::min<size_t>(size_t(srcSlice.length), kMaxTexelHashBytes));
+          }
+
+          contentHash = XXH3_64bits_withSeed(&dstFormat, sizeof(dstFormat), contentHash);
+          contentHash = XXH3_64bits_withSeed(&dstMipExtent, sizeof(dstMipExtent), contentHash);
+          contentHash = XXH3_64bits_withSeed(&dstSubresource, sizeof(dstSubresource), contentHash);
+
+          const XXH64_hash_t existing = dstImage->getHash();
+          if (existing == 0ull)
+            dstImage->setHash(contentHash != 0ull ? contentHash : 1ull);
+          else
+            dstImage->setHash(XXH64(&contentHash, sizeof(contentHash), existing));
+        }
+      }
+    }
+    // NV-DXVK end
+
     if (dstIsImage && srcIsImage) {
       EmitCs([
         cDstImage  = pDstTexture->GetImage(),
@@ -3778,8 +3846,15 @@ namespace dxvk {
     // collide. Only full-subresource uploads (no pDstBox) establish/mix the
     // identity: partial box updates are streaming region fills, not the
     // texture's identity. Depth/stencil aspects are skipped.
+    //
+    // DX11_V258_TEXTURE_HASH_STABILITY: each subresource contributes to the
+    // identity exactly once (its first full upload). Without this guard,
+    // textures re-uploaded every frame (video, streamed atlases) mixed a new
+    // value into the hash on every upload, so their material hash never
+    // stabilized - replacements and texture tags could not key on them.
     if ((formatInfo->aspectMask & VK_IMAGE_ASPECT_COLOR_BIT)
-     && pDstBox == nullptr) {
+     && pDstBox == nullptr
+     && pDstTexture->TryMarkSubresourceHashed(DstSubresource)) {
       Rc<DxvkImage> dstImage = pDstTexture->GetImage();
       if (dstImage != nullptr) {
         // Cap the bytes hashed per upload for performance (mirrors the capped
