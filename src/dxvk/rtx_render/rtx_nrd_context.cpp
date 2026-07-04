@@ -88,6 +88,15 @@ namespace nrd {
       return NULL;
     }
 
+    // DX11_V264: positive confirmation - previously only the FAILURE logged,
+    // so a log without any NRD line was ambiguous. NRD.dll was missing from
+    // every bridge package (.trex staged only d3d11/dxgi), silently disabling
+    // the denoiser = the "noisy path tracing" reports. Every log now states
+    // the denoiser status explicitly.
+    dxvk::Logger::info(dxvk::str::format(
+      "[Remix-DX11] NRD denoiser loaded: v",
+      desc.versionMajor, ".", desc.versionMinor, ".", desc.versionBuild));
+
     return hNRD;
   }
 }

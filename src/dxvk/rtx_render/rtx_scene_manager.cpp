@@ -495,8 +495,14 @@ namespace dxvk {
     // subsystem (instances vs cached geometry) plus actual Vulkan device-local memory used. Cheap
     // (every 200 frames). If a number climbs monotonically over a session, that's the leak.
     {
+      // DX11_V267_LOG_CLEANUP: the census must not fill the log forever.
+      // Dense while a session warms up (every 200 frames for the first 2000),
+      // then a once-per-~5-minutes heartbeat (every 18000 frames at 60fps)
+      // which still catches slow monotonic VRAM leaks.
       const uint32_t fid = m_device->getCurrentFrameId();
-      if (fid != 0 && (fid % 200) == 0) {
+      const bool censusDue = (fid != 0)
+        && ((fid <= 2000u && (fid % 200) == 0) || (fid % 18000) == 0);
+      if (censusDue) {
         VkDeviceSize usedBytes = 0, budgetBytes = 0;
         const DxvkAdapterMemoryInfo mem = m_device->adapter()->getMemoryHeapInfo();
         for (uint32_t i = 0; i < mem.heapCount; ++i) {

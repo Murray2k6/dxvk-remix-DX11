@@ -148,8 +148,14 @@ void GameOverlay::setInputCapture(bool enable) {
     }
 
     m_rawInputCaptured = true;
-    Logger::info(str::format("[RemixOverlay] raw input captured for menu (saved ",
-      m_savedGameRid.size(), " game registration(s))"));
+    // DX11_V267_LOG_CLEANUP: every menu toggle logged forever; the handoff is
+    // validated, so a few lines per session are enough evidence it cycles.
+    static uint32_t s_captureLogCount = 0;
+    if (s_captureLogCount < 12) {
+      ++s_captureLogCount;
+      Logger::info(str::format("[RemixOverlay] raw input captured for menu (saved ",
+        m_savedGameRid.size(), " game registration(s))"));
+    }
     return;
   }
 
@@ -183,7 +189,11 @@ void GameOverlay::setInputCapture(bool enable) {
 
   m_savedGameRid.clear();
   m_rawInputCaptured = false;
-  Logger::info("[RemixOverlay] raw input released back to the game");
+  static uint32_t s_releaseLogCount = 0;
+  if (s_releaseLogCount < 12) {
+    ++s_releaseLogCount;
+    Logger::info("[RemixOverlay] raw input released back to the game");
+  }
 }
 
 void GameOverlay::show() {

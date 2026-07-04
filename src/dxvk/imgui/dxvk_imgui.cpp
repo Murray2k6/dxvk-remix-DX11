@@ -2461,6 +2461,21 @@ namespace dxvk {
 
           // and callback on result:
           [](std::vector<ObjectPickingValue>&& objectPickingValues, std::optional<XXH64_hash_t> legacyTextureHash) {
+            // DX11_V269: log how each world-click pick resolved (capped).
+            // "Clicking the game view does nothing" previously left no trace:
+            // the popup only opens when the pick resolves to a nonzero
+            // texture hash, so a pick landing on a hash-0 texture (any
+            // texture created before content hashing existed) silently
+            // selects nothing.
+            static uint32_t s_pickLogCount = 0;
+            if (s_pickLogCount < 16) {
+              ++s_pickLogCount;
+              Logger::info(str::format("[D3D11Rtx] world-click pick resolved: values=",
+                objectPickingValues.size(),
+                " textureHash=0x", std::hex, legacyTextureHash.value_or(kEmptyHash), std::dec,
+                legacyTextureHash.value_or(kEmptyHash) == kEmptyHash
+                  ? " (EMPTY - nothing selectable at that pixel)" : ""));
+            }
             // assert(legacyTextureHash);
             // found asynchronously the legacy texture hash, place it into texture_popup; so we would highlight it
             texture_popup::g_holdingTexture.exchange(legacyTextureHash.value_or(kEmptyHash));

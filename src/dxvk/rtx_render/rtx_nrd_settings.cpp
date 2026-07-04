@@ -84,6 +84,16 @@ namespace dxvk {
       default:
         break;
     }
+    // DX11_V266_DENOISER_STRENGTH: the DX11 capture's path-traced signal is
+    // noisier than native Remix (approximate cameras, absent per-object
+    // motion vectors), so lean on the same measures Unreal's path tracer
+    // uses: heavier temporal accumulation and hard firefly suppression.
+    if (RtxOptions::dx11StrongerDenoising()) {
+      reblurSettings.maxAccumulatedFrameNum = 48;
+      reblurSettings.maxFastAccumulatedFrameNum = 3;
+      reblurSettings.enableAntiFirefly = true;
+    }
+
     reblurSettings.hitDistanceParameters.A *= RtxOptions::getMeterToWorldUnitScale();
     if (type != dxvk::DenoiserType::DirectLight) {
       reblurSettings.hitDistanceReconstructionMode = nrd::HitDistanceReconstructionMode::AREA_3X3;
@@ -183,6 +193,30 @@ namespace dxvk {
       default:
         break;
     }
+
+    // DX11_V266_DENOISER_STRENGTH: the DX11 capture's path-traced signal is
+    // noisier than native Remix (approximate cameras, absent per-object
+    // motion vectors), so under-resolves with the stock tuning. Apply the
+    // same measures Unreal's path tracer leans on: substantially longer
+    // temporal accumulation, forced firefly suppression, and one extra
+    // a-trous iteration (each iteration doubles the spatial filter
+    // footprint) with stronger luminance smoothing on the indirect signal.
+    if (RtxOptions::dx11StrongerDenoising()) {
+      relaxSettings.enableAntiFirefly = true;
+      if (type == dxvk::DenoiserType::DirectLight) {
+        relaxSettings.diffuseMaxAccumulatedFrameNum = 40;
+        relaxSettings.specularMaxAccumulatedFrameNum = 40;
+        relaxSettings.diffuseMaxFastAccumulatedFrameNum = 2;
+      } else {
+        relaxSettings.diffuseMaxAccumulatedFrameNum = 96;
+        relaxSettings.specularMaxAccumulatedFrameNum = 80;
+        relaxSettings.diffuseMaxFastAccumulatedFrameNum = 4;
+        relaxSettings.atrousIterationNum = 6;
+        relaxSettings.diffusePhiLuminance = 1.5f;
+        relaxSettings.specularPhiLuminance = 1.2f;
+      }
+    }
+
     if (type != dxvk::DenoiserType::DirectLight) {
       relaxSettings.hitDistanceReconstructionMode = nrd::HitDistanceReconstructionMode::AREA_3X3;
     }

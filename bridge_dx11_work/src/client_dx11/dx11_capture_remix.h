@@ -43,6 +43,7 @@ struct ID3D11Resource;
 struct ID3D11InputLayout;
 struct ID3D11VertexShader;
 struct ID3D11DeviceContext;
+struct IDXGISwapChain;
 struct D3D11_INPUT_ELEMENT_DESC;
 
 #include <cstdint>
@@ -92,8 +93,14 @@ namespace dx11_capture {
   void CaptureDraw(ID3D11DeviceContext* context, uint32_t vertexCount,
                    uint32_t startVertexLocation);
 
-  // Frame boundary (hooked Present).
-  void OnPresent();
+  // Frame boundary (hooked Present). DX11_V265_BRIDGE_PRESENT_CAMERA: sends
+  // RemixApi_Startup (once, with the game window HWND from the swapchain),
+  // RemixApi_SetupCamera (per frame, from the camera scanned out of the bound
+  // VS constant buffers at draw time), and RemixApi_Present (per frame, with
+  // the game HWND as override so Remix presents INTO the game window instead
+  // of a secondary one). Without this pump the server never starts the Remix
+  // runtime and nothing path-traced reaches the screen for x86 bridge games.
+  void OnPresent(IDXGISwapChain* swapChain);
 
   // True once the bridge IPC handshake is up and streaming is enabled.
   bool IsStreamingEnabled();
