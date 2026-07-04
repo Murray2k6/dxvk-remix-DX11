@@ -42,16 +42,29 @@ namespace dxvk {
   }
 
   void RtxInitializer::initialize() {
+    // DX11_V267_BOOT_MARKER: the very first line of Remix initialization at
+    // game boot. Everything before the first pre-existing [init] line (RTXIO
+    // init, texture-manager async start, graphics-preset device queries) ran
+    // silently - a boot that froze or crashed in that window showed nothing
+    // from the initializer at all. With this marker plus the step lines
+    // below, a hung-boot log pinpoints the exact last-completed step.
+    Logger::info(str::format("[Remix-DX11][init] BEGIN RtxInitializer::initialize() game='",
+      env::getExeName(), "' pid=", GetCurrentProcessId()));
+
     ShaderManager::getInstance()->setDevice(m_device);
 
 #ifdef WITH_RTXIO
     if (RtxIo::enabled()) {
+      Logger::info("[Remix-DX11][init] initializing RTXIO...");
       RtxIo::get().initialize(m_device);
     }
     // start async before starting asset loading
+    Logger::info("[Remix-DX11][init] starting texture manager async worker...");
     DxvkObjects* pCommon = m_device->getCommon();
     pCommon->getTextureManager().startAsync();
 #endif
+
+    Logger::info("[Remix-DX11][init] applying graphics/upscaler/raytrace-mode presets...");
 
     // Initialize RTX settings presets
     // Todo: Improve this preset override functionality [REMIX-1482]

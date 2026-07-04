@@ -140,6 +140,10 @@ static HRESULT STDMETHODCALLTYPE HSwapPresent(IDXGISwapChain* self, UINT syncInt
       V219Log("capture", msg);
     }
     dx11_bridge_client::EnsureServer();
+    // DX11_V265_BRIDGE_PRESENT_CAMERA: frame boundary - send Startup (once,
+    // game HWND), SetupCamera and Present to the server so the Remix runtime
+    // attaches to and presents INTO the game window every frame.
+    dx11_capture::OnPresent(self);
     gV219InsideHook = false;
   }
   return oSwapPresent ? oSwapPresent(self, syncInterval, flags) : DXGI_ERROR_DEVICE_REMOVED;

@@ -31,6 +31,11 @@
 #include <vector>
 #include <set>
 
+// DX11_V263_CRASH_FILTER_SAFE: defined in d3d11_main.cpp. Re-installs the
+// log-only, chained unhandled-exception filter so a game crash handler
+// installed after ours cannot silently eat the crash signature.
+void RemixReassertCrashSignatureFilter();
+
 namespace dxvk {
 
   namespace {
@@ -697,7 +702,10 @@ namespace dxvk {
       // Fixed-point integer UVs: decoded to float by the interleaver with
       // rtx.integerTexcoordScale (Saints Row IV: TEXCOORD0 = R16G16_SINT).
       || format == VK_FORMAT_R16G16_SINT
-      || format == VK_FORMAT_R16G16_UINT;
+      || format == VK_FORMAT_R16G16_UINT
+      // DX11_V269: 32-bit fixed-point UVs, same scale treatment.
+      || format == VK_FORMAT_R32G32_SINT
+      || format == VK_FORMAT_R32G32_UINT;
   }
 
   static bool isPositionFormat(VkFormat format) {
@@ -756,7 +764,13 @@ namespace dxvk {
   static bool isColorFormat(VkFormat format) {
     return format == VK_FORMAT_B8G8R8A8_UNORM
         || format == VK_FORMAT_R8G8B8A8_UNORM
-        || format == VK_FORMAT_R32G32B32A32_SFLOAT;
+        || format == VK_FORMAT_R32G32B32A32_SFLOAT
+        // DX11_V268_VERTEX_COLOR_FORMATS: half4/unorm16 vertex colors -
+        // accepted only under an explicit COLOR semantic name (the scorer
+        // rejects them for generic names since these formats also carry
+        // normals/tangents in many layouts).
+        || format == VK_FORMAT_R16G16B16A16_UNORM
+        || format == VK_FORMAT_R16G16B16A16_SFLOAT;
   }
 
   static bool isBlendWeightFormat(VkFormat format) {
@@ -848,8 +862,10 @@ namespace dxvk {
     if (semantic.perInstance || semantic.systemValue != DxbcSystemValue::None || !isSupportedTexcoordFormat(semantic.format) || semantic.componentCount < 2)
       return std::numeric_limits<int>::min();
 
-    if (semantic.componentCount > 3)
-      return std::numeric_limits<int>::min();
+    // DX11_V269: 4-component texcoords are real UVs - engines pack two UV
+    // sets into one float4 (xy = uv0, zw = uv1). Rejecting them dropped the
+    // texcoord entirely (textures with no UVs = flat albedo); accept and use
+    // xy, just score below dedicated 2-component streams.
 
     int score = 0;
     if (semanticNameStartsWith(semantic, "TEXCOORD")
@@ -873,6 +889,8 @@ namespace dxvk {
       score += 220;
     else if (semantic.componentCount == 3)
       score += 100;
+    else if (semantic.componentCount == 4)
+      score += 40;  // DX11_V269: packed uv0+uv1 float4 - xy is used
 
     if (semantic.index == 0)
       score += 70;
@@ -904,9 +922,6 @@ namespace dxvk {
     if (semantic.perInstance || semantic.systemValue != DxbcSystemValue::None || !isSupportedTexcoordFormat(semantic.format) || semantic.componentCount < 2)
       return std::numeric_limits<int>::min();
 
-    if (semantic.componentCount > 3)
-      return std::numeric_limits<int>::min();
-
     if (semanticNameStartsWith(semantic, "POSITION")
      || semanticNameStartsWith(semantic, "NORMAL")
      || semanticNameStartsWith(semantic, "BLEND")
@@ -926,6 +941,8 @@ namespace dxvk {
       score += 240;
     else if (semantic.componentCount == 3)
       score += 100;
+    else if (semantic.componentCount == 4)
+      score += 40;  // DX11_V269: packed uv0+uv1 float4 - xy is used
 
     if (semantic.index == 0)
       score += 50;
@@ -994,6 +1011,13 @@ namespace dxvk {
 
   static int scoreColorSemantic(const D3D11RtxSemantic& semantic) {
     if (semantic.perInstance || semantic.systemValue != DxbcSystemValue::None || !isColorFormat(semantic.format))
+      return std::numeric_limits<int>::min();
+
+    // DX11_V268: 16-bit-per-channel formats double as normal/tangent storage
+    // in many vertex layouts; only an explicit COLOR name may claim them.
+    if ((semantic.format == VK_FORMAT_R16G16B16A16_UNORM
+      || semantic.format == VK_FORMAT_R16G16B16A16_SFLOAT)
+     && !semanticNameStartsWith(semantic, "COLOR"))
       return std::numeric_limits<int>::min();
 
     int score = 0;
@@ -1481,9 +1505,14 @@ namespace dxvk {
     // stage+slot+offset logged once) so we can see where the game stores world / view / projection
     // and fix the extraction. Captures both the menu and the 3D-scene matrices as they first appear.
     {
+      // DX11_V267_LOG_CLEANUP: this dump diagnosed the camera-extraction bugs
+      // (V240..V260, all fixed). It cost a per-draw cbuffer scan and 64 log
+      // lines every session for an issue that no longer exists. Now opt-in:
+      // set DXVK_REMIX_MTXDUMP=1 when debugging a new game's matrices.
+      static const bool s_mtxDumpEnabled = env::getEnvVar("DXVK_REMIX_MTXDUMP") == "1";
       static std::set<uint64_t> s_dumpedMatrixLocs;
       static uint32_t s_dumpLogged = 0;
-      if (s_dumpLogged < 64) {
+      if (s_mtxDumpEnabled && s_dumpLogged < 64) {
         for (int si = 0; si < kNumStages; ++si) {
           const auto& cbsD = *stageCbs[si];
           for (uint32_t slot = 0; slot < D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT; ++slot) {
@@ -3722,14 +3751,25 @@ namespace dxvk {
     RasterBuffer skinIndexBuffer;
     uint32_t skinBonesPerVertex = 0;
 
-    // Color0: the interleaver converts BGRA and RGBA packed-byte formats.
-    // Both B8G8R8A8_UNORM (D3D11 D3DCOLOR) and R8G8B8A8_UNORM (D3D11) are
-    // supported â€” the interleaver swaps R/B for RGBA.  Float vertex color
-    // formats are not supported; Remix defaults to white when color0 is absent.
+    // Color0: the interleaver's uint path accepts ONLY B8G8R8A8_UNORM, but the
+    // capture admits the formats games actually declare for COLOR0 and the
+    // DX11_V268 normalization below converts them all into that layout:
+    // packed bytes (BGRA/RGBA), float4 (very common in modern engines - was
+    // silently dropped, washing baked lighting/tinting out to white), half4
+    // and unorm16 (COLOR-named only; those formats double as normal/tangent
+    // storage under other names).
     RasterBuffer colBuffer;
-    if (colSem && (colSem->format == VK_FORMAT_B8G8R8A8_UNORM
-                || colSem->format == VK_FORMAT_R8G8B8A8_UNORM)) {
-      colBuffer = makeVertexBuffer(colSem);
+    if (colSem) {
+      const VkFormat cf = colSem->format;
+      const bool packedByteColor = cf == VK_FORMAT_B8G8R8A8_UNORM
+                                || cf == VK_FORMAT_R8G8B8A8_UNORM;
+      const bool wideColor = cf == VK_FORMAT_R32G32B32A32_SFLOAT
+                          || ((cf == VK_FORMAT_R16G16B16A16_UNORM
+                            || cf == VK_FORMAT_R16G16B16A16_SFLOAT)
+                           && semanticNameStartsWith(*colSem, "COLOR"));
+      if (packedByteColor || wideColor) {
+        colBuffer = makeVertexBuffer(colSem);
+      }
     }
 
     RasterBuffer idxBuffer;
@@ -4080,6 +4120,21 @@ namespace dxvk {
               const int16_t* s = reinterpret_cast<const int16_t*>(src);
               u = std::max(s[0] / 32767.0f, -1.0f); v = std::max(s[1] / 32767.0f, -1.0f);
             } return true;
+            // DX11_V269: previously accepted by the capture but never decoded
+            // here NOR supported by the interleaver - the channel was dropped
+            // and textures rendered with no UVs (flat albedo).
+            case VK_FORMAT_R8G8B8A8_SNORM: { // xy
+              const int8_t* s = reinterpret_cast<const int8_t*>(src);
+              u = std::max(s[0] / 127.0f, -1.0f); v = std::max(s[1] / 127.0f, -1.0f);
+            } return true;
+            case VK_FORMAT_R32G32_SINT: {
+              const int32_t* s = reinterpret_cast<const int32_t*>(src);
+              u = s[0] * intUvScale; v = s[1] * intUvScale;
+            } return true;
+            case VK_FORMAT_R32G32_UINT: {
+              const uint32_t* s = reinterpret_cast<const uint32_t*>(src);
+              u = s[0] * intUvScale; v = s[1] * intUvScale;
+            } return true;
             default:
               return false;
           }
@@ -4088,7 +4143,8 @@ namespace dxvk {
         const uint32_t uvBytes =
           (srcFmt == VK_FORMAT_R8G8_UNORM || srcFmt == VK_FORMAT_R8G8_SNORM) ? 2u :
           (srcFmt == VK_FORMAT_R16G16_UNORM || srcFmt == VK_FORMAT_R16G16_SNORM
-           || srcFmt == VK_FORMAT_R16G16_SINT || srcFmt == VK_FORMAT_R16G16_UINT) ? 4u : 8u;
+           || srcFmt == VK_FORMAT_R16G16_SINT || srcFmt == VK_FORMAT_R16G16_UINT
+           || srcFmt == VK_FORMAT_R8G8B8A8_SNORM) ? 4u : 8u;
 
         float probeU = 0.f, probeV = 0.f;
         if (srcBase != nullptr && srcStride > 0 && srcLen >= uvBytes
@@ -4127,13 +4183,23 @@ namespace dxvk {
       }
 
       // --- COLOR0 ---
-      // The interleaver's uint path accepts ONLY B8G8R8A8_UNORM; the capture
-      // also admits R8G8B8A8_UNORM. Games that bake lighting into vertex colors
-      // (Saints Row IV: rtx.vertexColorIsBakedLighting) lose their lighting when
-      // the channel is dropped, so swizzle R/B into the interleaver-native
-      // layout instead.
+      // DX11_V268_VERTEX_COLOR_FORMATS (supersedes the RGBA8-only V252 swap):
+      // the interleaver's uint path accepts ONLY B8G8R8A8_UNORM. Convert every
+      // other admitted COLOR0 format into that layout - RGBA8 (byte swizzle),
+      // float4 (was silently dropped: games that bake lighting/tinting into
+      // vertex colors washed out to white), half4 and unorm16. B8G8R8A8 is
+      // the D3DCOLOR byte order the Remix shaders decode, matching what the
+      // native d3d11 path always fed them.
       if (geo.color0Buffer.defined()
-       && geo.color0Buffer.vertexFormat() == VK_FORMAT_R8G8B8A8_UNORM) {
+       && geo.color0Buffer.vertexFormat() != VK_FORMAT_B8G8R8A8_UNORM) {
+        const VkFormat colFmt = geo.color0Buffer.vertexFormat();
+        const uint32_t colElemBytes =
+            colFmt == VK_FORMAT_R8G8B8A8_UNORM      ? 4u
+          : colFmt == VK_FORMAT_R16G16B16A16_UNORM  ? 8u
+          : colFmt == VK_FORMAT_R16G16B16A16_SFLOAT ? 8u
+          : colFmt == VK_FORMAT_R32G32B32A32_SFLOAT ? 16u
+          : 0u;
+
         bool colorConverted = false;
         const uint8_t* srcBase = reinterpret_cast<const uint8_t*>(
           geo.color0Buffer.mapPtr(geo.color0Buffer.offsetFromSlice()));
@@ -4143,17 +4209,46 @@ namespace dxvk {
           ? geo.color0Buffer.length() - srcSliceOff
           : 0;
 
-        if (srcBase != nullptr && srcStride > 0
+        if (colElemBytes != 0 && srcBase != nullptr && srcStride > 0
          && drawVertexCount > 0 && drawVertexCount <= kMaxFormatConvertVertices) {
           const VkDeviceSize dstSize = VkDeviceSize(drawVertexCount) * 4u;
-          Rc<DxvkBuffer> dst = createHostVisibleHelperBuffer(m_context->m_device, dstSize, "d3d11 rtx color0 rgba->bgra");
+          Rc<DxvkBuffer> dst = createHostVisibleHelperBuffer(m_context->m_device, dstSize, "d3d11 rtx color0 to bgra");
           uint8_t* out = dst != nullptr ? reinterpret_cast<uint8_t*>(dst->mapPtr(0)) : nullptr;
           if (out != nullptr) {
+            auto toByte = [](float c) -> uint8_t {
+              if (!std::isfinite(c)) c = 1.0f;
+              c = c < 0.0f ? 0.0f : (c > 1.0f ? 1.0f : c);
+              return static_cast<uint8_t>(c * 255.0f + 0.5f);
+            };
             for (uint32_t v = 0; v < drawVertexCount; ++v) {
               const size_t off = size_t(v) * srcStride;
               uint8_t r = 255, g = 255, b = 255, a = 255;
-              if (off + 4 <= srcLen) {
-                r = srcBase[off + 0]; g = srcBase[off + 1]; b = srcBase[off + 2]; a = srcBase[off + 3];
+              if (off + colElemBytes <= srcLen) {
+                const uint8_t* src = srcBase + off;
+                switch (colFmt) {
+                  case VK_FORMAT_R8G8B8A8_UNORM:
+                    r = src[0]; g = src[1]; b = src[2]; a = src[3];
+                    break;
+                  case VK_FORMAT_R16G16B16A16_UNORM: {
+                    const uint16_t* u = reinterpret_cast<const uint16_t*>(src);
+                    r = uint8_t(u[0] >> 8); g = uint8_t(u[1] >> 8);
+                    b = uint8_t(u[2] >> 8); a = uint8_t(u[3] >> 8);
+                    break;
+                  }
+                  case VK_FORMAT_R16G16B16A16_SFLOAT: {
+                    const uint16_t* h = reinterpret_cast<const uint16_t*>(src);
+                    r = toByte(decodeFloat16(h[0])); g = toByte(decodeFloat16(h[1]));
+                    b = toByte(decodeFloat16(h[2])); a = toByte(decodeFloat16(h[3]));
+                    break;
+                  }
+                  case VK_FORMAT_R32G32B32A32_SFLOAT: {
+                    const float* f = reinterpret_cast<const float*>(src);
+                    r = toByte(f[0]); g = toByte(f[1]); b = toByte(f[2]); a = toByte(f[3]);
+                    break;
+                  }
+                  default:
+                    break;
+                }
               }
               out[v * 4 + 0] = b; out[v * 4 + 1] = g; out[v * 4 + 2] = r; out[v * 4 + 3] = a;
             }
@@ -4164,8 +4259,9 @@ namespace dxvk {
         }
 
         if (!colorConverted) {
-          // Cannot convert (unmapped/huge): drop the channel so the interleaver
-          // never sees a format it cannot decode. White fallback, never corrupt.
+          // Cannot convert (unmapped/huge/unknown): drop the channel so the
+          // interleaver never sees a format it cannot decode. White fallback,
+          // never corrupt.
           geo.color0Buffer = RasterBuffer();
           colBuffer = RasterBuffer();
         }
@@ -5549,6 +5645,15 @@ namespace dxvk {
   }
 
   void D3D11Rtx::EndFrame(const Rc<DxvkImage>& backbuffer, VkExtent2D remixViewportExtent) {
+    // DX11_V263_CRASH_FILTER_SAFE: games install their own unhandled-exception
+    // filter during startup, replacing ours; periodically re-assert so the
+    // crash signature is always logged (theirs still runs via the chain).
+    {
+      static uint32_t s_filterReassertCounter = 0;
+      if ((s_filterReassertCounter++ & 255u) == 0u)
+        ::RemixReassertCrashSignatureFilter();
+    }
+
     UpdateTrackedExtents(backbuffer, remixViewportExtent);
 
     // DX11_V255_FULLRES_TARGET_GUARD: the ray tracer's output resolution is the

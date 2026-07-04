@@ -19,80 +19,72 @@
 namespace {
   HMODULE g_d3d11Module = nullptr;
 
-  // DX11_V261_CRASH_SIGNATURE_LOG
-  // Testers' hard crashes reach us as a log that simply stops: the crash
-  // record (faulting module + offset) only exists in the Windows event log
-  // on THEIR machine. Capture the signature ourselves with a vectored
-  // exception handler that LOGS hardware exceptions into the Remix log and
-  // always returns EXCEPTION_CONTINUE_SEARCH - it never handles anything,
-  // so game crash handlers, SEH, and WER behave exactly as before. The
-  // logged module+offset resolves against this build's PDB (cdb `ln`).
-  // Capped so intentionally-caught hardware exceptions (DRM etc.) cannot
-  // spam the log; C++ exceptions (0xE06D7363) are ignored entirely.
-  std::atomic<uint32_t> g_crashLogCount = { 0 };
-  PVOID g_crashLogHandle = nullptr;
+  // DX11_V263_CRASH_FILTER_SAFE (replaces the V261 vectored handler)
+  // V261 used AddVectoredExceptionHandler(1): it fired on EVERY hardware
+  // exception in the process, including exceptions games and DRM wrappers
+  // throw AND CATCH by design during startup (guarded memory probes,
+  // unpacker stubs). Running file I/O, heap allocation, and module lookups
+  // inside those contexts (loader lock, heap lock, DRM stub) can hang or
+  // kill the game before it ever creates a device - "no ray tracing and no
+  // logs". This filter instead installs via SetUnhandledExceptionFilter:
+  // it runs ONLY for truly fatal, unhandled exceptions - zero interference
+  // with a running game - logs the signature (module + offset, resolvable
+  // against this build's PDB), then forwards to whatever filter the game
+  // had installed so its own crash handling and WER behave exactly as
+  // before.
+  std::atomic<LPTOP_LEVEL_EXCEPTION_FILTER> g_prevCrashFilter = { nullptr };
+  std::atomic<bool> g_crashFilterInstalled = { false };
+  std::atomic<bool> g_inCrashFilter = { false };
 
-  bool isHardwareExceptionCode(DWORD code) {
-    switch (code) {
-      case EXCEPTION_ACCESS_VIOLATION:
-      case EXCEPTION_ARRAY_BOUNDS_EXCEEDED:
-      case EXCEPTION_DATATYPE_MISALIGNMENT:
-      case EXCEPTION_ILLEGAL_INSTRUCTION:
-      case EXCEPTION_IN_PAGE_ERROR:
-      case EXCEPTION_INT_DIVIDE_BY_ZERO:
-      case EXCEPTION_PRIV_INSTRUCTION:
-      case EXCEPTION_STACK_OVERFLOW:
-        return true;
-      default:
-        return false;
-    }
-  }
+  LONG WINAPI remixUnhandledCrashFilter(EXCEPTION_POINTERS* xp) {
+    // Recursion guard: if logging itself faults, step aside immediately.
+    bool expected = false;
+    const bool firstEntry = g_inCrashFilter.compare_exchange_strong(expected, true);
 
-  LONG CALLBACK remixCrashSignatureLogger(EXCEPTION_POINTERS* xp) {
-    if (xp == nullptr || xp->ExceptionRecord == nullptr)
-      return EXCEPTION_CONTINUE_SEARCH;
+    if (firstEntry && xp != nullptr && xp->ExceptionRecord != nullptr) {
+      const DWORD code = xp->ExceptionRecord->ExceptionCode;
+      void* addr = xp->ExceptionRecord->ExceptionAddress;
 
-    const DWORD code = xp->ExceptionRecord->ExceptionCode;
-    if (!isHardwareExceptionCode(code))
-      return EXCEPTION_CONTINUE_SEARCH;
+      char modPath[MAX_PATH] = {};
+      uintptr_t offset = 0;
+      HMODULE mod = nullptr;
+      if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS
+                           | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                             reinterpret_cast<LPCWSTR>(addr), &mod) && mod != nullptr) {
+        GetModuleFileNameA(mod, modPath, MAX_PATH);
+        offset = reinterpret_cast<uintptr_t>(addr) - reinterpret_cast<uintptr_t>(mod);
+      }
 
-    if (g_crashLogCount.fetch_add(1, std::memory_order_relaxed) >= 8)
-      return EXCEPTION_CONTINUE_SEARCH;
+      // Access violations carry the access type and target address.
+      uintptr_t avType = 0;
+      uintptr_t avTarget = 0;
+      const bool isAv = (code == EXCEPTION_ACCESS_VIOLATION || code == EXCEPTION_IN_PAGE_ERROR)
+                     && xp->ExceptionRecord->NumberParameters >= 2;
+      if (isAv) {
+        avType = static_cast<uintptr_t>(xp->ExceptionRecord->ExceptionInformation[0]);
+        avTarget = static_cast<uintptr_t>(xp->ExceptionRecord->ExceptionInformation[1]);
+      }
 
-    void* addr = xp->ExceptionRecord->ExceptionAddress;
-    char modPath[MAX_PATH] = {};
-    uintptr_t offset = 0;
-    HMODULE mod = nullptr;
-    if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS
-                         | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                           reinterpret_cast<LPCWSTR>(addr), &mod) && mod != nullptr) {
-      GetModuleFileNameA(mod, modPath, MAX_PATH);
-      offset = reinterpret_cast<uintptr_t>(addr) - reinterpret_cast<uintptr_t>(mod);
-    }
+      std::string avInfo;
+      if (isAv) {
+        avInfo = dxvk::str::format(
+          avType == 1 ? " write-to=0x" : (avType == 8 ? " exec-at=0x" : " read-from=0x"),
+          std::hex, avTarget);
+      }
 
-    // Access violations carry the access type and target address.
-    uintptr_t avType = 0;
-    uintptr_t avTarget = 0;
-    const bool isAv = (code == EXCEPTION_ACCESS_VIOLATION || code == EXCEPTION_IN_PAGE_ERROR)
-                   && xp->ExceptionRecord->NumberParameters >= 2;
-    if (isAv) {
-      avType = static_cast<uintptr_t>(xp->ExceptionRecord->ExceptionInformation[0]);
-      avTarget = static_cast<uintptr_t>(xp->ExceptionRecord->ExceptionInformation[1]);
-    }
+      dxvk::Logger::err(dxvk::str::format(
+        "[Remix-DX11][crash] UNHANDLED exception code=0x", std::hex, code,
+        " addr=0x", reinterpret_cast<uintptr_t>(addr),
+        " module=", modPath[0] ? modPath : "<unknown>",
+        " offset=0x", offset, avInfo));
 
-    std::string avInfo;
-    if (isAv) {
-      avInfo = dxvk::str::format(
-        avType == 1 ? " write-to=0x" : (avType == 8 ? " exec-at=0x" : " read-from=0x"),
-        std::hex, avTarget);
+      g_inCrashFilter.store(false, std::memory_order_relaxed);
     }
 
-    dxvk::Logger::err(dxvk::str::format(
-      "[Remix-DX11][crash] exception code=0x", std::hex, code,
-      " addr=0x", reinterpret_cast<uintptr_t>(addr),
-      " module=", modPath[0] ? modPath : "<unknown>",
-      " offset=0x", offset, avInfo));
-
+    // Forward to the game's own filter so its crash handling still runs.
+    LPTOP_LEVEL_EXCEPTION_FILTER prev = g_prevCrashFilter.load(std::memory_order_relaxed);
+    if (prev != nullptr && prev != &remixUnhandledCrashFilter)
+      return prev(xp);
     return EXCEPTION_CONTINUE_SEARCH;
   }
 
@@ -119,6 +111,19 @@ namespace {
   }
 }
 
+// DX11_V263_CRASH_FILTER_SAFE: (re)install the log-only unhandled-exception
+// filter. Games install their own filter during startup (Unity CrashHandler,
+// launcher SEH), which would replace ours and silently eat the crash
+// signature; calling this periodically (EndFrame) keeps ours last-installed
+// while chaining to theirs, so both run. External linkage - called from
+// d3d11_rtx.cpp.
+void RemixReassertCrashSignatureFilter() {
+  LPTOP_LEVEL_EXCEPTION_FILTER prev = SetUnhandledExceptionFilter(&remixUnhandledCrashFilter);
+  if (prev != nullptr && prev != &remixUnhandledCrashFilter)
+    g_prevCrashFilter.store(prev, std::memory_order_relaxed);
+  g_crashFilterInstalled.store(true, std::memory_order_relaxed);
+}
+
 // Ensure all Remix runtime DLLs (dxgi, NRD, DLSS, etc.) resolve from the
 // game directory, not System32.  Launchers (Rockstar, Epic, Steam) often
 // change CWD or use restricted search paths.
@@ -139,7 +144,7 @@ void logRemixDx11BuildBanner() {
     return;
   dxvk::Logger::info("=====================================================");
   dxvk::Logger::info(dxvk::str::format("[Remix-DX11] build stamp: ", __DATE__, " ", __TIME__));
-  dxvk::Logger::info("[Remix-DX11] fixes: nrcVendorFallback texcoordSINT SR4viewport budgetHeadroom inputSeparation grayPlaceholder revertedDLSSGuard initStepLogging allVendorPrewarmSkip anyGameAlbedoFix significanceCullingOptIn gpuSceneUI remixapiExport taauDefaultAllVendors rtxOptionsNullGuard rtxOptionsRootCreate intelFseSwapchainFix steamOverlayVkDisable wsiSelfDeadlockPump vramLeakDiag restoreIconicWindow intelFifoPresent intelForceFSEallowed gdiInteropPresent frameLatencyHandleGuard noUvFlatAlbedo baseVertexGeometry gpuSceneBBox perVendorPresent gdiWsiFallback nrcOptIn nvidiaPrewarm rawInputHandoff noInfiniteWaits nonblockingRtPipelines tlasFirewall interleaverFormatNorm dynamicVbSnapshot color0Norm interleaverSkipGuard intUvDecode menuPassthrough migrationPersists fullresTargetGuard viewInProjCbuffer fallbackRadianceTame textureHashStability bridgeTextureContentHash skinningNameGate preciseCamera crashSignatureLog vpConfirmOncePerFrame");
+  dxvk::Logger::info("[Remix-DX11] fixes: nrcVendorFallback texcoordSINT SR4viewport budgetHeadroom inputSeparation grayPlaceholder revertedDLSSGuard initStepLogging allVendorPrewarmSkip anyGameAlbedoFix significanceCullingOptIn gpuSceneUI remixapiExport taauDefaultAllVendors rtxOptionsNullGuard rtxOptionsRootCreate intelFseSwapchainFix steamOverlayVkDisable wsiSelfDeadlockPump vramLeakDiag restoreIconicWindow intelFifoPresent intelForceFSEallowed gdiInteropPresent frameLatencyHandleGuard noUvFlatAlbedo baseVertexGeometry gpuSceneBBox perVendorPresent gdiWsiFallback nrcOptIn nvidiaPrewarm rawInputHandoff noInfiniteWaits nonblockingRtPipelines tlasFirewall interleaverFormatNorm dynamicVbSnapshot color0Norm interleaverSkipGuard intUvDecode menuPassthrough migrationPersists fullresTargetGuard viewInProjCbuffer fallbackRadianceTame textureHashStability bridgeTextureContentHash skinningNameGate preciseCamera vpConfirmOncePerFrame crashFilterSafe nrdDenoiserPayload strongerDenoising bridgePresentCamera bootMarkerLogCleanup vertexColorFormats texcoordFormats pickResolveLog");
   dxvk::Logger::info("[Remix-DX11] if this line is absent or older than your last build, the game loaded a STALE d3d11.dll.");
   dxvk::Logger::info("=====================================================");
 }
@@ -147,11 +152,10 @@ void logRemixDx11BuildBanner() {
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
   if (reason == DLL_PROCESS_ATTACH) {
     g_d3d11Module = hModule;
-    // DX11_V261_CRASH_SIGNATURE_LOG: first-position vectored handler so the
-    // signature is logged even when the game's own crash handler (Unity
-    // CrashHandler, launcher SEH) consumes the exception afterwards.
-    if (g_crashLogHandle == nullptr)
-      g_crashLogHandle = AddVectoredExceptionHandler(1, remixCrashSignatureLogger);
+    // DX11_V263_CRASH_FILTER_SAFE: unhandled-only, chained - never fires
+    // during normal operation, so it cannot interfere with game/DRM startup
+    // the way the V261 vectored handler could.
+    RemixReassertCrashSignatureFilter();
     if (!dxvk::env::shouldBypassRemixForCurrentProcess()) {
       wchar_t path[MAX_PATH];
       if (GetModuleFileNameW(hModule, path, MAX_PATH)) {
@@ -164,9 +168,9 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
       }
     }
   } else if (reason == DLL_PROCESS_DETACH) {
-    if (g_crashLogHandle != nullptr) {
-      RemoveVectoredExceptionHandler(g_crashLogHandle);
-      g_crashLogHandle = nullptr;
+    if (g_crashFilterInstalled.load(std::memory_order_relaxed)) {
+      SetUnhandledExceptionFilter(g_prevCrashFilter.load(std::memory_order_relaxed));
+      g_crashFilterInstalled.store(false, std::memory_order_relaxed);
     }
   }
   return TRUE;

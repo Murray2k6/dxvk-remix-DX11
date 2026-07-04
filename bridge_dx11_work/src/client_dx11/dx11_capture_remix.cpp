@@ -267,6 +267,160 @@ namespace {
   std::atomic<uint64_t> g_meshesStreamed { 0 };
 
   // ===================================================================== //
+  // DX11_V265_BRIDGE_PRESENT_CAMERA: camera captured from VS constants.   //
+  // ===================================================================== //
+
+  // Both matrices row-major in the D3D row-vector convention (the layout the
+  // server forwards verbatim into remixapi_CameraInfo view/projection).
+  struct CameraWire {
+    float view[16] = {};
+    float proj[16] = {};
+    bool valid = false;
+    bool viewFound = false;
+    uint64_t frame = ~0ull;
+  };
+  CameraWire g_camera;                       // guarded by g_mutex
+  std::atomic<uint64_t> g_frameIndex { 0 };  // bumped in OnPresent
+  uint64_t g_cameraScanFrame = ~0ull;        // guarded by g_mutex
+  uint32_t g_cameraScanAttempts = 0;         // guarded by g_mutex
+
+  bool isFinite16(const float* m) {
+    for (int i = 0; i < 16; ++i)
+      if (!std::isfinite(m[i])) return false;
+    return true;
+  }
+
+  // D3D row-vector perspective: diag scales in m00/m11, w-generator in m[2][3],
+  // m[3][3] == 0, shear terms zero.
+  bool isPerspectiveRowMajor(const float* m) {
+    if (!isFinite16(m)) return false;
+    if (std::fabs(std::fabs(m[11]) - 1.0f) > 0.02f) return false;  // m[2][3]
+    if (std::fabs(m[15]) > 0.02f) return false;                    // m[3][3]
+    if (std::fabs(m[0]) < 0.1f || std::fabs(m[5]) < 0.1f) return false;
+    if (std::fabs(m[1]) > 0.02f || std::fabs(m[3]) > 0.02f) return false;
+    if (std::fabs(m[4]) > 0.02f || std::fabs(m[7]) > 0.02f) return false;
+    if (std::fabs(m[12]) > 0.02f || std::fabs(m[13]) > 0.02f) return false;
+    return true;
+  }
+
+  // Rigid-body view: orthonormal 3x3, affine last column, not identity.
+  bool isViewLikeRowMajor(const float* m) {
+    if (!isFinite16(m)) return false;
+    if (std::fabs(m[3]) > 0.01f || std::fabs(m[7]) > 0.01f || std::fabs(m[11]) > 0.01f) return false;
+    if (std::fabs(m[15] - 1.0f) > 0.01f) return false;
+    for (int r = 0; r < 3; ++r) {
+      const float len = m[r*4+0]*m[r*4+0] + m[r*4+1]*m[r*4+1] + m[r*4+2]*m[r*4+2];
+      if (std::fabs(len - 1.0f) > 0.1f) return false;
+    }
+    if (std::fabs(m[0]*m[4] + m[1]*m[5] + m[2]*m[6]) > 0.08f) return false;
+    if (std::fabs(m[0]*m[8] + m[1]*m[9] + m[2]*m[10]) > 0.08f) return false;
+    if (std::fabs(m[4]*m[8] + m[5]*m[9] + m[6]*m[10]) > 0.08f) return false;
+    bool identity = true;
+    for (int r = 0; r < 4 && identity; ++r)
+      for (int c = 0; c < 4; ++c)
+        if (std::fabs(m[r*4+c] - (r == c ? 1.0f : 0.0f)) > 1e-5f) { identity = false; break; }
+    return !identity;
+  }
+
+  void transpose16(const float* in, float* out) {
+    for (int r = 0; r < 4; ++r)
+      for (int c = 0; c < 4; ++c)
+        out[c*4 + r] = in[r*4 + c];
+  }
+
+  // Scan the bound VS constant buffers (cached CPU copies - no GPU access)
+  // for a projection + view pair. STRICTLY bounded: at most 4 attempts per
+  // frame, slots 0-3, first 4KB per buffer - per-draw cost explosions freeze
+  // in-game frame rates (the V262 lesson).
+  void noteCameraFromConstants(ID3D11DeviceContext* ctx) {
+    const uint64_t frame = g_frameIndex.load(std::memory_order_relaxed);
+    {
+      std::lock_guard<std::recursive_mutex> lock(g_mutex);
+      if (g_camera.valid && g_camera.viewFound && g_camera.frame == frame) return;
+      if (g_cameraScanFrame != frame) { g_cameraScanFrame = frame; g_cameraScanAttempts = 0; }
+      if (g_cameraScanAttempts >= 4) return;
+      ++g_cameraScanAttempts;
+    }
+
+    ID3D11Buffer* cbs[4] = {};
+    ctx->VSGetConstantBuffers(0, 4, cbs);
+
+    for (uint32_t slot = 0; slot < 4; ++slot) {
+      ID3D11Buffer* cb = cbs[slot];
+      if (!cb) continue;
+
+      std::lock_guard<std::recursive_mutex> lock(g_mutex);
+      auto it = g_buffers.find(cb);
+      if (it == g_buffers.end() || it->second.data.size() < 64) continue;
+      const uint8_t* bytes = it->second.data.data();
+      const size_t scanEnd = it->second.data.size() < 4096 ? it->second.data.size() : (size_t) 4096;
+
+      // Pass 1: find the projection (as-stored or transposed).
+      size_t projOff = SIZE_MAX;
+      float proj[16];
+      for (size_t off = 0; off + 64 <= scanEnd; off += 16) {
+        const float* raw = reinterpret_cast<const float*>(bytes + off);
+        if (isPerspectiveRowMajor(raw)) {
+          memcpy(proj, raw, sizeof(proj));
+          projOff = off;
+          break;
+        }
+        float t[16];
+        transpose16(raw, t);
+        if (isPerspectiveRowMajor(t)) {
+          memcpy(proj, t, sizeof(proj));
+          projOff = off;
+          break;
+        }
+      }
+      if (projOff == SIZE_MAX) continue;
+
+      // Pass 2: find the view in the same buffer (both conventions).
+      bool viewFound = false;
+      float view[16] = { 1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1 };
+      for (size_t off = 0; off + 64 <= scanEnd; off += 16) {
+        if (off == projOff) continue;
+        const float* raw = reinterpret_cast<const float*>(bytes + off);
+        if (isViewLikeRowMajor(raw)) {
+          memcpy(view, raw, sizeof(view));
+          viewFound = true;
+          break;
+        }
+        float t[16];
+        transpose16(raw, t);
+        if (isViewLikeRowMajor(t)) {
+          memcpy(view, t, sizeof(view));
+          viewFound = true;
+          break;
+        }
+      }
+
+      // Keep the best camera this frame: any camera beats none, and a camera
+      // with a real view beats a projection-only one.
+      if (!g_camera.valid || viewFound || g_camera.frame != frame) {
+        memcpy(g_camera.proj, proj, sizeof(proj));
+        memcpy(g_camera.view, view, sizeof(view));
+        g_camera.valid = true;
+        g_camera.viewFound = viewFound;
+        g_camera.frame = frame;
+
+        static bool s_cameraLogged = false;
+        if (!s_cameraLogged) {
+          s_cameraLogged = true;
+          logf("capture", "camera captured from VS constants: slot=%u projOff=%u view=%s",
+               slot, (unsigned) projOff, viewFound ? "yes" : "NO (origin)");
+        }
+      }
+      if (g_camera.viewFound)
+        break;
+    }
+
+    for (uint32_t slot = 0; slot < 4; ++slot) {
+      if (cbs[slot]) cbs[slot]->Release();
+    }
+  }
+
+  // ===================================================================== //
   // Materials.                                                            //
   // ===================================================================== //
 
@@ -804,6 +958,8 @@ void CaptureDrawIndexed(ID3D11DeviceContext* context, uint32_t indexCount,
                         uint32_t startIndexLocation, int32_t baseVertexLocation) {
   if (!context || !IsStreamingEnabled() || indexCount < 3) return;
 
+  noteCameraFromConstants(context);
+
   ID3D11InputLayout* layout = nullptr;
   context->IAGetInputLayout(&layout);
 
@@ -864,6 +1020,8 @@ void CaptureDraw(ID3D11DeviceContext* context, uint32_t vertexCount,
                  uint32_t startVertexLocation) {
   if (!context || !IsStreamingEnabled() || vertexCount < 3) return;
 
+  noteCameraFromConstants(context);
+
   ID3D11InputLayout* layout = nullptr;
   context->IAGetInputLayout(&layout);
 
@@ -905,7 +1063,47 @@ void CaptureDraw(ID3D11DeviceContext* context, uint32_t vertexCount,
   if (layout) layout->Release();
 }
 
-void OnPresent() { }
+// DX11_V265_BRIDGE_PRESENT_CAMERA: the per-frame pump that makes the server
+// actually render. Startup attaches the Remix runtime to the GAME window
+// (HWNDs are system-global, so the x64 server presents into the x86 game's
+// window - this is what makes the Remix output primary instead of a stray
+// secondary window), SetupCamera feeds the frame's captured camera, Present
+// kicks the path-traced frame with the game HWND as override.
+void OnPresent(IDXGISwapChain* swapChain) {
+  if (!IsStreamingEnabled()) return;
+
+  g_frameIndex.fetch_add(1, std::memory_order_relaxed);
+
+  static uint64_t s_hwnd64 = 0;
+  static bool s_startupSent = false;
+  if (!s_startupSent && swapChain) {
+    DXGI_SWAP_CHAIN_DESC desc = {};
+    if (SUCCEEDED(swapChain->GetDesc(&desc)) && desc.OutputWindow) {
+      s_hwnd64 = (uint64_t)(uintptr_t) desc.OutputWindow;
+      ClientMessage c(Commands::RemixApi_Startup);
+      c.send_data((uint32_t) sizeof(s_hwnd64), &s_hwnd64);
+      s_startupSent = true;
+      logf("capture", "RemixApi_Startup sent (game hwnd=0x%llx)", (unsigned long long) s_hwnd64);
+    }
+  }
+  if (!s_startupSent) return;
+
+  {
+    std::lock_guard<std::recursive_mutex> lock(g_mutex);
+    if (g_camera.valid) {
+      float blob[32];
+      memcpy(blob, g_camera.view, sizeof(g_camera.view));
+      memcpy(blob + 16, g_camera.proj, sizeof(g_camera.proj));
+      ClientMessage c(Commands::RemixApi_SetupCamera);
+      c.send_data((uint32_t) sizeof(blob), blob);
+    }
+  }
+
+  {
+    ClientMessage c(Commands::RemixApi_Present);
+    c.send_data((uint32_t) sizeof(s_hwnd64), &s_hwnd64);
+  }
+}
 
 bool IsStreamingEnabled() {
   return dx11_bridge_client::EnsureServer();
