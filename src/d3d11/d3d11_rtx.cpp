@@ -258,6 +258,23 @@ namespace dxvk {
     LightManager::fallbackLightDirectionObject().setDeferred(Vector3(-0.3f, -1.0f, 0.5f), defaults);
     LightManager::fallbackLightAngleObject().setDeferred(5.0f, defaults);
 
+    // DX11_V272_NRD_DENOISER_SAFE_DEFAULT: the NRD pre-composition denoiser
+    // has never had validated inputs in this DX11 fork - it was a silent
+    // no-op until NRD.dll shipping was fixed (V264/V270), so the raw (noisy
+    // but VISIBLE) signal always reached the screen. Now that NRD loads and
+    // runs, its denoised output is BLACK: the DX11 capture path does not
+    // populate the per-object motion-vector / linear-viewZ inputs NRD needs,
+    // so it accumulates to black, and the composite uses those denoised
+    // inputs whenever useDenoiser is on and Ray Reconstruction is not active
+    // -> the whole viewport blanks to black. Default NRD OFF in the DX11 path
+    // so the viewport is NEVER black. Denoising is still provided by Ray
+    // Reconstruction (NVIDIA DLSS-RR, a separate path that bypasses NRD) where
+    // supported, and TAAU gives temporal smoothing on every vendor. NRD stays
+    // fully loadable (V270 robust loader) - re-enable it for input validation
+    // with env DXVK_REMIX_USE_NRD=1 or rtx.useDenoiser=true in rtx.conf.
+    if (env::getEnvVar("DXVK_REMIX_USE_NRD") != "1") {
+      RtxOptions::useDenoiser.setDeferred(false);
+    }
   }
 
   void D3D11Rtx::OnDraw(UINT vertexCount, UINT startVertex) {
@@ -5273,6 +5290,54 @@ namespace dxvk {
           significantInputCount));
       }
       return;
+    }
+
+    // DX11_V271_NO_BLACK_FROM_VERTEX_COLOR: an all-black COLOR0 stream must
+    // never become albedo. Untextured draws SelectArg1(vertexColor) -> black
+    // geometry; textured draws Modulate(texture, vertexColor) -> black
+    // textures. And with vertexColorIsBakedLighting (default true) the shader
+    // normalizes color by its max channel, which for (0,0,0) is a divide-by-
+    // zero that cannot recover. Widening COLOR0 acceptance (V268: float4/half4/
+    // unorm16) let non-diffuse streams that decode to ~0 reach here. By this
+    // point geo.color0Buffer is always B8G8R8A8_UNORM (native passes through;
+    // every other format is converted to it above), so one sampled scan for a
+    // uniformly-black stream covers all formats. Drop it if so - the surface
+    // then uses its texture / white default instead of rendering black. A
+    // stream with ANY non-trivial color anywhere is kept (real vertex color /
+    // baked lighting with shadows is legitimate).
+    if (geo.color0Buffer.defined()) {
+      const uint8_t* colScan = reinterpret_cast<const uint8_t*>(
+        geo.color0Buffer.mapPtr(geo.color0Buffer.offsetFromSlice()));
+      const uint32_t colScanStride = geo.color0Buffer.stride();
+      const uint32_t colScanSliceOff = geo.color0Buffer.offsetFromSlice();
+      const size_t colScanLen = geo.color0Buffer.length() > colScanSliceOff
+        ? geo.color0Buffer.length() - colScanSliceOff
+        : 0;
+      if (colScan != nullptr && colScanStride >= 4u && geo.vertexCount > 0) {
+        constexpr uint32_t kMaxColorScan = 256u;
+        const uint32_t sampleCount = std::min(geo.vertexCount, kMaxColorScan);
+        const uint32_t step = std::max(1u, geo.vertexCount / sampleCount);
+        uint8_t maxChannel = 0;
+        for (uint32_t v = 0; v < geo.vertexCount && maxChannel < 4u; v += step) {
+          const size_t off = size_t(v) * colScanStride;
+          if (off + 3u > colScanLen)
+            break;
+          // B8G8R8A8: bytes 0,1,2 are B,G,R (alpha ignored - alpha 0 is common
+          // and legitimate, only RGB drives albedo brightness).
+          maxChannel = std::max({ maxChannel, colScan[off + 0], colScan[off + 1], colScan[off + 2] });
+        }
+        if (maxChannel < 4u) {
+          // Uniformly black (< ~1.5% on every sampled vertex) - not real
+          // diffuse color. Drop so it cannot blacken the surface.
+          geo.color0Buffer = RasterBuffer();
+          colBuffer = RasterBuffer();
+          static uint32_t sBlackColorDropLogCount = 0;
+          if (sBlackColorDropLogCount < 8) {
+            ++sBlackColorDropLogCount;
+            Logger::info("[D3D11Rtx] Dropped all-black COLOR0 stream (would render surface black); using texture/white albedo.");
+          }
+        }
+      }
     }
 
     // Vertex-color wiring. N64-era ports and fixed-function-style renderers

@@ -853,15 +853,40 @@ namespace dxvk {
     }
   }
 
+  // DX11_V270_MENU_TOGGLE_DEBOUNCE
+  bool ImGUI::consumeMenuToggleHotkey() {
+    using namespace std::chrono;
+    // 200ms: comfortably longer than the cross-path duplication window (the
+    // three paths fire within the same or adjacent frames, ~16-33ms apart),
+    // yet short enough not to block an intentional rapid re-toggle.
+    constexpr uint64_t kDebounceMs = 200;
+    static dxvk::mutex s_mutex;
+    static uint64_t s_lastToggleMs = 0;
+    const uint64_t nowMs = static_cast<uint64_t>(
+      duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count());
+    std::lock_guard<dxvk::mutex> lock(s_mutex);
+    if (s_lastToggleMs != 0 && nowMs - s_lastToggleMs < kDebounceMs) {
+      return false;
+    }
+    s_lastToggleMs = nowMs;
+    return true;
+  }
+
+  void ImGUI::toggleMenuFromHotkey() {
+    if (!consumeMenuToggleHotkey()) {
+      return;
+    }
+    const UIType next = (RtxOptions::showUI() != UIType::None)
+      ? UIType::None
+      : (RtxOptions::defaultToAdvancedUI() ? UIType::Advanced : UIType::Basic);
+    switchMenu(next, true);
+  }
+
   void ImGUI::processHotkeys() {
     auto& io = ImGui::GetIO();
 
     if (checkHotkeyState(RtxOptions::remixMenuKeyBinds())) {
-      if(RtxOptions::defaultToAdvancedUI()) {
-        switchMenu(RtxOptions::showUI() != UIType::None ? UIType::None : UIType::Advanced);
-      } else {
-        switchMenu(RtxOptions::showUI() != UIType::None ? UIType::None : UIType::Basic);
-      }
+      toggleMenuFromHotkey();
     }
 
 
@@ -879,6 +904,21 @@ namespace dxvk {
   void ImGUI::update(const Rc<DxvkContext>& ctx) {
     ImGui_ImplDxvk::NewFrame();
     ImGui_ImplWin32_NewFrame();
+
+    // DX11_V270_UI_DISPLAY_MATCHES_SURFACE: ImGui_ImplWin32_NewFrame just set
+    // io.DisplaySize to the game WINDOW client rect, but the menu is
+    // composited into the RT surface (m_renderSurfaceExtent) and object
+    // picking rescales clicks against the RT target extent. When the window
+    // rect diverges from the surface (DPI scaling, windowed mode, internal
+    // render-scale), the menu and every click landed on the wrong region -
+    // "raytracer reading the wrong viewport" + "can't select in the
+    // viewport". Force ImGui's coordinate space to BE the render surface so
+    // the whole chain (layout, compositing viewport, pick rescale) is
+    // consistent in render-target space.
+    if (m_renderSurfaceExtent.width > 0u && m_renderSurfaceExtent.height > 0u) {
+      ImGui::GetIO().DisplaySize =
+        ImVec2((float) m_renderSurfaceExtent.width, (float) m_renderSurfaceExtent.height);
+    }
 
     ImGui::NewFrame();
 
@@ -4245,6 +4285,10 @@ namespace dxvk {
     VkExtent2D         surfaceSize,
     bool               vsync) {
     ScopedGpuProfileZone(ctx, "ImGUI Render");
+
+    // DX11_V270_UI_DISPLAY_MATCHES_SURFACE: hand update() the true render
+    // surface so it can pin io.DisplaySize to it (see update()).
+    m_renderSurfaceExtent = surfaceSize;
 
     if (m_overlayWin.ptr() != nullptr) {
       m_overlayWin->update(gameHwnd);

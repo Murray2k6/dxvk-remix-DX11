@@ -115,6 +115,18 @@ namespace dxvk {
     bool isRemixMenuHotkeyLatched() const { return m_remixMenuHotkeyLatched; }
     void markRemixMenuHotkeyHandled() { m_remixMenuHotkeyLatched = true; }
 
+    // DX11_V270_MENU_TOGGLE_DEBOUNCE: the single authority for hotkey-driven
+    // menu toggling. Three independent paths can see the same physical Remix
+    // hotkey press (ImGui processHotkeys, the DX11 WndProc hook, and the DX11
+    // async Alt+X poll), and the per-frame latch is cleared mid-frame, so a
+    // single press toggled the menu 2-3x = "reopens when done once". This
+    // consumes a toggle at most once per debounce window regardless of which
+    // path calls it, then performs the open/close. Menu BUTTONS call
+    // switchMenu directly and are unaffected.
+    void toggleMenuFromHotkey();
+    // Returns true at most once per debounce window; thread- and path-safe.
+    static bool consumeMenuToggleHotkey();
+
     enum Tabs {
       kTab_Rendering = 0,
       kTab_Setup,
@@ -149,6 +161,11 @@ namespace dxvk {
     // DX11_V225: per-frame latch so the DX11 in-process WndProc hotkey paths do
     // not toggle the Remix menu more than once per frame. Reset in update().
     bool                  m_remixMenuHotkeyLatched = false;
+
+    // DX11_V270_UI_DISPLAY_MATCHES_SURFACE: the RT render surface extent the
+    // menu is composited into; io.DisplaySize is pinned to this each frame so
+    // ImGui coordinates match the render target (correct picking + layout).
+    VkExtent2D            m_renderSurfaceExtent = { 0u, 0u };
 
     Rc<DxvkImage>         m_fontTexture;
     Rc<DxvkImageView>     m_fontTextureView;
