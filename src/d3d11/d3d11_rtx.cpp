@@ -3202,20 +3202,32 @@ namespace dxvk {
         && imgInfo.extent.width == rtWidth && imgInfo.extent.height == rtHeight);
       const bool rtSizedIntermediate = matchesRT
         && (hasHazardBindFlags || isSingleMipLargeTexture || dataOrSceneFormat);
-      const bool likelyIntermediate = multisampledView
+      // DX11_V273_USE_REAL_ALBEDO: a mipmapped strong-albedo color texture
+      // (RGBA8/BGRA8/BC1-3-7) that is NOT the actively-bound render target is
+      // an unambiguous real game material texture - the exact thing the user
+      // wants on screen. The intermediate/data heuristics below occasionally
+      // mis-flag such a texture (e.g. when it happens to match the RT size),
+      // which rejected it -> the surface fell back to the gray placeholder or
+      // to an unbound (BLACK) albedo. Never reject a clear albedo, so real
+      // colors always render. Render targets are excluded (isCurrentRT /
+      // matchesRT) and mip presence keeps out untextured RT/video surfaces,
+      // so this cannot pull garbage into the material.
+      const bool clearAlbedo = strongAlbedoFormat && hasMips && !isCurrentRT && !matchesRT;
+
+      const bool likelyIntermediate = !clearAlbedo && (multisampledView
         || isCurrentRT
         || rtSizedIntermediate
-        || ((hasRtBind || hasUavBind || hasDepthBind) && isSingleMipLargeTexture && !strongAlbedoFormat);
+        || ((hasRtBind || hasUavBind || hasDepthBind) && isSingleMipLargeTexture && !strongAlbedoFormat));
       const bool rejectTextureBrowserCandidate = !materialViewDimension
         || multisampledView
         || isCurrentRT
         || rtSizedIntermediate
         || (hasDepthBind && !hasMips)
         || ((hasRtBind || hasUavBind) && isSingleMipLargeTexture && !bc);
-      const bool rejectMaterialCandidate = rejectTextureBrowserCandidate
+      const bool rejectMaterialCandidate = !clearAlbedo && (rejectTextureBrowserCandidate
         || likelyIntermediate
         || !albedoFormat
-        || dataOrSceneFormat;
+        || dataOrSceneFormat);
 
       int score = 0;
       if (colorBc)                  score += 14;  // Color BC = strong material signal.
