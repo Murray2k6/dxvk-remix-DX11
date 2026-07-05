@@ -29,6 +29,9 @@
 #include "../../util/util_global_time.h"
 #include <Shlwapi.h>
 #include <filesystem>
+#include <vector>
+#include <algorithm>
+#include <string>
 
 namespace nrd {
   using pfnCreateInstance = Result(*)(const InstanceCreationDesc& instanceCreationDesc, Instance*& instance);
@@ -53,46 +56,114 @@ namespace nrd {
     pfnGetDenoiserString GetDenoiserString;
   } dispatch;
 
+  // DX11_V270_NRD_ROBUST_LOAD: locate NRD.dll across every plausible layout.
+  // The old loader only tried the runtime DLL's OWN directory; when the
+  // runtime lives in .trex but NRD.dll landed a level up (or vice versa, or
+  // the game dir differs from the module dir under the bridge), the load
+  // failed and the denoiser silently became a no-op ("denoiser is null" =
+  // raw, noisy path tracing). Try, in order: the runtime module's dir, its
+  // .trex subdir, its parent dir, the process exe's dir, and finally a bare
+  // name (PATH/CWD). First successful load wins; each attempt is logged.
+  static HMODULE loadNrdLibrary() {
+    HMODULE hModule = nullptr;
+    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                       reinterpret_cast<LPCWSTR>(&loadNrdLibrary), &hModule);
+
+    wchar_t moduleDir[MAX_PATH] = {};
+    if (hModule != nullptr && GetModuleFileNameW(hModule, moduleDir, MAX_PATH) != 0)
+      PathRemoveFileSpecW(moduleDir);
+
+    wchar_t exeDir[MAX_PATH] = {};
+    if (GetModuleFileNameW(nullptr, exeDir, MAX_PATH) != 0)
+      PathRemoveFileSpecW(exeDir);
+
+    std::vector<std::filesystem::path> candidates;
+    auto addDir = [&candidates](const wchar_t* dir) {
+      if (dir == nullptr || dir[0] == L'\0')
+        return;
+      std::filesystem::path base(dir);
+      candidates.push_back(base / L"NRD.dll");
+      candidates.push_back(base / L".trex" / L"NRD.dll");
+      candidates.push_back(base.parent_path() / L"NRD.dll");
+    };
+    addDir(moduleDir);
+    addDir(exeDir);
+    candidates.push_back(std::filesystem::path(L"NRD.dll"));  // PATH / CWD
+
+    std::vector<std::wstring> tried;
+    for (const auto& cand : candidates) {
+      const std::wstring w = cand.wstring();
+      if (std::find(tried.begin(), tried.end(), w) != tried.end())
+        continue;
+      tried.push_back(w);
+
+      HMODULE hNRD = LoadLibraryExW(w.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+      if (hNRD != nullptr) {
+        dxvk::Logger::info(dxvk::str::format("[Remix-DX11] NRD.dll loaded from: ", dxvk::str::fromws(w.c_str())));
+        return hNRD;
+      }
+    }
+
+    dxvk::Logger::err(dxvk::str::format(
+      "[Remix-DX11] Unable to load NRD.dll from any known location (lastError=",
+      (uint32_t) GetLastError(), ") - DENOISER DISABLED (path tracing will be noisy). ",
+      "Copy NRD.dll next to the runtime d3d11.dll."));
+    return NULL;
+  }
+
   HMODULE initialize() {
-    HMODULE hModule;
-    GetModuleHandleEx(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR) &initialize, &hModule);
-
-    wchar_t modulePath[MAX_PATH];
-    GetModuleFileNameW(hModule, modulePath, MAX_PATH);
-    PathRemoveFileSpecW(modulePath);
-
-    std::filesystem::path path(modulePath);
-    path.append("NRD.dll");
-    HMODULE hNRD = LoadLibraryW(path.c_str());
+    HMODULE hNRD = loadNrdLibrary();
     if (hNRD == NULL) {
-      dxvk::Logger::err("Unable to load NRD, this feature will be disabled");
       return NULL;
     }
 
-#define GET_PROC_MACRO(proc)  dispatch.##proc = (pfn##proc)GetProcAddress(hNRD, #proc)
-    GET_PROC_MACRO(CreateInstance);
-    GET_PROC_MACRO(DestroyInstance);
-    GET_PROC_MACRO(GetLibraryDesc);
-    GET_PROC_MACRO(GetInstanceDesc);
-    GET_PROC_MACRO(SetCommonSettings);
-    GET_PROC_MACRO(SetDenoiserSettings);
-    GET_PROC_MACRO(GetComputeDispatches);
-    GET_PROC_MACRO(GetResourceTypeString);
-    GET_PROC_MACRO(GetDenoiserString);
-#undef GET_PROC_MACRO
+    // Resolve and VALIDATE every entry point. A null proc that the old code
+    // called unchecked (GetLibraryDesc at minimum) was an access violation;
+    // now a missing export disables the denoiser cleanly instead of crashing.
+    bool allProcs = true;
+    auto getProc = [&](const char* name, void** out) {
+      *out = reinterpret_cast<void*>(GetProcAddress(hNRD, name));
+      if (*out == nullptr) {
+        dxvk::Logger::err(dxvk::str::format("[Remix-DX11] NRD.dll missing export '", name, "' - denoiser disabled."));
+        allProcs = false;
+      }
+    };
+    getProc("CreateInstance",       reinterpret_cast<void**>(&dispatch.CreateInstance));
+    getProc("DestroyInstance",      reinterpret_cast<void**>(&dispatch.DestroyInstance));
+    getProc("GetLibraryDesc",       reinterpret_cast<void**>(&dispatch.GetLibraryDesc));
+    getProc("GetInstanceDesc",      reinterpret_cast<void**>(&dispatch.GetInstanceDesc));
+    getProc("SetCommonSettings",    reinterpret_cast<void**>(&dispatch.SetCommonSettings));
+    getProc("SetDenoiserSettings",  reinterpret_cast<void**>(&dispatch.SetDenoiserSettings));
+    getProc("GetComputeDispatches", reinterpret_cast<void**>(&dispatch.GetComputeDispatches));
+    getProc("GetResourceTypeString",reinterpret_cast<void**>(&dispatch.GetResourceTypeString));
+    getProc("GetDenoiserString",    reinterpret_cast<void**>(&dispatch.GetDenoiserString));
 
-    const LibraryDesc& desc = dispatch.GetLibraryDesc();
-    if (desc.versionMajor != NRD_VERSION_MAJOR || desc.versionMinor != NRD_VERSION_MINOR || desc.versionBuild != NRD_VERSION_BUILD) {
-      dxvk::Logger::err("Incorrect version of NRD has been loaded.  Ensure the correct DLLs have been copied to the Remix binary directory.  NRD disabled.");
+    if (!allProcs) {
       FreeLibrary(hNRD);
       return NULL;
     }
 
-    // DX11_V264: positive confirmation - previously only the FAILURE logged,
-    // so a log without any NRD line was ambiguous. NRD.dll was missing from
-    // every bridge package (.trex staged only d3d11/dxgi), silently disabling
-    // the denoiser = the "noisy path tracing" reports. Every log now states
-    // the denoiser status explicitly.
+    const LibraryDesc& desc = dispatch.GetLibraryDesc();
+    // ABI compatibility is major.minor; the build number is a patch level.
+    // Reject on major/minor mismatch (would crash or misbehave), but only
+    // WARN on a build-number mismatch so a compatible patch build still
+    // denoises instead of silently disabling.
+    if (desc.versionMajor != NRD_VERSION_MAJOR || desc.versionMinor != NRD_VERSION_MINOR) {
+      dxvk::Logger::err(dxvk::str::format(
+        "[Remix-DX11] NRD.dll ABI mismatch: loaded v", desc.versionMajor, ".", desc.versionMinor, ".", desc.versionBuild,
+        " but built against v", NRD_VERSION_MAJOR, ".", NRD_VERSION_MINOR, ".", NRD_VERSION_BUILD,
+        " - denoiser disabled. Ship the matching NRD.dll."));
+      FreeLibrary(hNRD);
+      return NULL;
+    }
+    if (desc.versionBuild != NRD_VERSION_BUILD) {
+      dxvk::Logger::warn(dxvk::str::format(
+        "[Remix-DX11] NRD.dll build mismatch: loaded v", desc.versionMajor, ".", desc.versionMinor, ".", desc.versionBuild,
+        " vs built v", NRD_VERSION_MAJOR, ".", NRD_VERSION_MINOR, ".", NRD_VERSION_BUILD,
+        " - proceeding (ABI-compatible)."));
+    }
+
+    // DX11_V264: positive confirmation - every log now states denoiser status.
     dxvk::Logger::info(dxvk::str::format(
       "[Remix-DX11] NRD denoiser loaded: v",
       desc.versionMajor, ".", desc.versionMinor, ".", desc.versionBuild));

@@ -227,16 +227,9 @@ namespace dxvk {
       }
 
       auto& gui = sc->m_device->getCommon()->getImgui();
-      // Skip if the hotkey was already processed by processHotkeys() this frame
-      if (gui.isRemixMenuHotkeyLatched()) {
-        --recursionDepth;
-        return 0;
-      }
-      const bool uiOpen = gui.isMenuOpen();
-      const UIType nextType = uiOpen
-        ? UIType::None
-        : (RtxOptions::defaultToAdvancedUI() ? UIType::Advanced : UIType::Basic);
-      gui.switchMenu(nextType, true, false);
+      // DX11_V270_MENU_TOGGLE_DEBOUNCE: single debounced authority; consumes
+      // the toggle at most once per window across ALL hotkey paths.
+      gui.toggleMenuFromHotkey();
       gui.markRemixMenuHotkeyHandled();
       --recursionDepth;
       return 0;
@@ -754,14 +747,10 @@ namespace dxvk {
         }
 
         auto& gui = m_device->getCommon()->getImgui();
-        if (!gui.isRemixMenuHotkeyLatched()) {
-          const bool uiOpen = gui.isMenuOpen();
-          const UIType nextType = uiOpen
-            ? UIType::None
-            : (RtxOptions::defaultToAdvancedUI() ? UIType::Advanced : UIType::Basic);
-          gui.switchMenu(nextType, true, false);
-          gui.markRemixMenuHotkeyHandled();
-        }
+        // DX11_V270_MENU_TOGGLE_DEBOUNCE: shared debounced toggle so this
+        // async poll cannot double-fire against the WndProc/ImGui paths.
+        gui.toggleMenuFromHotkey();
+        gui.markRemixMenuHotkeyHandled();
       }
     }
 
