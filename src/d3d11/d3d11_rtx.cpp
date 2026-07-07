@@ -63,18 +63,24 @@ namespace dxvk {
       // replaces it with an empty composite - the "menu renders black" bug.
       // Pass such frames through so the game's own raster shows, EXCEPT while
       // the Remix menu is open, since that menu renders inside the composite.
+      // DX11_V274: hasValidCamera now means a REAL (non-identity) view camera.
+      // Inject only when the frame can actually be ray traced: the Remix UI is
+      // open (it renders inside the composite), OR we have a real camera this
+      // frame, OR we are carrying a valid previous scene. forceInjection still
+      // bypasses the stricter scene-draw/previous-scene requirements of the
+      // default path, but it must NOT inject scene draws without a real camera
+      // - that renders black. Camera-less frames pass through to the game's
+      // raster so the screen is never black.
       if (RtxOptions::forceInjection()) {
         const bool remixUiOpen = RtxOptions::showUI() != UIType::None;
-        if (!hasGameSceneDraws && !hasValidCamera && !previousSceneAvailable && !remixUiOpen)
-          return false;
-        return true;
+        return remixUiOpen || hasValidCamera || previousSceneAvailable;
       }
 
       // First-time RTX injection needs a real scene camera. Otherwise loading
       // screens, menus, and weak viewport-fallback candidates can replace the
       // game frame with a black Remix composite. Previous scenes may only carry
       // when the current game frame still has a valid camera.
-      return hasValidCamera && hasGameSceneDraws && (hasGameSceneDraws || previousSceneAvailable); // DX11_V124_CAMERA_ARTIFACT_STABILITY: do not inject fallback-only bootstrap/menu composite frames
+      return hasValidCamera && hasGameSceneDraws; // DX11_V124_CAMERA_ARTIFACT_STABILITY: do not inject fallback-only bootstrap/menu composite frames
     }
 
   }
@@ -391,40 +397,87 @@ namespace dxvk {
         / uint64_t(maxInstances - 1));
     };
 
-    for (UINT i = 0; i < maxInstances; ++i) {
-      UINT instIdx = sampleInstanceIndex(i);
-      size_t instOffset = static_cast<size_t>(instIdx) * instStride;
-
-      // Read 3 or 4 float4 rows to build a world matrix.
-      // Row layout: each row is at instOffset + row.byteOffset within the instance buffer.
+    // Read the per-instance world matrix at a given instance index.
+    auto readInstMatrix = [&](UINT instIdx, Matrix4& out) -> bool {
+      const size_t instOffset = static_cast<size_t>(instIdx) * instStride;
       float rows[4][4] = {};
-      bool valid = true;
-
       for (size_t r = 0; r < std::min<size_t>(instRows.size(), 4); ++r) {
-        size_t rowOff = instOffset + instRows[r].byteOffset;
-        if (rowOff + 16 > instBufLen) { valid = false; break; }
+        const size_t rowOff = instOffset + instRows[r].byteOffset;
+        if (rowOff + 16 > instBufLen) return false;
         const void* ptr = instBufSlice.mapPtr(rowOff);
-        if (!ptr) { valid = false; break; }
+        if (!ptr) return false;
         std::memcpy(rows[r], ptr, 16);
-        for (int c = 0; c < 4; ++c) {
-          if (!std::isfinite(rows[r][c])) { valid = false; break; }
-        }
-        if (!valid) break;
+        for (int c = 0; c < 4; ++c)
+          if (!std::isfinite(rows[r][c])) return false;
       }
-
-      if (!valid) continue;
-
-      // If only 3 rows, the 4th row is (0,0,0,1) â€” affine transform.
+      // If only 3 rows, the 4th row is (0,0,0,1) - affine transform.
       if (instRows.size() == 3) {
         rows[3][0] = 0.f; rows[3][1] = 0.f; rows[3][2] = 0.f; rows[3][3] = 1.f;
       }
-
-      Matrix4 instMatrix(
+      out = Matrix4(
         Vector4(rows[0][0], rows[0][1], rows[0][2], rows[0][3]),
         Vector4(rows[1][0], rows[1][1], rows[1][2], rows[1][3]),
         Vector4(rows[2][0], rows[2][1], rows[2][2], rows[2][3]),
         Vector4(rows[3][0], rows[3][1], rows[3][2], rows[3][3]));
+      return true;
+    };
 
+    // DX11_V276_NO_STACKED_INSTANCE_COPIES: submitting the whole mesh once per
+    // instance record with a (near-)identical per-instance transform stacks N
+    // coincident copies of the geometry. Self-intersecting opaque geometry
+    // shades PURE BLACK in the path tracer (near-coplanar duplicate surfaces
+    // fight and the integrator resolves them to zero) - the "black roads /
+    // debris ground / trash-blanket" artifact, which is a GEOMETRY duplication
+    // bug, NOT a texture bug. This happens when the per-instance step data is
+    // not really distinct spatial placements (misread stride/offset, or
+    // instancing used for non-transform data that we mis-fit to a matrix), so
+    // every "instance" collapses to one placement. Detect that by sampling the
+    // instance transforms up front: if they are all near-identical, this is
+    // degenerate instancing - submit the mesh ONE time, not N overlapping
+    // copies. Genuine distinct instancing (transforms differ) falls through to
+    // the normal per-instance submission below.
+    {
+      Matrix4 firstMatrix;
+      bool haveFirst = false;
+      bool anyDistinct = false;
+      uint32_t sampledCount = 0;
+      const UINT sampleN = std::min<UINT>(maxInstances, 16u);
+      for (UINT i = 0; i < sampleN && !anyDistinct; ++i) {
+        Matrix4 m;
+        if (!readInstMatrix(sampleInstanceIndex(i), m))
+          continue;
+        ++sampledCount;
+        if (!haveFirst) {
+          firstMatrix = m;
+          haveFirst = true;
+          continue;
+        }
+        float deviation = 0.0f;
+        for (int r = 0; r < 4; ++r)
+          for (int c = 0; c < 4; ++c)
+            deviation += std::abs(m[r][c] - firstMatrix[r][c]);
+        if (deviation > 1.0e-3f)
+          anyDistinct = true;
+      }
+
+      if (haveFirst && !anyDistinct && sampledCount >= 2) {
+        static uint32_t sDegenerateInstLog = 0;
+        if (sDegenerateInstLog < 8) {
+          ++sDegenerateInstLog;
+          Logger::info(str::format(
+            "[D3D11Rtx] Degenerate instancing: ", instanceCount,
+            " instances share one placement - submitting the mesh ONCE to avoid stacked "
+            "coincident copies (self-intersection renders black)."));
+        }
+        SubmitDraw(indexed, count, start, base, &firstMatrix);
+        return;
+      }
+    }
+
+    for (UINT i = 0; i < maxInstances; ++i) {
+      Matrix4 instMatrix;
+      if (!readInstMatrix(sampleInstanceIndex(i), instMatrix))
+        continue;
       SubmitDraw(indexed, count, start, base, &instMatrix);
     }
   }
@@ -5939,10 +5992,40 @@ namespace dxvk {
       const bool hasAcceptedSceneDraws = draws > 0 || acceptedDraws > 0;
       const bool hasGameSceneDraws = trustedSceneAcceptedDraws > 0 || acceptedDraws > 0;
       const bool previousSceneAvailable = rtx->getSceneManager().isPreviousFrameSceneAvailable();
+
+      // DX11_V274_REQUIRE_REAL_VIEW_TO_INJECT: RtCamera::isValid() only checks
+      // the camera was touched this frame - it is TRUE even when the view
+      // matrix is identity (the "view=NO" state: a projection was found but
+      // the view matrix was not). A correct projection with an identity view
+      // puts the RT camera at the world origin looking at nothing, so the
+      // whole path-traced frame renders BLACK - the exact "raytracing is
+      // black" report, independent of albedo / lighting / denoiser. Require a
+      // REAL (non-identity) view to inject; when the view cannot be resolved,
+      // pass the frame through to the game's own raster so the screen is
+      // never black. (View-matrix detection can fail per engine - notably
+      // Unity; passthrough is the safe result until the layout is located.
+      // Set DXVK_REMIX_MTXDUMP=1 to dump the cbuffer matrices and fix it.)
+      const Matrix4d& camWorldToView = rtx->getSceneManager().getCamera().getWorldToView(false);
+      double viewIdentityDeviation = 0.0;
+      for (int r = 0; r < 4; ++r)
+        for (int c = 0; c < 4; ++c)
+          viewIdentityDeviation += std::abs(camWorldToView[r][c] - (r == c ? 1.0 : 0.0));
+      const bool hasRealView = viewIdentityDeviation > 1.0e-4;
+      const bool hasRealCamera = camValid && hasRealView;
+
+      static uint32_t sNoRealViewLogCount = 0;
+      if (camValid && !hasRealView && sNoRealViewLogCount < 12) {
+        ++sNoRealViewLogCount;
+        Logger::info(str::format(
+          "[D3D11Rtx] Camera has no real view matrix (identity view=origin camera) - passing frame "
+          "through instead of injecting a black RT frame. frameId=", fid,
+          " draws=", draws, " (set DXVK_REMIX_MTXDUMP=1 to capture matrices for view-detection fix)"));
+      }
+
       const bool shouldInjectRtx = shouldInjectD3D11RtxFrame(
             backbuffer != nullptr,
             hasGameSceneDraws,
-            camValid || hasAcceptedSceneDraws,
+            hasRealCamera,
             previousSceneAvailable && hasAcceptedSceneDraws);
 
       if (!shouldInjectRtx) {

@@ -205,15 +205,22 @@ namespace dxvk {
     // crash risk (matches the RTX 4060 / Minecraft crash that lands right at the first RT
     // frame). So prewarm on NVIDIA and keep it disabled on AMD/Intel. Escape hatch:
     // DXVK_REMIX_PREWARM = "0" forces off, "1" forces on, on any vendor.
-    const uint32_t vendorId = m_device->properties().core.properties.vendorID;
-    const bool prewarmUnsafeVendor =
-         vendorId == static_cast<uint32_t>(DxvkGpuVendor::Amd)
-      || vendorId == static_cast<uint32_t>(DxvkGpuVendor::Intel);
-    bool doPrewarm = !prewarmUnsafeVendor; // NVIDIA (and unknown vendors) prewarm; AMD/Intel do not
+    // DX11_V275_NO_PREWARM_BY_DEFAULT: prewarm registration (below) can hang or
+    // crash SYNCHRONOUSLY at launch - the init log stops right after "starting
+    // shader prewarm" with no further step. This is the "game only stays in
+    // Task Manager and never boots" / launch-freeze report, and it has now been
+    // seen on all three vendors (AMD deadlock, Intel Arc crash, NVIDIA hang),
+    // not just AMD/Intel. Since V248 made the RT pipelines compile ASYNC +
+    // NON-BLOCKING on first use (they enqueue to the state-cache workers and
+    // the frame simply skips RT until each pipeline is ready - no inline stall,
+    // no first-frame crash, which V244 NRC-opt-in also addressed), prewarm is
+    // no longer needed to avoid first-frame stutter. Default it OFF on EVERY
+    // vendor so the game ALWAYS boots ("any game must work"); pipelines warm up
+    // in the background and RT engages once they are ready. Re-enable for
+    // benchmarking / prewarm testing with env DXVK_REMIX_PREWARM=1.
+    bool doPrewarm = false;
     const std::string prewarmOverride = env::getEnvVar("DXVK_REMIX_PREWARM");
-    if (prewarmOverride == "0")
-      doPrewarm = false;
-    else if (prewarmOverride == "1")
+    if (prewarmOverride == "1")
       doPrewarm = true;
 
     if (!asyncShaderPrewarming() || !doPrewarm) {
