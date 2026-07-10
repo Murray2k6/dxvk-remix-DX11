@@ -166,6 +166,9 @@ namespace dxvk {
       uint32_t noPositionSemantic = 0;
       uint32_t noTexcoordLayout = 0;
       uint32_t texcoordGenerated = 0;
+      // DX11_V280: no-TEXCOORD-layout draws whose UVs were recovered from the
+      // vertex shader's output via the stream-out capture replay.
+      uint32_t texcoordCaptured = 0;
       uint32_t position2D = 0;
       uint32_t noPositionBuffer = 0;
       uint32_t noIndexBuffer = 0;
@@ -180,6 +183,12 @@ namespace dxvk {
       uint32_t positionFormatRejected = 0;
       uint32_t poisonedPositions = 0;
       uint32_t vertexRangeRejected = 0;
+      // DX11_V277: depth-only draws (prepass/shadow re-renders) excluded so
+      // geometry never enters the RT scene as stacked coincident copies.
+      uint32_t depthOnlySkipped = 0;
+      // DX11_V281: wireframe-fill draws (debug/editor overlays) excluded -
+      // their triangles are lines on screen, not solid RT surfaces.
+      uint32_t wireframeSkipped = 0;
     };
 
     SubmitRejectStats                    m_submitRejectStats;
@@ -253,6 +262,18 @@ namespace dxvk {
     TextureRef getOrCreateUntexturedPlaceholder();
 
     Rc<DxvkSampler> getDefaultSampler() const;
+
+    // DX11_V280_TEXCOORD_CAPTURE: recover texture coordinates for textured
+    // draws whose input layout has no TEXCOORD stream by replaying the draw's
+    // vertex range through a stream-out passthrough pipeline (game VS +
+    // generated xfb GS, rasterization discarded) and feeding the captured
+    // per-vertex UVs to the RT geometry. Engine-agnostic: keyed purely off
+    // the VS output signature and device transform-feedback support.
+    bool TryCaptureTexcoordsViaStreamOut(DrawCallState& dcs, RasterGeometry& geo,
+                                         bool indexed, UINT count, UINT start, INT base);
+    uint32_t     m_texcoordCapturesThisFrame = 0;
+    VkDeviceSize m_texcoordCaptureBytesThisFrame = 0;
+
     void SubmitDraw(bool indexed, UINT count, UINT start, INT base,
                     const Matrix4* instanceTransform = nullptr);
     void SubmitInstancedDraw(bool indexed, UINT count, UINT start, INT base,

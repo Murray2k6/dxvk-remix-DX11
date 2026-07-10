@@ -56,7 +56,7 @@ d3d11_rtx_include_path = include_directories('../dxvk', '../../public/include')
 d3d11_dll = shared_library('d3d11'+dll_ext, dxgi_common_src + d3d11_src,
     glsl_generator.process(d3d11_shaders), d3d11_res,
   name_prefix         : '',
-  link_args           : [ usd_plugin_delay_load_args, '/DEPENDENTLOADFLAG:0x1100' ],
+  link_args           : [ usd_plugin_delay_load_args, remix_satellite_delay_load_args, '/DEPENDENTLOADFLAG:0x1100' ],
   dependencies        : [ lib_dxgi, dxbc_dep, dxvk_dep ],
   include_directories : [ dxvk_include_path, dxvk_shader_include_path, usd_include_paths, lssusd_include_paths, d3d11_rtx_include_path ],
   install             : true,

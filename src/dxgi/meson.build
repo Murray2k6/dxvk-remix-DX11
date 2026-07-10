@@ -14,7 +14,7 @@ dxgi_src = [
 
 dxgi_dll = shared_library('dxgi'+dll_ext, dxgi_src, dxgi_res,
   name_prefix         : '',
-  link_args           : [ usd_plugin_delay_load_args, '/DEPENDENTLOADFLAG:0x1100' ],
+  link_args           : [ usd_plugin_delay_load_args, remix_satellite_delay_load_args, '/DEPENDENTLOADFLAG:0x1100' ],
   dependencies        : [ dxvk_dep ],
   include_directories : dxvk_include_path,
   install             : true,

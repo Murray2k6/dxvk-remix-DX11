@@ -4,6 +4,7 @@
 #include <utility>
 
 #include <windows.h>
+#include <delayimp.h>
 
 #include "../dxgi/dxgi_adapter.h"
 
@@ -144,14 +145,69 @@ void logRemixDx11BuildBanner() {
     return;
   dxvk::Logger::info("=====================================================");
   dxvk::Logger::info(dxvk::str::format("[Remix-DX11] build stamp: ", __DATE__, " ", __TIME__));
-  dxvk::Logger::info("[Remix-DX11] fixes: nrcVendorFallback texcoordSINT SR4viewport budgetHeadroom inputSeparation grayPlaceholder revertedDLSSGuard initStepLogging allVendorPrewarmSkip anyGameAlbedoFix significanceCullingOptIn gpuSceneUI remixapiExport taauDefaultAllVendors rtxOptionsNullGuard rtxOptionsRootCreate intelFseSwapchainFix steamOverlayVkDisable wsiSelfDeadlockPump vramLeakDiag restoreIconicWindow intelFifoPresent intelForceFSEallowed gdiInteropPresent frameLatencyHandleGuard noUvFlatAlbedo baseVertexGeometry gpuSceneBBox perVendorPresent gdiWsiFallback nrcOptIn nvidiaPrewarm rawInputHandoff noInfiniteWaits nonblockingRtPipelines tlasFirewall interleaverFormatNorm dynamicVbSnapshot color0Norm interleaverSkipGuard intUvDecode menuPassthrough migrationPersists fullresTargetGuard viewInProjCbuffer fallbackRadianceTame textureHashStability bridgeTextureContentHash skinningNameGate preciseCamera vpConfirmOncePerFrame crashFilterSafe nrdDenoiserPayload strongerDenoising bridgePresentCamera bootMarkerLogCleanup vertexColorFormats texcoordFormats pickResolveLog nrdRobustLoad menuToggleDebounce uiDisplayMatchesSurface noBlackFromVertexColor nrdDenoiserSafeDefault useRealAlbedo requireRealViewToInject noPrewarmByDefault noStackedInstanceCopies");
+  dxvk::Logger::info("[Remix-DX11] fixes: nrcVendorFallback texcoordSINT SR4viewport budgetHeadroom inputSeparation grayPlaceholder revertedDLSSGuard initStepLogging allVendorPrewarmSkip anyGameAlbedoFix significanceCullingOptIn gpuSceneUI remixapiExport taauDefaultAllVendors rtxOptionsNullGuard rtxOptionsRootCreate intelFseSwapchainFix steamOverlayVkDisable wsiSelfDeadlockPump vramLeakDiag restoreIconicWindow intelFifoPresent intelForceFSEallowed gdiInteropPresent frameLatencyHandleGuard noUvFlatAlbedo baseVertexGeometry gpuSceneBBox perVendorPresent gdiWsiFallback nrcOptIn nvidiaPrewarm rawInputHandoff noInfiniteWaits nonblockingRtPipelines tlasFirewall interleaverFormatNorm dynamicVbSnapshot color0Norm interleaverSkipGuard intUvDecode menuPassthrough migrationPersists fullresTargetGuard viewInProjCbuffer fallbackRadianceTame textureHashStability bridgeTextureContentHash skinningNameGate preciseCamera vpConfirmOncePerFrame crashFilterSafe nrdDenoiserPayload strongerDenoising bridgePresentCamera bootMarkerLogCleanup vertexColorFormats texcoordFormats pickResolveLog nrdRobustLoad menuToggleDebounce uiDisplayMatchesSurface noBlackFromVertexColor nrdDenoiserSafeDefault useRealAlbedo requireRealViewToInject noPrewarmByDefault noStackedInstanceCopies noDepthOnlyGeometry skyAutoDetect realShaderModel colorNameGate mirroredWinding launcherBypass nrdOn globalTonemap texcoordCaptureSO v271SubmitFix dx11FixedFunction bootBreadcrumb sysDllExports satelliteDelayLoad eacAdvisory");
   dxvk::Logger::info("[Remix-DX11] if this line is absent or older than your last build, the game loaded a STALE d3d11.dll.");
+  // DX11_V282: anti-cheat advisory (detection + guidance only; Remix cannot
+  // and must not run under an active anti-cheat).
+  if (const char* antiCheat = dxvk::env::remixDetectAntiCheat()) {
+    dxvk::Logger::warn(dxvk::str::format(
+      "[Remix-DX11] ", antiCheat, " detected near the game. If the game fails to launch or exits at startup ",
+      "with Remix installed, launch the game's official anti-cheat-disabled / mod mode ",
+      "(e.g. Halo MCC's 'Anti-Cheat Disabled' Steam launch option)."));
+  }
   dxvk::Logger::info("=====================================================");
 }
+
+// DX11_V282_SATELLITE_DELAYLOAD: C-API satellite DLLs (vulkan-1, rtxio,
+// NRC_Vulkan, libxess, Aftermath, NvLowLatencyVk) are delay-loaded (see
+// meson link args). Previously they were static imports: ONE missing file -
+// or no Vulkan runtime on the machine - made the Windows loader kill the
+// process with STATUS_DLL_NOT_FOUND before any of our code ran ("game does
+// not load and no logs get made"). With delay-load the game boots, and a
+// missing satellite surfaces HERE at first use: log it to both the boot
+// breadcrumb (kernel32-only, always works) and the main log, then let the
+// delay-load exception propagate so the V263 crash filter records the
+// signature too.
+static FARPROC WINAPI remixDelayLoadFailureHook(unsigned dliNotify, PDelayLoadInfo pdli) {
+  if ((dliNotify == dliFailLoadLib || dliNotify == dliFailGetProc)
+   && pdli != nullptr && pdli->szDll != nullptr) {
+    char msg[320];
+    size_t pos = 0;
+    const char* head = "MISSING SATELLITE DLL (copy the FULL x64 payload next to the game exe): ";
+    for (const char* s = head; *s != '\0' && pos < sizeof(msg) - 1; ++s)
+      msg[pos++] = *s;
+    for (const char* s = pdli->szDll; *s != '\0' && pos < sizeof(msg) - 1; ++s)
+      msg[pos++] = *s;
+    msg[pos] = '\0';
+    dxvk::env::remixAppendBootLine("d3d11.dll", msg);
+    dxvk::Logger::err(std::string("[Remix-DX11] ") + msg);
+  }
+  return nullptr;
+}
+extern "C" const PfnDliHook __pfnDliFailureHook2 = remixDelayLoadFailureHook;
 
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
   if (reason == DLL_PROCESS_ATTACH) {
     g_d3d11Module = hModule;
+    // DX11_V282_BOOT_BREADCRUMB: pure kernel32, loader-lock safe. If a user
+    // reports "no logs at all", the absence of even this file (with the DLL
+    // in place) proves the DLL never attached - anti-cheat block, wrong
+    // architecture, or a missing hard dependency - a different failure class
+    // than a crash after attach.
+    dxvk::env::remixAppendBootLine("d3d11.dll",
+      dxvk::env::shouldBypassRemixForCurrentProcess() ? "attached (bypass)" : "attached");
+    if (const char* antiCheat = dxvk::env::remixDetectAntiCheat()) {
+      char msg[256];
+      size_t pos = 0;
+      for (const char* s = antiCheat; *s != '\0' && pos < sizeof(msg) - 1; ++s)
+        msg[pos++] = *s;
+      const char* tail = " detected: if the game refuses to launch with Remix installed,"
+                         " use the game's official anti-cheat-disabled / mod launch mode";
+      for (const char* s = tail; *s != '\0' && pos < sizeof(msg) - 1; ++s)
+        msg[pos++] = *s;
+      msg[pos] = '\0';
+      dxvk::env::remixAppendBootLine("d3d11.dll", msg);
+    }
     // DX11_V263_CRASH_FILTER_SAFE: unhandled-only, chained - never fires
     // during normal operation, so it cannot interfere with game/DRM startup
     // the way the V261 vectored handler could.
@@ -182,6 +238,38 @@ namespace dxvk {
   
 extern "C" {
   using namespace dxvk;
+
+  // DX11_V282_SYS_DLL_EXPORTS: the SYSTEM d3d10/d3d10_1.dll import these
+  // three functions from "d3d11.dll" BY NAME. Any module in the game process
+  // that loads system D3D10 (video middleware, overlays, launcher UIs)
+  // resolves that import against OUR already-loaded d3d11.dll; before these
+  // stubs existed, the missing names failed that load with
+  // STATUS_ENTRYPOINT_NOT_FOUND - which can take down the game with no logs.
+  // Same layered-device stubs upstream DXVK ships; D3D10-on-Remix itself
+  // stays unsupported (E_NOTIMPL), but the loader is satisfied.
+  HRESULT STDMETHODCALLTYPE D3D11CoreCreateLayeredDevice(
+    const void* unknown0, DWORD unknown1, const void* unknown2, REFIID riid, void** ppvObject) {
+    static bool warned = false;
+    if (!std::exchange(warned, true))
+      Logger::warn("D3D11CoreCreateLayeredDevice: Stub (D3D10 layered devices unsupported)");
+    return E_NOTIMPL;
+  }
+
+  SIZE_T STDMETHODCALLTYPE D3D11CoreGetLayeredDeviceSize(
+    const void* unknown0, DWORD unknown1) {
+    static bool warned = false;
+    if (!std::exchange(warned, true))
+      Logger::warn("D3D11CoreGetLayeredDeviceSize: Stub (D3D10 layered devices unsupported)");
+    return 0;
+  }
+
+  HRESULT STDMETHODCALLTYPE D3D11CoreRegisterLayers(
+    const void* unknown0, DWORD unknown1) {
+    static bool warned = false;
+    if (!std::exchange(warned, true))
+      Logger::warn("D3D11CoreRegisterLayers: Stub (D3D10 layered devices unsupported)");
+    return E_NOTIMPL;
+  }
 
   static HMODULE loadSystemD3D11() {
     wchar_t sysPath[MAX_PATH];

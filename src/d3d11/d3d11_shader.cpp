@@ -1,12 +1,292 @@
+#include <cctype>
+
 #include "d3d11_device.h"
 #include "d3d11_shader.h"
 
 namespace dxvk {
-  
+
+  // DX11_V277_REAL_SHADER_MODEL: parse the shader model version from the raw
+  // DXBC container. Layout: 'DXBC' magic (4) + checksum (16) + one (4) +
+  // totalSize (4) + chunkCount (4) + chunkCount x uint32 chunk offsets; each
+  // chunk = fourCC (4) + size (4) + data. The SHDR (SM4) or SHEX (SM5) chunk's
+  // first DWORD is the version token: bits [3:0] = minor, [7:4] = major.
+  // Fully bounds-checked; returns false (caller keeps the 4.0 default) on any
+  // malformed input.
+  static bool parseDxbcShaderModel(
+    const void* pBytecode,
+    size_t      length,
+    uint32_t&   outMajor,
+    uint32_t&   outMinor) {
+    const uint8_t* bytes = reinterpret_cast<const uint8_t*>(pBytecode);
+    if (bytes == nullptr || length < 0x20)
+      return false;
+
+    auto readU32 = [&](size_t offset) -> uint32_t {
+      uint32_t v = 0;
+      std::memcpy(&v, bytes + offset, sizeof(v));
+      return v;
+    };
+
+    // 'DXBC' magic
+    if (readU32(0) != 0x43425844u)
+      return false;
+
+    const uint32_t chunkCount = readU32(0x1C);
+    if (chunkCount == 0 || chunkCount > 64)
+      return false;
+    if (0x20 + size_t(chunkCount) * 4 > length)
+      return false;
+
+    constexpr uint32_t kFourCcShdr = 0x52444853u; // 'SHDR'
+    constexpr uint32_t kFourCcShex = 0x58454853u; // 'SHEX'
+
+    for (uint32_t i = 0; i < chunkCount; ++i) {
+      const uint32_t chunkOffset = readU32(0x20 + size_t(i) * 4);
+      // Chunk header (fourCC + size) plus the version DWORD must fit.
+      if (size_t(chunkOffset) + 12 > length)
+        continue;
+
+      const uint32_t fourCc = readU32(chunkOffset);
+      if (fourCc != kFourCcShdr && fourCc != kFourCcShex)
+        continue;
+
+      const uint32_t versionToken = readU32(size_t(chunkOffset) + 8);
+      const uint32_t minor = versionToken & 0xFu;
+      const uint32_t major = (versionToken >> 4) & 0xFu;
+      // D3D11 shader models are 4.0 - 5.1; reject garbage tokens.
+      if (major < 4 || major > 6 || minor > 1)
+        return false;
+
+      outMajor = major;
+      outMinor = minor;
+      return true;
+    }
+
+    return false;
+  }
+
+  // DX11_V281_FIXED_FUNCTION: walk the SHDR/SHEX instruction stream for the
+  // discard opcode (13 - covers both discard_z and discard_nz, i.e. HLSL
+  // clip() and explicit discard). D3D10+ removed the fixed-function alpha
+  // test; a pixel shader that discards IS this API generation's alpha test,
+  // so the capture layer needs to know. Instruction skipping uses the
+  // per-instruction DWORD length in OpcodeToken0 bits [30:24]; custom-data
+  // blocks (opcode 53) carry their full DWORD count in the following token
+  // instead. Fully bounds-checked with a hard iteration cap; returns false
+  // on any malformed input.
+  static bool parseDxbcUsesDiscard(
+    const void* pBytecode,
+    size_t      length) {
+    const uint8_t* bytes = reinterpret_cast<const uint8_t*>(pBytecode);
+    if (bytes == nullptr || length < 0x20)
+      return false;
+
+    auto readU32 = [&](size_t offset) -> uint32_t {
+      uint32_t v = 0;
+      std::memcpy(&v, bytes + offset, sizeof(v));
+      return v;
+    };
+
+    if (readU32(0) != 0x43425844u) // 'DXBC'
+      return false;
+
+    const uint32_t chunkCount = readU32(0x1C);
+    if (chunkCount == 0 || chunkCount > 64)
+      return false;
+    if (0x20 + size_t(chunkCount) * 4 > length)
+      return false;
+
+    constexpr uint32_t kFourCcShdr = 0x52444853u; // 'SHDR'
+    constexpr uint32_t kFourCcShex = 0x58454853u; // 'SHEX'
+
+    for (uint32_t i = 0; i < chunkCount; ++i) {
+      const uint32_t chunkOffset = readU32(0x20 + size_t(i) * 4);
+      if (size_t(chunkOffset) + 16 > length)
+        continue;
+
+      const uint32_t fourCc = readU32(chunkOffset);
+      if (fourCc != kFourCcShdr && fourCc != kFourCcShex)
+        continue;
+
+      const uint32_t chunkSize = readU32(size_t(chunkOffset) + 4);
+      const size_t dataStart = size_t(chunkOffset) + 8;
+      if (dataStart + chunkSize > length || chunkSize < 8)
+        return false;
+
+      // Program header: version token, then total program length in DWORDs
+      // (including these two tokens). Instructions follow.
+      const uint32_t programLength = readU32(dataStart + 4);
+      const size_t programEnd = std::min(
+        dataStart + size_t(programLength) * 4,
+        dataStart + chunkSize);
+
+      size_t pos = dataStart + 8;
+      uint32_t iterations = 0;
+      while (pos + 4 <= programEnd && ++iterations < (1u << 20)) {
+        const uint32_t token0 = readU32(pos);
+        const uint32_t opcode = token0 & 0x7FFu;
+
+        if (opcode == 13u) // discard
+          return true;
+
+        size_t instrDwords;
+        if (opcode == 53u) { // custom data: next token holds the full length
+          if (pos + 8 > programEnd)
+            return false;
+          instrDwords = readU32(pos + 4);
+          if (instrDwords < 2)
+            return false;
+        } else {
+          instrDwords = (token0 >> 24) & 0x7Fu;
+          if (instrDwords == 0)
+            return false;
+        }
+        pos += instrDwords * 4;
+      }
+      return false;
+    }
+
+    return false;
+  }
+
+  // DX11_V280_TEXCOORD_CAPTURE: scan the DXBC OUTPUT signature chunk
+  // (OSGN = SM4/5, OSG5 = SM5 with streams, OSG1 = SM5.1) for a texcoord-like
+  // element the stream-out capture can read back. Engine-agnostic on purpose:
+  // semantic names in DXBC signatures are free-form strings chosen by each
+  // engine's HLSL ("TEXCOORD", "UV", "TexUV", ...), so this matches by
+  // substring preference rather than any fixed per-engine table. Requirements
+  // are structural: not a system value, float components, at least .xy
+  // written, stream 0. Fully bounds-checked; returns false on any malformed
+  // input (caller simply skips capture support for that shader).
+  static bool parseDxbcOutputTexcoord(
+    const void*  pBytecode,
+    size_t       length,
+    std::string& outName,
+    uint32_t&    outIndex) {
+    const uint8_t* bytes = reinterpret_cast<const uint8_t*>(pBytecode);
+    if (bytes == nullptr || length < 0x20)
+      return false;
+
+    auto readU32 = [&](size_t offset) -> uint32_t {
+      uint32_t v = 0;
+      std::memcpy(&v, bytes + offset, sizeof(v));
+      return v;
+    };
+
+    // 'DXBC' magic
+    if (readU32(0) != 0x43425844u)
+      return false;
+
+    const uint32_t chunkCount = readU32(0x1C);
+    if (chunkCount == 0 || chunkCount > 64)
+      return false;
+    if (0x20 + size_t(chunkCount) * 4 > length)
+      return false;
+
+    constexpr uint32_t kFourCcOsgn = 0x4E47534Fu; // 'OSGN'
+    constexpr uint32_t kFourCcOsg5 = 0x3547534Fu; // 'OSG5'
+    constexpr uint32_t kFourCcOsg1 = 0x3147534Fu; // 'OSG1'
+
+    for (uint32_t i = 0; i < chunkCount; ++i) {
+      const uint32_t chunkOffset = readU32(0x20 + size_t(i) * 4);
+      if (size_t(chunkOffset) + 16 > length)
+        continue;
+
+      const uint32_t fourCc = readU32(chunkOffset);
+      if (fourCc != kFourCcOsgn && fourCc != kFourCcOsg5 && fourCc != kFourCcOsg1)
+        continue;
+
+      const uint32_t chunkSize = readU32(size_t(chunkOffset) + 4);
+      const size_t dataStart = size_t(chunkOffset) + 8;
+      if (dataStart + chunkSize > length || chunkSize < 8)
+        return false;
+
+      const uint32_t elementCount = readU32(dataStart);
+      if (elementCount == 0 || elementCount > 64)
+        return false;
+
+      // OSG5/OSG1 elements lead with a uint32 stream id; OSG1 trails a
+      // uint32 min-precision field. The shared fields sit at the same
+      // relative offsets once the leading stream id is skipped.
+      const size_t elemSize     = (fourCc == kFourCcOsgn) ? 24 : (fourCc == kFourCcOsg5 ? 28 : 32);
+      const size_t nameFieldOff = (fourCc == kFourCcOsgn) ? 0 : 4;
+      const size_t tableStart   = dataStart + 8;
+      if (8 + size_t(elementCount) * elemSize > chunkSize)
+        return false;
+
+      bool found = false;
+      int bestScore = 0;
+      uint32_t bestIndex = 0;
+      std::string bestName;
+
+      for (uint32_t e = 0; e < elementCount; ++e) {
+        const size_t el = tableStart + size_t(e) * elemSize;
+
+        if (fourCc != kFourCcOsgn && readU32(el) != 0)
+          continue; // only stream 0 is capturable here
+
+        const uint32_t nameOffset    = readU32(el + nameFieldOff + 0);
+        const uint32_t semanticIdx   = readU32(el + nameFieldOff + 4);
+        const uint32_t systemValue   = readU32(el + nameFieldOff + 8);
+        const uint32_t componentType = readU32(el + nameFieldOff + 12);
+        const uint8_t  mask          = bytes[el + nameFieldOff + 20];
+
+        if (systemValue != 0)   // skip SV_Position & friends
+          continue;
+        if (componentType != 3) // D3D_REGISTER_COMPONENT_FLOAT32
+          continue;
+        if ((mask & 0x3u) != 0x3u) // needs at least .xy written
+          continue;
+
+        if (size_t(nameOffset) >= chunkSize)
+          continue;
+        const char* name = reinterpret_cast<const char*>(bytes + dataStart + nameOffset);
+        const size_t maxLen = chunkSize - nameOffset;
+        size_t n = 0;
+        while (n < maxLen && name[n] != '\0')
+          ++n;
+        if (n == 0 || n >= maxLen || n > 63)
+          continue;
+
+        std::string upper(name, n);
+        for (auto& c : upper)
+          c = char(::toupper(static_cast<unsigned char>(c)));
+
+        int score = 0;
+        if (upper.find("TEXCOORD") != std::string::npos)
+          score = 3;
+        else if (upper.compare(0, 2, "UV") == 0)
+          score = 2;
+        else if (upper.find("TEX") != std::string::npos)
+          score = 1;
+        if (score == 0)
+          continue;
+
+        // Prefer the strongest name match, then the lowest semantic index
+        // (TEXCOORD0/UV0 is the diffuse UV set in every engine convention).
+        if (!found || score > bestScore || (score == bestScore && semanticIdx < bestIndex)) {
+          found = true;
+          bestScore = score;
+          bestIndex = semanticIdx;
+          bestName.assign(name, n);
+        }
+      }
+
+      if (found) {
+        outName = std::move(bestName);
+        outIndex = bestIndex;
+        return true;
+      }
+      return false; // signature present, nothing texcoord-like in it
+    }
+
+    return false;
+  }
+
   D3D11CommonShader:: D3D11CommonShader() { }
   D3D11CommonShader::~D3D11CommonShader() { }
-  
-  
+
+
   D3D11CommonShader::D3D11CommonShader(
           D3D11Device*    pDevice,
     const DxvkShaderKey*  pShaderKey,
@@ -15,6 +295,17 @@ namespace dxvk {
           size_t          BytecodeLength) {
     const std::string name = pShaderKey->toString();
     Logger::debug(str::format("Compiling shader ", name));
+
+    // DX11_V277_REAL_SHADER_MODEL: record the true shader model for this
+    // shader so draw capture reports it instead of a hardcoded 4.0.
+    parseDxbcShaderModel(pShaderBytecode, BytecodeLength,
+                         m_shaderModelMajor, m_shaderModelMinor);
+
+    // DX11_V281_FIXED_FUNCTION: pixel shaders that discard are this API
+    // generation's alpha test; parse once so draw capture can mark cutout
+    // geometry (FillMaterialData).
+    if (pShaderKey->type() == VK_SHADER_STAGE_FRAGMENT_BIT)
+      m_usesDiscard = parseDxbcUsesDiscard(pShaderBytecode, BytecodeLength);
     
     DxbcReader reader(
       reinterpret_cast<const char*>(pShaderBytecode),
@@ -74,9 +365,85 @@ namespace dxvk {
     }
 
     pDevice->GetDXVKDevice()->registerShader(m_shader);
+
+    // DX11_V280_TEXCOORD_CAPTURE: for plain vertex shaders whose output
+    // signature declares a texcoord-like element, retain the bytecode and
+    // compile options so a stream-out capture GS can be built on demand.
+    // Bounded: only VS, only when a candidate output exists, and oversized
+    // blobs are skipped; the bytecode is released after the (single) build.
+    if (pShaderKey->type() == VK_SHADER_STAGE_VERTEX_BIT
+     && pDxbcModuleInfo->xfb == nullptr
+     && BytecodeLength <= (1u << 20)) {
+      std::string semanticName;
+      uint32_t semanticIndex = 0;
+      if (parseDxbcOutputTexcoord(pShaderBytecode, BytecodeLength, semanticName, semanticIndex)) {
+        m_texcoordCapture = std::make_shared<D3D11TexcoordCaptureState>();
+        m_texcoordCapture->bytecode.assign(
+          reinterpret_cast<const char*>(pShaderBytecode),
+          reinterpret_cast<const char*>(pShaderBytecode) + BytecodeLength);
+        m_texcoordCapture->options = pDxbcModuleInfo->options;
+        m_texcoordCapture->semanticName = std::move(semanticName);
+        m_texcoordCapture->semanticIndex = semanticIndex;
+      }
+    }
   }
 
-  
+
+  Rc<DxvkShader> D3D11CommonShader::GetTexcoordCaptureShader() const {
+    const std::shared_ptr<D3D11TexcoordCaptureState>& state = m_texcoordCapture;
+    if (state == nullptr)
+      return nullptr;
+
+    std::lock_guard<dxvk::mutex> lock(state->mutex);
+    if (state->attempted)
+      return state->shader;
+    state->attempted = true;
+
+    try {
+      DxbcReader reader(state->bytecode.data(), state->bytecode.size());
+      DxbcModule module(reader);
+
+      // Single xfb entry: the VS's texcoord output, .xy, into buffer 0 at
+      // offset 0 with stride 8. rasterizedStream = -1 turns the replay
+      // pipeline into a pure capture pass: dxvk keys rasterizer discard off
+      // the GS xfb stream, so the replay can never touch color or depth.
+      DxbcXfbInfo xfb = {};
+      xfb.entryCount = 1;
+      xfb.entries[0].semanticName   = state->semanticName.c_str();
+      xfb.entries[0].semanticIndex  = state->semanticIndex;
+      xfb.entries[0].componentIndex = 0;
+      xfb.entries[0].componentCount = 2;
+      xfb.entries[0].streamId       = 0;
+      xfb.entries[0].bufferId       = 0;
+      xfb.entries[0].offset         = 0;
+      xfb.strides[0] = 8;
+      xfb.rasterizedStream = -1;
+
+      DxbcModuleInfo info;
+      info.options = state->options;
+      info.tess = nullptr;
+      info.xfb = &xfb;
+
+      Rc<DxvkShader> gs = module.compilePassthroughShader(info, "dx11_texcoord_capture_gs");
+      gs->setShaderKey(DxvkShaderKey(VK_SHADER_STAGE_GEOMETRY_BIT,
+        Sha1Hash::compute(state->bytecode.data(), state->bytecode.size())));
+      state->shader = gs;
+
+      Logger::info(str::format(
+        "[Remix-DX11] V280: texcoord capture GS built (semantic=",
+        state->semanticName, state->semanticIndex, ")"));
+    } catch (const DxvkError& e) {
+      Logger::warn(str::format(
+        "[Remix-DX11] V280: texcoord capture GS compile failed: ", e.message()));
+    }
+
+    // One attempt per shader either way; the bytecode is no longer needed.
+    state->bytecode.clear();
+    state->bytecode.shrink_to_fit();
+    return state->shader;
+  }
+
+
   D3D11ShaderModuleSet:: D3D11ShaderModuleSet() { }
   D3D11ShaderModuleSet::~D3D11ShaderModuleSet() { }
   

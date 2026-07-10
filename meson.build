@@ -518,6 +518,23 @@ usd_plugins = []
 usd_plugin_deps = []
 usd_plugin_delay_load_args = []
 
+# DX11_V282_SATELLITE_DELAYLOAD: C-API satellite runtimes are delay-loaded so
+# that a MISSING satellite (partial payload copy, or a machine without a
+# Vulkan runtime) fails at first feature use - logged by the delay-load
+# failure hook in d3d11_main.cpp/dxgi_main.cpp - instead of making the
+# Windows loader kill the game at startup with STATUS_DLL_NOT_FOUND before
+# any log can exist ("game does not load and no logs get made").
+# The USD/python/boost stack exports C++ data symbols and cannot be
+# delay-loaded; those DLLs remain hard load-time dependencies.
+remix_satellite_delay_load_args = [
+  '/DELAYLOAD:vulkan-1.dll',
+  '/DELAYLOAD:rtxio.dll',
+  '/DELAYLOAD:NRC_Vulkan.dll',
+  '/DELAYLOAD:libxess.dll',
+  '/DELAYLOAD:GFSDK_Aftermath_Lib.x64.dll',
+  '/DELAYLOAD:NvLowLatencyVk.dll',
+]
+
 nvapi_include_paths = include_directories('submodules/nvapi')
 nvapi_lib_path = join_paths(global_src_root_norm, 'submodules/nvapi', nvapi_arch_dir)
 nvapi_lib = dxvk_compiler.find_library(nvapi_lib_name, dirs : nvapi_lib_path)
