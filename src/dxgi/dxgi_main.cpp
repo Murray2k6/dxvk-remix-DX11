@@ -1,13 +1,40 @@
 #include "dxgi_factory.h"
 #include "dxgi_include.h"
 
+#include <delayimp.h>
+
 #include "../util/util_env.h"
+
+// DX11_V282_SATELLITE_DELAYLOAD: same policy as d3d11_main.cpp - a missing
+// delay-loaded satellite is logged at first use instead of killing the
+// process at load time with no logs.
+static FARPROC WINAPI remixDxgiDelayLoadFailureHook(unsigned dliNotify, PDelayLoadInfo pdli) {
+  if ((dliNotify == dliFailLoadLib || dliNotify == dliFailGetProc)
+   && pdli != nullptr && pdli->szDll != nullptr) {
+    char msg[320];
+    size_t pos = 0;
+    const char* head = "MISSING SATELLITE DLL (copy the FULL x64 payload next to the game exe): ";
+    for (const char* s = head; *s != '\0' && pos < sizeof(msg) - 1; ++s)
+      msg[pos++] = *s;
+    for (const char* s = pdli->szDll; *s != '\0' && pos < sizeof(msg) - 1; ++s)
+      msg[pos++] = *s;
+    msg[pos] = '\0';
+    dxvk::env::remixAppendBootLine("dxgi.dll", msg);
+    dxvk::Logger::err(std::string("[Remix-DX11] ") + msg);
+  }
+  return nullptr;
+}
+extern "C" const PfnDliHook __pfnDliFailureHook2 = remixDxgiDelayLoadFailureHook;
 
 // Same DLL search path fix as d3d11_main.cpp — ensures Remix runtime DLLs
 // are found in the game directory when loaded through launchers with
 // restricted search paths.
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
     if (reason == DLL_PROCESS_ATTACH) {
+    // DX11_V282_BOOT_BREADCRUMB (kernel32-only, loader-lock safe; see
+    // util_env.h - proves the DLL attached even when no other log exists).
+    dxvk::env::remixAppendBootLine("dxgi.dll",
+      dxvk::env::shouldBypassRemixForCurrentProcess() ? "attached (bypass)" : "attached");
     if (!dxvk::env::shouldBypassRemixForCurrentProcess()) {
       wchar_t path[MAX_PATH];
       if (GetModuleFileNameW(hModule, path, MAX_PATH)) {
@@ -126,6 +153,47 @@ extern "C" {
       dxvk::Logger::warn("DXGIGetDebugInterface1: Stub");
 
     return E_NOINTERFACE;
+  }
+
+  // DX11_V282_SYS_DLL_EXPORTS: the SYSTEM d3d11.dll and d3d10/d3d10_1.dll
+  // import these from "dxgi.dll" BY NAME. When the launcher bypass (V279)
+  // loads the system d3d11.dll into a process where OUR dxgi.dll is already
+  // resident, or any module loads system D3D10, the loader resolves those
+  // imports against us; missing names failed the load with
+  // STATUS_ENTRYPOINT_NOT_FOUND - games/launchers dying with no logs. Stubs
+  // satisfy the loader; D3D10 device creation through Remix's DXGI stays
+  // unsupported (E_NOTIMPL). x64 calling convention makes the exact
+  // signatures loader-irrelevant; these match the documented DDK shapes.
+  DLLEXPORT HRESULT __stdcall DXGID3D10CreateDevice(
+    HMODULE hModule, void* pFactory, void* pAdapter, UINT Flags, void* unknown, void** ppDevice) {
+    static bool warned = false;
+    if (!std::exchange(warned, true))
+      dxvk::Logger::warn("DXGID3D10CreateDevice: Stub (D3D10 devices unsupported)");
+    return E_NOTIMPL;
+  }
+
+  DLLEXPORT HRESULT __stdcall DXGID3D10CreateLayeredDevice(
+    void* unknown0, void* unknown1, void* unknown2, void* unknown3, void* unknown4) {
+    static bool warned = false;
+    if (!std::exchange(warned, true))
+      dxvk::Logger::warn("DXGID3D10CreateLayeredDevice: Stub (D3D10 devices unsupported)");
+    return E_NOTIMPL;
+  }
+
+  DLLEXPORT SIZE_T __stdcall DXGID3D10GetLayeredDeviceSize(
+    const void* pLayers, UINT NumLayers) {
+    static bool warned = false;
+    if (!std::exchange(warned, true))
+      dxvk::Logger::warn("DXGID3D10GetLayeredDeviceSize: Stub (D3D10 devices unsupported)");
+    return 0;
+  }
+
+  DLLEXPORT HRESULT __stdcall DXGID3D10RegisterLayers(
+    const void* pLayers, UINT NumLayers) {
+    static bool warned = false;
+    if (!std::exchange(warned, true))
+      dxvk::Logger::warn("DXGID3D10RegisterLayers: Stub (D3D10 devices unsupported)");
+    return E_NOTIMPL;
   }
 
 }

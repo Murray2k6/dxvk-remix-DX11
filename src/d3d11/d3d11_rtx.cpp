@@ -264,23 +264,37 @@ namespace dxvk {
     LightManager::fallbackLightDirectionObject().setDeferred(Vector3(-0.3f, -1.0f, 0.5f), defaults);
     LightManager::fallbackLightAngleObject().setDeferred(5.0f, defaults);
 
-    // DX11_V272_NRD_DENOISER_SAFE_DEFAULT: the NRD pre-composition denoiser
-    // has never had validated inputs in this DX11 fork - it was a silent
-    // no-op until NRD.dll shipping was fixed (V264/V270), so the raw (noisy
-    // but VISIBLE) signal always reached the screen. Now that NRD loads and
-    // runs, its denoised output is BLACK: the DX11 capture path does not
-    // populate the per-object motion-vector / linear-viewZ inputs NRD needs,
-    // so it accumulates to black, and the composite uses those denoised
-    // inputs whenever useDenoiser is on and Ray Reconstruction is not active
-    // -> the whole viewport blanks to black. Default NRD OFF in the DX11 path
-    // so the viewport is NEVER black. Denoising is still provided by Ray
-    // Reconstruction (NVIDIA DLSS-RR, a separate path that bypasses NRD) where
-    // supported, and TAAU gives temporal smoothing on every vendor. NRD stays
-    // fully loadable (V270 robust loader) - re-enable it for input validation
-    // with env DXVK_REMIX_USE_NRD=1 or rtx.useDenoiser=true in rtx.conf.
-    if (env::getEnvVar("DXVK_REMIX_USE_NRD") != "1") {
+    // DX11_V277_SKY_AUTODETECT: DX11 capture never categorized any draw as
+    // sky, so rays that MISSED all geometry sampled an EMPTY (BLACK) sky -
+    // rotating the camera between geometry and skyless void flickered
+    // grey<->black. The upstream auto-detection (rtx_types.cpp: skybox draws
+    // render at the camera origin with depth writes off - true in virtually
+    // every engine) was simply disabled by default. Enable it so the game's
+    // own skybox becomes the RT sky/environment light on any engine.
+    RtxOptions::skyAutoDetectObject().setDeferred(
+      SkyAutoDetectMode::CameraPositionAndDepthFlags, defaults);
+
+    // DX11_V279_NRD_ON (supersedes the V272 off-default): the "NRD outputs
+    // black" diagnosis was wrong about the denoiser - the black frames came
+    // from the since-fixed real causes (identity-view camera parking the RT
+    // camera at the origin [V274], rays missing into an undetected black sky
+    // [V277], and stacked coincident geometry [V276/V277]). NRD's inputs
+    // (motion vectors, linear viewZ) are produced by the RT gbuffer pass
+    // itself, not by the capture layer, so they exist. With the black causes
+    // fixed, the denoiser is REQUIRED for usable path tracing (kept at the
+    // engine default: ON) together with the V266 strengthened settings.
+    // Escape hatch: DXVK_REMIX_USE_NRD=0 disables it for A/B testing.
+    if (env::getEnvVar("DXVK_REMIX_USE_NRD") == "0") {
       RtxOptions::useDenoiser.setDeferred(false);
     }
+
+    // DX11_V279_GLOBAL_TONEMAP: rtx.tonemappingMode defaults to Local - the
+    // exposure-histogram tonemapper, which washes out, crushes, or flickers
+    // on content with erratic luminance (captured DX11 scenes with fallback
+    // lighting are exactly that). Default the DX11 path to the Global filmic
+    // tonemapper, which is stable across arbitrary content; per-game opt back
+    // into Local via rtx.tonemappingMode=1 in rtx.conf.
+    RtxOptions::tonemappingModeObject().setDeferred(TonemappingMode::Global, defaults);
   }
 
   void D3D11Rtx::OnDraw(UINT vertexCount, UINT startVertex) {
@@ -303,6 +317,180 @@ namespace dxvk {
     m_drawCallID = 0;
     m_drawsSinceFlush = 0;
     m_submitRejectStats = {};
+  }
+
+  // DX11_V280_TEXCOORD_CAPTURE: engine-agnostic recovery of texture
+  // coordinates for textured draws whose input layout carries no usable
+  // TEXCOORD stream - the UVs exist only as vertex-shader OUTPUTS (computed
+  // from other attributes, instance data, or constants). The draw's vertex
+  // range is replayed once through DXVK's stream-output passthrough pipeline
+  // (the exact mechanism backing D3D11 CreateGeometryShaderWithStreamOutput):
+  //
+  //   game VS (unmodified) -> generated point-in/point-out passthrough GS
+  //   with one xfb entry (TEXCOORDn.xy, buffer 0, stride 8) and
+  //   rasterizedStream = -1, which dxvk turns into rasterizer discard
+  //   (dxvk_graphics.cpp keys discard off the GS xfb stream) - the replay
+  //   can never write a pixel or a depth value.
+  //
+  // The replay is a POINT_LIST draw over the draw's vertex range with the
+  // game's own IA bindings: every vertex becomes one point primitive, so it
+  // is processed exactly once and in order - captured vertex i IS geometry
+  // vertex i. That keeps indexed geometry indexed (positions and indices stay
+  // the IA-sourced ones; only the texcoord stream is new) and works for
+  // strips and lists alike, since the original topology only matters to the
+  // rasterizer, which is discarded.
+  //
+  // This is the D3D11 expression of what Unreal Engine does for ray tracing
+  // (RayTracingDynamicGeometryUpdate: a dedicated GPU pass re-evaluates
+  // shader-computed vertex data into a buffer the BLAS consumes), with UE's
+  // cost policies applied as the per-draw and per-frame budgets below.
+  bool D3D11Rtx::TryCaptureTexcoordsViaStreamOut(
+      DrawCallState& dcs, RasterGeometry& geo,
+      bool indexed, UINT count, UINT start, INT base) {
+    // Kill switch for field diagnosis; capture is otherwise always available.
+    static const bool s_disabled = env::getEnvVar("DXVK_REMIX_TEXCOORD_CAPTURE") == "0";
+    if (s_disabled)
+      return false;
+
+    // Capability gate, not a game gate: transform feedback is present on
+    // NVIDIA/AMD/Intel desktop Vulkan drivers (dxvk needs it for D3D11
+    // stream output), but verify rather than assume.
+    if (!m_context->m_device->features().extTransformFeedback.transformFeedback)
+      return false;
+
+    // Structural guards: the replay assumes the VS is the only stage shaping
+    // vertices and that the GS slot and SO buffers are free for the capture
+    // pipeline. Tessellated / GS-driven / SO-active draws pass through to the
+    // existing flat-albedo fallback instead.
+    if (m_context->m_state.gs.shader != nullptr
+     || m_context->m_state.hs.shader != nullptr
+     || m_context->m_state.ds.shader != nullptr)
+      return false;
+
+    for (const auto& soTarget : m_context->m_state.so.targets) {
+      if (soTarget.buffer != nullptr)
+        return false;
+    }
+
+    // Simple topologies only: the replay rebinds POINT_LIST and must restore
+    // the game's input-assembly state exactly (same mapping as
+    // D3D11DeviceContext::ApplyPrimitiveTopology, including strip restart).
+    DxvkInputAssemblyState restoreIa = { VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, VK_FALSE, 0 };
+    switch (m_context->m_state.ia.primitiveTopology) {
+      case D3D_PRIMITIVE_TOPOLOGY_POINTLIST:
+        restoreIa = { VK_PRIMITIVE_TOPOLOGY_POINT_LIST, VK_FALSE, 0 };
+        break;
+      case D3D_PRIMITIVE_TOPOLOGY_LINELIST:
+        restoreIa = { VK_PRIMITIVE_TOPOLOGY_LINE_LIST, VK_FALSE, 0 };
+        break;
+      case D3D_PRIMITIVE_TOPOLOGY_LINESTRIP:
+        restoreIa = { VK_PRIMITIVE_TOPOLOGY_LINE_STRIP, VK_TRUE, 0 };
+        break;
+      case D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST:
+        restoreIa = { VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, VK_FALSE, 0 };
+        break;
+      case D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP:
+        restoreIa = { VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP, VK_TRUE, 0 };
+        break;
+      default:
+        return false;
+    }
+
+    // UE-style cost budgets (UE distance-limits its dynamic-geometry
+    // re-evaluation and caps RT instance counts; the equivalents for a
+    // per-draw capture are hard per-draw and per-frame ceilings so a
+    // pathological frame degrades to the flat-albedo fallback instead of
+    // stalling the GPU).
+    static constexpr uint32_t     kMaxCaptureVerticesPerDraw = 2u << 20;
+    static constexpr uint32_t     kMaxCapturesPerFrame       = 128u;
+    static constexpr VkDeviceSize kMaxCaptureBytesPerFrame   = 64ull << 20;
+
+    const uint32_t vertexCount = geo.vertexCount;
+    if (vertexCount == 0 || vertexCount > kMaxCaptureVerticesPerDraw)
+      return false;
+
+    const VkDeviceSize captureBytes = VkDeviceSize(vertexCount) * 8u;
+    if (m_texcoordCapturesThisFrame >= kMaxCapturesPerFrame
+     || m_texcoordCaptureBytesThisFrame + captureBytes > kMaxCaptureBytesPerFrame)
+      return false;
+
+    if (m_context->m_state.vs.shader == nullptr)
+      return false;
+    const D3D11CommonShader* commonVs = m_context->m_state.vs.shader->GetCommonShader();
+    if (commonVs == nullptr || !commonVs->HasTexcoordCaptureCandidate())
+      return false;
+
+    // Compiled once per VS on first need; nullptr means the compile failed
+    // (logged inside) and this VS will never capture.
+    Rc<DxvkShader> captureGs = commonVs->GetTexcoordCaptureShader();
+    if (captureGs == nullptr)
+      return false;
+
+    DxvkBufferCreateInfo info;
+    info.size   = captureBytes;
+    info.usage  = VK_BUFFER_USAGE_TRANSFORM_FEEDBACK_BUFFER_BIT_EXT
+                | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT
+                | VK_BUFFER_USAGE_TRANSFER_SRC_BIT
+                | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT;
+    info.stages = VK_PIPELINE_STAGE_TRANSFORM_FEEDBACK_BIT_EXT
+                | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT
+                | VK_PIPELINE_STAGE_TRANSFER_BIT;
+    info.access = VK_ACCESS_TRANSFORM_FEEDBACK_WRITE_BIT_EXT
+                | VK_ACCESS_SHADER_READ_BIT
+                | VK_ACCESS_TRANSFER_READ_BIT;
+
+    Rc<DxvkBuffer> captureBuffer = m_context->m_device->createBuffer(
+      info, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+      DxvkMemoryStats::Category::RTXBuffer, "dx11 texcoord capture");
+
+    // The geometry's vertex slices were folded to begin at the draw's base
+    // (indexed) / start (non-indexed) vertex, so replaying from that same
+    // first vertex makes captured vertex i correspond exactly to slice
+    // vertex i.
+    const uint32_t firstVertex = indexed ? uint32_t(std::max(base, 0)) : start;
+
+    m_context->EmitCs([cGs = std::move(captureGs),
+                       cBuf = DxvkBufferSlice(captureBuffer, 0, captureBytes),
+                       cCount = vertexCount,
+                       cFirst = firstVertex,
+                       cRestoreIa = restoreIa](DxvkContext* ctx) {
+      const DxvkInputAssemblyState pointIa = { VK_PRIMITIVE_TOPOLOGY_POINT_LIST, VK_FALSE, 0 };
+      ctx->bindShader(VK_SHADER_STAGE_GEOMETRY_BIT, cGs);
+      ctx->bindXfbBuffer(0, cBuf, DxvkBufferSlice());
+      ctx->setInputAssemblyState(pointIa);
+      ctx->draw(cCount, 1, cFirst, 0);
+      // Restore the game's exact pipeline state within this same command
+      // stream position: no GS was bound (guarded above), no SO targets were
+      // bound, and the original input assembly is re-applied.
+      ctx->bindShader(VK_SHADER_STAGE_GEOMETRY_BIT, nullptr);
+      ctx->bindXfbBuffer(0, DxvkBufferSlice(), DxvkBufferSlice());
+      ctx->setInputAssemblyState(cRestoreIa);
+    });
+
+    ++m_texcoordCapturesThisFrame;
+    m_texcoordCaptureBytesThisFrame += captureBytes;
+
+    // Wire the captured stream into BOTH the local geometry (later checks in
+    // SubmitDraw read it) and the already-copied DrawCallState payload that
+    // actually reaches the RT scene. Geometry hashes were scheduled before
+    // this point from IA data only, which is intentional: the capture buffer
+    // is GPU-written and unreadable by the CPU hash worker, and IA-only
+    // hashing keeps the hash stable per frame/run/GPU.
+    const RasterBuffer capturedUvs(
+      DxvkBufferSlice(captureBuffer, 0, captureBytes), 0, 8u, VK_FORMAT_R32G32_SFLOAT);
+    geo.texcoordBuffer = capturedUvs;
+    dcs.geometryData.texcoordBuffer = capturedUvs;
+
+    static uint32_t sTexcoordCaptureLogCount = 0;
+    if (sTexcoordCaptureLogCount < 12) {
+      ++sTexcoordCaptureLogCount;
+      Logger::info(str::format(
+        "[D3D11Rtx] V280: captured texcoords via stream-out replay (verts=", vertexCount,
+        ", indexed=", indexed ? 1 : 0,
+        ", count=", count,
+        ")"));
+    }
+    return true;
   }
 
   void D3D11Rtx::SubmitInstancedDraw(bool indexed, UINT count, UINT start, INT base,
@@ -3584,19 +3772,46 @@ namespace dxvk {
         mat.alphaTestCompareOp     = VK_COMPARE_OP_GREATER;
         mat.alphaTestReferenceValue = 128;
       }
+
+      // DX11_V281_FIXED_FUNCTION: the OM blend CONSTANT is real DX11/12
+      // fixed-function state (OMSetBlendState's BlendFactor argument; the
+      // identical D3D12 dynamic is OMSetBlendFactor). When this draw's blend
+      // equation actually references it, forward the constant as the
+      // material's constant color so constant-faded surfaces (UI fades,
+      // scripted transparency ramps) keep their real opacity in the RT scene
+      // instead of the opaque-white default.
+      auto referencesBlendFactor = [](D3D11_BLEND b) {
+        return b == D3D11_BLEND_BLEND_FACTOR || b == D3D11_BLEND_INV_BLEND_FACTOR;
+      };
+      if (rt0.BlendEnable
+       && (referencesBlendFactor(rt0.SrcBlend)      || referencesBlendFactor(rt0.DestBlend)
+        || referencesBlendFactor(rt0.SrcBlendAlpha) || referencesBlendFactor(rt0.DestBlendAlpha))) {
+        const FLOAT* bf = m_context->m_state.om.blendFactor;
+        auto to8 = [](float f) {
+          return uint32_t(std::max(0.0f, std::min(1.0f, f)) * 255.0f + 0.5f);
+        };
+        // tFactor is ARGB packed (the shader decodes it as .bgra).
+        mat.tFactor = (to8(bf[3]) << 24) | (to8(bf[0]) << 16) | (to8(bf[1]) << 8) | to8(bf[2]);
+      }
     }
 
-    // --- Alpha test from depth-stencil state ---
-    // Some engines use stencil ops to simulate alpha test; detect write-mask-zero
-    // with stencil as a proxy for "discard if alpha < ref".
-    D3D11DepthStencilState* dsState = m_context->m_state.om.dsState;
-    if (dsState && !mat.alphaTestEnabled) {
-      D3D11_DEPTH_STENCIL_DESC dsDesc;
-      dsState->GetDesc(&dsDesc);
-      if (dsDesc.StencilEnable && dsDesc.FrontFace.StencilFunc == D3D11_COMPARISON_LESS) {
+    // --- Alpha test, the DX10/11/12 way ---
+    // D3D10 removed the fixed-function alpha test entirely; nothing in the
+    // depth-stencil object expresses it (the previous stencil-func heuristic
+    // here misfired on deferred renderers' real stencil usage and fed a
+    // BITMASK - StencilReadMask - in as an alpha reference). The API
+    // generation's actual mechanisms are AlphaToCoverage (handled above) and
+    // shader discard: HLSL clip()/discard compiled into the pixel shader IS
+    // the alpha test of DX10/11/12. A PS that can discard marks this draw as
+    // cutout geometry, with the universal clip(alpha - 0.5) convention as the
+    // reference. Opaque textures (alpha = 255) pass unconditionally, so this
+    // is inert on draws whose discard serves another purpose.
+    if (!mat.alphaTestEnabled && m_context->m_state.ps.shader != nullptr) {
+      const D3D11CommonShader* commonPs = m_context->m_state.ps.shader->GetCommonShader();
+      if (commonPs != nullptr && commonPs->UsesDiscard()) {
         mat.alphaTestEnabled        = true;
         mat.alphaTestCompareOp      = VK_COMPARE_OP_GREATER;
-        mat.alphaTestReferenceValue  = dsDesc.StencilReadMask;
+        mat.alphaTestReferenceValue = 128;
       }
     }
 
@@ -3676,11 +3891,26 @@ namespace dxvk {
       [](const auto& rtv) { return rtv.ptr() != nullptr; });
     const bool hasDepthStencilTarget = omState.depthStencilView.ptr() != nullptr;
 
-    // Skip draws with no output target at all. Depth-only draws with a pixel
-    // shader can still carry real world geometry and material textures, so
-    // feed those to Remix instead of tying visibility to raster color output.
+    // Skip draws with no output target at all.
     if (!hasColorRenderTarget && !hasDepthStencilTarget) {
       ++m_submitRejectStats.noRenderTarget;
+      return;
+    }
+
+    // DX11_V277_NO_DEPTH_ONLY_GEOMETRY: reject depth-only draws (depth/stencil
+    // bound, NO color target). These are depth-prepass and shadow-map
+    // re-renders of geometry the color pass ALSO draws - and they usually DO
+    // bind a pixel shader (alpha-tested foliage/fences clip in the PS), so the
+    // PS==null check above never caught them. Submitting them put every such
+    // mesh into the RT scene two or three times per frame: the prepass copy
+    // (no color texture) coincident with the textured main-pass copy - the
+    // "grey/black flicker like a placeholder texture in the way" - and the
+    // shadow-pass copy placed with the LIGHT's matrices (its cbuffers hold the
+    // light view/proj during that pass) - the "geometry stacking on each
+    // other" corruption. A depth-only draw can never contribute visible color;
+    // the color pass provides the one true copy, so nothing visible is lost.
+    if (!hasColorRenderTarget) {
+      ++m_submitRejectStats.depthOnlySkipped;
       return;
     }
 
@@ -3845,10 +4075,16 @@ namespace dxvk {
       const VkFormat cf = colSem->format;
       const bool packedByteColor = cf == VK_FORMAT_B8G8R8A8_UNORM
                                 || cf == VK_FORMAT_R8G8B8A8_UNORM;
-      const bool wideColor = cf == VK_FORMAT_R32G32B32A32_SFLOAT
-                          || ((cf == VK_FORMAT_R16G16B16A16_UNORM
-                            || cf == VK_FORMAT_R16G16B16A16_SFLOAT)
-                           && semanticNameStartsWith(*colSem, "COLOR"));
+      // DX11_V277: ALL wide color formats (float4 included) now require an
+      // explicit COLOR semantic name. A generic-named float4 stream is more
+      // often per-vertex data (weights, params) than diffuse color; feeding
+      // it into the albedo modulate tinted surfaces with garbage - part of
+      // the "wrong colors" corruption. Real float4 vertex colors are named
+      // COLOR in practice, so nothing legitimate is lost.
+      const bool wideColor = (cf == VK_FORMAT_R32G32B32A32_SFLOAT
+                           || cf == VK_FORMAT_R16G16B16A16_UNORM
+                           || cf == VK_FORMAT_R16G16B16A16_SFLOAT)
+                          && semanticNameStartsWith(*colSem, "COLOR");
       if (packedByteColor || wideColor) {
         colBuffer = makeVertexBuffer(colSem);
       }
@@ -3904,6 +4140,19 @@ namespace dxvk {
     D3D11RasterizerState* rsState = m_context->m_state.rs.state;
     if (rsState) {
       const auto* rsDesc = rsState->Desc();
+
+      // DX11_V281_FIXED_FUNCTION: fill mode is real DX11/12 fixed-function
+      // rasterizer state (D3D12 packs the same field into the PSO's
+      // D3D12_RASTERIZER_DESC). Wireframe draws are debug visualizations and
+      // editor overlays - their triangles are only ever LINES on screen, so
+      // submitting them as solid RT geometry inserts opaque phantom surfaces
+      // into the path-traced scene. Skip them; the game's own wireframe
+      // rasterization still renders through the passthrough pipeline.
+      if (rsDesc->FillMode == D3D11_FILL_WIREFRAME) {
+        ++m_submitRejectStats.wireframeSkipped;
+        return;
+      }
+
       switch (rsDesc->CullMode) {
         case D3D11_CULL_NONE:  geo.cullMode = VK_CULL_MODE_NONE;      break;
         case D3D11_CULL_FRONT: geo.cullMode = VK_CULL_MODE_FRONT_BIT; break;
@@ -4771,17 +5020,48 @@ namespace dxvk {
         dcs.transformData.objectToView = dcs.transformData.worldToView * dcs.transformData.objectToWorld;
     }
 
+    // DX11_V278_MIRRORED_TRANSFORM_WINDING (generalized from FO4-Remix's
+    // "preserve mirror transforms in batched bases" inside-out-geometry fix):
+    // a mirrored placement (negative-determinant world transform - games
+    // mirror batched statics constantly: left/right prop variants, reflected
+    // room chunks) flips triangle winding. Left uncorrected, the mesh renders
+    // INSIDE-OUT in the RT scene: viewed from outside it back-face culls away
+    // or shades black. Flip the declared front face for negative-determinant
+    // placements so mirrored instances shade correctly. The 3x3 determinant
+    // is transpose-invariant, so this is matrix-layout-proof.
+    {
+      const Matrix4& o2w = dcs.transformData.objectToWorld;
+      const float det3 =
+          o2w[0][0] * (o2w[1][1] * o2w[2][2] - o2w[1][2] * o2w[2][1])
+        - o2w[0][1] * (o2w[1][0] * o2w[2][2] - o2w[1][2] * o2w[2][0])
+        + o2w[0][2] * (o2w[1][0] * o2w[2][1] - o2w[1][1] * o2w[2][0]);
+      if (det3 < 0.0f) {
+        dcs.geometryData.frontFace =
+          (dcs.geometryData.frontFace == VK_FRONT_FACE_COUNTER_CLOCKWISE)
+            ? VK_FRONT_FACE_CLOCKWISE
+            : VK_FRONT_FACE_COUNTER_CLOCKWISE;
+      }
+    }
+
     // Let processCameraData() classify the camera from the matrices.
     // Hardcoding Main would bypass Remix's sky/portal/shadow detection.
     dcs.cameraType       = CameraType::Unknown;
     dcs.usesVertexShader = (m_context->m_state.vs.shader != nullptr);
     dcs.usesPixelShader  = (m_context->m_state.ps.shader != nullptr);
 
-    // D3D11 shaders are always SM 4.0+.
-    if (dcs.usesVertexShader)
-      dcs.vertexShaderInfo = ShaderProgramInfo{4, 0};
-    if (dcs.usesPixelShader)
-      dcs.pixelShaderInfo = ShaderProgramInfo{4, 0};
+    // DX11_V277_REAL_SHADER_MODEL: report the ACTUAL shader model parsed from
+    // each shader's DXBC version token (4.0 - 5.1). Modern D3D11 games ship
+    // SM 5.x; the previous hardcoded {4, 0} misreported every draw.
+    if (dcs.usesVertexShader) {
+      const D3D11CommonShader* commonVs = m_context->m_state.vs.shader->GetCommonShader();
+      dcs.vertexShaderInfo = ShaderProgramInfo{
+        commonVs->GetShaderModelMajor(), commonVs->GetShaderModelMinor() };
+    }
+    if (dcs.usesPixelShader) {
+      const D3D11CommonShader* commonPs = m_context->m_state.ps.shader->GetCommonShader();
+      dcs.pixelShaderInfo = ShaderProgramInfo{
+        commonPs->GetShaderModelMajor(), commonPs->GetShaderModelMinor() };
+    }
     dcs.zWriteEnable     = zWriteEnable;
     dcs.zEnable          = zEnable;
     dcs.stencilEnabled   = stencilEnabled;
@@ -5394,8 +5674,12 @@ namespace dxvk {
         if (maxChannel < 4u) {
           // Uniformly black (< ~1.5% on every sampled vertex) - not real
           // diffuse color. Drop so it cannot blacken the surface.
+          // DX11_V280 fix: dcs.geometryData was COPIED from geo before this
+          // point, so the local clear alone never reached the submitted
+          // draw - the all-black stream still shipped to the RT scene.
           geo.color0Buffer = RasterBuffer();
           colBuffer = RasterBuffer();
+          dcs.geometryData.color0Buffer = RasterBuffer();
           static uint32_t sBlackColorDropLogCount = 0;
           if (sBlackColorDropLogCount < 8) {
             ++sBlackColorDropLogCount;
@@ -5477,7 +5761,17 @@ namespace dxvk {
       // surface renders as solid geometry lit by the path tracer rather than
       // as a garbled texture smear. This is a strict improvement over the
       // swimming-texgen artifact and over simply dropping the draw.
-      if (dcs.transformData.texgenMode == TexGenMode::None) {
+      //
+      // DX11_V280_TEXCOORD_CAPTURE: before falling back to flat albedo, try
+      // to recover the REAL UVs. When the input layout has no TEXCOORD, most
+      // engines still compute one in the vertex shader; the stream-out replay
+      // reads that output back as a per-vertex stream, so the draw keeps its
+      // actual texture with correct coordinates. Only when capture is not
+      // possible (no texcoord VS output, GS/tessellation active, budget
+      // exhausted, xfb unsupported) does the flat-albedo fallback apply.
+      if (TryCaptureTexcoordsViaStreamOut(dcs, geo, indexed, count, start, base)) {
+        ++m_submitRejectStats.texcoordCaptured;
+      } else if (dcs.transformData.texgenMode == TexGenMode::None) {
         // Prefer the draw's own vertex colors when present: they are real
         // per-vertex data that needs no texture coordinates, so they make a
         // faithful flat albedo. Only fall back to the neutral TFactor constant
@@ -5783,6 +6077,10 @@ namespace dxvk {
       if ((s_filterReassertCounter++ & 255u) == 0u)
         ::RemixReassertCrashSignatureFilter();
     }
+
+    // DX11_V280: per-frame stream-out capture budget.
+    m_texcoordCapturesThisFrame = 0;
+    m_texcoordCaptureBytesThisFrame = 0;
 
     UpdateTrackedExtents(backbuffer, remixViewportExtent);
 

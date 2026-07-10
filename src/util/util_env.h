@@ -185,6 +185,114 @@ namespace dxvk::env {
 
 namespace dxvk::env {
 
+#ifdef _WIN32
+  // DX11_V282_BOOT_BREADCRUMB: earliest-possible boot signal, written at DLL
+  // attach with pure kernel32 calls (loader-lock safe: no LoadLibrary, no CRT
+  // streams, no threads, no allocation). Appends one line to
+  // remix-dx11-boot.log next to the game executable. Diagnostic value:
+  // "the game will not start and no logs exist" splits into two different
+  // failure classes -
+  //   - breadcrumb file absent  -> this DLL never attached: an anti-cheat or
+  //     the Windows loader blocked it (incomplete payload, wrong architecture,
+  //     missing hard dependency);
+  //   - breadcrumb present, main log absent -> attach succeeded and the
+  //     process died before device creation (see [crash] lines / bypass state).
+  inline void remixAppendBootLine(const char* component, const char* message) {
+    char exePath[MAX_PATH] = {};
+    const DWORD exeLen = ::GetModuleFileNameA(nullptr, exePath, DWORD(sizeof(exePath)));
+    if (exeLen == 0 || exeLen >= DWORD(sizeof(exePath)))
+      return;
+
+    int dirLen = -1;
+    for (int i = 0; exePath[i] != '\0'; ++i) {
+      if (exePath[i] == '\\')
+        dirLen = i;
+    }
+    if (dirLen < 0 || dirLen > MAX_PATH - 32)
+      return;
+
+    char logPath[MAX_PATH] = {};
+    std::memcpy(logPath, exePath, size_t(dirLen) + 1);
+    std::memcpy(logPath + dirLen + 1, "remix-dx11-boot.log", sizeof("remix-dx11-boot.log"));
+
+    const HANDLE file = ::CreateFileA(logPath, FILE_APPEND_DATA,
+      FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE)
+      return;
+
+    char line[640];
+    size_t pos = 0;
+    auto append = [&](const char* s) {
+      while (s != nullptr && *s != '\0' && pos < sizeof(line) - 2)
+        line[pos++] = *s++;
+    };
+    auto appendU32 = [&](DWORD v) {
+      char digits[12];
+      int n = 0;
+      do {
+        digits[n++] = char('0' + v % 10u);
+        v /= 10u;
+      } while (v != 0 && n < 10);
+      while (n > 0 && pos < sizeof(line) - 2)
+        line[pos++] = digits[--n];
+    };
+
+    append("[remix-boot] ");
+    append(component);
+    append(" ");
+    append(message);
+    append(" exe=");
+    append(exePath + dirLen + 1);
+    append(" pid=");
+    appendU32(::GetCurrentProcessId());
+    append(" tick=");
+    appendU32(::GetTickCount());
+    line[pos++] = '\r';
+    line[pos++] = '\n';
+
+    DWORD written = 0;
+    ::WriteFile(file, line, DWORD(pos), &written, nullptr);
+    ::CloseHandle(file);
+  }
+
+  // DX11_V282: detects anti-cheat runtimes near the game executable (exe dir
+  // and up to two parent dirs - Halo MCC keeps EasyAntiCheat two levels above
+  // MCC-Win64-Shipping.exe). Detection and user guidance ONLY: Remix cannot
+  // and must not run under an active anti-cheat; users must use the game's
+  // OFFICIAL anti-cheat-disabled / modding launch mode (e.g. Halo MCC's
+  // "Anti-Cheat Disabled" Steam launch option).
+  inline const char* remixDetectAntiCheat() {
+    char dir[MAX_PATH] = {};
+    const DWORD exeLen = ::GetModuleFileNameA(nullptr, dir, DWORD(sizeof(dir)));
+    if (exeLen == 0 || exeLen >= DWORD(sizeof(dir)))
+      return nullptr;
+
+    // First cut drops the exe name; each further cut climbs one directory.
+    for (int level = 0; level < 3; ++level) {
+      int cut = -1;
+      for (int i = 0; dir[i] != '\0'; ++i) {
+        if (dir[i] == '\\')
+          cut = i;
+      }
+      if (cut <= 2) // stop at the drive root ("C:\")
+        break;
+      dir[cut] = '\0';
+      if (cut > MAX_PATH - 20)
+        continue;
+
+      char probe[MAX_PATH];
+      std::memcpy(probe, dir, size_t(cut));
+      std::memcpy(probe + cut, "\\EasyAntiCheat", sizeof("\\EasyAntiCheat"));
+      if (::GetFileAttributesA(probe) != INVALID_FILE_ATTRIBUTES)
+        return "EasyAntiCheat";
+      std::memcpy(probe + cut, "\\BattlEye", sizeof("\\BattlEye"));
+      if (::GetFileAttributesA(probe) != INVALID_FILE_ATTRIBUTES)
+        return "BattlEye";
+    }
+    return nullptr;
+  }
+#endif
+
   inline bool shouldBypassRemixForCurrentProcess() {
 #ifdef _WIN32
     auto readFlag = [](const char* name, bool fallback) -> bool {
@@ -221,6 +329,24 @@ namespace dxvk::env {
       // Remix chain and must not be auto-bypassed.
       if (!_stricmp(fileName, "NvRemixBridge.exe") || !_stricmp(fileName, "NvRemixLauncher32.exe"))
         return false;
+
+      // DX11_V279_LAUNCHER_BYPASS: game LAUNCHERS render their small UI with
+      // D3D11 from the same game folder, so the full Remix runtime (Vulkan
+      // device, shader compilation, RTX init) spins up INSIDE the launcher
+      // process and can crash or wedge it before the actual game is ever
+      // spawned - "the game hard crashes going nowhere" (Bethesda:
+      // SkyrimSELauncher.exe, Fallout4Launcher.exe; many other titles ship a
+      // *Launcher*.exe the same way). A launcher does not need path tracing;
+      // forward it to the system D3D11 and let the real game process get
+      // Remix. If a game's MAIN exe is genuinely named *launcher*, opt back
+      // in with DXVK_REMIX_FORCE_CURRENT_PROCESS=1 (checked above).
+      char lowerName[MAX_PATH] = {};
+      size_t n = 0;
+      for (; fileName[n] != '\0' && n < MAX_PATH - 1; ++n)
+        lowerName[n] = static_cast<char>(::tolower(static_cast<unsigned char>(fileName[n])));
+      lowerName[n] = '\0';
+      if (std::strstr(lowerName, "launcher") != nullptr)
+        return true;
     }
 
     return false;
