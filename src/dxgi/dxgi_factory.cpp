@@ -5,7 +5,9 @@
 namespace dxvk {
 
   DxgiFactory::DxgiFactory(UINT Flags)
-  : m_instance    (new DxvkInstance()),
+  // DX11_V283_SHARED_VK_INSTANCE: all factories share the process-wide
+  // instance; concurrent creations serialize instead of racing the loader.
+  : m_instance    (DxvkInstance::getOrCreateSharedInstance()),
     m_monitorInfo (this),
     m_options     (m_instance->config()),
     m_flags       (Flags) {

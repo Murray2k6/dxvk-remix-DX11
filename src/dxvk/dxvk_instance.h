@@ -42,12 +42,25 @@ namespace dxvk {
    * device creation.
    */
   class DxvkInstance : public RcObject {
-    
+
   public:
-    
+
     DxvkInstance();
     ~DxvkInstance();
-    
+
+    // DX11_V283_SHARED_VK_INSTANCE: process-wide shared instance. D3D11 games
+    // reach instance creation from several entry points on different threads
+    // (DXGI factory creation, D3D11CreateDevice with a foreign adapter);
+    // creating separate DxvkInstances CONCURRENTLY parks multiple threads
+    // inside vkCreateInstance, where implicit layers / ICDs can deadlock
+    // under the Vulkan loader's global lock (observed in the field: two
+    // instance creations 400ms apart, both logs ending at the line printed
+    // immediately before vkCreateInstance). All entry points share ONE
+    // instance behind a mutex: the second caller waits - holding no loader
+    // or Vulkan locks - instead of racing, and gets the same adapters.
+    // DXVK_REMIX_SHARED_INSTANCE=0 reverts to per-call instances.
+    static Rc<DxvkInstance> getOrCreateSharedInstance();
+
     /**
      * \brief Vulkan instance functions
      * \returns Vulkan instance functions

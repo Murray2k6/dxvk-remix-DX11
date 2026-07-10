@@ -384,6 +384,28 @@ namespace dxvk {
     *markerSize = strlen((const char*) pMarker);
   }
 
+  // DX11_V283_SHARED_VK_INSTANCE: see header. One instance per process; the
+  // mutex makes any second entry point WAIT for the first creation (holding
+  // no Vulkan/loader locks) and then reuse it, instead of running a second
+  // vkCreateInstance concurrently - the loader's global lock plus implicit
+  // layer / ICD internal locks turned that race into a startup hang.
+  Rc<DxvkInstance> DxvkInstance::getOrCreateSharedInstance() {
+    static dxvk::mutex s_sharedInstanceMutex;
+    static Rc<DxvkInstance> s_sharedInstance;
+
+    static const bool s_shareDisabled =
+      env::getEnvVar("DXVK_REMIX_SHARED_INSTANCE") == "0";
+    if (s_shareDisabled)
+      return new DxvkInstance();
+
+    std::lock_guard<dxvk::mutex> lock(s_sharedInstanceMutex);
+    if (s_sharedInstance == nullptr)
+      s_sharedInstance = new DxvkInstance();
+    else
+      Logger::info("[Remix-DX11][init] reusing shared Vulkan instance");
+    return s_sharedInstance;
+  }
+
   DxvkInstance::DxvkInstance() {
     Logger::info(str::format("Game: ", env::getExeName()));
     Logger::info(str::format("DXVK_Remix: ", DXVK_VERSION));
@@ -695,8 +717,14 @@ namespace dxvk {
     info.enabledExtensionCount    = extensionNameList.count();
     info.ppEnabledExtensionNames  = extensionNameList.names();
     
+    // DX11_V283: pinpoint markers - a log ending between these two lines
+    // means the hang is INSIDE vkCreateInstance (implicit layer / ICD /
+    // loader), not in Remix code. Disable third-party Vulkan implicit layers
+    // (RTSS, OBS, overlays) to isolate.
+    Logger::info("[Remix-DX11][init] vkCreateInstance...");
     VkInstance result = VK_NULL_HANDLE;
     VkResult status = m_vkl->vkCreateInstance(&info, nullptr, &result);
+    Logger::info(str::format("[Remix-DX11][init] vkCreateInstance returned ", status));
 
     if (status != VK_SUCCESS) {
       Logger::err(str::format("Unable to create a Vulkan instance, error code: ", status, "."));
