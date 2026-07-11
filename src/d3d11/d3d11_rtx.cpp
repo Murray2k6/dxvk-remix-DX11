@@ -410,9 +410,6 @@ namespace dxvk {
       return false;
 
     const VkDeviceSize captureBytes = VkDeviceSize(vertexCount) * 8u;
-    if (m_texcoordCapturesThisFrame >= kMaxCapturesPerFrame
-     || m_texcoordCaptureBytesThisFrame + captureBytes > kMaxCaptureBytesPerFrame)
-      return false;
 
     if (m_context->m_state.vs.shader == nullptr)
       return false;
@@ -426,49 +423,116 @@ namespace dxvk {
     if (captureGs == nullptr)
       return false;
 
-    DxvkBufferCreateInfo info;
-    info.size   = captureBytes;
-    info.usage  = VK_BUFFER_USAGE_TRANSFORM_FEEDBACK_BUFFER_BIT_EXT
-                | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT
-                | VK_BUFFER_USAGE_TRANSFER_SRC_BIT
-                | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT;
-    info.stages = VK_PIPELINE_STAGE_TRANSFORM_FEEDBACK_BIT_EXT
-                | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT
-                | VK_PIPELINE_STAGE_TRANSFER_BIT;
-    info.access = VK_ACCESS_TRANSFORM_FEEDBACK_WRITE_BIT_EXT
-                | VK_ACCESS_SHADER_READ_BIT
-                | VK_ACCESS_TRANSFER_READ_BIT;
-
-    Rc<DxvkBuffer> captureBuffer = m_context->m_device->createBuffer(
-      info, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
-      DxvkMemoryStats::Category::RTXBuffer, "dx11 texcoord capture");
-
     // The geometry's vertex slices were folded to begin at the draw's base
     // (indexed) / start (non-indexed) vertex, so replaying from that same
     // first vertex makes captured vertex i correspond exactly to slice
     // vertex i.
     const uint32_t firstVertex = indexed ? uint32_t(std::max(base, 0)) : start;
 
-    m_context->EmitCs([cGs = std::move(captureGs),
-                       cBuf = DxvkBufferSlice(captureBuffer, 0, captureBytes),
-                       cCount = vertexCount,
-                       cFirst = firstVertex,
-                       cRestoreIa = restoreIa](DxvkContext* ctx) {
-      const DxvkInputAssemblyState pointIa = { VK_PRIMITIVE_TOPOLOGY_POINT_LIST, VK_FALSE, 0 };
-      ctx->bindShader(VK_SHADER_STAGE_GEOMETRY_BIT, cGs);
-      ctx->bindXfbBuffer(0, cBuf, DxvkBufferSlice());
-      ctx->setInputAssemblyState(pointIa);
-      ctx->draw(cCount, 1, cFirst, 0);
-      // Restore the game's exact pipeline state within this same command
-      // stream position: no GS was bound (guarded above), no SO targets were
-      // bound, and the original input assembly is re-applied.
-      ctx->bindShader(VK_SHADER_STAGE_GEOMETRY_BIT, nullptr);
-      ctx->bindXfbBuffer(0, DxvkBufferSlice(), DxvkBufferSlice());
-      ctx->setInputAssemblyState(cRestoreIa);
-    });
+    // DX11_V285_TEXCOORD_CAPTURE_REUSE: key the persistent capture buffer on
+    // the draw identity - the VS (fixes the GS variant and output semantic),
+    // the replayed vertex range, and every bound vertex-buffer binding that
+    // feeds it. Same identity => same buffer object across frames (stable for
+    // the scene manager's per-frame unique-buffer table) and across the
+    // multiple passes that re-draw the same mesh within one frame.
+    uint64_t cacheKey = uint64_t(reinterpret_cast<uintptr_t>(commonVs));
+    auto mixKey = [&cacheKey](uint64_t v) {
+      cacheKey ^= v + 0x9e3779b97f4a7c15ull + (cacheKey << 6) + (cacheKey >> 2);
+    };
+    mixKey(firstVertex);
+    mixKey(vertexCount);
+    for (uint32_t slot = 0; slot < D3D11_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT; ++slot) {
+      const auto& vb = m_context->m_state.ia.vertexBuffers[slot];
+      if (vb.buffer == nullptr)
+        continue;
+      mixKey(uint64_t(reinterpret_cast<uintptr_t>(vb.buffer.ptr())));
+      mixKey((uint64_t(vb.offset) << 20) | uint64_t(vb.stride) | (uint64_t(slot) << 56));
+    }
 
-    ++m_texcoordCapturesThisFrame;
-    m_texcoordCaptureBytesThisFrame += captureBytes;
+    const uint32_t curFrame = m_context->m_device->getCurrentFrameId();
+    TexcoordCaptureEntry& entry = m_texcoordCaptureCache[cacheKey];
+    const bool haveUsableBuffer = entry.buffer != nullptr && entry.capacity >= captureBytes;
+    const bool alreadyCapturedThisFrame = haveUsableBuffer && entry.lastCapturedFrame == curFrame;
+    entry.lastUsedFrame = curFrame;
+
+    if (!alreadyCapturedThisFrame) {
+      // A replay costs GPU time and per-frame budget whether or not the buffer
+      // already exists; only allocation is avoided on reuse.
+      if (m_texcoordCapturesThisFrame >= kMaxCapturesPerFrame
+       || m_texcoordCaptureBytesThisFrame + captureBytes > kMaxCaptureBytesPerFrame) {
+        if (entry.buffer == nullptr)
+          m_texcoordCaptureCache.erase(cacheKey);
+        return false;
+      }
+
+      if (!haveUsableBuffer) {
+        // Round the capacity up so vertex-count jitter between frames reuses
+        // the same allocation instead of replacing it.
+        VkDeviceSize capacity = 4096u;
+        while (capacity < captureBytes)
+          capacity <<= 1;
+
+        DxvkBufferCreateInfo info;
+        info.size   = capacity;
+        info.usage  = VK_BUFFER_USAGE_TRANSFORM_FEEDBACK_BUFFER_BIT_EXT
+                    | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT
+                    | VK_BUFFER_USAGE_TRANSFER_SRC_BIT
+                    | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT;
+        info.stages = VK_PIPELINE_STAGE_TRANSFORM_FEEDBACK_BIT_EXT
+                    | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT
+                    | VK_PIPELINE_STAGE_TRANSFER_BIT;
+        info.access = VK_ACCESS_TRANSFORM_FEEDBACK_WRITE_BIT_EXT
+                    | VK_ACCESS_SHADER_READ_BIT
+                    | VK_ACCESS_TRANSFER_READ_BIT;
+
+        Rc<DxvkBuffer> newBuffer = m_context->m_device->createBuffer(
+          info, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+          DxvkMemoryStats::Category::RTXBuffer, "dx11 texcoord capture");
+        if (newBuffer == nullptr) {
+          if (entry.buffer == nullptr)
+            m_texcoordCaptureCache.erase(cacheKey);
+          return false;
+        }
+        m_texcoordCaptureCacheBytes += capacity - entry.capacity;
+        entry.buffer   = std::move(newBuffer);
+        entry.capacity = capacity;
+        entry.lastCapturedFrame = ~0u;
+      } else {
+        // Reusing last frame's buffer: rotate to a fresh physical slice (the
+        // standard dxvk discard/rename pattern) so this frame's stream-out
+        // write can never race GPU reads of the previous frame's contents.
+        // Later reads (BLAS/interleave record at EndFrame) resolve the newest
+        // slice, which is exactly this frame's UVs.
+        auto freshSlice = entry.buffer->allocSlice();
+        m_context->EmitCs([cBuffer = entry.buffer, cSlice = freshSlice](DxvkContext* ctx) {
+          ctx->invalidateBuffer(cBuffer, cSlice);
+        });
+      }
+
+      m_context->EmitCs([cGs = std::move(captureGs),
+                         cBuf = DxvkBufferSlice(entry.buffer, 0, captureBytes),
+                         cCount = vertexCount,
+                         cFirst = firstVertex,
+                         cRestoreIa = restoreIa](DxvkContext* ctx) {
+        const DxvkInputAssemblyState pointIa = { VK_PRIMITIVE_TOPOLOGY_POINT_LIST, VK_FALSE, 0 };
+        ctx->bindShader(VK_SHADER_STAGE_GEOMETRY_BIT, cGs);
+        ctx->bindXfbBuffer(0, cBuf, DxvkBufferSlice());
+        ctx->setInputAssemblyState(pointIa);
+        ctx->draw(cCount, 1, cFirst, 0);
+        // Restore the game's exact pipeline state within this same command
+        // stream position: no GS was bound (guarded above), no SO targets were
+        // bound, and the original input assembly is re-applied.
+        ctx->bindShader(VK_SHADER_STAGE_GEOMETRY_BIT, nullptr);
+        ctx->bindXfbBuffer(0, DxvkBufferSlice(), DxvkBufferSlice());
+        ctx->setInputAssemblyState(cRestoreIa);
+      });
+
+      entry.lastCapturedFrame = curFrame;
+      ++m_texcoordCapturesThisFrame;
+      m_texcoordCaptureBytesThisFrame += captureBytes;
+    }
+
+    const Rc<DxvkBuffer>& captureBuffer = entry.buffer;
 
     // Wire the captured stream into BOTH the local geometry (later checks in
     // SubmitDraw read it) and the already-copied DrawCallState payload that
@@ -491,6 +555,45 @@ namespace dxvk {
         ")"));
     }
     return true;
+  }
+
+  // DX11_V285_TEXCOORD_CAPTURE_REUSE: age out capture buffers whose draw
+  // identity has not been seen recently (scene change, mesh unloaded). The
+  // hard caps bound the cache on pathological scenes; a wholesale reset is
+  // safe because entries are pure allocations - the geometry entries that
+  // still reference a buffer keep it alive until they release it, and the
+  // next frame simply re-captures what it needs.
+  void D3D11Rtx::SweepTexcoordCaptureCache(uint32_t currentFrame) {
+    static constexpr uint32_t     kEvictAfterFrames = 600u;      // ~10s at 60fps
+    static constexpr size_t       kMaxEntries       = 4096u;
+    static constexpr VkDeviceSize kMaxCacheBytes    = 256ull << 20;
+
+    const bool overBudget = m_texcoordCaptureCache.size() > kMaxEntries
+                         || m_texcoordCaptureCacheBytes > kMaxCacheBytes;
+    if (!overBudget && (currentFrame & 255u) != 0u)
+      return;
+
+    for (auto it = m_texcoordCaptureCache.begin(); it != m_texcoordCaptureCache.end();) {
+      if (it->second.lastUsedFrame + kEvictAfterFrames < currentFrame) {
+        m_texcoordCaptureCacheBytes -= it->second.capacity;
+        it = m_texcoordCaptureCache.erase(it);
+      } else {
+        ++it;
+      }
+    }
+
+    if (m_texcoordCaptureCache.size() > kMaxEntries
+     || m_texcoordCaptureCacheBytes > kMaxCacheBytes) {
+      // More live capture identities than the cache admits even after the age
+      // sweep - reset wholesale rather than thrash an LRU under pressure.
+      m_texcoordCaptureCache.clear();
+      m_texcoordCaptureCacheBytes = 0;
+      static uint32_t sCacheResetLog = 0;
+      if (sCacheResetLog < 4) {
+        ++sCacheResetLog;
+        Logger::info("[D3D11Rtx] V285: texcoord capture cache reset (over budget)");
+      }
+    }
   }
 
   void D3D11Rtx::SubmitInstancedDraw(bool indexed, UINT count, UINT start, INT base,
@@ -564,6 +667,37 @@ namespace dxvk {
     if (instStride == 0) {
       SubmitDraw(indexed, count, start, base);
       return;
+    }
+
+    // DX11_V285_INSTANCE_ROW_STRIDE_CLAMP: input layouts routinely declare
+    // more per-instance float4 elements than the BOUND stream's stride holds
+    // (layouts shared across mesh types; observed in Skyrim: 4 declared rows,
+    // bound stride 32 = room for only 2). A row whose bytes extend past the
+    // stride reads the NEXT instance's data - finite but garbage matrix rows
+    // for every instance, i.e. exploded/misplaced instanced geometry and a
+    // bloated TLAS. Keep only rows that fit inside one instance record.
+    {
+      size_t kept = 0;
+      for (size_t i = 0; i < instRows.size(); ++i) {
+        if (uint64_t(instRows[i].byteOffset) + 16u <= uint64_t(instStride))
+          instRows[kept++] = instRows[i];
+      }
+      if (kept != instRows.size()) {
+        static uint32_t sRowClampLog = 0;
+        if (sRowClampLog < 3) {
+          ++sRowClampLog;
+          Logger::info(str::format("[D3D11Rtx] Instanced draw: clamped ", instRows.size() - kept,
+                                   " declared per-instance float4 row(s) that exceed the bound stride (",
+                                   instStride, " bytes); ", kept, " row(s) remain."));
+        }
+        instRows.resize(kept);
+      }
+      if (instRows.size() < 3) {
+        // Not enough in-stride rows for an affine transform - this stream is
+        // per-instance data (colors/params), not matrices. One placement.
+        SubmitDraw(indexed, count, start, base);
+        return;
+      }
     }
 
     // Cap to avoid excessive submission â€” configurable via rtx.maxInstanceSubmissions
@@ -921,18 +1055,76 @@ namespace dxvk {
     return true;
   }
 
-  static Rc<DxvkBuffer> createHostVisibleHelperBuffer(const Rc<DxvkDevice>& device, VkDeviceSize size, const char* name) {
+  // DX11_V285_HELPER_BUFFER_POOL: see d3d11_rtx.h. Pool-backed replacement
+  // for the old per-draw createBuffer. Every helper keeps its own OBJECT for
+  // the duration of its use (per-draw freshness preserved - no renaming, no
+  // V250-class staleness); only provably-released objects are reused.
+  Rc<DxvkBuffer> D3D11Rtx::AcquireHostVisibleHelperBuffer(VkDeviceSize size, const char* name) {
+    // Best fit from the free list: smallest capacity that holds the request,
+    // but never a grossly oversized one (waste bound).
+    const VkDeviceSize maxAcceptable = std::max<VkDeviceSize>(size * 4u, 8192u);
+    size_t best = SIZE_MAX;
+    for (size_t i = 0; i < m_helperFree.size(); ++i) {
+      const VkDeviceSize cap = m_helperFree[i].capacity;
+      if (cap >= size && cap <= maxAcceptable
+       && (best == SIZE_MAX || cap < m_helperFree[best].capacity))
+        best = i;
+    }
+    if (best != SIZE_MAX) {
+      HelperPoolItem item = m_helperFree[best];
+      m_helperFree[best] = m_helperFree.back();
+      m_helperFree.pop_back();
+      m_helperRetired.push_back(item);
+      return item.buffer;
+    }
+
+    // Power-of-two capacities so per-frame size jitter reuses pool entries.
+    VkDeviceSize capacity = 4096u;
+    while (capacity < size)
+      capacity <<= 1;
+
     DxvkBufferCreateInfo info;
-    info.size = size;
+    info.size = capacity;
     info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
     info.stages = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT;
     info.access = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT;
 
-    return device->createBuffer(
+    Rc<DxvkBuffer> buffer = m_context->m_device->createBuffer(
       info,
       VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
       DxvkMemoryStats::Category::RTXBuffer,
       name);
+
+    static constexpr VkDeviceSize kMaxPoolBytes = 384ull << 20;
+    if (buffer != nullptr && m_helperPoolBytes + capacity <= kMaxPoolBytes) {
+      m_helperPoolBytes += capacity;
+      m_helperRetired.push_back({ buffer, capacity });
+    }
+    // Beyond the pool cap the buffer is simply unpooled - identical to the
+    // old per-draw allocation behavior.
+    return buffer;
+  }
+
+  void D3D11Rtx::RecycleHelperBuffers() {
+    // A retired buffer is reusable once this pool holds the only reference
+    // and the GPU has retired all command lists that touched it.
+    for (size_t i = 0; i < m_helperRetired.size();) {
+      DxvkBuffer* raw = m_helperRetired[i].buffer.ptr();
+      if (raw != nullptr && raw->refCount() == 1 && !raw->isInUse(DxvkAccess::Read)) {
+        m_helperFree.push_back(m_helperRetired[i]);
+        m_helperRetired[i] = m_helperRetired.back();
+        m_helperRetired.pop_back();
+      } else {
+        ++i;
+      }
+    }
+    // Bound the idle free list so a scene change does not park hundreds of
+    // MB forever.
+    static constexpr size_t kMaxFreeItems = 2048;
+    while (m_helperFree.size() > kMaxFreeItems) {
+      m_helperPoolBytes -= m_helperFree.back().capacity;
+      m_helperFree.pop_back();
+    }
   }
 
   static bool semanticNameStartsWith(const D3D11RtxSemantic& semantic, const char* prefix) {
@@ -2965,6 +3157,37 @@ namespace dxvk {
 
     transforms.sanitize();
 
+    // DX11_V285_OFFSCREEN_CAMERA_GATE: classify this draw's color target.
+    // Offscreen pre-passes (water reflection, environment cubemaps, mirrors)
+    // render with their OWN camera BEFORE the main scene each frame; because
+    // RtCamera::update() is first-touch-wins per frame, their camera would
+    // otherwise claim the Main camera every frame and the entire path-traced
+    // scene renders from the wrong viewpoint. A target counts as the scene
+    // target when its extent matches the swapchain output OR the established
+    // Remix scene viewport (either exactly-ish, or same aspect at >=50% size -
+    // dynamic-resolution/internal-scale main targets stay accepted). Nothing
+    // is decided before the output extent is known (first frames: flag stays
+    // false, previous behavior).
+    if (renderTargetWidth > 0.0f && renderTargetHeight > 0.0f
+     && m_lastOutputExtent.width > 0u && m_lastOutputExtent.height > 0u) {
+      const float rtAspect = renderTargetWidth / renderTargetHeight;
+      auto matchesSceneExtent = [&](VkExtent2D ref) -> bool {
+        if (ref.width == 0u || ref.height == 0u)
+          return false;
+        const float refW = float(ref.width);
+        const float refH = float(ref.height);
+        if (std::abs(renderTargetWidth - refW) <= 0.15f * refW
+         && std::abs(renderTargetHeight - refH) <= 0.15f * refH)
+          return true;
+        const float refAspect = refW / refH;
+        return std::abs(rtAspect - refAspect) <= 0.05f * refAspect
+            && renderTargetWidth >= 0.5f * refW;
+      };
+      transforms.offscreenRenderTarget =
+        !matchesSceneExtent(m_lastOutputExtent)
+        && !matchesSceneExtent(m_lastRemixViewportExtent);
+    }
+
     // Log camera discovery once.
     static bool s_cameraLogged = false;
     if (projSlot != UINT32_MAX && !s_cameraLogged) {
@@ -4289,7 +4512,7 @@ namespace dxvk {
           return;
         }
 
-        Rc<DxvkBuffer> copy = createHostVisibleHelperBuffer(m_context->m_device, bytes, "d3d11 rtx dynamic vb snapshot");
+        Rc<DxvkBuffer> copy = AcquireHostVisibleHelperBuffer(bytes, "d3d11 rtx dynamic vb snapshot");
         void* dst = copy != nullptr ? copy->mapPtr(0) : nullptr;
         if (dst == nullptr)
           return;
@@ -4316,7 +4539,7 @@ namespace dxvk {
           const VkDeviceSize wanted = VkDeviceSize(count) * idxStrideBytesSnap;
           const VkDeviceSize bytes = std::min<VkDeviceSize>(wanted, idxBuffer.length());
           if (bytes > 0 && bytes <= kMaxSnapshotBytes) {
-            Rc<DxvkBuffer> copy = createHostVisibleHelperBuffer(m_context->m_device, bytes, "d3d11 rtx dynamic ib snapshot");
+            Rc<DxvkBuffer> copy = AcquireHostVisibleHelperBuffer(bytes, "d3d11 rtx dynamic ib snapshot");
             void* dst = copy != nullptr ? copy->mapPtr(0) : nullptr;
             if (dst != nullptr) {
               std::memcpy(dst, srcMap, size_t(bytes));
@@ -4374,7 +4597,7 @@ namespace dxvk {
          && srcBase != nullptr && srcStride > 0
          && drawVertexCount > 0 && drawVertexCount <= kMaxFormatConvertVertices) {
           const VkDeviceSize dstSize = VkDeviceSize(drawVertexCount) * 12u;
-          Rc<DxvkBuffer> dst = createHostVisibleHelperBuffer(m_context->m_device, dstSize, "d3d11 rtx positions f16->f32");
+          Rc<DxvkBuffer> dst = AcquireHostVisibleHelperBuffer(dstSize, "d3d11 rtx positions f16->f32");
           float* out = dst != nullptr ? reinterpret_cast<float*>(dst->mapPtr(0)) : nullptr;
           if (out != nullptr) {
             for (uint32_t v = 0; v < drawVertexCount; ++v) {
@@ -4482,7 +4705,7 @@ namespace dxvk {
          && drawVertexCount > 0 && drawVertexCount <= kMaxFormatConvertVertices
          && decodeUv(srcBase, probeU, probeV)) {
           const VkDeviceSize dstSize = VkDeviceSize(drawVertexCount) * 8u;
-          Rc<DxvkBuffer> dst = createHostVisibleHelperBuffer(m_context->m_device, dstSize, "d3d11 rtx texcoords ->f32");
+          Rc<DxvkBuffer> dst = AcquireHostVisibleHelperBuffer(dstSize, "d3d11 rtx texcoords ->f32");
           float* out = dst != nullptr ? reinterpret_cast<float*>(dst->mapPtr(0)) : nullptr;
           if (out != nullptr) {
             for (uint32_t v = 0; v < drawVertexCount; ++v) {
@@ -4543,7 +4766,7 @@ namespace dxvk {
         if (colElemBytes != 0 && srcBase != nullptr && srcStride > 0
          && drawVertexCount > 0 && drawVertexCount <= kMaxFormatConvertVertices) {
           const VkDeviceSize dstSize = VkDeviceSize(drawVertexCount) * 4u;
-          Rc<DxvkBuffer> dst = createHostVisibleHelperBuffer(m_context->m_device, dstSize, "d3d11 rtx color0 to bgra");
+          Rc<DxvkBuffer> dst = AcquireHostVisibleHelperBuffer(dstSize, "d3d11 rtx color0 to bgra");
           uint8_t* out = dst != nullptr ? reinterpret_cast<uint8_t*>(dst->mapPtr(0)) : nullptr;
           if (out != nullptr) {
             auto toByte = [](float c) -> uint8_t {
@@ -4705,8 +4928,8 @@ namespace dxvk {
                 const VkDeviceSize weightBufferSize = VkDeviceSize(explicitWeightCount) * VkDeviceSize(drawVertexCount) * sizeof(float);
                 const VkDeviceSize indexBufferSize = VkDeviceSize(drawVertexCount) * sizeof(uint32_t);
 
-                Rc<DxvkBuffer> normalizedWeightBuffer = createHostVisibleHelperBuffer(m_context->m_device, weightBufferSize, "d3d11 skinning weights");
-                Rc<DxvkBuffer> normalizedIndexBuffer = createHostVisibleHelperBuffer(m_context->m_device, indexBufferSize, "d3d11 skinning indices");
+                Rc<DxvkBuffer> normalizedWeightBuffer = AcquireHostVisibleHelperBuffer(weightBufferSize, "d3d11 skinning weights");
+                Rc<DxvkBuffer> normalizedIndexBuffer = AcquireHostVisibleHelperBuffer(indexBufferSize, "d3d11 skinning indices");
 
                 if (normalizedWeightBuffer != nullptr && normalizedIndexBuffer != nullptr) {
                   float* dstWeights = reinterpret_cast<float*>(normalizedWeightBuffer->mapPtr(0));
@@ -6081,6 +6304,11 @@ namespace dxvk {
     // DX11_V280: per-frame stream-out capture budget.
     m_texcoordCapturesThisFrame = 0;
     m_texcoordCaptureBytesThisFrame = 0;
+
+    // DX11_V285: age out capture buffers for meshes no longer drawn, and
+    // return provably-released helper buffers to the reuse pool.
+    SweepTexcoordCaptureCache(m_context->m_device->getCurrentFrameId());
+    RecycleHelperBuffers();
 
     UpdateTrackedExtents(backbuffer, remixViewportExtent);
 

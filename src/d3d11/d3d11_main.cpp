@@ -145,7 +145,7 @@ void logRemixDx11BuildBanner() {
     return;
   dxvk::Logger::info("=====================================================");
   dxvk::Logger::info(dxvk::str::format("[Remix-DX11] build stamp: ", __DATE__, " ", __TIME__));
-  dxvk::Logger::info("[Remix-DX11] fixes: nrcVendorFallback texcoordSINT SR4viewport budgetHeadroom inputSeparation grayPlaceholder revertedDLSSGuard initStepLogging allVendorPrewarmSkip anyGameAlbedoFix significanceCullingOptIn gpuSceneUI remixapiExport taauDefaultAllVendors rtxOptionsNullGuard rtxOptionsRootCreate intelFseSwapchainFix steamOverlayVkDisable wsiSelfDeadlockPump vramLeakDiag restoreIconicWindow intelFifoPresent intelForceFSEallowed gdiInteropPresent frameLatencyHandleGuard noUvFlatAlbedo baseVertexGeometry gpuSceneBBox perVendorPresent gdiWsiFallback nrcOptIn nvidiaPrewarm rawInputHandoff noInfiniteWaits nonblockingRtPipelines tlasFirewall interleaverFormatNorm dynamicVbSnapshot color0Norm interleaverSkipGuard intUvDecode menuPassthrough migrationPersists fullresTargetGuard viewInProjCbuffer fallbackRadianceTame textureHashStability bridgeTextureContentHash skinningNameGate preciseCamera vpConfirmOncePerFrame crashFilterSafe nrdDenoiserPayload strongerDenoising bridgePresentCamera bootMarkerLogCleanup vertexColorFormats texcoordFormats pickResolveLog nrdRobustLoad menuToggleDebounce uiDisplayMatchesSurface noBlackFromVertexColor nrdDenoiserSafeDefault useRealAlbedo requireRealViewToInject noPrewarmByDefault noStackedInstanceCopies noDepthOnlyGeometry skyAutoDetect realShaderModel colorNameGate mirroredWinding launcherBypass nrdOn globalTonemap texcoordCaptureSO v271SubmitFix dx11FixedFunction bootBreadcrumb sysDllExports satelliteDelayLoad eacAdvisory sharedVkInstance vkCreateInstanceMarkers");
+  dxvk::Logger::info("[Remix-DX11] fixes: nrcVendorFallback texcoordSINT SR4viewport budgetHeadroom inputSeparation grayPlaceholder revertedDLSSGuard initStepLogging allVendorPrewarmSkip anyGameAlbedoFix significanceCullingOptIn gpuSceneUI remixapiExport taauDefaultAllVendors rtxOptionsNullGuard rtxOptionsRootCreate intelFseSwapchainFix steamOverlayVkDisable wsiSelfDeadlockPump vramLeakDiag restoreIconicWindow intelFifoPresent intelForceFSEallowed gdiInteropPresent frameLatencyHandleGuard noUvFlatAlbedo baseVertexGeometry gpuSceneBBox perVendorPresent gdiWsiFallback nrcOptIn nvidiaPrewarm rawInputHandoff noInfiniteWaits nonblockingRtPipelines tlasFirewall interleaverFormatNorm dynamicVbSnapshot color0Norm interleaverSkipGuard intUvDecode menuPassthrough migrationPersists fullresTargetGuard viewInProjCbuffer fallbackRadianceTame textureHashStability bridgeTextureContentHash skinningNameGate preciseCamera vpConfirmOncePerFrame crashFilterSafe nrdDenoiserPayload strongerDenoising bridgePresentCamera bootMarkerLogCleanup vertexColorFormats texcoordFormats pickResolveLog nrdRobustLoad menuToggleDebounce uiDisplayMatchesSurface noBlackFromVertexColor nrdDenoiserSafeDefault useRealAlbedo requireRealViewToInject noPrewarmByDefault noStackedInstanceCopies noDepthOnlyGeometry skyAutoDetect realShaderModel colorNameGate mirroredWinding launcherBypass nrdOn globalTonemap texcoordCaptureSO v271SubmitFix dx11FixedFunction bootBreadcrumb sysDllExports satelliteDelayLoad eacAdvisory sharedVkInstance vkCreateInstanceMarkers crossDllInstanceLock borrowDxgiInstance adapterEnumMarkers texcoordCaptureReuse offscreenCameraGate instRowStrideClamp censusOnGrowth helperBufferPool");
   dxvk::Logger::info("[Remix-DX11] if this line is absent or older than your last build, the game loaded a STALE d3d11.dll.");
   // DX11_V282: anti-cheat advisory (detection + guidance only; Remix cannot
   // and must not run under an active anti-cheat).
@@ -488,15 +488,81 @@ extern "C" {
       DXGI_ADAPTER_DESC desc;
       pAdapter->GetDesc(&desc);
 
-      // DX11_V283_SHARED_VK_INSTANCE: reuse the factory's instance instead of
-      // creating a second one concurrently (startup hang: two threads parked
-      // in vkCreateInstance under the loader's global lock).
-      dxvkInstance = DxvkInstance::getOrCreateSharedInstance();
-      dxvkAdapter  = dxvkInstance->findAdapterByLuid(&desc.AdapterLuid);
+      // DX11_V284_BORROW_DXGI_INSTANCE: dxvk is a static library linked into
+      // BOTH dxgi.dll and d3d11.dll, so V283's shared-instance statics exist
+      // once PER DLL - calling getOrCreateSharedInstance here still built a
+      // SECOND dxvk runtime (observed in the FFXV trace: full duplicate
+      // config parse + a second vkCreateInstance racing dxgi.dll's adapter
+      // enumeration inside the driver). Resolve the foreign adapter through
+      // OUR dxgi.dll factory instead: its adapters QI to IDXGIDXVKAdapter,
+      // whose COM interface hands over dxgi.dll's ALREADY-CREATED instance -
+      // one Vulkan instance in the whole process, no concurrent driver entry.
+      do {
+        HMODULE dxgiModule = ::GetModuleHandleW(L"dxgi.dll");
+        if (dxgiModule == nullptr)
+          break;
+
+        // Borrow only from OUR dxgi (same directory as this d3d11.dll); the
+        // system dxgi has no DXVK adapters to offer.
+        wchar_t dxgiPath[MAX_PATH] = {};
+        wchar_t selfPath[MAX_PATH] = {};
+        if (::GetModuleFileNameW(dxgiModule, dxgiPath, MAX_PATH) == 0
+         || ::GetModuleFileNameW(g_d3d11Module, selfPath, MAX_PATH) == 0)
+          break;
+        wchar_t* dxgiSep = wcsrchr(dxgiPath, L'\\');
+        wchar_t* selfSep = wcsrchr(selfPath, L'\\');
+        if (dxgiSep == nullptr || selfSep == nullptr
+         || (dxgiSep - dxgiPath) != (selfSep - selfPath)
+         || _wcsnicmp(dxgiPath, selfPath, size_t(dxgiSep - dxgiPath)) != 0)
+          break;
+
+        using PFN_CreateDXGIFactory1 = HRESULT (WINAPI*)(REFIID, void**);
+        auto createFactory1 = reinterpret_cast<PFN_CreateDXGIFactory1>(
+          ::GetProcAddress(dxgiModule, "CreateDXGIFactory1"));
+        if (createFactory1 == nullptr)
+          break;
+
+        Com<IDXGIFactory1> remixFactory;
+        if (FAILED(createFactory1(__uuidof(IDXGIFactory1), reinterpret_cast<void**>(&remixFactory))))
+          break;
+
+        for (UINT i = 0; dxvkInstance == nullptr; i++) {
+          Com<IDXGIAdapter1> candidate;
+          if (remixFactory->EnumAdapters1(i, &candidate) != S_OK)
+            break;
+
+          Com<IDXGIDXVKAdapter> candidateVk;
+          if (FAILED(candidate->QueryInterface(__uuidof(IDXGIDXVKAdapter), reinterpret_cast<void**>(&candidateVk))))
+            continue;
+
+          // Take the instance from the first DXVK adapter; take the adapter
+          // itself only on a LUID match (otherwise the LUID/device-id
+          // lookups below run against the borrowed instance).
+          dxvkInstance = candidateVk->GetDXVKInstance();
+
+          DXGI_ADAPTER_DESC1 candDesc;
+          if (SUCCEEDED(candidate->GetDesc1(&candDesc))
+           && std::memcmp(&candDesc.AdapterLuid, &desc.AdapterLuid, sizeof(LUID)) == 0)
+            dxvkAdapter = candidateVk->GetDXVKAdapter();
+        }
+
+        if (dxvkInstance != nullptr)
+          Logger::info("[Remix-DX11][init] foreign adapter resolved through Remix dxgi factory (borrowed instance)");
+      } while (false);
+
+      // DX11_V283_SHARED_VK_INSTANCE fallback: no borrowable dxgi factory in
+      // this process - create (or reuse) this DLL's own shared instance.
+      // Cross-DLL construction is serialized by the named kernel mutex in
+      // getOrCreateSharedInstance either way.
+      if (dxvkInstance == nullptr)
+        dxvkInstance = DxvkInstance::getOrCreateSharedInstance();
+
+      if (dxvkAdapter == nullptr)
+        dxvkAdapter = dxvkInstance->findAdapterByLuid(&desc.AdapterLuid);
 
       if (dxvkAdapter == nullptr)
         dxvkAdapter = dxvkInstance->findAdapterByDeviceId(desc.VendorId, desc.DeviceId);
-      
+
       if (dxvkAdapter == nullptr)
         dxvkAdapter = dxvkInstance->enumAdapters(0);
 

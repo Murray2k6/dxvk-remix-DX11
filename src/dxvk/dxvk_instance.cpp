@@ -389,20 +389,57 @@ namespace dxvk {
   // no Vulkan/loader locks) and then reuse it, instead of running a second
   // vkCreateInstance concurrently - the loader's global lock plus implicit
   // layer / ICD internal locks turned that race into a startup hang.
+  // DX11_V284_CROSS_DLL_INSTANCE_SERIALIZATION: dxvk is a STATIC library
+  // linked into BOTH dxgi.dll and d3d11.dll, so the V283 statics below exist
+  // once PER DLL - they cannot see the other DLL's instance. The FFXV trace
+  // showed exactly that: dxgi.dll's instance hung in adapter enumeration
+  // while d3d11.dll's own dxvk copy ran vkCreateInstance concurrently in the
+  // same driver (in-driver lock inversion). A NAMED kernel mutex serializes
+  // the whole construction window (vkCreateInstance + adapter enumeration)
+  // across every dxvk copy in the process. Kernel mutexes are recursive per
+  // thread, so ICD re-entry on the creating thread cannot self-deadlock.
+  // Bounded wait: after 120s we log and proceed rather than hang forever.
+  namespace {
+    struct RemixCrossDllInstanceLock {
+      HANDLE handle = nullptr;
+      bool   owned  = false;
+      RemixCrossDllInstanceLock() {
+        handle = ::CreateMutexA(nullptr, FALSE, "Local\\RemixDx11VkInstanceCreate");
+        if (handle != nullptr) {
+          const DWORD wait = ::WaitForSingleObject(handle, 120000);
+          owned = (wait == WAIT_OBJECT_0 || wait == WAIT_ABANDONED);
+          if (!owned)
+            Logger::warn("[Remix-DX11][init] cross-DLL instance lock timed out after 120s; continuing unserialized");
+        }
+      }
+      ~RemixCrossDllInstanceLock() {
+        if (handle != nullptr) {
+          if (owned)
+            ::ReleaseMutex(handle);
+          ::CloseHandle(handle);
+        }
+      }
+    };
+  }
+
   Rc<DxvkInstance> DxvkInstance::getOrCreateSharedInstance() {
     static dxvk::mutex s_sharedInstanceMutex;
     static Rc<DxvkInstance> s_sharedInstance;
 
     static const bool s_shareDisabled =
       env::getEnvVar("DXVK_REMIX_SHARED_INSTANCE") == "0";
-    if (s_shareDisabled)
+    if (s_shareDisabled) {
+      RemixCrossDllInstanceLock crossDllLock;
       return new DxvkInstance();
+    }
 
     std::lock_guard<dxvk::mutex> lock(s_sharedInstanceMutex);
-    if (s_sharedInstance == nullptr)
+    if (s_sharedInstance == nullptr) {
+      RemixCrossDllInstanceLock crossDllLock;
       s_sharedInstance = new DxvkInstance();
-    else
+    } else {
       Logger::info("[Remix-DX11][init] reusing shared Vulkan instance");
+    }
     return s_sharedInstance;
   }
 
@@ -477,10 +514,18 @@ namespace dxvk {
     m_vkl = new vk::LibraryFn();
     m_vki = new vk::InstanceFn(true, this->createInstance());
 
+    // DX11_V284: init markers - the FFXV hang trace ended AFTER
+    // "vkCreateInstance returned VK_SUCCESS" with no adapter logs, i.e. the
+    // hang was in adapter enumeration below while ANOTHER dxvk copy (the
+    // other DLL) ran vkCreateInstance concurrently in the driver. These
+    // markers bound each driver call so the next trace names the exact one.
+    Logger::info("[Remix-DX11][init] enumerating Vulkan adapters...");
     m_adapters = this->queryAdapters();
+    Logger::info(str::format("[Remix-DX11][init] adapters enumerated: ", m_adapters.size()));
 
     for (const auto& provider : m_extProviders)
       provider->initDeviceExtensions(this);
+    Logger::info("[Remix-DX11][init] device extension providers initialized");
 
     for (uint32_t i = 0; i < m_adapters.size(); i++) {
       for (const auto& provider : m_extProviders) {
