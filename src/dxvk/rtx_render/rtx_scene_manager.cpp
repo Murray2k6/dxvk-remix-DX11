@@ -499,11 +499,20 @@ namespace dxvk {
       // Dense while a session warms up (every 200 frames for the first 2000),
       // then a once-per-~5-minutes heartbeat (every 18000 frames at 60fps)
       // which still catches slow monotonic VRAM leaks.
+      // DX11_V285_CENSUS_ON_GROWTH: the throttle went quiet exactly when the
+      // Skyrim leak began (world load at frame ~2000+), so the census now also
+      // fires whenever device-local usage grows >=256 MiB past the last line
+      // (at most once per 100 frames) - a leak can no longer hide between
+      // heartbeats. Also reports the per-frame unique-buffer table population
+      // (kBufferCacheLimit overflow silently drops draws) so buffer-object
+      // churn is visible directly.
       const uint32_t fid = m_device->getCurrentFrameId();
-      const bool censusDue = (fid != 0)
+      static VkDeviceSize s_lastCensusUsedBytes = 0;
+      static uint32_t s_lastGrowthCensusFrame = 0;
+      bool censusDue = (fid != 0)
         && ((fid <= 2000u && (fid % 200) == 0) || (fid % 18000) == 0);
-      if (censusDue) {
-        VkDeviceSize usedBytes = 0, budgetBytes = 0;
+      VkDeviceSize usedBytes = 0, budgetBytes = 0;
+      {
         const DxvkAdapterMemoryInfo mem = m_device->adapter()->getMemoryHeapInfo();
         for (uint32_t i = 0; i < mem.heapCount; ++i) {
           if (mem.heaps[i].heapFlags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) {
@@ -511,9 +520,19 @@ namespace dxvk {
             budgetBytes += mem.heaps[i].memoryBudget;
           }
         }
+      }
+      if (!censusDue
+       && usedBytes > s_lastCensusUsedBytes + (256ull << 20)
+       && fid > s_lastGrowthCensusFrame + 100u) {
+        censusDue = true;
+        s_lastGrowthCensusFrame = fid;
+      }
+      if (censusDue) {
+        s_lastCensusUsedBytes = usedBytes;
         Logger::info(str::format("[Remix-DX11][vram] frame=", fid,
           " instances=", m_instanceManager.getActiveCount(),
           " geoEntries=", m_drawCallCache.getEntries().size(),
+          " frameBuffers=", m_bufferCache.getActiveCount(), "/", m_bufferCache.getTotalCount(),
           " vramUsedMiB=", usedBytes / (1024ull * 1024ull),
           " vramBudgetMiB=", budgetBytes / (1024ull * 1024ull)));
       }

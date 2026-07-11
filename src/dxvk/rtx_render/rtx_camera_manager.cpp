@@ -51,6 +51,19 @@ namespace dxvk {
       return input.testCategoryFlags(InstanceCategories::Sky) ? CameraType::Sky : CameraType::Unknown;
     }
 
+    // DX11_V285_OFFSCREEN_CAMERA_GATE: draws into offscreen color targets
+    // (water reflection, environment cubemap, mirror passes) carry that pass's
+    // OWN view/projection. RtCamera::update() is first-touch-wins per frame and
+    // those passes render BEFORE the main scene in most engines, so without
+    // this gate the reflection camera claims the Main camera every frame and
+    // the whole scene is traced from the wrong viewpoint ("raytracer uses the
+    // wrong camera"). The geometry itself still submits (Unknown falls back to
+    // the Main camera pose at the call site); it just never drives a camera.
+    if (input.getTransformData().offscreenRenderTarget) {
+      ONCE(Logger::info("[RTX] CameraManager: ignoring camera from an offscreen render-target pass (reflection/cubemap/mirror)"));
+      return input.testCategoryFlags(InstanceCategories::Sky) ? CameraType::Sky : CameraType::Unknown;
+    }
+
     switch (RtxOptions::fusedWorldViewMode()) {
     case FusedWorldViewMode::None:
       if (input.getTransformData().objectToView == input.getTransformData().objectToWorld && !isIdentityExact(input.getTransformData().objectToView)) {

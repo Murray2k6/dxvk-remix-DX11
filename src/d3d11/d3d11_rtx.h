@@ -274,6 +274,47 @@ namespace dxvk {
     uint32_t     m_texcoordCapturesThisFrame = 0;
     VkDeviceSize m_texcoordCaptureBytesThisFrame = 0;
 
+    // DX11_V285_TEXCOORD_CAPTURE_REUSE: one persistent capture buffer per draw
+    // identity (VS + vertex-buffer bindings + vertex range), reused across
+    // frames instead of allocating a fresh device-local buffer per draw per
+    // frame. The per-draw-per-frame allocations flooded VRAM and the scene
+    // manager's unique-buffer table within seconds of world rendering (Skyrim:
+    // RADAR_PRE_LEAK + "pushing more unique buffers" + OMM budget collapse).
+    // Re-replays into the same buffer at most once per frame via a fresh
+    // rename slice (invalidateBuffer - the standard dxvk discard pattern), so
+    // the GPU never races a slice it is still reading and the buffer object
+    // stays stable for the scene manager's caches.
+    struct TexcoordCaptureEntry {
+      Rc<DxvkBuffer> buffer;
+      VkDeviceSize   capacity = 0;
+      uint32_t       lastUsedFrame = 0;
+      uint32_t       lastCapturedFrame = ~0u;
+    };
+    std::unordered_map<uint64_t, TexcoordCaptureEntry> m_texcoordCaptureCache;
+    VkDeviceSize m_texcoordCaptureCacheBytes = 0;
+    void SweepTexcoordCaptureCache(uint32_t currentFrame);
+
+    // DX11_V285_HELPER_BUFFER_POOL: host-visible helper buffers (dynamic
+    // vertex/index snapshots, format-conversion outputs, skinning streams)
+    // must be FRESH per draw - record-time slice resolution forbids renaming
+    // one shared buffer within a frame (the V250 bug class) - but the buffer
+    // OBJECTS are recyclable: once the pool holds the only reference
+    // (refCount()==1: no DrawCallState, no geometry-cache entry, no pending
+    // hash job) and the GPU has retired every command list that touched it
+    // (isInUse()==false), the object can back a new helper without a fresh
+    // allocation. Kills the per-draw-per-frame buffer-object churn that
+    // flooded system commit (Windows RADAR_PRE_LEAK) and the scene manager's
+    // per-frame unique-buffer table during world rendering in every game.
+    struct HelperPoolItem {
+      Rc<DxvkBuffer> buffer;
+      VkDeviceSize   capacity = 0;
+    };
+    std::vector<HelperPoolItem> m_helperRetired;
+    std::vector<HelperPoolItem> m_helperFree;
+    VkDeviceSize m_helperPoolBytes = 0;
+    Rc<DxvkBuffer> AcquireHostVisibleHelperBuffer(VkDeviceSize size, const char* name);
+    void RecycleHelperBuffers();
+
     void SubmitDraw(bool indexed, UINT count, UINT start, INT base,
                     const Matrix4* instanceTransform = nullptr);
     void SubmitInstancedDraw(bool indexed, UINT count, UINT start, INT base,

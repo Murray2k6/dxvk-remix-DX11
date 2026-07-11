@@ -565,6 +565,13 @@ struct DrawCallTransforms {
   // viewport fallback (no real game projection yet). Read by d3d11_rtx heuristics
   // and CameraManager so fallback frames are not treated as a stable scene camera.
   bool usedViewportFallbackProjection = false;
+  // DX11_V285: set by the DX11 layer when the draw renders into an offscreen
+  // color target (water reflection, environment cubemap, mirror pass) whose
+  // extent matches neither the swapchain output nor the established scene
+  // viewport. Such passes carry their OWN camera; CameraManager must not let
+  // them claim the Main camera (RtCamera::update is first-touch-wins per frame
+  // and these passes render BEFORE the main scene in most engines).
+  bool offscreenRenderTarget = false;
   Vector4 clipPlane{ 0.f };
   TexGenMode texgenMode = TexGenMode::None;
   std::shared_ptr<const std::vector<Matrix4>> instancesToObject;
