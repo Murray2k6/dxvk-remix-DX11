@@ -1,9 +1,163 @@
 #include <cctype>
+#include <algorithm>
+#include <filesystem>
 
 #include "d3d11_device.h"
 #include "d3d11_shader.h"
 
 namespace dxvk {
+
+  static D3D11PositionTransformBinding findPositionTransformBinding(const DxbcModule& module) {
+    D3D11PositionTransformBinding result;
+
+    const Rc<DxbcIsgn> outputSignature = module.osgn();
+    if (outputSignature == nullptr)
+      return result;
+
+    uint32_t positionRegister = UINT32_MAX;
+    for (const DxbcSgnEntry& entry : *outputSignature) {
+      std::string semantic = entry.semanticName;
+      std::transform(semantic.begin(), semantic.end(), semantic.begin(),
+        [](unsigned char c) { return char(std::toupper(c)); });
+      if (entry.systemValue == DxbcSystemValue::Position
+       || semantic == "SV_POSITION"
+       || semantic == "POSITION") {
+        positionRegister = entry.registerId;
+        break;
+      }
+    }
+    if (positionRegister == UINT32_MAX)
+      return result;
+
+    struct TransformComponents {
+      std::array<int32_t, 4> cbSlots = { -1, -1, -1, -1 };
+      std::array<int32_t, 4> cbRegisters = { -1, -1, -1, -1 };
+    } position;
+    std::unordered_map<uint32_t, TransformComponents> temporaryTransforms;
+
+    auto staticRegisterIndex = [](const DxbcRegister& reg, uint32_t dimension, int32_t& index) {
+      if (reg.idxDim <= dimension || reg.idx[dimension].relReg != nullptr)
+        return false;
+      index = reg.idx[dimension].offset;
+      return index >= 0;
+    };
+
+    auto invalidateWrittenComponents = [](TransformComponents& transform, const DxbcRegMask& mask) {
+      for (uint32_t component = 0; component < 4; ++component) {
+        if (mask[component]) {
+          transform.cbSlots[component] = -1;
+          transform.cbRegisters[component] = -1;
+        }
+      }
+    };
+
+    auto recordDp4 = [&](TransformComponents& transform, const DxbcRegister& dst,
+                         const DxbcShaderInstruction& ins) {
+      if (dst.mask.popCount() != 1)
+        return false;
+
+      const DxbcRegister* cb = nullptr;
+      if (ins.src[0].type == DxbcOperandType::ConstantBuffer)
+        cb = &ins.src[0];
+      else if (ins.src[1].type == DxbcOperandType::ConstantBuffer)
+        cb = &ins.src[1];
+      if (cb == nullptr || !cb->modifiers.isClear()
+       || cb->swizzle != DxbcRegSwizzle(0, 1, 2, 3))
+        return false;
+
+      int32_t slot = -1;
+      int32_t cbRegister = -1;
+      if (!staticRegisterIndex(*cb, 0, slot)
+       || !staticRegisterIndex(*cb, 1, cbRegister))
+        return false;
+
+      const uint32_t component = dst.mask.firstSet();
+      transform.cbSlots[component] = slot;
+      transform.cbRegisters[component] = cbRegister;
+      return true;
+    };
+
+    DxbcCodeSlice code = module.instructionSlice();
+    DxbcDecodeContext decoder;
+    while (!code.atEnd()) {
+      decoder.decodeInstruction(code);
+      const DxbcShaderInstruction& ins = decoder.getInstruction();
+      if (ins.dstCount == 0)
+        continue;
+
+      const DxbcRegister& dst = ins.dst[0];
+      int32_t dstRegister = -1;
+      const bool isPositionOutput = dst.type == DxbcOperandType::Output
+        && staticRegisterIndex(dst, 0, dstRegister)
+        && uint32_t(dstRegister) == positionRegister;
+      const bool isTemporary = dst.type == DxbcOperandType::Temp
+        && staticRegisterIndex(dst, 0, dstRegister);
+
+      if (ins.op == DxbcOpcode::Dp4 && ins.dstCount == 1 && ins.srcCount == 2) {
+        if (isPositionOutput) {
+          if (!recordDp4(position, dst, ins))
+            invalidateWrittenComponents(position, dst.mask);
+        } else if (isTemporary) {
+          TransformComponents& temporary = temporaryTransforms[uint32_t(dstRegister)];
+          if (!recordDp4(temporary, dst, ins))
+            invalidateWrittenComponents(temporary, dst.mask);
+        }
+        continue;
+      }
+
+      // Most optimized SM5 vertex shaders calculate clip position into a
+      // temporary and end with `mov oN, rM`. Propagate the four proven dp4
+      // components through that exact move, including scalar write masks and
+      // source swizzles. No arithmetic or dynamic indexing is guessed.
+      if (isPositionOutput && ins.op == DxbcOpcode::Mov
+       && ins.dstCount == 1 && ins.srcCount == 1
+       && ins.src[0].type == DxbcOperandType::Temp
+       && ins.src[0].modifiers.isClear()) {
+        int32_t sourceRegister = -1;
+        if (staticRegisterIndex(ins.src[0], 0, sourceRegister)) {
+          const auto source = temporaryTransforms.find(uint32_t(sourceRegister));
+          if (source != temporaryTransforms.end()) {
+            for (uint32_t component = 0; component < 4; ++component) {
+              if (!dst.mask[component])
+                continue;
+              const uint32_t sourceComponent = ins.src[0].swizzle[component];
+              position.cbSlots[component] = source->second.cbSlots[sourceComponent];
+              position.cbRegisters[component] = source->second.cbRegisters[sourceComponent];
+            }
+            continue;
+          }
+        }
+      }
+
+      if (isPositionOutput)
+        invalidateWrittenComponents(position, dst.mask);
+      if (isTemporary)
+        invalidateWrittenComponents(temporaryTransforms[uint32_t(dstRegister)], dst.mask);
+    }
+
+    const int32_t slot = position.cbSlots[0];
+    if (slot < 0)
+      return result;
+    for (uint32_t component = 0; component < 4; ++component) {
+      if (position.cbSlots[component] != slot || position.cbRegisters[component] < 0)
+        return result;
+    }
+
+    // Require four distinct consecutive registers. This rejects coincidental
+    // dp4s used for lighting and accepts both ascending and descending packing.
+    std::array<int32_t, 4> sortedRegisters = position.cbRegisters;
+    std::sort(sortedRegisters.begin(), sortedRegisters.end());
+    for (uint32_t i = 1; i < 4; ++i) {
+      if (sortedRegisters[i] != sortedRegisters[0] + int32_t(i))
+        return result;
+    }
+
+    result.valid = true;
+    result.constantBufferSlot = uint32_t(slot);
+    for (uint32_t component = 0; component < 4; ++component)
+      result.constantRegisters[component] = uint32_t(position.cbRegisters[component]);
+    return result;
+  }
 
   // DX11_V277_REAL_SHADER_MODEL: parse the shader model version from the raw
   // DXBC container. Layout: 'DXBC' magic (4) + checksum (16) + one (4) +
@@ -312,10 +466,31 @@ namespace dxvk {
       BytecodeLength);
     
     DxbcModule module(reader);
+
+    if (pShaderKey->type() == VK_SHADER_STAGE_VERTEX_BIT)
+      m_positionTransform = findPositionTransformBinding(module);
     
     // If requested by the user, dump both the raw DXBC
     // shader and the compiled SPIR-V module to a file.
-    const std::string dumpPath = env::getEnvVar("DXVK_SHADER_DUMP_PATH");
+    std::string dumpPath = env::getEnvVar("DXVK_SHADER_DUMP_PATH");
+    // Steam often launches the actual game through an already-running client,
+    // so per-launch environment variables never reach the game process. Allow
+    // an explicit marker beside the executable to enable the same raw DXBC/SPV
+    // dump path without a registry or global environment mutation. The marker
+    // is opt-in and has zero runtime cost after this creation-time check.
+    if (dumpPath.empty()
+     && pShaderKey->type() == VK_SHADER_STAGE_VERTEX_BIT
+     && std::filesystem::exists("dx11-camera-shader-dump.flag")) {
+      dumpPath = "rtx-remix/logs/dx11-camera-shaders";
+      std::error_code createError;
+      std::filesystem::create_directories(dumpPath, createError);
+      if (createError) {
+        Logger::warn(str::format(
+          "[Remix-DX11] Could not create camera shader dump directory: ",
+          createError.message()));
+        dumpPath.clear();
+      }
+    }
     
     if (dumpPath.size() != 0) {
       reader.store(std::ofstream(str::tows(str::format(dumpPath, "/", name, ".dxbc").c_str()).c_str(),

@@ -565,6 +565,14 @@ struct DrawCallTransforms {
   // viewport fallback (no real game projection yet). Read by d3d11_rtx heuristics
   // and CameraManager so fallback frames are not treated as a stable scene camera.
   bool usedViewportFallbackProjection = false;
+  // Some D3D11 engines render in camera-relative world space. In that layout
+  // the real main-camera view is intentionally identity when the camera has no
+  // rotation; geometry has already had the high-precision camera origin
+  // removed before it reaches the vertex shader. This flag is set only after
+  // the identity view has been proven by a coherent View/Projection/ViewProj/
+  // inverse camera block, so an unresolved camera is never mistaken for a
+  // valid camera-relative one.
+  bool cameraRelativeView = false;
   // DX11_V285: set by the DX11 layer when the draw renders into an offscreen
   // color target (water reflection, environment cubemap, mirror pass) whose
   // extent matches neither the swapchain output nor the established scene

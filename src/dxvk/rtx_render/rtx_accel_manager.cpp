@@ -1783,7 +1783,42 @@ namespace dxvk {
         desc.scratchData.deviceAddress += m_scratchBuffer->getDeviceAddress();
       }
       assert(blasToBuild.size() == blasRangesToBuild.size());
-      ctx->vkCmdBuildAccelerationStructuresKHR(blasToBuild.size(), blasToBuild.data(), blasRangesToBuild.data());
+
+      // DX11_V290_PREEMPTIBLE_BLAS_BATCHES: a single Vulkan build call with
+      // hundreds of captured DX11 BLASes can become one long, effectively
+      // non-preemptible NVIDIA driver operation. Two live runs produced
+      // nvlddmkm Event 153 followed by VK_ERROR_DEVICE_LOST at that workload.
+      // Emit bounded calls with explicit AS barriers between them so Windows'
+      // GPU scheduler gets regular command boundaries. This builds the same
+      // complete ray-tracing scene; only the submission granularity changes.
+      static constexpr uint32_t kMaxBlasesPerBuildCall = 32u;
+      const uint32_t buildCount = static_cast<uint32_t>(blasToBuild.size());
+      for (uint32_t first = 0; first < buildCount; first += kMaxBlasesPerBuildCall) {
+        const uint32_t batchCount = std::min(kMaxBlasesPerBuildCall, buildCount - first);
+        ctx->vkCmdBuildAccelerationStructuresKHR(
+          batchCount,
+          blasToBuild.data() + first,
+          blasRangesToBuild.data() + first);
+
+        if (first + batchCount < buildCount) {
+          ctx->emitMemoryBarrier(
+            0,
+            VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
+            VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR,
+            VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
+            VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR |
+              VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR);
+        }
+      }
+
+      static uint32_t sBatchedBuildLogs = 0;
+      if (buildCount > kMaxBlasesPerBuildCall && sBatchedBuildLogs < 16u) {
+        ++sBatchedBuildLogs;
+        Logger::info(str::format(
+          "[RTX][BLAS] split ", buildCount, " builds into ",
+          (buildCount + kMaxBlasesPerBuildCall - 1u) / kMaxBlasesPerBuildCall,
+          " watchdog-safe batches; scratchMiB=", totalScratchMemory >> 20));
+      }
 
       execBarriers.accessBuffer(
        m_scratchBuffer->getSliceHandle(),

@@ -620,14 +620,21 @@ namespace dxvk {
       preferredIntegrateDirectRaytraceMode = DxvkPathtracerIntegrateDirect::RaytraceMode::RayQuery;
 
       if (vendorID == static_cast<uint32_t>(DxvkGpuVendor::Nvidia) || driverID == VK_DRIVER_ID_MESA_RADV) {
-        // Default to a mixture of Trace Ray and Ray Query on NVIDIA and RADV
+        // DX11_V288_STABLE_RT: use the compute RayQuery path for indirect
+        // integration on NVIDIA as well. The previous automatic preset silently
+        // selected a TraceRay RGS despite the DX11 UI/config expectation; the
+        // live RTX 5060 run then produced nvlddmkm Event 153 followed by
+        // VK_ERROR_DEVICE_LOST. RayQuery traverses the same TLAS and computes
+        // the same indirect lighting without the separate RT-pipeline stack/SBT
+        // failure surface. This remains real hardware ray tracing, not a raster
+        // fallback. Explicit non-Auto presets can still select TraceRay.
         if (driverID == VK_DRIVER_ID_MESA_RADV) {
-          Logger::info("RADV driver detected, setting default raytrace modes to Trace Ray (Indirect Integrate) and Ray Query (GBuffer, Direct Integrate)");
+          Logger::info("RADV driver detected, setting default raytrace modes to Ray Query compute");
         } else {
-          Logger::info("NVIDIA architecture detected, setting default raytrace modes to Trace Ray (Indirect Integrate) and Ray Query (GBuffer, Direct Integrate)");
+          Logger::info("NVIDIA architecture detected, setting stable DX11 raytrace modes to Ray Query compute");
         }
 
-        preferredIntegrateIndirectRaytraceMode = DxvkPathtracerIntegrateIndirect::RaytraceMode::TraceRay;
+        preferredIntegrateIndirectRaytraceMode = DxvkPathtracerIntegrateIndirect::RaytraceMode::RayQuery;
       } else {
         // Default to Ray Query on AMD/Intel
         Logger::info("Non-NVIDIA architecture detected, setting default raytrace modes to Ray Query");
