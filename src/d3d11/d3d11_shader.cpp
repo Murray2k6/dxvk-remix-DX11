@@ -11,7 +11,8 @@ namespace dxvk {
     D3D11PositionTransformBinding result;
 
     const Rc<DxbcIsgn> outputSignature = module.osgn();
-    if (outputSignature == nullptr)
+    const Rc<DxbcIsgn> inputSignature = module.isgn();
+    if (outputSignature == nullptr || inputSignature == nullptr)
       return result;
 
     uint32_t positionRegister = UINT32_MAX;
@@ -29,11 +30,44 @@ namespace dxvk {
     if (positionRegister == UINT32_MAX)
       return result;
 
+    uint32_t positionInputRegister = UINT32_MAX;
+    bool positionInputHasW = false;
+    for (const DxbcSgnEntry& entry : *inputSignature) {
+      std::string semantic = entry.semanticName;
+      std::transform(semantic.begin(), semantic.end(), semantic.begin(),
+        [](unsigned char c) { return char(std::toupper(c)); });
+      if ((semantic == "POSITION" || semantic == "SV_POSITION")
+       && entry.semanticIndex == 0) {
+        positionInputRegister = entry.registerId;
+        positionInputHasW = entry.componentMask[3];
+        break;
+      }
+    }
+    if (positionInputRegister == UINT32_MAX)
+      return result;
+
+    constexpr int32_t kInvalidRegister = -1;
+    constexpr int32_t kSyntheticAffineRow = -2;
+
     struct TransformComponents {
-      std::array<int32_t, 4> cbSlots = { -1, -1, -1, -1 };
-      std::array<int32_t, 4> cbRegisters = { -1, -1, -1, -1 };
+      std::array<int32_t, 4> cbSlots = {
+        kInvalidRegister, kInvalidRegister, kInvalidRegister, kInvalidRegister };
+      std::array<int32_t, 4> cbRegisters = {
+        kInvalidRegister, kInvalidRegister, kInvalidRegister, kInvalidRegister };
+      std::array<uint32_t, 4> prefixCounts = { 0, 0, 0, 0 };
+      std::array<D3D11PositionTransformMatrixBinding, 4> prefixes;
     } position;
     std::unordered_map<uint32_t, TransformComponents> temporaryTransforms;
+
+    enum class PositionOrigin : uint8_t {
+      Unknown,
+      PositionX,
+      PositionY,
+      PositionZ,
+      One,
+    };
+    using PositionOrigins = std::array<PositionOrigin, 4>;
+    std::unordered_map<uint32_t, PositionOrigins> temporaryOrigins;
 
     auto staticRegisterIndex = [](const DxbcRegister& reg, uint32_t dimension, int32_t& index) {
       if (reg.idxDim <= dimension || reg.idx[dimension].relReg != nullptr)
@@ -42,13 +76,147 @@ namespace dxvk {
       return index >= 0;
     };
 
-    auto invalidateWrittenComponents = [](TransformComponents& transform, const DxbcRegMask& mask) {
+    auto matrixBindingEqual = [](const D3D11PositionTransformMatrixBinding& a,
+                                 const D3D11PositionTransformMatrixBinding& b) {
+      return a.constantBufferSlot == b.constantBufferSlot
+          && a.constantRegisters == b.constantRegisters;
+    };
+
+    auto collapseTransform = [&](const TransformComponents& transform,
+                                 D3D11PositionTransformBinding& chain) {
+      const bool syntheticW = transform.cbRegisters[3] == kSyntheticAffineRow;
+      const uint32_t realRowCount = syntheticW ? 3u : 4u;
+      const int32_t slot = transform.cbSlots[0];
+      if (slot < 0)
+        return false;
+
+      for (uint32_t component = 0; component < realRowCount; ++component) {
+        if (transform.cbSlots[component] != slot || transform.cbRegisters[component] < 0)
+          return false;
+      }
+      if (syntheticW) {
+        if (transform.cbSlots[3] != kSyntheticAffineRow)
+          return false;
+      } else if (transform.cbSlots[3] != slot || transform.cbRegisters[3] < 0) {
+        return false;
+      }
+
+      std::array<int32_t, 4> sortedRegisters = transform.cbRegisters;
+      std::sort(sortedRegisters.begin(), sortedRegisters.begin() + realRowCount);
+      for (uint32_t i = 1; i < realRowCount; ++i) {
+        if (sortedRegisters[i] != sortedRegisters[0] + int32_t(i))
+          return false;
+      }
+
+      const uint32_t prefixCount = transform.prefixCounts[0];
+      if (prefixCount > 1)
+        return false;
+      for (uint32_t component = 1; component < 4; ++component) {
+        if (transform.prefixCounts[component] != prefixCount)
+          return false;
+        if (prefixCount != 0
+         && !matrixBindingEqual(transform.prefixes[component], transform.prefixes[0]))
+          return false;
+      }
+
+      chain = {};
+      chain.valid = true;
+      chain.matrixCount = prefixCount + 1;
+      if (prefixCount != 0)
+        chain.matrices[0] = transform.prefixes[0];
+
+      D3D11PositionTransformMatrixBinding& current = chain.matrices[prefixCount];
+      current.constantBufferSlot = uint32_t(slot);
+      for (uint32_t component = 0; component < 4; ++component) {
+        current.constantRegisters[component] = transform.cbRegisters[component] == kSyntheticAffineRow
+          ? UINT32_MAX
+          : uint32_t(transform.cbRegisters[component]);
+      }
+      return true;
+    };
+
+    auto invalidateWrittenComponents = [=](TransformComponents& transform, const DxbcRegMask& mask) {
       for (uint32_t component = 0; component < 4; ++component) {
         if (mask[component]) {
-          transform.cbSlots[component] = -1;
-          transform.cbRegisters[component] = -1;
+          transform.cbSlots[component] = kInvalidRegister;
+          transform.cbRegisters[component] = kInvalidRegister;
+          transform.prefixCounts[component] = 0;
         }
       }
+    };
+
+    auto invalidateOrigins = [](PositionOrigins& origins, const DxbcRegMask& mask) {
+      for (uint32_t component = 0; component < 4; ++component) {
+        if (mask[component])
+          origins[component] = PositionOrigin::Unknown;
+      }
+    };
+
+    auto sourceOrigin = [&](const DxbcRegister& source, uint32_t destinationComponent) {
+      if (!source.modifiers.isClear())
+        return PositionOrigin::Unknown;
+      const uint32_t sourceComponent = source.swizzle[destinationComponent];
+
+      int32_t sourceRegister = -1;
+      if (source.type == DxbcOperandType::Input
+       && staticRegisterIndex(source, 0, sourceRegister)
+       && uint32_t(sourceRegister) == positionInputRegister) {
+        switch (sourceComponent) {
+          case 0: return PositionOrigin::PositionX;
+          case 1: return PositionOrigin::PositionY;
+          case 2: return PositionOrigin::PositionZ;
+          default: return PositionOrigin::Unknown;
+        }
+      }
+
+      if (source.type == DxbcOperandType::Temp
+       && staticRegisterIndex(source, 0, sourceRegister)) {
+        const auto entry = temporaryOrigins.find(uint32_t(sourceRegister));
+        if (entry != temporaryOrigins.end())
+          return entry->second[sourceComponent];
+      }
+
+      if (source.type == DxbcOperandType::Imm32) {
+        const uint32_t bits = source.componentCount == DxbcComponentCount::Component1
+          ? source.imm.u32_1
+          : source.imm.u32_4[sourceComponent];
+        if (bits == 0x3f800000u)
+          return PositionOrigin::One;
+      }
+
+      return PositionOrigin::Unknown;
+    };
+
+    auto isCanonicalPositionVector = [&](const DxbcRegister& vector) {
+      if (!vector.modifiers.isClear())
+        return false;
+
+      int32_t vectorRegister = -1;
+      if (vector.type == DxbcOperandType::Input
+       && positionInputHasW
+       && staticRegisterIndex(vector, 0, vectorRegister)
+       && uint32_t(vectorRegister) == positionInputRegister) {
+        return vector.swizzle == DxbcRegSwizzle(0, 1, 2, 3);
+      }
+
+      if (vector.type != DxbcOperandType::Temp
+       || !staticRegisterIndex(vector, 0, vectorRegister))
+        return false;
+      const auto origins = temporaryOrigins.find(uint32_t(vectorRegister));
+      if (origins == temporaryOrigins.end())
+        return false;
+
+      const std::array<PositionOrigin, 4> expected = {
+        PositionOrigin::PositionX,
+        PositionOrigin::PositionY,
+        PositionOrigin::PositionZ,
+        PositionOrigin::One,
+      };
+      for (uint32_t component = 0; component < 4; ++component) {
+        if (origins->second[vector.swizzle[component]] != expected[component])
+          return false;
+      }
+      return true;
     };
 
     auto recordDp4 = [&](TransformComponents& transform, const DxbcRegister& dst,
@@ -57,13 +225,35 @@ namespace dxvk {
         return false;
 
       const DxbcRegister* cb = nullptr;
-      if (ins.src[0].type == DxbcOperandType::ConstantBuffer)
+      const DxbcRegister* vector = nullptr;
+      if (ins.src[0].type == DxbcOperandType::ConstantBuffer) {
         cb = &ins.src[0];
-      else if (ins.src[1].type == DxbcOperandType::ConstantBuffer)
+        vector = &ins.src[1];
+      } else if (ins.src[1].type == DxbcOperandType::ConstantBuffer) {
         cb = &ins.src[1];
-      if (cb == nullptr || !cb->modifiers.isClear()
+        vector = &ins.src[0];
+      }
+      if (cb == nullptr || vector == nullptr || !cb->modifiers.isClear()
        || cb->swizzle != DxbcRegSwizzle(0, 1, 2, 3))
         return false;
+
+      D3D11PositionTransformBinding prefix;
+      if (isCanonicalPositionVector(*vector)) {
+        prefix.valid = true;
+        prefix.matrixCount = 0;
+      } else {
+        int32_t vectorRegister = -1;
+        if (vector->type != DxbcOperandType::Temp
+         || !vector->modifiers.isClear()
+         || vector->swizzle != DxbcRegSwizzle(0, 1, 2, 3)
+         || !staticRegisterIndex(*vector, 0, vectorRegister))
+          return false;
+        const auto source = temporaryTransforms.find(uint32_t(vectorRegister));
+        if (source == temporaryTransforms.end()
+         || !collapseTransform(source->second, prefix)
+         || prefix.matrixCount != 1)
+          return false;
+      }
 
       int32_t slot = -1;
       int32_t cbRegister = -1;
@@ -74,6 +264,9 @@ namespace dxvk {
       const uint32_t component = dst.mask.firstSet();
       transform.cbSlots[component] = slot;
       transform.cbRegisters[component] = cbRegister;
+      transform.prefixCounts[component] = prefix.matrixCount;
+      if (prefix.matrixCount != 0)
+        transform.prefixes[component] = prefix.matrices[0];
       return true;
     };
 
@@ -101,6 +294,7 @@ namespace dxvk {
           TransformComponents& temporary = temporaryTransforms[uint32_t(dstRegister)];
           if (!recordDp4(temporary, dst, ins))
             invalidateWrittenComponents(temporary, dst.mask);
+          invalidateOrigins(temporaryOrigins[uint32_t(dstRegister)], dst.mask);
         }
         continue;
       }
@@ -109,53 +303,60 @@ namespace dxvk {
       // temporary and end with `mov oN, rM`. Propagate the four proven dp4
       // components through that exact move, including scalar write masks and
       // source swizzles. No arithmetic or dynamic indexing is guessed.
-      if (isPositionOutput && ins.op == DxbcOpcode::Mov
-       && ins.dstCount == 1 && ins.srcCount == 1
-       && ins.src[0].type == DxbcOperandType::Temp
-       && ins.src[0].modifiers.isClear()) {
+      if (ins.op == DxbcOpcode::Mov && ins.dstCount == 1 && ins.srcCount == 1) {
+        TransformComponents* destinationTransform = isPositionOutput
+          ? &position
+          : (isTemporary ? &temporaryTransforms[uint32_t(dstRegister)] : nullptr);
+
+        bool copiedTransform = false;
         int32_t sourceRegister = -1;
-        if (staticRegisterIndex(ins.src[0], 0, sourceRegister)) {
+        if (destinationTransform != nullptr
+         && ins.src[0].type == DxbcOperandType::Temp
+         && ins.src[0].modifiers.isClear()
+         && staticRegisterIndex(ins.src[0], 0, sourceRegister)) {
           const auto source = temporaryTransforms.find(uint32_t(sourceRegister));
           if (source != temporaryTransforms.end()) {
             for (uint32_t component = 0; component < 4; ++component) {
               if (!dst.mask[component])
                 continue;
               const uint32_t sourceComponent = ins.src[0].swizzle[component];
-              position.cbSlots[component] = source->second.cbSlots[sourceComponent];
-              position.cbRegisters[component] = source->second.cbRegisters[sourceComponent];
+              destinationTransform->cbSlots[component] = source->second.cbSlots[sourceComponent];
+              destinationTransform->cbRegisters[component] = source->second.cbRegisters[sourceComponent];
+              destinationTransform->prefixCounts[component] = source->second.prefixCounts[sourceComponent];
+              destinationTransform->prefixes[component] = source->second.prefixes[sourceComponent];
             }
-            continue;
+            copiedTransform = true;
           }
         }
+        if (destinationTransform != nullptr && !copiedTransform)
+          invalidateWrittenComponents(*destinationTransform, dst.mask);
+
+        if (isTemporary) {
+          PositionOrigins& origins = temporaryOrigins[uint32_t(dstRegister)];
+          for (uint32_t component = 0; component < 4; ++component) {
+            if (!dst.mask[component])
+              continue;
+            origins[component] = sourceOrigin(ins.src[0], component);
+            if (component == 3 && origins[component] == PositionOrigin::One) {
+              TransformComponents& temporary = temporaryTransforms[uint32_t(dstRegister)];
+              temporary.cbSlots[3] = kSyntheticAffineRow;
+              temporary.cbRegisters[3] = kSyntheticAffineRow;
+              temporary.prefixCounts[3] = 0;
+            }
+          }
+        }
+        continue;
       }
 
       if (isPositionOutput)
         invalidateWrittenComponents(position, dst.mask);
-      if (isTemporary)
+      if (isTemporary) {
         invalidateWrittenComponents(temporaryTransforms[uint32_t(dstRegister)], dst.mask);
+        invalidateOrigins(temporaryOrigins[uint32_t(dstRegister)], dst.mask);
+      }
     }
 
-    const int32_t slot = position.cbSlots[0];
-    if (slot < 0)
-      return result;
-    for (uint32_t component = 0; component < 4; ++component) {
-      if (position.cbSlots[component] != slot || position.cbRegisters[component] < 0)
-        return result;
-    }
-
-    // Require four distinct consecutive registers. This rejects coincidental
-    // dp4s used for lighting and accepts both ascending and descending packing.
-    std::array<int32_t, 4> sortedRegisters = position.cbRegisters;
-    std::sort(sortedRegisters.begin(), sortedRegisters.end());
-    for (uint32_t i = 1; i < 4; ++i) {
-      if (sortedRegisters[i] != sortedRegisters[0] + int32_t(i))
-        return result;
-    }
-
-    result.valid = true;
-    result.constantBufferSlot = uint32_t(slot);
-    for (uint32_t component = 0; component < 4; ++component)
-      result.constantRegisters[component] = uint32_t(position.cbRegisters[component]);
+    collapseTransform(position, result);
     return result;
   }
 

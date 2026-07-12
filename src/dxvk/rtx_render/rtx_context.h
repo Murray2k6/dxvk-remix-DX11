@@ -120,7 +120,10 @@ namespace dxvk {
     SceneManager& getSceneManager();
     Resources& getResourceManager();
   
-    static void triggerScreenshot() { s_triggerScreenshot = true; }
+    static void triggerScreenshot(bool captureDebugImages = false) {
+      s_triggerScreenshot = true;
+      s_triggerDebugScreenshot |= captureDebugImages;
+    }
     static void triggerUsdCapture() { s_triggerUsdCapture = true; }
 
     void bindCommonRayTracingResources(const Resources::RaytracingOutput& rtOutput);
@@ -238,6 +241,7 @@ namespace dxvk {
     bool shouldUseUpscaler() const { return shouldUseDLSS() || shouldUseNIS() || shouldUseTAA() || shouldUseXeSS(); }
 
     inline static bool s_triggerScreenshot = false;
+    inline static bool s_triggerDebugScreenshot = false;
     inline static bool s_triggerUsdCapture = false;
     inline static const bool s_capturePrePresentTestScreenshot = env::getEnvVar("RTX_TAKE_PRE_PRESENT_SCREENSHOT_FRAME") != "";
 

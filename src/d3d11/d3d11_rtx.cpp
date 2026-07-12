@@ -666,6 +666,16 @@ namespace dxvk {
       return a.byteOffset < b.byteOffset;
     });
 
+    // Input layouts may expose aliases at the same byte offset (for example,
+    // multiple semantic names mapped onto one packed instance field). They
+    // are one physical float4, not independent matrix rows. Counting aliases
+    // made a 32-byte record appear to contain three or four rows and caused us
+    // to read overlapping data as a transform.
+    instRows.erase(std::unique(instRows.begin(), instRows.end(),
+      [](const Float4Row& a, const Float4Row& b) {
+        return a.inputSlot == b.inputSlot && a.byteOffset == b.byteOffset;
+      }), instRows.end());
+
     if (instRows.size() < 3) {
       // No instance transform found â€” submit once without instance data.
       // This handles instancing used for non-transform data (colors, etc.)
@@ -718,6 +728,26 @@ namespace dxvk {
         }
         instRows.resize(kept);
       }
+
+      // A matrix row sequence is contiguous. Select one maximal run of up to
+      // four distinct float4s; unrelated instance colors/parameters elsewhere
+      // in the same stream must not be spliced into a transform.
+      std::vector<Float4Row> bestRun;
+      for (size_t begin = 0; begin < instRows.size(); ++begin) {
+        std::vector<Float4Row> run;
+        run.push_back(instRows[begin]);
+        for (size_t i = begin + 1; i < instRows.size() && run.size() < 4; ++i) {
+          if (instRows[i].byteOffset != run.back().byteOffset + 16u)
+            break;
+          run.push_back(instRows[i]);
+        }
+        if (run.size() > bestRun.size())
+          bestRun = std::move(run);
+        if (bestRun.size() == 4)
+          break;
+      }
+      instRows = std::move(bestRun);
+
       if (instRows.size() < 3) {
         // Not enough in-stride rows for an affine transform - this stream is
         // per-instance data (colors/params), not matrices. One placement.
@@ -762,11 +792,59 @@ namespace dxvk {
       if (instRows.size() == 3) {
         rows[3][0] = 0.f; rows[3][1] = 0.f; rows[3][2] = 0.f; rows[3][3] = 1.f;
       }
-      out = Matrix4(
+      const Matrix4 storedRows(
         Vector4(rows[0][0], rows[0][1], rows[0][2], rows[0][3]),
         Vector4(rows[1][0], rows[1][1], rows[1][2], rows[1][3]),
         Vector4(rows[2][0], rows[2][1], rows[2][2], rows[2][3]),
         Vector4(rows[3][0], rows[3][1], rows[3][2], rows[3][3]));
+
+      auto affineInstanceScore = [](const Matrix4& candidate) {
+        for (uint32_t column = 0; column < 4; ++column) {
+          for (uint32_t row = 0; row < 4; ++row) {
+            if (!std::isfinite(candidate[column][row]))
+              return -1.0e30f;
+          }
+        }
+        if (std::abs(candidate[0][3]) > 0.01f
+         || std::abs(candidate[1][3]) > 0.01f
+         || std::abs(candidate[2][3]) > 0.01f
+         || std::abs(candidate[3][3] - 1.0f) > 0.01f)
+          return -1.0e30f;
+
+        float score = 0.0f;
+        Vector3 axes[3];
+        for (uint32_t column = 0; column < 3; ++column) {
+          const float lengthSq =
+              candidate[0][column] * candidate[0][column]
+            + candidate[1][column] * candidate[1][column]
+            + candidate[2][column] * candidate[2][column];
+          if (!std::isfinite(lengthSq) || lengthSq < 1.0e-8f || lengthSq > 1.0e8f)
+            return -1.0e30f;
+          const float invLength = 1.0f / std::sqrt(lengthSq);
+          axes[column] = Vector3(
+            candidate[0][column] * invLength,
+            candidate[1][column] * invLength,
+            candidate[2][column] * invLength);
+        }
+        const float shear = std::abs(dot(axes[0], axes[1]))
+                          + std::abs(dot(axes[0], axes[2]))
+                          + std::abs(dot(axes[1], axes[2]));
+        if (shear > 1.5f)
+          return -1.0e30f;
+        score -= shear;
+        return score;
+      };
+
+      // D3D instance transforms are conventionally supplied as three/four
+      // dot-product rows. Matrix4 stores columns, so the transposed candidate
+      // is preferred when both layouts are structurally affine. Four-column
+      // input layouts are also accepted through the stored candidate.
+      const Matrix4 rowVectorTransform = transpose(storedRows);
+      const float rowVectorScore = affineInstanceScore(rowVectorTransform) + 0.01f;
+      const float columnVectorScore = affineInstanceScore(storedRows);
+      if (rowVectorScore <= -1.0e20f && columnVectorScore <= -1.0e20f)
+        return false;
+      out = rowVectorScore >= columnVectorScore ? rowVectorTransform : storedRows;
       return true;
     };
 
@@ -3310,25 +3388,72 @@ namespace dxvk {
         ? commonVs->GetPositionTransformBinding()
         : nullptr;
       if (binding != nullptr
-       && binding->constantBufferSlot < D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT) {
-        const auto& cb = m_context->m_state.vs.constantBuffers[binding->constantBufferSlot];
-        if (cb.buffer != nullptr) {
+       && binding->matrixCount >= 1u
+       && binding->matrixCount <= binding->matrices.size()) {
+        std::array<Matrix4, 2> shaderMatrices;
+        auto readShaderMatrix = [&](const D3D11PositionTransformMatrixBinding& matrixBinding,
+                                    Matrix4& shaderMatrix) {
+          if (matrixBinding.constantBufferSlot
+              >= D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT)
+            return false;
+
+          const auto& cb = m_context->m_state.vs.constantBuffers[matrixBinding.constantBufferSlot];
+          if (cb.buffer == nullptr)
+            return false;
+
           const auto mapped = cb.buffer->GetMappedSlice();
           const uint8_t* ptr = reinterpret_cast<const uint8_t*>(mapped.mapPtr);
+          if (ptr == nullptr)
+            return false;
+
           const size_t bufferSize = cb.buffer->Desc()->ByteWidth;
           const auto [bindingBase, bindingEnd] = cbRange(cb);
-          Matrix4 shaderObjectToClip;
-          bool registersReadable = ptr != nullptr;
-          for (uint32_t row = 0; row < 4 && registersReadable; ++row) {
-            const size_t offset = bindingBase + size_t(binding->constantRegisters[row]) * 16u;
-            if (offset + 16u > bindingEnd || offset + 16u > bufferSize) {
-              registersReadable = false;
-              break;
+          for (uint32_t row = 0; row < 4; ++row) {
+            const uint32_t shaderRegister = matrixBinding.constantRegisters[row];
+            if (shaderRegister == UINT32_MAX) {
+              // A three-row affine transform commonly ends with `mov w, 1`.
+              // Preserve that exact homogeneous row without reading a
+              // nonexistent fourth constant register.
+              shaderMatrix[row] = Vector4(0.0f, 0.0f, 0.0f, 1.0f);
+              continue;
             }
-            std::memcpy(shaderObjectToClip[row].data, ptr + offset, 16u);
+
+            const size_t offset = bindingBase + size_t(shaderRegister) * 16u;
+            if (offset + 16u > bindingEnd || offset + 16u > bufferSize)
+              return false;
+            std::memcpy(shaderMatrix[row].data, ptr + offset, 16u);
+          }
+          return isFiniteMatrix(shaderMatrix);
+        };
+
+        bool matricesReadable = true;
+        for (uint32_t i = 0; i < binding->matrixCount; ++i)
+          matricesReadable &= readShaderMatrix(binding->matrices[i], shaderMatrices[i]);
+
+        if (matricesReadable) {
+          // DXBC dp4 constants are normally stored as row vectors while
+          // Matrix4 stores columns. Test both representations. For a proven
+          // two-stage shader chain, preserve application order A then B, but
+          // also test the reversed multiplication needed by row-vector
+          // conventions. The affine factor test below rejects bad variants.
+          std::vector<Matrix4> shaderObjectToClipCandidates;
+          if (binding->matrixCount == 1u) {
+            shaderObjectToClipCandidates.push_back(shaderMatrices[0]);
+            shaderObjectToClipCandidates.push_back(transpose(shaderMatrices[0]));
+          } else {
+            const std::array<Matrix4, 2> first = {
+              shaderMatrices[0], transpose(shaderMatrices[0]) };
+            const std::array<Matrix4, 2> second = {
+              shaderMatrices[1], transpose(shaderMatrices[1]) };
+            for (const Matrix4& a : first) {
+              for (const Matrix4& b : second) {
+                shaderObjectToClipCandidates.push_back(b * a);
+                shaderObjectToClipCandidates.push_back(a * b);
+              }
+            }
           }
 
-          if (registersReadable && isFiniteMatrix(shaderObjectToClip)) {
+          if (!shaderObjectToClipCandidates.empty()) {
             // Factor against the exact projection Remix will use, including
             // orientation normalization and jitter removal. This guarantees
             // replacementProjection * objectToVirtualWorld reproduces the
@@ -3336,12 +3461,12 @@ namespace dxvk {
             const Matrix4 replacementProjection = transforms.viewToProjection;
             const Matrix4 inverseProjection = inverse(replacementProjection);
             if (isFiniteMatrix(inverseProjection)) {
-              std::array<Matrix4, 4> candidates = {
-                inverseProjection * shaderObjectToClip,
-                inverseProjection * transpose(shaderObjectToClip),
-                transpose(shaderObjectToClip * inverseProjection),
-                transpose(transpose(shaderObjectToClip) * inverseProjection),
-              };
+              std::vector<Matrix4> candidates;
+              candidates.reserve(shaderObjectToClipCandidates.size() * 2u);
+              for (const Matrix4& shaderObjectToClip : shaderObjectToClipCandidates) {
+                candidates.push_back(inverseProjection * shaderObjectToClip);
+                candidates.push_back(transpose(shaderObjectToClip * inverseProjection));
+              }
 
               auto affineScore = [](const Matrix4& candidate) -> float {
                 if (!isFiniteMatrix(candidate))
@@ -3405,13 +3530,26 @@ namespace dxvk {
                 static uint32_t sShaderTransformLogs = 0;
                 if (sShaderTransformLogs < 16u) {
                   ++sShaderTransformLogs;
+                  std::string bindingDescription;
+                  for (uint32_t matrixIndex = 0;
+                       matrixIndex < binding->matrixCount;
+                       ++matrixIndex) {
+                    const auto& matrixBinding = binding->matrices[matrixIndex];
+                    if (!bindingDescription.empty())
+                      bindingDescription += " -> ";
+                    bindingDescription += str::format("cb=", matrixBinding.constantBufferSlot, " regs=");
+                    for (uint32_t row = 0; row < 4; ++row) {
+                      if (row != 0)
+                        bindingDescription += ",";
+                      const uint32_t shaderRegister = matrixBinding.constantRegisters[row];
+                      bindingDescription += shaderRegister == UINT32_MAX
+                        ? "affine-w"
+                        : std::to_string(shaderRegister);
+                    }
+                  }
                   Logger::info(str::format(
                     "[D3D11Rtx] shader-proven object-to-view: vs=", commonVs->GetName(),
-                    " cb=", binding->constantBufferSlot,
-                    " regs=", binding->constantRegisters[0], ",",
-                    binding->constantRegisters[1], ",",
-                    binding->constantRegisters[2], ",",
-                    binding->constantRegisters[3],
+                    " matrices=", binding->matrixCount, " ", bindingDescription,
                     " [replacement view-space camera]"));
                 }
               }
@@ -6650,6 +6788,22 @@ namespace dxvk {
       static uint32_t s_filterReassertCounter = 0;
       if ((s_filterReassertCounter++ & 255u) == 0u)
         ::RemixReassertCrashSignatureFilter();
+    }
+
+    // An in-process GPU capture is the only reliable way to diagnose a
+    // fullscreen game launched through Steam (desktop capture APIs run in a
+    // different session). Drop dx11-remix-screenshot.flag beside the game
+    // executable; it is consumed once and captures the final image plus the
+    // albedo, normals, motion, depth, noisy and denoised lighting buffers.
+    // Poll at a low cadence so the dormant diagnostic has negligible cost.
+    const uint32_t screenshotFrame = m_context->m_device->getCurrentFrameId();
+    if ((screenshotFrame & 31u) == 0u
+     && ::GetFileAttributesW(L"dx11-remix-screenshot.flag") != INVALID_FILE_ATTRIBUTES) {
+      ::DeleteFileW(L"dx11-remix-screenshot.flag");
+      m_context->EmitCs([](DxvkContext*) {
+        RtxContext::triggerScreenshot(true);
+      });
+      Logger::info("[D3D11Rtx] Consumed dx11-remix-screenshot.flag; capturing GPU debug images");
     }
 
     // DX11_V280: per-frame stream-out capture budget.

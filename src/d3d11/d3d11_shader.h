@@ -24,10 +24,17 @@ namespace dxvk {
   // four dp4 instructions whose constant-buffer operands are the four rows or
   // columns of object-to-clip. Recording the exact registers avoids guessing
   // camera/world matrices from unrelated affine constants at draw time.
-  struct D3D11PositionTransformBinding {
-    bool valid = false;
+  struct D3D11PositionTransformMatrixBinding {
     uint32_t constantBufferSlot = 0;
     std::array<uint32_t, 4> constantRegisters = { 0, 0, 0, 0 };
+  };
+
+  struct D3D11PositionTransformBinding {
+    bool valid = false;
+    uint32_t matrixCount = 0;
+    // Application order: matrices[0] consumes the original POSITION input;
+    // matrices[1], when present, consumes matrices[0]'s homogeneous result.
+    std::array<D3D11PositionTransformMatrixBinding, 2> matrices;
   };
 
   // DX11_V280_TEXCOORD_CAPTURE: shared state for building a stream-output
