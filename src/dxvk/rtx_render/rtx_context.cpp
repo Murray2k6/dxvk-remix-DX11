@@ -84,6 +84,16 @@ namespace dxvk {
   bool g_forceKeepObjectPickingImage = false;
 
   void RtxContext::takeScreenshot(std::string imageName, Rc<DxvkImage> image) {
+    // Optional debug resources are not guaranteed to be allocated in every
+    // rendering mode. The developer-menu screenshot path used to pass a null
+    // image into AssetExporter::exportImage, which dereferenced image->info()
+    // and crashed the game. Skip absent buffers while still exporting every
+    // resource that exists; the warning identifies which stage is unavailable.
+    if (image == nullptr) {
+      Logger::warn(str::format("RTX: Skipping screenshot for unallocated image '", imageName, "'"));
+      return;
+    }
+
     // NOTE: Improve this, I'd like all textures from the same frame to have the same time code...  Currently sampling the time on each "dump op" results in different timecodes.
     auto t = std::time(nullptr);
     auto tm = *std::localtime(&t);
@@ -580,7 +590,7 @@ namespace dxvk {
 
       const bool captureTestScreenshot = (m_screenshotFrameEnabled && m_device->getCurrentFrameId() == m_screenshotFrameNum);
       const bool captureScreenImage = s_triggerScreenshot || (captureTestScreenshot && !s_capturePrePresentTestScreenshot);
-      const bool captureDebugImage = RtxOptions::captureDebugImage();
+      const bool captureDebugImage = RtxOptions::captureDebugImage() || s_triggerDebugScreenshot;
       
       if (s_triggerUsdCapture) {
         s_triggerUsdCapture = false;
@@ -848,6 +858,7 @@ namespace dxvk {
       }
     }
     s_triggerScreenshot = false;
+    s_triggerDebugScreenshot = false;
 
     // Some time in the future kill process
     if (m_triggerDelayedTerminate &&
