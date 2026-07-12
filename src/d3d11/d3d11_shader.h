@@ -2,6 +2,7 @@
 
 #include <memory>
 #include <mutex>
+#include <array>
 #include <unordered_map>
 #include <vector>
 
@@ -18,6 +19,16 @@
 namespace dxvk {
 
   class D3D11Device;
+
+  // A common DXBC vertex-shader transform pattern writes SV_Position with
+  // four dp4 instructions whose constant-buffer operands are the four rows or
+  // columns of object-to-clip. Recording the exact registers avoids guessing
+  // camera/world matrices from unrelated affine constants at draw time.
+  struct D3D11PositionTransformBinding {
+    bool valid = false;
+    uint32_t constantBufferSlot = 0;
+    std::array<uint32_t, 4> constantRegisters = { 0, 0, 0, 0 };
+  };
 
   // DX11_V280_TEXCOORD_CAPTURE: shared state for building a stream-output
   // "capture" variant of a game vertex shader on demand. Some engines carry no
@@ -99,6 +110,10 @@ namespace dxvk {
       return m_usesDiscard;
     }
 
+    const D3D11PositionTransformBinding* GetPositionTransformBinding() const {
+      return m_positionTransform.valid ? &m_positionTransform : nullptr;
+    }
+
     // Lazily compiles and returns the xfb passthrough GS that captures the
     // VS's texcoord output (TEXCOORDn.xy, buffer 0, stride 8, rasterization
     // discarded). Returns nullptr if compilation failed or no candidate
@@ -116,6 +131,8 @@ namespace dxvk {
 
     // DX11_V281_FIXED_FUNCTION (parsed for pixel shaders only)
     bool m_usesDiscard = false;
+
+    D3D11PositionTransformBinding m_positionTransform;
 
     // DX11_V280_TEXCOORD_CAPTURE (null for non-VS or VS without texcoord output)
     std::shared_ptr<D3D11TexcoordCaptureState> m_texcoordCapture;

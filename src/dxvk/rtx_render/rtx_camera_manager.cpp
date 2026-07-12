@@ -66,7 +66,9 @@ namespace dxvk {
 
     switch (RtxOptions::fusedWorldViewMode()) {
     case FusedWorldViewMode::None:
-      if (input.getTransformData().objectToView == input.getTransformData().objectToWorld && !isIdentityExact(input.getTransformData().objectToView)) {
+      if (!input.getTransformData().cameraRelativeView
+       && input.getTransformData().objectToView == input.getTransformData().objectToWorld
+       && !isIdentityExact(input.getTransformData().objectToView)) {
         return input.testCategoryFlags(InstanceCategories::Sky) ? CameraType::Sky : CameraType::Unknown;
       }
       break;
@@ -180,9 +182,13 @@ namespace dxvk {
     }
 
     // DX11_V225: track real vs viewport-fallback main cameras for the DX11 layer.
-    if (cameraType == CameraType::Main) {
+    // These flags describe the draw that actually won the first-touch camera
+    // update. Updating them for later Main-classified draws made EndFrame use
+    // metadata from a camera that RtCamera::update had ignored.
+    if (cameraType == CameraType::Main && shouldUpdateMainCamera) {
       const bool usedViewportFallback = input.getTransformData().usedViewportFallbackProjection;
       m_mainCameraLastUpdateUsedViewportFallback = usedViewportFallback;
+      m_mainCameraLastUpdateUsedCameraRelativeView = input.getTransformData().cameraRelativeView;
       if (!usedViewportFallback) {
         m_hasSeenRealMainCamera = true;
       }

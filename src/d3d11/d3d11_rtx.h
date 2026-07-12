@@ -92,6 +92,10 @@ namespace dxvk {
     // tell the camera view from shadow-light views, mirror cameras, bone
     // matrices, or a stored camera-to-world.
     bool                                 m_viewConfirmed = false;
+    // The confirmed view location belongs to a coherent camera-relative frame
+    // block and may legitimately contain identity. The block is revalidated
+    // before each identity view is accepted.
+    bool                                 m_viewCameraRelative = false;
     // The confirmed location stores camera-to-world; invert on each re-read.
     bool                                 m_viewInverted = false;
     // Throttles late-session confirmation attempts to once per frame.
@@ -99,10 +103,6 @@ namespace dxvk {
 
     // Cached world matrix cbuffer location — reduces per-draw scanning.
     // World matrices change every draw but often live at the same (stage, slot, offset).
-    uint32_t                             m_worldSlot   = UINT32_MAX;
-    int                                  m_worldStage  = -1;
-    size_t                               m_worldOffset = SIZE_MAX;
-
     // Smoothed camera position — exponential moving average dampens
     // micro-jitter from floating-point rounding in cbuffer matrix extraction.
     Vector3                              m_smoothedCamPos = Vector3(0.0f);
@@ -183,6 +183,10 @@ namespace dxvk {
       uint32_t positionFormatRejected = 0;
       uint32_t poisonedPositions = 0;
       uint32_t vertexRangeRejected = 0;
+      // Draws whose index stream is truncated, overflows, or addresses a
+      // vertex outside the submitted position slice. Passing any of these to
+      // a Vulkan BLAS build is undefined and can reset the GPU driver.
+      uint32_t indexRangeRejected = 0;
       // DX11_V277: depth-only draws (prepass/shadow re-renders) excluded so
       // geometry never enters the RT scene as stacked coincident copies.
       uint32_t depthOnlySkipped = 0;
@@ -273,6 +277,18 @@ namespace dxvk {
                                          bool indexed, UINT count, UINT start, INT base);
     uint32_t     m_texcoordCapturesThisFrame = 0;
     VkDeviceSize m_texcoordCaptureBytesThisFrame = 0;
+
+    // DX11_V286_GAMEPLAY_MATRIX_DUMP: env-free camera diagnostic. Steam's DRM
+    // relaunch strips DXVK_REMIX_MTXDUMP from the child process, so the env
+    // dump never fires for Steam titles. When a real gameplay scene frame is
+    // detected (many accepted scene draws) but the view is unresolved/wrong,
+    // EndFrame arms a short dump burst; ExtractTransforms then logs the full
+    // live cbuffer matrix landscape ([gpdump] lines) for those frames -
+    // undeduped, so the true per-frame values at the camera cbuffer locations
+    // are visible. Bounded by a line budget and a small burst count.
+    uint32_t m_forceMatrixDumpUntilFrame = 0;
+    uint32_t m_forceMatrixDumpLines = 0;
+    uint32_t m_forceMatrixDumpBursts = 3;
 
     // DX11_V285_TEXCOORD_CAPTURE_REUSE: one persistent capture buffer per draw
     // identity (VS + vertex-buffer bindings + vertex range), reused across

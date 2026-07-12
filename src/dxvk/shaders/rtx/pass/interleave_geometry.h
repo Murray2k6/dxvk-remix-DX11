@@ -48,6 +48,10 @@ namespace interleaver {
     // Passthrough format mapping
     VK_FORMAT_B8G8R8A8_UNORM = 44,
     VK_FORMAT_R16G16_SFLOAT = 83,
+    // DX11_V286_HALF4_POSITIONS: half-float positions (Skyrim SE stores nearly
+    // all static world geometry this way in DEVICE-LOCAL buffers, so CPU-side
+    // conversion is impossible and rejecting dropped the entire world).
+    VK_FORMAT_R16G16B16A16_SFLOAT = 97,
     VK_FORMAT_R32G32_SFLOAT = 103,
     VK_FORMAT_R32G32B32_SFLOAT = 106,
     VK_FORMAT_R32G32B32A32_SFLOAT = 109,
@@ -56,6 +60,7 @@ namespace interleaver {
   bool formatConversionFloatSupported(uint32_t format) {
     switch (format) {
     case SupportedVkFormats::VK_FORMAT_R16G16_SFLOAT:
+    case SupportedVkFormats::VK_FORMAT_R16G16B16A16_SFLOAT:
     case SupportedVkFormats::VK_FORMAT_R32G32_SFLOAT:
     case SupportedVkFormats::VK_FORMAT_R32G32B32_SFLOAT:
     case SupportedVkFormats::VK_FORMAT_R32G32B32A32_SFLOAT:
@@ -85,6 +90,13 @@ namespace interleaver {
       float r = f16tof32(data & 0xFFFFu);
       float g = f16tof32((data >> 16u) & 0xFFFFu);
       return float3(r, g, 0);
+    }
+    case SupportedVkFormats::VK_FORMAT_R16G16B16A16_SFLOAT:
+    {
+      // Four half-floats in two 32-bit words: [G(31:16)|R(15:0)] [A(31:16)|B(15:0)]; xyz used.
+      uint d0 = asuint(input[index + 0]);
+      uint d1 = asuint(input[index + 1]);
+      return float3(f16tof32(d0 & 0xFFFFu), f16tof32((d0 >> 16u) & 0xFFFFu), f16tof32(d1 & 0xFFFFu));
     }
     case SupportedVkFormats::VK_FORMAT_R32G32_SFLOAT:
       return float3(input[index + 0], input[index + 1], 0);

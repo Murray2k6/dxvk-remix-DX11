@@ -954,7 +954,8 @@ namespace dxvk {
     
       // An attempt to resolve cases where games pre-combine view and world matrices
       if (RtxOptions::resolvePreCombinedMatrices() &&
-        isIdentityExact(drawCallState.getTransformData().worldToView)) {
+        isIdentityExact(drawCallState.getTransformData().worldToView) &&
+        !drawCallState.getTransformData().cameraRelativeView) {
         const auto* referenceCamera = &cameraManager.getCamera(drawCallState.cameraType);
         // Note: we may accept a data even from a prev frame, as we need any information to restore;
         // but if camera data is stale, it introduces an scene object transform's lag

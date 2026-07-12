@@ -47,6 +47,13 @@ namespace dxvk {
      */
     Rc<DxbcIsgn> isgn() const { return m_isgnChunk; }
     Rc<DxbcIsgn> osgn() const { return m_osgnChunk; }
+
+    // Read-only instruction stream access for lightweight D3D11 capture
+    // metadata analysis. The returned slice remains valid for this module's
+    // lifetime and is decoded with the same DxbcDecodeContext as compilation.
+    DxbcCodeSlice instructionSlice() const {
+      return m_shexChunk != nullptr ? m_shexChunk->slice() : DxbcCodeSlice(nullptr, nullptr);
+    }
     
     /**
      * \brief Compiles DXBC shader to SPIR-V module

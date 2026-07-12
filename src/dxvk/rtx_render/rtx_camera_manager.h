@@ -65,6 +65,7 @@ namespace dxvk {
     // cameras from synthesized viewport-fallback projections during startup.
     bool hasSeenRealMainCamera() const { return m_hasSeenRealMainCamera; }
     bool mainCameraLastUpdateUsedViewportFallback() const { return m_mainCameraLastUpdateUsedViewportFallback; }
+    bool mainCameraLastUpdateUsedCameraRelativeView() const { return m_mainCameraLastUpdateUsedCameraRelativeView; }
 
   private:
     template<
@@ -89,6 +90,7 @@ namespace dxvk {
     uint32_t m_lastCameraCutFrameId = -1;
     bool m_hasSeenRealMainCamera = false;
     bool m_mainCameraLastUpdateUsedViewportFallback = false;
+    bool m_mainCameraLastUpdateUsedCameraRelativeView = false;
     fast_unordered_cache<DecomposeProjectionParams> m_decompositionCache;
 
     DecomposeProjectionParams getOrDecomposeProjection(const Matrix4& viewToProjection);

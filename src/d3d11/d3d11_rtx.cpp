@@ -213,7 +213,7 @@ namespace dxvk {
     RtxOptions::graphicsPresetObject().setDeferred(GraphicsPreset::Custom, defaults);
 
     // Universal source-level default. Manufacturer upscalers remain selectable
-    // in the UI/config, but first launch should not vendor-force DLSS/XeSS/FSR.
+    // in the UI/config, but first launch should not vendor-force DLSS/XeSS.
     RtxOptions::upscalerTypeObject().setDeferred(UpscalerType::TAAU, defaults);
 
     // Do not force a fused world-view convention globally.
@@ -230,10 +230,23 @@ namespace dxvk {
     // from reflections, shadows, and GI.
     RtxOptions::AntiCulling::Object::enableObject().setDeferred(true, defaults);
     RtxOptions::AntiCulling::Object::enableHighPrecisionAntiCullingObject().setDeferred(true, defaults);
-    RtxOptions::AntiCulling::Object::numObjectsToKeepObject().setDeferred(20000u, defaults);
-    RtxOptions::AntiCulling::Object::fovScaleObject().setDeferred(2.0f, defaults);
-    RtxOptions::AntiCulling::Object::farPlaneScaleObject().setDeferred(10.0f, defaults);
+    // DX11_V290_BOUNDED_RT_SCENE: retain enough off-camera geometry for useful
+    // shadows/reflections without allowing a long play session to accumulate a
+    // 20k-object, 10x-far-plane acceleration-structure workload. The old DX11
+    // defaults repeatedly drove an 8-GiB NVIDIA GPU to its residency ceiling
+    // immediately before nvlddmkm Event 153. These are still wider than the
+    // raster camera and remain overridable by an explicit user setting.
+    RtxOptions::AntiCulling::Object::numObjectsToKeepObject().setDeferred(4096u, defaults);
+    RtxOptions::AntiCulling::Object::fovScaleObject().setDeferred(1.5f, defaults);
+    RtxOptions::AntiCulling::Object::farPlaneScaleObject().setDeferred(4.0f, defaults);
     RtxOptions::AntiCulling::Light::enableObject().setDeferred(true, defaults);
+
+    // Keep the always-rebuilt merged BLAS small. Large dynamic meshes get an
+    // independent BLAS instead of joining a monolithic per-frame build, which
+    // gives the driver smaller preemptible pieces of acceleration-structure
+    // work and avoids a multi-second watchdog-visible build command.
+    RtxOptions::minPrimsInDynamicBLASObject().setDeferred(256u, defaults);
+    RtxOptions::maxPrimsInMergedBLASObject().setDeferred(8192u, defaults);
 
     // Use incoming vertex buffers directly where safe (device-local geometry).
     // NOTE: host-visible/renameable (D3D11 dynamic) buffers are ALWAYS
@@ -242,6 +255,14 @@ namespace dxvk {
     // reads a later rename's bytes at EndFrame record time (geometry collapses
     // to a point / turns to garbage).
     RtxOptions::useBuffersDirectlyObject().setDeferred(true, defaults);
+
+    // DX11_V288_STABLE_RT: captured DX11 alpha geometry is dynamic and its
+    // material classification can change from draw to draw. Building opacity
+    // micromaps for that stream adds a second GPU-side geometry build path and
+    // was active immediately before the observed NVIDIA driver reset. Regular
+    // any-hit/ray-query alpha testing is fully ray traced and is the robust
+    // default; an explicit rtx.conf setting can still opt OMM back in.
+    RtxOptions::OpacityMicromap::enableObject().setDeferred(false, defaults);
 
     // --- Fallback lighting ---
     // D3D11 has no legacy lighting API â€” all lighting is shader-driven,
@@ -402,8 +423,13 @@ namespace dxvk {
     // pathological frame degrades to the flat-albedo fallback instead of
     // stalling the GPU).
     static constexpr uint32_t     kMaxCaptureVerticesPerDraw = 2u << 20;
-    static constexpr uint32_t     kMaxCapturesPerFrame       = 128u;
-    static constexpr VkDeviceSize kMaxCaptureBytesPerFrame   = 64ull << 20;
+    // Transform-feedback replays share the graphics queue with BLAS builds and
+    // path tracing. Bound them tightly so a scene containing many shader-only
+    // UV streams degrades to the existing flat-albedo path instead of creating
+    // a long driver submission (observed as nvlddmkm 153/device-lost on an
+    // 8-GiB RTX 5060).
+    static constexpr uint32_t     kMaxCapturesPerFrame       = 32u;
+    static constexpr VkDeviceSize kMaxCaptureBytesPerFrame   = 16ull << 20;
 
     const uint32_t vertexCount = geo.vertexCount;
     if (vertexCount == 0 || vertexCount > kMaxCaptureVerticesPerDraw)
@@ -566,7 +592,7 @@ namespace dxvk {
   void D3D11Rtx::SweepTexcoordCaptureCache(uint32_t currentFrame) {
     static constexpr uint32_t     kEvictAfterFrames = 600u;      // ~10s at 60fps
     static constexpr size_t       kMaxEntries       = 4096u;
-    static constexpr VkDeviceSize kMaxCacheBytes    = 256ull << 20;
+    static constexpr VkDeviceSize kMaxCacheBytes    = 96ull << 20;
 
     const bool overBudget = m_texcoordCaptureCache.size() > kMaxEntries
                          || m_texcoordCaptureCacheBytes > kMaxCacheBytes;
@@ -1095,7 +1121,10 @@ namespace dxvk {
       DxvkMemoryStats::Category::RTXBuffer,
       name);
 
-    static constexpr VkDeviceSize kMaxPoolBytes = 384ull << 20;
+    // Leave deterministic residency headroom for BLAS scratch, swapchain
+    // recreation, and the path-tracing targets. 128 MiB is enough to recycle
+    // the common dynamic streams without parking the previous 384 MiB cap.
+    static constexpr VkDeviceSize kMaxPoolBytes = 128ull << 20;
     if (buffer != nullptr && m_helperPoolBytes + capacity <= kMaxPoolBytes) {
       m_helperPoolBytes += capacity;
       m_helperRetired.push_back({ buffer, capacity });
@@ -1962,7 +1991,14 @@ namespace dxvk {
       static const bool s_mtxDumpEnabled = env::getEnvVar("DXVK_REMIX_MTXDUMP") == "1";
       static std::set<uint64_t> s_dumpedMatrixLocs;
       static uint32_t s_dumpLogged = 0;
-      if (s_mtxDumpEnabled && s_dumpLogged < 64) {
+      // DX11_V286_GAMEPLAY_MATRIX_DUMP: env-free burst armed by EndFrame when a
+      // real gameplay scene frame has no resolved camera. Undeduped so the LIVE
+      // per-frame values at camera cbuffer locations (e.g. slot 12 off 0 - is it
+      // identity in gameplay?) are visible; the env path stays deduped-by-location.
+      const uint32_t curFrameDump = m_context->m_device->getCurrentFrameId();
+      const bool forcedDump = curFrameDump <= m_forceMatrixDumpUntilFrame
+                           && m_forceMatrixDumpLines < 240;
+      if ((s_mtxDumpEnabled && s_dumpLogged < 64) || forcedDump) {
         for (int si = 0; si < kNumStages; ++si) {
           const auto& cbsD = *stageCbs[si];
           for (uint32_t slot = 0; slot < D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT; ++slot) {
@@ -1973,13 +2009,25 @@ namespace dxvk {
             if (!ptrD) continue;
             const size_t bufSizeD = cbD.buffer->Desc()->ByteWidth;
             auto [baseD, endD] = cbRange(cbD);
-            for (size_t off = baseD; off + 64 <= endD && s_dumpLogged < 64; off += 16) {
+            for (size_t off = baseD; off + 64 <= endD; off += 16) {
+              if (forcedDump && m_forceMatrixDumpLines >= 240) break;
+              if (!forcedDump && s_dumpLogged >= 64) break;
               Matrix4 m = readCbMatrix(ptrD, off, bufSizeD);
               if (isIdentityExact(m)) continue;
               const bool rowAffine = std::abs(m[0][3]) < 0.01f && std::abs(m[1][3]) < 0.01f && std::abs(m[2][3]) < 0.01f && std::abs(m[3][3] - 1.0f) < 0.01f;
               const bool colAffine = std::abs(m[3][0]) < 0.01f && std::abs(m[3][1]) < 0.01f && std::abs(m[3][2]) < 0.01f && std::abs(m[3][3] - 1.0f) < 0.01f;
               const bool persp     = classifyPerspective(m) != 0;
               if (!rowAffine && !colAffine && !persp) continue;
+              if (forcedDump) {
+                ++m_forceMatrixDumpLines;
+                Logger::info(str::format("[D3D11Rtx][gpdump] fid=", curFrameDump, " stage=", kStageNames[si], " slot=", slot, " off=", off,
+                  (persp ? " PERSP" : ""), (rowAffine ? " rowAff" : ""), (colAffine ? " colAff" : ""),
+                  " r0=", m[0][0], ",", m[0][1], ",", m[0][2], ",", m[0][3],
+                  " r1=", m[1][0], ",", m[1][1], ",", m[1][2], ",", m[1][3],
+                  " r2=", m[2][0], ",", m[2][1], ",", m[2][2], ",", m[2][3],
+                  " r3=", m[3][0], ",", m[3][1], ",", m[3][2], ",", m[3][3]));
+                continue;
+              }
               const uint64_t key = (uint64_t(si) << 40) | (uint64_t(slot) << 32) | uint64_t(off);
               if (!s_dumpedMatrixLocs.insert(key).second) continue;
               ++s_dumpLogged;
@@ -2324,7 +2372,19 @@ namespace dxvk {
         if (ptr) {
           Matrix4 c = readMatrixWithConvention(ptr, m_viewOffset, cb.buffer->Desc()->ByteWidth, m_viewColumnMajor);
           Matrix4 resolvedView;
-          if (resolveViewMatrixCandidate(c, resolvedView)) {
+          const bool cachedCameraRelativeIdentity =
+               m_viewCameraRelative
+            && m_viewConfirmed
+            && m_viewStage == projStage
+            && m_viewSlot == projSlot
+            && m_viewOffset + 64 == projOffset
+            && m_viewColumnMajor == m_columnMajor
+            && isIdentityExact(c);
+          if (cachedCameraRelativeIdentity) {
+            transforms.worldToView = c;
+            transforms.cameraRelativeView = true;
+            viewCacheHit = true;
+          } else if (resolveViewMatrixCandidate(c, resolvedView)) {
             // DX11_V260_PRECISE_CAMERA: a confirmed camera-to-world location
             // stores the inverse of the view - flip it back on every re-read.
             if (m_viewInverted) {
@@ -2452,6 +2512,7 @@ namespace dxvk {
                   m_viewColumnMajor = cands[ci].columnMajor;
                   m_viewInverted = cands[ci].inverted;
                   m_viewConfirmed = true;
+                  m_viewCameraRelative = false;
                   viewCacheHit = true;
                   locked = true;
                   static bool s_viewConfirmedLogged = false;
@@ -2754,14 +2815,121 @@ namespace dxvk {
     // flag, and a re-discovered location must re-earn confirmed status.
     if (!viewCacheHit && !isIdentityExact(transforms.worldToView)) {
       m_viewConfirmed = false;
+      m_viewCameraRelative = false;
       m_viewInverted = false;
+    }
+
+    // DX11_V287_CAMERA_RELATIVE_VIEW: a rigid-matrix scan deliberately rejects
+    // identity because identity normally means "view unresolved". Some modern
+    // engines, however, upload a camera-relative frame block where object/world
+    // coordinates already have the high-precision camera origin removed. Their
+    // real CameraView is therefore identity whenever yaw/pitch are zero.
+    //
+    // Accept that identity only when the surrounding camera block proves it:
+    //   [View][Projection][ViewProjection] ... [ViewInverse]
+    //     [ViewProjectionInverse][ProjectionInverse]
+    // Both the forward and inverse compositions must agree. This distinguishes
+    // an intentional camera-relative identity view from padding, an unresolved
+    // camera, and repeated projection constants. Skyrim SE's b12 PerFrame block
+    // is one example, but the validation is based entirely on matrix coherence.
+    bool cameraRelativeBlockValidated = false;
+    if (haveRawProjNormalized
+     && projSlot != UINT32_MAX
+     && projStage >= 0 && projStage < kNumStages
+     && projOffset >= 64) {
+      const auto& cb = (*stageCbs[projStage])[projSlot];
+      if (cb.buffer != nullptr) {
+        const auto mapped = cb.buffer->GetMappedSlice();
+        const uint8_t* ptr = reinterpret_cast<const uint8_t*>(mapped.mapPtr);
+        const size_t bufSize = cb.buffer->Desc()->ByteWidth;
+        const size_t viewOffset = projOffset - 64;
+        const size_t viewProjOffset = projOffset + 64;
+        const size_t viewInverseOffset = projOffset + 384;
+        const size_t viewProjInverseOffset = projOffset + 448;
+        const size_t projInverseOffset = projOffset + 512;
+
+        if (ptr && projInverseOffset + 64 <= bufSize) {
+          auto matricesNear = [](const Matrix4& a, const Matrix4& b, float relativeTolerance) -> bool {
+            float maxRef = 1.0f;
+            float maxDiff = 0.0f;
+            for (int r = 0; r < 4; ++r) {
+              for (int c = 0; c < 4; ++c) {
+                if (!std::isfinite(a[r][c]) || !std::isfinite(b[r][c]))
+                  return false;
+                maxRef = std::max(maxRef, std::abs(b[r][c]));
+                maxDiff = std::max(maxDiff, std::abs(a[r][c] - b[r][c]));
+              }
+            }
+            return maxDiff <= relativeTolerance * maxRef;
+          };
+          auto nearIdentity = [&matricesNear](const Matrix4& m) -> bool {
+            return matricesNear(m, Matrix4(), 1.0e-4f);
+          };
+
+          const Matrix4 storedView = readMatrixWithConvention(
+            ptr, viewOffset, bufSize, m_columnMajor);
+          const Matrix4 storedViewProj = readMatrixWithConvention(
+            ptr, viewProjOffset, bufSize, m_columnMajor);
+          const Matrix4 storedViewInverse = readMatrixWithConvention(
+            ptr, viewInverseOffset, bufSize, m_columnMajor);
+          const Matrix4 storedViewProjInverse = readMatrixWithConvention(
+            ptr, viewProjInverseOffset, bufSize, m_columnMajor);
+          const Matrix4 storedProjInverse = readMatrixWithConvention(
+            ptr, projInverseOffset, bufSize, m_columnMajor);
+          const Matrix4 calculatedProjInverse = inverse(rawProjNormalized);
+
+          const bool identityViewPair = nearIdentity(storedView)
+                                     && nearIdentity(storedViewInverse);
+          const bool forwardCoherent =
+               matricesNear(rawProjNormalized * storedView, storedViewProj, 0.002f)
+            || matricesNear(storedView * rawProjNormalized, storedViewProj, 0.002f);
+          const bool inverseCoherent =
+               matricesNear(calculatedProjInverse, storedViewProjInverse, 0.002f)
+            && matricesNear(calculatedProjInverse, storedProjInverse, 0.002f);
+
+          if (identityViewPair && forwardCoherent && inverseCoherent) {
+            cameraRelativeBlockValidated = true;
+            transforms.worldToView = storedView;
+            transforms.cameraRelativeView = true;
+            m_viewStage = projStage;
+            m_viewSlot = projSlot;
+            m_viewOffset = viewOffset;
+            m_viewColumnMajor = m_columnMajor;
+            m_viewInverted = false;
+            m_viewConfirmed = true;
+            m_viewCameraRelative = true;
+            viewCacheHit = true;
+
+            static bool sCameraRelativeViewLogged = false;
+            if (!sCameraRelativeViewLogged) {
+              sCameraRelativeViewLogged = true;
+              Logger::info(str::format(
+                "[D3D11Rtx] Camera-relative identity view CONFIRMED from coherent camera block: stage=",
+                kStageNames[projStage], " slot=", projSlot,
+                " viewOff=", viewOffset, " projOff=", projOffset));
+            }
+          }
+        }
+      }
+    }
+
+    // A cached identity is only a fast-path candidate. If the surrounding
+    // matrices stop agreeing (shader/layout/pass change), reject this draw and
+    // force a fresh scan on the next one instead of injecting a stale camera.
+    if (transforms.cameraRelativeView && !cameraRelativeBlockValidated) {
+      transforms.cameraRelativeView = false;
+      m_viewCameraRelative = false;
+      m_viewConfirmed = false;
+      viewCacheHit = false;
     }
 
     // --- AXIS AUTO-DETECTION (camera-backed projection-derived) ---
     // Only learn handedness/Y-flip from draws where we recovered both a
-    // plausible projection and a plausible view matrix. This avoids locking
-    // the session to helper, shadow, or other non-scene projections.
-    if (projSlot != UINT32_MAX && !isIdentityExact(transforms.worldToView)) {
+    // plausible projection and either a non-identity view matrix or a camera-
+    // relative identity view proven by the coherent frame-block checks above.
+    // This avoids locking the session to helper, shadow, or other projections.
+    if (projSlot != UINT32_MAX
+     && (!isIdentityExact(transforms.worldToView) || transforms.cameraRelativeView)) {
       const bool canVote = !m_yFlipSettled || !m_lhSettled;
 
       if (canVote) {
@@ -2959,9 +3127,6 @@ namespace dxvk {
           score += 1.0f;
         if (projStage == 0 && projSlot != UINT32_MAX && slot == projSlot + 1)
           score += 4.0f;
-        if (stageIdx == m_worldStage && slot == m_worldSlot && off == m_worldOffset)
-          score += 3.0f;
-
         if (projOffset != SIZE_MAX) {
           const size_t distance = off > projOffset ? off - projOffset : projOffset - off;
           if (distance <= 128)
@@ -3000,20 +3165,6 @@ namespace dxvk {
         }
       };
 
-      auto tryWorldAt = [&](int stageIdx, uint32_t slot, size_t offset) -> bool {
-        if (stageIdx < 0 || stageIdx >= kNumStages) return false;
-        if (slot >= D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT) return false;
-        const auto& cb = (*stageCbs[stageIdx])[slot];
-        if (cb.buffer == nullptr) return false;
-        const auto mapped = cb.buffer->GetMappedSlice();
-        const uint8_t* ptr = reinterpret_cast<const uint8_t*>(mapped.mapPtr);
-        if (!ptr || offset + 64 > cb.buffer->Desc()->ByteWidth) return false;
-        Matrix4 candidate = readMatrix(ptr, offset, cb.buffer->Desc()->ByteWidth);
-        if (!isWorldCandidate(candidate)) return false;
-        considerRawWorldCandidate(stageIdx, slot, offset, candidate);
-        return true;
-      };
-
       auto scanWorldCb = [&](int stageIdx, uint32_t slot) -> bool {
         if (slot >= D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT) return false;
         const auto& cb = (*stageCbs[stageIdx])[slot];
@@ -3035,14 +3186,11 @@ namespace dxvk {
         return sawCandidate;
       };
 
-      bool cachedWorldHit = false;
-      if (m_worldSlot != UINT32_MAX && m_worldOffset != SIZE_MAX) {
-        cachedWorldHit = tryWorldAt(m_worldStage, m_worldSlot, m_worldOffset);
-        if (cachedWorldHit && bestRawWorldSlot != UINT32_MAX) {
-          transforms.objectToWorld = bestRawWorldCandidate;
-          found = true;
-        }
-      }
+      // Never reuse a world-matrix location across vertex shaders. A global
+      // (stage,slot,offset) cache can point at a bone, light, shadow or post
+      // matrix as soon as the game changes shaders, producing an invalid scene
+      // in every debug view. Rescan and validate the active draw's bindings.
+      const bool cachedWorldHit = false;
 
       if (!cachedWorldHit) {
         // Prefer commonly used locations first, but do not stop there.
@@ -3124,9 +3272,6 @@ namespace dxvk {
         static bool s_worldLogged = false;
         if (bestDerivedWorldSlot != UINT32_MAX && bestDerivedWorldScore >= bestRawWorldScore) {
           transforms.objectToWorld = bestDerivedWorldCandidate;
-          m_worldStage = bestDerivedWorldStage;
-          m_worldSlot = bestDerivedWorldSlot;
-          m_worldOffset = bestDerivedWorldOffset;
           found = true;
 
           static bool s_objectViewLogged = false;
@@ -3137,15 +3282,12 @@ namespace dxvk {
           }
         } else if (bestRawWorldSlot != UINT32_MAX) {
           transforms.objectToWorld = bestRawWorldCandidate;
-          m_worldStage = bestRawWorldStage;
-          m_worldSlot = bestRawWorldSlot;
-          m_worldOffset = bestRawWorldOffset;
           found = true;
 
           if (!s_worldLogged) {
             s_worldLogged = true;
             Logger::info(str::format("[D3D11Rtx] World matrix found: stage=",
-              kStageNames[m_worldStage], " slot=", m_worldSlot, " off=", m_worldOffset));
+              kStageNames[bestRawWorldStage], " slot=", bestRawWorldSlot, " off=", bestRawWorldOffset));
           }
         }
       }
@@ -3154,6 +3296,130 @@ namespace dxvk {
     transforms.objectToView = transforms.objectToWorld;
     if (!isIdentityExact(transforms.worldToView))
       transforms.objectToView = transforms.worldToView * transforms.objectToWorld;
+
+    // DX11_V291_SHADER_PROVEN_OBJECT_TO_VIEW: generic cbuffer scanning cannot
+    // distinguish an object's transform from bone, light, reflection, and
+    // post-process matrices. Prefer the exact four constant registers that the
+    // bound vertex shader dp4s into SV_Position. Factoring object-to-clip by
+    // the already validated projection yields object-to-view without relying
+    // on engine names or a per-game layout.
+    if (!isIdentityExact(transforms.viewToProjection)
+     && m_context->m_state.vs.shader != nullptr) {
+      const D3D11CommonShader* commonVs = m_context->m_state.vs.shader->GetCommonShader();
+      const D3D11PositionTransformBinding* binding = commonVs != nullptr
+        ? commonVs->GetPositionTransformBinding()
+        : nullptr;
+      if (binding != nullptr
+       && binding->constantBufferSlot < D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT) {
+        const auto& cb = m_context->m_state.vs.constantBuffers[binding->constantBufferSlot];
+        if (cb.buffer != nullptr) {
+          const auto mapped = cb.buffer->GetMappedSlice();
+          const uint8_t* ptr = reinterpret_cast<const uint8_t*>(mapped.mapPtr);
+          const size_t bufferSize = cb.buffer->Desc()->ByteWidth;
+          const auto [bindingBase, bindingEnd] = cbRange(cb);
+          Matrix4 shaderObjectToClip;
+          bool registersReadable = ptr != nullptr;
+          for (uint32_t row = 0; row < 4 && registersReadable; ++row) {
+            const size_t offset = bindingBase + size_t(binding->constantRegisters[row]) * 16u;
+            if (offset + 16u > bindingEnd || offset + 16u > bufferSize) {
+              registersReadable = false;
+              break;
+            }
+            std::memcpy(shaderObjectToClip[row].data, ptr + offset, 16u);
+          }
+
+          if (registersReadable && isFiniteMatrix(shaderObjectToClip)) {
+            // Factor against the exact projection Remix will use, including
+            // orientation normalization and jitter removal. This guarantees
+            // replacementProjection * objectToVirtualWorld reproduces the
+            // game's clip transform.
+            const Matrix4 replacementProjection = transforms.viewToProjection;
+            const Matrix4 inverseProjection = inverse(replacementProjection);
+            if (isFiniteMatrix(inverseProjection)) {
+              std::array<Matrix4, 4> candidates = {
+                inverseProjection * shaderObjectToClip,
+                inverseProjection * transpose(shaderObjectToClip),
+                transpose(shaderObjectToClip * inverseProjection),
+                transpose(transpose(shaderObjectToClip) * inverseProjection),
+              };
+
+              auto affineScore = [](const Matrix4& candidate) -> float {
+                if (!isFiniteMatrix(candidate))
+                  return -1.0e30f;
+                // Remix's canonical matrices multiply column vectors: affine
+                // transforms have a [0,0,0,1] final column.
+                const float affineError =
+                    std::abs(candidate[0][3])
+                  + std::abs(candidate[1][3])
+                  + std::abs(candidate[2][3])
+                  + std::abs(candidate[3][3] - 1.0f);
+                if (affineError > 0.02f)
+                  return -1.0e30f;
+
+                float score = 20.0f - affineError * 500.0f;
+                Vector3 axes[3];
+                for (uint32_t column = 0; column < 3; ++column) {
+                  const float lengthSq =
+                      candidate[0][column] * candidate[0][column]
+                    + candidate[1][column] * candidate[1][column]
+                    + candidate[2][column] * candidate[2][column];
+                  if (!std::isfinite(lengthSq) || lengthSq < 1.0e-8f || lengthSq > 1.0e8f)
+                    return -1.0e30f;
+                  const float invLength = 1.0f / std::sqrt(lengthSq);
+                  axes[column] = Vector3(
+                    candidate[0][column] * invLength,
+                    candidate[1][column] * invLength,
+                    candidate[2][column] * invLength);
+                }
+                const float shear = std::abs(dot(axes[0], axes[1]))
+                                  + std::abs(dot(axes[0], axes[2]))
+                                  + std::abs(dot(axes[1], axes[2]));
+                if (shear > 1.5f)
+                  return -1.0e30f;
+                return score - shear * 2.0f;
+              };
+
+              float bestScore = -1.0e30f;
+              Matrix4 bestObjectToView;
+              for (const Matrix4& candidate : candidates) {
+                const float score = affineScore(candidate);
+                if (score > bestScore) {
+                  bestScore = score;
+                  bestObjectToView = candidate;
+                }
+              }
+
+              if (bestScore > -1.0e20f) {
+                transforms.objectToView = bestObjectToView;
+                // Full DX11 replacement camera: the RT world is view space,
+                // its camera is identity, and every draw carries the complete
+                // shader-proven model-view transform. Do not mix game-specific
+                // world/view layouts between shaders.
+                transforms.objectToWorld = bestObjectToView;
+                transforms.worldToView = Matrix4();
+                transforms.cameraRelativeView = true;
+                // A synthesized projection is trustworthy once an exact
+                // shader clip transform factors into a finite affine model-view.
+                transforms.usedViewportFallbackProjection = false;
+
+                static uint32_t sShaderTransformLogs = 0;
+                if (sShaderTransformLogs < 16u) {
+                  ++sShaderTransformLogs;
+                  Logger::info(str::format(
+                    "[D3D11Rtx] shader-proven object-to-view: vs=", commonVs->GetName(),
+                    " cb=", binding->constantBufferSlot,
+                    " regs=", binding->constantRegisters[0], ",",
+                    binding->constantRegisters[1], ",",
+                    binding->constantRegisters[2], ",",
+                    binding->constantRegisters[3],
+                    " [replacement view-space camera]"));
+                }
+              }
+            }
+          }
+        }
+      }
+    }
 
     transforms.sanitize();
 
@@ -3201,9 +3467,35 @@ namespace dxvk {
         " diag=(", p[0][0], ",", p[1][1], ",", p[2][2], ")",
         " m[2][3]=", p[2][3],
         m_columnMajor ? " [column-major]" : " [row-major]",
-        " view=", hasView ? "yes" : "NO",
+        " view=", transforms.cameraRelativeView ? "camera-relative" : (hasView ? "yes" : "NO"),
         " viewConfirmed=", m_viewConfirmed ? "yes" : "no",
         " world=", hasWorld ? "yes" : "NO"));
+    }
+
+    // DX11_V286_GAMEPLAY_MATRIX_DUMP: arm the env-free matrix-dump burst on the
+    // exact failing condition, detectable right here with `this` available: a
+    // real scene projection was found (m_hasSeenRealSceneProjection rules out
+    // the menu/loading) but the view resolved to identity - i.e. the RT camera
+    // would sit at the world origin. Setting the window to the next 2 frames
+    // makes the [gpdump] block at the top of ExtractTransforms log the live
+    // cbuffer matrices for those frames. A short burst budget + cooldown keep
+    // it to a handful of bursts total, then it stays silent.
+    {
+      const uint32_t curFrame = m_context->m_device->getCurrentFrameId();
+      const bool viewIsIdentity = isIdentityExact(transforms.worldToView);
+      if (m_forceMatrixDumpBursts > 0
+       && m_hasSeenRealSceneProjection
+       && projSlot != UINT32_MAX
+       && !transforms.usedViewportFallbackProjection
+       && viewIsIdentity
+       && !transforms.cameraRelativeView
+       && curFrame > m_forceMatrixDumpUntilFrame + 90u) {
+        m_forceMatrixDumpUntilFrame = curFrame + 2u;
+        --m_forceMatrixDumpBursts;
+        Logger::info(str::format(
+          "[D3D11Rtx][gpdump] arming gameplay matrix dump at fid=", curFrame,
+          " (projFound + identity view = origin camera); dumping next 2 frames"));
+      }
     }
 
     return transforms;
@@ -4376,11 +4668,16 @@ namespace dxvk {
         return;
       }
 
-      switch (rsDesc->CullMode) {
-        case D3D11_CULL_NONE:  geo.cullMode = VK_CULL_MODE_NONE;      break;
-        case D3D11_CULL_FRONT: geo.cullMode = VK_CULL_MODE_FRONT_BIT; break;
-        case D3D11_CULL_BACK:  geo.cullMode = VK_CULL_MODE_BACK_BIT;  break;
-      }
+      // DX11_V289_RAY_SAFE_TWO_SIDED: the application's raster cull mode is
+      // valid only for rays originating at the raster camera. Remix launches
+      // primary, shadow, reflection, and indirect rays from arbitrary points;
+      // carrying D3D11_CULL_BACK/FRONT into the TLAS therefore removes valid
+      // intersections from the opposite side and produces black faces, light
+      // leaks, and missing foliage. Keep the original front-winding convention
+      // below (it is still needed for hit orientation and normal handling), but
+      // make captured DX11 geometry two-sided for ray traversal. Authored USD
+      // replacements retain their own forceCullBit/cull policy downstream.
+      geo.cullMode = VK_CULL_MODE_NONE;
       geo.frontFace = rsDesc->FrontCounterClockwise
         ? VK_FRONT_FACE_COUNTER_CLOCKWISE
         : VK_FRONT_FACE_CLOCKWISE;
@@ -4390,15 +4687,36 @@ namespace dxvk {
     // this draw so Remix doesn't read out of bounds when building the BLAS.
     // The position slice now starts at the draw's first vertex (base/start folded
     // in above), so all counts below are relative to that origin.
-    const uint32_t maxVBVertices = posBuffer.stride() > 0
-      ? static_cast<uint32_t>(posBuffer.length() / posBuffer.stride())
-      : count;
+    // Count only complete position elements. The old length/stride division
+    // ignored the semantic byte offset and could advertise one extra vertex;
+    // an index to that element then made the BLAS read past the buffer slice.
+    const uint32_t positionBytes = positionElementBytes(posBuffer.vertexFormat());
+    const VkDeviceSize positionOffset = posBuffer.offsetFromSlice();
+    const VkDeviceSize positionLength = posBuffer.length();
+    const VkDeviceSize positionReadable = positionLength > positionOffset
+      ? positionLength - positionOffset
+      : 0;
+    const VkDeviceSize maxVBVerticesWide = posBuffer.stride() > 0
+      && positionBytes > 0
+      && positionReadable >= positionBytes
+      ? 1u + (positionReadable - positionBytes) / posBuffer.stride()
+      : 0u;
+    const uint32_t maxVBVertices = static_cast<uint32_t>(
+      std::min<VkDeviceSize>(maxVBVerticesWide, UINT32_MAX));
+    if (maxVBVertices == 0) {
+      ++m_submitRejectStats.vertexRangeRejected;
+      return;
+    }
     uint32_t drawVertexCount;
     uint32_t hashStart = 0;
     uint32_t hashCount;
     if (!indexed) {
       // Non-indexed: relative vertices [0, count) after the start offset.
-      drawVertexCount = std::min(count, maxVBVertices);
+      if (count > maxVBVertices) {
+        ++m_submitRejectStats.vertexRangeRejected;
+        return;
+      }
+      drawVertexCount = count;
       hashCount = drawVertexCount;
     } else {
       // Indexed: index values are relative to the base vertex, so the highest
@@ -4412,17 +4730,45 @@ namespace dxvk {
       const uint32_t idxAvail = idxBuffer.defined()
         ? static_cast<uint32_t>(idxBuffer.length() / idxStrideBytes)
         : 0u;
-      const uint32_t scanCount = std::min(count, idxAvail);
+      // BLAS indexCount remains the original draw count. A short slice cannot
+      // be repaired by scanning fewer elements; the GPU would read beyond it.
+      if (idxAvail < count) {
+        ++m_submitRejectStats.indexRangeRejected;
+        return;
+      }
+      const uint32_t scanCount = count;
       static constexpr uint32_t kMaxIndexScan = 4u << 20; // cap submit-thread work
       if (idxScan && scanCount > 0 && scanCount <= kMaxIndexScan) {
+        const bool primitiveRestart = vkTopology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP;
+        bool invalidIndex = false;
         if (idxBuffer.indexType() == VK_INDEX_TYPE_UINT32) {
           const uint32_t* ip = static_cast<const uint32_t*>(idxScan);
-          for (uint32_t i = 0; i < scanCount; ++i)
-            maxIndexPlusOne = std::max(maxIndexPlusOne, ip[i] + 1u);
+          for (uint32_t i = 0; i < scanCount; ++i) {
+            const uint32_t index = ip[i];
+            if (primitiveRestart && index == UINT32_MAX)
+              continue;
+            if (index >= maxVBVertices) {
+              invalidIndex = true;
+              break;
+            }
+            maxIndexPlusOne = std::max(maxIndexPlusOne, index + 1u);
+          }
         } else {
           const uint16_t* ip = static_cast<const uint16_t*>(idxScan);
-          for (uint32_t i = 0; i < scanCount; ++i)
-            maxIndexPlusOne = std::max(maxIndexPlusOne, uint32_t(ip[i]) + 1u);
+          for (uint32_t i = 0; i < scanCount; ++i) {
+            const uint32_t index = ip[i];
+            if (primitiveRestart && index == UINT16_MAX)
+              continue;
+            if (index >= maxVBVertices) {
+              invalidIndex = true;
+              break;
+            }
+            maxIndexPlusOne = std::max(maxIndexPlusOne, index + 1u);
+          }
+        }
+        if (invalidIndex || maxIndexPlusOne == 0) {
+          ++m_submitRejectStats.indexRangeRejected;
+          return;
         }
       }
       if (maxIndexPlusOne > 0) {
@@ -4573,6 +4919,11 @@ namespace dxvk {
           case VK_FORMAT_R32G32B32A32_SFLOAT:
           case VK_FORMAT_R8G8B8A8_UNORM:
           case static_cast<VkFormat>(65): // A2B10G10R10_SNORM_PACK32
+          // DX11_V286_HALF4_POSITIONS: the interleaver now decodes half4
+          // directly (interleave_geometry.h), so device-local half4 position
+          // buffers - Skyrim SE's entire static world, previously REJECTED
+          // because CPU conversion needs a mappable buffer - bind directly.
+          case static_cast<VkFormat>(97): // R16G16B16A16_SFLOAT
             return true;
           default:
             return false;
@@ -6413,7 +6764,14 @@ namespace dxvk {
           " remixViewport=", singleRemixViewportExtent.width, "x", singleRemixViewportExtent.height));
       }
     }
-    if (s_submitSummaryLogCount < 24 && m_submitRejectStats.total > draws) {
+    // DX11_V286: the 24-line session cap was fully consumed at the menu, so
+    // in-world accept/reject statistics were never visible in field logs.
+    // Keep the early burst, then emit one summary every ~900 frames (~15s)
+    // forever - the periodic line is what diagnoses in-world geometry drops.
+    const bool submitSummaryPeriodicDue =
+      (m_context->m_device->getCurrentFrameId() % 900u) == 0u;
+    if ((s_submitSummaryLogCount < 24 || submitSummaryPeriodicDue)
+     && m_submitRejectStats.total > draws) {
       ++s_submitSummaryLogCount;
       Logger::info(str::format(
         "[D3D11Rtx] Submit summary: total=", m_submitRejectStats.total,
@@ -6433,6 +6791,7 @@ namespace dxvk {
         " noSemantics=", m_submitRejectStats.noSemantics,
         " noTexcoord=", m_submitRejectStats.noTexcoordLayout,
         " texgen=", m_submitRejectStats.texcoordGenerated,
+        " texCapture=", m_submitRejectStats.texcoordCaptured,
         " noPosSem=", m_submitRejectStats.noPositionSemantic,
         " pos2D=", m_submitRejectStats.position2D,
         " noPosBuffer=", m_submitRejectStats.noPositionBuffer,
@@ -6443,7 +6802,13 @@ namespace dxvk {
         " hashFail=", m_submitRejectStats.geometryHashScheduleFailed,
         " posFmtRej=", m_submitRejectStats.positionFormatRejected,
         " posPoison=", m_submitRejectStats.poisonedPositions,
-        " vtxRangeRej=", m_submitRejectStats.vertexRangeRejected));
+        " vtxRangeRej=", m_submitRejectStats.vertexRangeRejected,
+        " idxRangeRej=", m_submitRejectStats.indexRangeRejected,
+        " helperMiB=", m_helperPoolBytes >> 20,
+        " helperRetired=", m_helperRetired.size(),
+        " helperFree=", m_helperFree.size(),
+        " uvCacheMiB=", m_texcoordCaptureCacheBytes >> 20,
+        " uvCacheEntries=", m_texcoordCaptureCache.size()));
     }
 
     ResetCommandListState();
@@ -6537,10 +6902,12 @@ namespace dxvk {
         for (int c = 0; c < 4; ++c)
           viewIdentityDeviation += std::abs(camWorldToView[r][c] - (r == c ? 1.0 : 0.0));
       const bool hasRealView = viewIdentityDeviation > 1.0e-4;
-      const bool hasRealCamera = camValid && hasRealView;
+      const bool hasConfirmedCameraRelativeView =
+        rtx->getSceneManager().getCameraManager().mainCameraLastUpdateUsedCameraRelativeView();
+      const bool hasRealCamera = camValid && (hasRealView || hasConfirmedCameraRelativeView);
 
       static uint32_t sNoRealViewLogCount = 0;
-      if (camValid && !hasRealView && sNoRealViewLogCount < 12) {
+      if (camValid && !hasRealView && !hasConfirmedCameraRelativeView && sNoRealViewLogCount < 12) {
         ++sNoRealViewLogCount;
         Logger::info(str::format(
           "[D3D11Rtx] Camera has no real view matrix (identity view=origin camera) - passing frame "

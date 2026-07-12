@@ -629,9 +629,7 @@ nrc_dll_name = 'NRC_Vulkan.dll'
 nrc_dll_path = join_paths(global_src_root_norm, 'submodules/nrc/bin/')
 
 xess_dll_path = join_paths(global_src_root_norm, 'submodules/xess/bin/')
-ffx_dll_path = join_paths(global_src_root_norm, 'submodules/fidelityfx-sdk/FidelityFX-SDK-2.2.0/Kits/FidelityFX/signedbin/')
 external_dll_paths += nrc_dll_path
-external_dll_paths += ffx_dll_path
 
 nrd_lib_path = join_paths(global_src_root_norm, 'external/nrd/Lib/Release/')
 if get_option('buildtype') == 'debug'  
@@ -854,19 +852,6 @@ if dxvk_is_ninja
       endif
     endforeach
 
-    foreach ffx_dll : [
-      'amd_fidelityfx_loader_dx12.dll',
-      'amd_fidelityfx_upscaler_dx12.dll',
-      'amd_fidelityfx_denoiser_dx12.dll',
-      'amd_fidelityfx_radiancecache_dx12.dll',
-      'amd_fidelityfx_framegeneration_dx12.dll',
-    ]
-      ffx_dll_file = join_paths(ffx_dll_path, ffx_dll)
-      if fs.exists(ffx_dll_file)
-        install_data(ffx_dll_file, install_dir : output_path, install_tag: target_suffix)
-      endif
-    endforeach
-
     if fs.exists(join_paths(dlss_lib_path, 'nvngx_dlss.dll'))
       install_data(join_paths(dlss_lib_path, 'nvngx_dlss.dll'), install_dir : output_path, install_tag: target_suffix)
     endif 
@@ -962,5 +947,4 @@ endif # dxvk_is_ninja
 if fs.is_dir('nv-private')
   subdir('nv-private')
 endif
-
 

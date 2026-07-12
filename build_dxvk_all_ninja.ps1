@@ -8,6 +8,16 @@
 # build. Parser validation is still done by the repair script; runtime StrictMode
 # is disabled so optional switches behave normally.
 Set-StrictMode -Off
+# The generated script historically relied on callers to define OutputRoot.
+# With StrictMode disabled, an omitted value becomes an empty string and
+# Stage-DualOutput resolves it to the repository root. Packaging then attempts
+# to archive the entire worktree (including its own destination under
+# _packages), producing an unbounded, invalid archive. Keep all staged output
+# under the documented _output directory when the caller supplies no override.
+if (!(Test-Path -LiteralPath variable:script:OutputRoot) -or
+    [string]::IsNullOrWhiteSpace([string]$script:OutputRoot)) {
+  $script:OutputRoot = '_output'
+}
 # DX11_V219_DEFINE_CLEAN_SWITCH_DEFAULT
 # StrictMode-safe default.  Some clone-sync paths test $Clean before any caller
 # defines it.  Default false means "do not delete/reclone unless explicitly set."
@@ -5083,6 +5093,13 @@ function Sync-RealRemix15RayTracingSubmodulesV219 {
       $lines.Add(('BAD: upstream real submodule missing: {0}' -f $src))
       [System.IO.File]::WriteAllLines($report, $lines)
       Die "V219 upstream real submodule missing: $src"
+    }
+
+    $srcFull = [IO.Path]::GetFullPath($src).TrimEnd('\')
+    $dstFull = [IO.Path]::GetFullPath($dst).TrimEnd('\')
+    if ($srcFull -ieq $dstFull) {
+      $lines.Add(('OK: real submodule {0} already resides at destination; skipped destructive self-copy: {1}' -f $s, $dstFull))
+      continue
     }
 
     if (Test-Path -LiteralPath $dst -PathType Container) {
@@ -11265,8 +11282,14 @@ extern "C" HRESULT WINAPI D3D11CreateDeviceAndSwapChain(IDXGIAdapter* adapter, D
 }
 
 function Prepare-DX11BridgeSource([string]$PackDir) {
+  $work = Join-Path $Root 'bridge_dx11_work'
   $sourceBridge = Join-Path $Root 'bridge'
-  if (!(Test-Path (Join-Path $sourceBridge 'meson.build'))) {
+  $sourceBridgeReady = Test-Path (Join-Path $sourceBridge 'meson.build')
+  $workBridgeReady = Test-Path (Join-Path $work 'src\client')
+  # A completed bridge work tree is already the normalized, patched source
+  # consumed below. Do not perform a redundant recursive NVIDIA clone merely
+  # because the optional pristine ./bridge directory is absent.
+  if (!$sourceBridgeReady -and !$workBridgeReady) {
     $cloneRoot = Join-Path $Root '_nvidia_dxvk_remix_for_dx11_bridge'
     if ($Clean -and (Test-Path $cloneRoot)) {
       Log "Removing old clone: $cloneRoot"
@@ -11287,9 +11310,10 @@ function Prepare-DX11BridgeSource([string]$PackDir) {
     }
     $sourceBridge = Join-Path $cloneRoot 'bridge'
   }
-  if (!(Test-Path (Join-Path $sourceBridge 'src\client'))) { Die "Bridge source missing client folder: $sourceBridge" }
+  if (!(Test-Path (Join-Path $sourceBridge 'src\client')) -and !$workBridgeReady) {
+    Die "Bridge source missing client folder: $sourceBridge"
+  }
 
-  $work = Join-Path $Root 'bridge_dx11_work'
   if ($Clean -and (Test-Path $work)) { Log "Removing old DX11 bridge work tree: $work"; Remove-DirectoryRobust $work }
   if (!(Test-Path $work)) { Log "Copying bridge source to $work"; Copy-Item -LiteralPath $sourceBridge -Destination $work -Recurse -Force }
 

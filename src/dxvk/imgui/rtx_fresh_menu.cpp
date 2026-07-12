@@ -323,11 +323,6 @@ namespace dxvk {
         break;
       }
 
-      case UpscalerType::FSR4:
-        ImGui::TextWrapped("FSR 4 mode stays selectable. Runtime dispatch keeps the requested AMD mode and falls back only when the native backend is unavailable.");
-        RemixGui::SliderFloat("Resolution Scale", &RtxOptions::resolutionScaleObject(), 0.33f, 1.0f, "%.2f", kFreshSliderFlags);
-        break;
-
       case UpscalerType::None:
         break;
     }

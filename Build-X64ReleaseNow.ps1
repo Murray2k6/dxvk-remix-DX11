@@ -120,6 +120,7 @@ function Invoke-NativeTimeout {
 
 function Repair-PathForBuild {
   if ([string]::IsNullOrWhiteSpace($env:Path)) { return }
+  $hasBundledPythonTools = Test-Path -LiteralPath (Join-Path $Root '.build_deps\python\bin') -PathType Container
   $kept = New-Object System.Collections.Generic.List[string]
   $seen = @{}
   foreach ($raw in ($env:Path -split ';')) {
@@ -128,6 +129,7 @@ function Repair-PathForBuild {
     if ($entry -match '"') { continue }
     if ($entry -match '(?i)vcvars(all)?\.bat') { continue }
     try { $full = [IO.Path]::GetFullPath($entry).TrimEnd([char[]]@('\','/')) } catch { continue }
+    if ($hasBundledPythonTools -and $full -match '(?i)\\AppData\\(?:Local|Roaming)\\.*\\Python(?:\\|$)') { continue }
     if (-not (Test-Path -LiteralPath $full -PathType Container)) { continue }
     $key = $full.ToLowerInvariant()
     if ($seen.ContainsKey($key)) { continue }
@@ -198,11 +200,22 @@ function Add-PathBack([string]$Dir) {
 
 function Select-Tools([string]$VsPath) {
   $vsNinja = Join-Path $VsPath 'Common7\IDE\CommonExtensions\Microsoft\CMake\Ninja\ninja.exe'
-  if (-not (Test-Path -LiteralPath $vsNinja -PathType Leaf)) { throw "Visual Studio ninja.exe not found: $vsNinja" }
-  $env:NINJA = $vsNinja
-  Add-PathFront (Split-Path -Parent $vsNinja)
+  $bundledNinja = Join-Path $Root '.build_deps\python\bin\ninja.exe'
+  $selectedNinja = if (Test-Path -LiteralPath $bundledNinja -PathType Leaf) {
+    $bundledNinja
+  } elseif (Test-Path -LiteralPath $vsNinja -PathType Leaf) {
+    $vsNinja
+  } else {
+    throw "Neither bundled nor Visual Studio ninja.exe was found."
+  }
+  $env:NINJA = $selectedNinja
+  Add-PathFront (Split-Path -Parent $selectedNinja)
 
   $mesonCandidates = New-Object System.Collections.Generic.List[string]
+  # The integrated build provisions a workspace-local Python/Meson runtime.
+  # Prefer it so this standalone incremental builder works on the same clean
+  # machine and does not depend on a user-global Python installation.
+  $mesonCandidates.Add((Join-Path $Root '.build_deps\python\bin\meson.exe'))
   if ($env:APPDATA) {
     $rp = Join-Path $env:APPDATA 'Python'
     if (Test-Path $rp) {
@@ -225,7 +238,7 @@ function Select-Tools([string]$VsPath) {
     if ($m -and (Test-Path -LiteralPath $m -PathType Leaf)) {
       Add-PathBack (Split-Path -Parent $m)
       Write-Ok "Meson: $m"
-      Write-Ok "Ninja: $vsNinja"
+      Write-Ok "Ninja: $selectedNinja"
       return $m
     }
   }

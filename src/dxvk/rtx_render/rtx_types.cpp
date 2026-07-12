@@ -333,13 +333,23 @@ namespace dxvk {
       assert(skinningData.numBonesPerVertex <= 4);
 
       if (pLastCamera != nullptr) {
-        const auto fusedMode = RtxOptions::fusedWorldViewMode();
-        if (likely(fusedMode == FusedWorldViewMode::None)) {
-          transformData.objectToView = transformData.worldToView;
-          // Do not bother when transform is fused. Camera matrices are identity and so is worldToView.
+        if (transformData.cameraRelativeView) {
+          // A DX11 replacement camera intentionally stores the complete
+          // shader-proven model-view transform as objectToWorld in a virtual
+          // view-space world. Preserve it; decomposing it through a previously
+          // seen game camera would put skinned and rigid meshes in different
+          // coordinate systems.
+          transformData.objectToWorld = transformData.objectToView;
+          transformData.worldToView = Matrix4();
+        } else {
+          const auto fusedMode = RtxOptions::fusedWorldViewMode();
+          if (likely(fusedMode == FusedWorldViewMode::None)) {
+            transformData.objectToView = transformData.worldToView;
+            // Do not bother when transform is fused. Camera matrices are identity and so is worldToView.
+          }
+          transformData.objectToWorld = pLastCamera->getViewToWorld(false) * transformData.objectToView;
+          transformData.worldToView = pLastCamera->getWorldToView(false);
         }
-        transformData.objectToWorld = pLastCamera->getViewToWorld(false) * transformData.objectToView;
-        transformData.worldToView = pLastCamera->getWorldToView(false);
       } else {
         ONCE(Logger::warn("[RTX-Compatibility-Warn] Cannot decompose the matrices for a skinned mesh because the camera is not set."));
       }

@@ -512,12 +512,24 @@ namespace dxvk {
       bool censusDue = (fid != 0)
         && ((fid <= 2000u && (fid % 200) == 0) || (fid % 18000) == 0);
       VkDeviceSize usedBytes = 0, budgetBytes = 0;
+      VkDeviceSize appBufferBytes = 0, appTextureBytes = 0;
+      VkDeviceSize rtxBufferBytes = 0, rtxAsBytes = 0, rtxOmmBytes = 0;
+      VkDeviceSize rtxMaterialBytes = 0, rtxTargetBytes = 0, rtxReplacementBytes = 0;
       {
         const DxvkAdapterMemoryInfo mem = m_device->adapter()->getMemoryHeapInfo();
         for (uint32_t i = 0; i < mem.heapCount; ++i) {
           if (mem.heaps[i].heapFlags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) {
             usedBytes   += mem.heaps[i].memoryAllocated;
             budgetBytes += mem.heaps[i].memoryBudget;
+            const DxvkMemoryStats& stats = m_device->getMemoryStats(i);
+            appBufferBytes += stats.usedByCategory(DxvkMemoryStats::Category::AppBuffer);
+            appTextureBytes += stats.usedByCategory(DxvkMemoryStats::Category::AppTexture);
+            rtxBufferBytes += stats.usedByCategory(DxvkMemoryStats::Category::RTXBuffer);
+            rtxAsBytes += stats.usedByCategory(DxvkMemoryStats::Category::RTXAccelerationStructure);
+            rtxOmmBytes += stats.usedByCategory(DxvkMemoryStats::Category::RTXOpacityMicromap);
+            rtxMaterialBytes += stats.usedByCategory(DxvkMemoryStats::Category::RTXMaterialTexture);
+            rtxTargetBytes += stats.usedByCategory(DxvkMemoryStats::Category::RTXRenderTarget);
+            rtxReplacementBytes += stats.usedByCategory(DxvkMemoryStats::Category::RTXReplacementGeometry);
           }
         }
       }
@@ -533,8 +545,21 @@ namespace dxvk {
           " instances=", m_instanceManager.getActiveCount(),
           " geoEntries=", m_drawCallCache.getEntries().size(),
           " frameBuffers=", m_bufferCache.getActiveCount(), "/", m_bufferCache.getTotalCount(),
+          // DX11_V286: light population - the DX11 layer captures no game
+          // lights, so this is the fallback light + any Remix/USD lights.
+          // lights=0 here while the scene renders black = the fallback light
+          // is not reaching the scene (the exact bug being chased).
+          " lights=", m_lightManager.getActiveCount(),
           " vramUsedMiB=", usedBytes / (1024ull * 1024ull),
-          " vramBudgetMiB=", budgetBytes / (1024ull * 1024ull)));
+          " vramBudgetMiB=", budgetBytes / (1024ull * 1024ull),
+          " appBufMiB=", appBufferBytes >> 20,
+          " appTexMiB=", appTextureBytes >> 20,
+          " rtxBufMiB=", rtxBufferBytes >> 20,
+          " asMiB=", rtxAsBytes >> 20,
+          " ommMiB=", rtxOmmBytes >> 20,
+          " matTexMiB=", rtxMaterialBytes >> 20,
+          " rtTargetMiB=", rtxTargetBytes >> 20,
+          " replGeoMiB=", rtxReplacementBytes >> 20));
       }
     }
 
