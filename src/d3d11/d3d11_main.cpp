@@ -1,9 +1,11 @@
 #include <array>
 #include <atomic>
+#include <cstdio>
 #include <filesystem>
 #include <utility>
 
 #include <windows.h>
+#include <dbghelp.h>
 #include <delayimp.h>
 
 #include "../dxgi/dxgi_adapter.h"
@@ -36,6 +38,108 @@ namespace {
   std::atomic<LPTOP_LEVEL_EXCEPTION_FILTER> g_prevCrashFilter = { nullptr };
   std::atomic<bool> g_crashFilterInstalled = { false };
   std::atomic<bool> g_inCrashFilter = { false };
+
+  // Record raw module-relative return addresses from the exception context.
+  // Keeping symbol resolution out of the target process avoids loading PDBs or
+  // taking the DbgHelp symbol lock while the process may already be compromised;
+  // the offsets can be resolved deterministically against the shipped PDB.
+  void logRemixCrashStack(CONTEXT* exceptionContext) {
+#if defined(_M_X64)
+    if (exceptionContext == nullptr)
+      return;
+
+    CONTEXT context = *exceptionContext;
+    STACKFRAME64 frame = {};
+    frame.AddrPC.Offset = context.Rip;
+    frame.AddrPC.Mode = AddrModeFlat;
+    frame.AddrStack.Offset = context.Rsp;
+    frame.AddrStack.Mode = AddrModeFlat;
+    frame.AddrFrame.Offset = context.Rbp;
+    frame.AddrFrame.Mode = AddrModeFlat;
+
+    const HANDLE process = GetCurrentProcess();
+    const HANDLE thread = GetCurrentThread();
+    DWORD64 previousPc = 0;
+
+    for (uint32_t depth = 0; depth < 32 && frame.AddrPC.Offset != 0; ++depth) {
+      const DWORD64 pc = frame.AddrPC.Offset;
+      if (pc == previousPc)
+        break;
+      previousPc = pc;
+
+      char modulePath[MAX_PATH] = {};
+      uintptr_t moduleOffset = 0;
+      HMODULE module = nullptr;
+      if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS
+                           | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                             reinterpret_cast<LPCWSTR>(pc), &module)
+       && module != nullptr) {
+        GetModuleFileNameA(module, modulePath, MAX_PATH);
+        moduleOffset = static_cast<uintptr_t>(pc)
+                     - reinterpret_cast<uintptr_t>(module);
+      }
+
+      dxvk::Logger::err(dxvk::str::format(
+        "[Remix-DX11][crash][stack] #", std::dec, depth,
+        " pc=0x", std::hex, pc,
+        " module=", modulePath[0] ? modulePath : "<unknown>",
+        " offset=0x", moduleOffset));
+
+      if (!StackWalk64(IMAGE_FILE_MACHINE_AMD64, process, thread, &frame,
+                       &context, nullptr, SymFunctionTableAccess64,
+                       SymGetModuleBase64, nullptr))
+        break;
+    }
+#else
+    (void)exceptionContext;
+#endif
+  }
+
+  void writeRemixCrashDump(EXCEPTION_POINTERS* exceptionPointers) {
+    if (exceptionPointers == nullptr)
+      return;
+
+    char tempPath[MAX_PATH] = {};
+    const DWORD tempLength = GetTempPathA(MAX_PATH, tempPath);
+    if (tempLength == 0 || tempLength >= MAX_PATH)
+      return;
+
+    char dumpPath[MAX_PATH] = {};
+    if (sprintf_s(dumpPath, "%sremix-dx11-crash-%lu.dmp", tempPath,
+                  static_cast<unsigned long>(GetCurrentProcessId())) <= 0)
+      return;
+
+    HANDLE dumpFile = CreateFileA(dumpPath, GENERIC_WRITE, FILE_SHARE_READ,
+                                  nullptr, CREATE_ALWAYS,
+                                  FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (dumpFile == INVALID_HANDLE_VALUE) {
+      dxvk::Logger::err(dxvk::str::format(
+        "[Remix-DX11][crash] minidump create failed error=", GetLastError()));
+      return;
+    }
+
+    MINIDUMP_EXCEPTION_INFORMATION exceptionInfo = {};
+    exceptionInfo.ThreadId = GetCurrentThreadId();
+    exceptionInfo.ExceptionPointers = exceptionPointers;
+    exceptionInfo.ClientPointers = FALSE;
+    const MINIDUMP_TYPE dumpType = static_cast<MINIDUMP_TYPE>(
+      MiniDumpWithThreadInfo | MiniDumpWithUnloadedModules
+      | MiniDumpWithProcessThreadData);
+    const BOOL wroteDump = MiniDumpWriteDump(
+      GetCurrentProcess(), GetCurrentProcessId(), dumpFile, dumpType,
+      &exceptionInfo, nullptr, nullptr);
+    const DWORD dumpError = wroteDump ? ERROR_SUCCESS : GetLastError();
+    CloseHandle(dumpFile);
+
+    if (wroteDump) {
+      dxvk::Logger::err(dxvk::str::format(
+        "[Remix-DX11][crash] minidump=", dumpPath));
+    } else {
+      DeleteFileA(dumpPath);
+      dxvk::Logger::err(dxvk::str::format(
+        "[Remix-DX11][crash] minidump write failed error=", dumpError));
+    }
+  }
 
   LONG WINAPI remixUnhandledCrashFilter(EXCEPTION_POINTERS* xp) {
     // Recursion guard: if logging itself faults, step aside immediately.
@@ -78,6 +182,9 @@ namespace {
         " addr=0x", reinterpret_cast<uintptr_t>(addr),
         " module=", modPath[0] ? modPath : "<unknown>",
         " offset=0x", offset, avInfo));
+
+      logRemixCrashStack(xp->ContextRecord);
+      writeRemixCrashDump(xp);
 
       g_inCrashFilter.store(false, std::memory_order_relaxed);
     }
@@ -145,8 +252,8 @@ void logRemixDx11BuildBanner() {
     return;
   dxvk::Logger::info("=====================================================");
   dxvk::Logger::info(dxvk::str::format("[Remix-DX11] build stamp: ", __DATE__, " ", __TIME__));
-  dxvk::Logger::info("[Remix-DX11] fixes: nrcVendorFallback texcoordSINT SR4viewport budgetHeadroom inputSeparation grayPlaceholder revertedDLSSGuard initStepLogging allVendorPrewarmSkip anyGameAlbedoFix significanceCullingOptIn gpuSceneUI remixapiExport taauDefaultAllVendors rtxOptionsNullGuard rtxOptionsRootCreate intelFseSwapchainFix steamOverlayVkDisable wsiSelfDeadlockPump vramLeakDiag restoreIconicWindow intelFifoPresent intelForceFSEallowed gdiInteropPresent frameLatencyHandleGuard noUvFlatAlbedo baseVertexGeometry gpuSceneBBox perVendorPresent gdiWsiFallback nrcOptIn nvidiaPrewarm rawInputHandoff noInfiniteWaits nonblockingRtPipelines tlasFirewall interleaverFormatNorm dynamicVbSnapshot color0Norm interleaverSkipGuard intUvDecode menuPassthrough migrationPersists fullresTargetGuard viewInProjCbuffer fallbackRadianceTame textureHashStability bridgeTextureContentHash skinningNameGate preciseCamera vpConfirmOncePerFrame crashFilterSafe nrdDenoiserPayload strongerDenoising bridgePresentCamera bootMarkerLogCleanup vertexColorFormats texcoordFormats pickResolveLog nrdRobustLoad menuToggleDebounce uiDisplayMatchesSurface noBlackFromVertexColor nrdDenoiserSafeDefault useRealAlbedo requireRealViewToInject noPrewarmByDefault noStackedInstanceCopies noDepthOnlyGeometry skyAutoDetect realShaderModel colorNameGate mirroredWinding launcherBypass nrdOn globalTonemap texcoordCaptureSO v271SubmitFix dx11FixedFunction bootBreadcrumb sysDllExports satelliteDelayLoad eacAdvisory sharedVkInstance vkCreateInstanceMarkers crossDllInstanceLock borrowDxgiInstance adapterEnumMarkers texcoordCaptureReuse offscreenCameraGate instRowStrideClamp censusOnGrowth helperBufferPool gpMatrixDump lightCensus submitSummaryPeriodic half4PositionInterleave cameraRelativeView firstTouchCameraMetadata indexBoundsFirewall allRayQueryDx11 ommSafeDefault captureBudgetTight raySafeTwoSided boundedRtScene preemptibleBlasBatches shaderProvenObjectToView");
-  dxvk::Logger::info("[Remix-DX11] camera/runtime: replacementViewCamera tempMoveTransformProof shaderScopedWorldScan cameraRelativeSkinning FSR_REMOVED");
+  dxvk::Logger::info("[Remix-DX11] fixes: nrcVendorFallback texcoordSINT SR4viewport budgetHeadroom inputSeparation noSyntheticTexture revertedDLSSGuard initStepLogging allVendorPrewarmSkip anyGameAlbedoFix significanceCullingOptIn gpuSceneUI remixapiExport taauDefaultAllVendors rtxOptionsNullGuard rtxOptionsRootCreate intelFseSwapchainFix steamOverlayVkDisable wsiSelfDeadlockPump vramLeakDiag restoreIconicWindow intelFifoPresent intelForceFSEallowed gdiInteropPresent frameLatencyHandleGuard noUvFlatAlbedo baseVertexGeometry gpuSceneBBox perVendorPresent gdiWsiFallback nrcOptIn nvidiaPrewarm rawInputHandoff noInfiniteWaits nonblockingRtPipelines tlasFirewall interleaverFormatNorm dynamicVbSnapshot color0Norm interleaverSkipGuard intUvDecode menuPassthrough migrationPersists fullresTargetGuard viewInProjCbuffer fallbackRadianceTame textureHashStability bridgeTextureContentHash skinningNameGate preciseCamera vpConfirmOncePerFrame crashFilterSafe nrdDenoiserPayload strongerDenoising bridgePresentCamera bootMarkerLogCleanup vertexColorFormats texcoordFormats pickResolveLog nrdRobustLoad menuToggleDebounce uiDisplayMatchesSurface noBlackFromVertexColor nrdDenoiserSafeDefault useRealAlbedo requireRealViewToInject noPrewarmByDefault noStackedInstanceCopies noDepthOnlyGeometry skyAutoDetect realShaderModel colorNameGate mirroredWinding launcherBypass nrdOn globalTonemap texcoordCaptureSO v271SubmitFix dx11FixedFunction bootBreadcrumb sysDllExports satelliteDelayLoad eacAdvisory sharedVkInstance vkCreateInstanceMarkers crossDllInstanceLock borrowDxgiInstance adapterEnumMarkers texcoordCaptureReuse offscreenCameraGate instRowStrideClamp censusOnGrowth helperBufferPool gpMatrixDump lightCensus submitSummaryPeriodic half4PositionInterleave cameraRelativeView exactCameraPriority firstTouchCameraMetadata indexBoundsFirewall allRayQueryDx11 ommSafeDefault captureBudgetComplete raySafeTwoSided boundedRtScene preemptibleBlasBatches shaderProvenObjectToView");
+  dxvk::Logger::info("[Remix-DX11] camera/runtime: replacementViewCamera tempMoveTransformProof shaderScopedWorldScan cameraRelativeSkinning dxbcTransformProfile pairedClipProjection pacedColdCaptures texturelessRtAuthoring noRasterSceneFallback remixScreenshotKey startupBrandingPassthrough FSR_REMOVED");
   dxvk::Logger::info("[Remix-DX11] if this line is absent or older than your last build, the game loaded a STALE d3d11.dll.");
   // DX11_V282: anti-cheat advisory (detection + guidance only; Remix cannot
   // and must not run under an active anti-cheat).

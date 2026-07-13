@@ -69,7 +69,8 @@ namespace dxvk {
   
   Rc<DxvkShader> DxbcModule::compilePassthroughShader(
     const DxbcModuleInfo& moduleInfo,
-    const std::string&    fileName) const {
+    const std::string&    fileName,
+          bool            preserveSystemValues) const {
     if (m_shexChunk == nullptr)
       throw DxvkError("DxbcModule::compile: No SHDR/SHEX chunk");
     
@@ -81,7 +82,7 @@ namespace dxvk {
       m_osgnChunk, m_osgnChunk,
       m_psgnChunk, analysisInfo);
     
-    compiler.processXfbPassthrough();
+    compiler.processXfbPassthrough(preserveSystemValues);
     return compiler.finalize();
   }
 

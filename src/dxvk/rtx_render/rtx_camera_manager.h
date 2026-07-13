@@ -91,6 +91,7 @@ namespace dxvk {
     bool m_hasSeenRealMainCamera = false;
     bool m_mainCameraLastUpdateUsedViewportFallback = false;
     bool m_mainCameraLastUpdateUsedCameraRelativeView = false;
+    uint32_t m_lastExactReplacementMainCameraFrame = ~0u;
     fast_unordered_cache<DecomposeProjectionParams> m_decompositionCache;
 
     DecomposeProjectionParams getOrDecomposeProjection(const Matrix4& viewToProjection);

@@ -317,6 +317,29 @@ namespace dxvk {
       throw DxvkError("Position hash should never be empty");
     }
 
+    if (geometryData.hasPostVsPositionHashSeed) {
+      const XXH64_hash_t originalPositionHash =
+        geometryData.hashes[HashComponents::VertexPosition];
+      // Complete the persistent capture identity with actual IA vertex
+      // contents once the asynchronous hash is available. This keeps identity
+      // stable across D3D11 buffer renames and draw-order changes without ever
+      // matching unrelated meshes that happen to share shader/layout state.
+      geometryData.postVsCaptureIdentity = XXH3_64bits_withSeed(
+        &geometryData.postVsCaptureIdentity,
+        sizeof(geometryData.postVsCaptureIdentity),
+        originalPositionHash);
+      if (geometryData.postVsCaptureIdentity == kEmptyHash)
+        geometryData.postVsCaptureIdentity = 0x9e3779b97f4a7c15ull;
+      geometryData.hashes[HashComponents::VertexPosition] =
+        XXH3_64bits_withSeed(
+          &geometryData.postVsPositionHashSeed,
+          sizeof(geometryData.postVsPositionHashSeed),
+          originalPositionHash);
+      geometryData.hashes[HashComponents::VertexShader] =
+        geometryData.postVsPositionHashSeed;
+      geometryData.hashes.precombine();
+    }
+
     return true;
   }
 

@@ -83,6 +83,18 @@ namespace dxvk {
   bool g_allowSrgbConversionForOutput = true;
   bool g_forceKeepObjectPickingImage = false;
 
+  static std::string describeRaytracerImage(const Rc<DxvkImage>& image) {
+    if (image == nullptr)
+      return "missing";
+
+    const auto& info = image->info();
+    return str::format(
+      info.extent.width, "x", info.extent.height, "x", info.extent.depth,
+      "/fmt", static_cast<uint32_t>(info.format),
+      "/layers", info.numLayers,
+      "/samples", static_cast<uint32_t>(info.sampleCount));
+  }
+
   void RtxContext::takeScreenshot(std::string imageName, Rc<DxvkImage> image) {
     // Optional debug resources are not guaranteed to be allocated in every
     // rendering mode. The developer-menu screenshot path used to pass a null
@@ -535,9 +547,53 @@ namespace dxvk {
       return;
     }
 
-    const bool isCameraValid = getSceneManager().getCamera().isValid(m_device->getCurrentFrameId());
+    const uint32_t currentFrameId = m_device->getCurrentFrameId();
+    const bool logRaytracerFrame =
+      m_lastRaytracerDiagnosticFrame == kInvalidFrameIndex ||
+      currentFrameId - m_lastRaytracerDiagnosticFrame >= 120u ||
+      s_triggerDebugScreenshot;
+
+    if (logRaytracerFrame)
+      m_lastRaytracerDiagnosticFrame = currentFrameId;
+
+    const bool isCameraValid = getSceneManager().getCamera().isValid(currentFrameId);
     if (!isCameraValid) {
       ONCE(Logger::info(str::format("[RTX-Compatibility-Info] Trying to raytrace but not detecting a valid camera.")));
+    }
+
+    if (logRaytracerFrame) {
+      const auto& sceneManager = getSceneManager();
+      const auto& camera = sceneManager.getCamera();
+      Logger::info(str::format(
+        "[Remix-RayTracer] frame=", currentFrameId,
+        " decision enabled=", isRaytracingEnabled,
+        " hwSupported=", m_rayTracingSupported,
+        " cameraValid=", isCameraValid,
+        " cameraLastUpdate=", camera.getLastUpdateFrame(),
+        " shadersPending=", common->pipelineManager().remixShaderCompilationCount(),
+        " surfaceBuffer=", sceneManager.getSurfaceBuffer() != nullptr,
+        " surfaces=", sceneManager.getAccelManager().getSurfaceCount(),
+        " instances=", sceneManager.getInstanceManager().getActiveCount(),
+        " lights=", sceneManager.getLightManager().getActiveCount(),
+        " target=", describeRaytracerImage(targetImage)));
+
+      if (isCameraValid) {
+        const auto& projection = camera.getViewToProjection();
+        bool projectionFinite = true;
+        for (uint32_t row = 0; row < 4; row++) {
+          for (uint32_t column = 0; column < 4; column++)
+            projectionFinite &= std::isfinite(projection[row][column]);
+        }
+
+        Logger::info(str::format(
+          "[Remix-RayTracer] frame=", currentFrameId,
+          " camera near=", camera.getNearPlane(),
+          " far=", camera.getFarPlane(),
+          " projectionFinite=", projectionFinite,
+          " projectionDiag=", projection[0][0], ",", projection[1][1], ",",
+          projection[2][2], ",", projection[3][3],
+          " projectionZW=", projection[2][3], ",", projection[3][2]));
+      }
     }
 
     // Update frame counter only after actual rendering
@@ -658,11 +714,32 @@ namespace dxvk {
         // Generate ray tracing constant buffer
         updateRaytraceArgsConstantBuffer(rtOutput, downscaledExtent, targetImage->info().extent);
 
+        if (logRaytracerFrame) {
+          Logger::info(str::format(
+            "[Remix-RayTracer] frame=", currentFrameId,
+            " begin renderExtent=", downscaledExtent.width, "x", downscaledExtent.height,
+            " outputExtent=", targetImage->info().extent.width, "x", targetImage->info().extent.height,
+            " outputReady=", rtOutput.isReady(),
+            " albedo=", describeRaytracerImage(rtOutput.m_primaryAlbedo.image),
+            " normal=", describeRaytracerImage(rtOutput.m_primaryWorldShadingNormal.image),
+            " linearZ=", describeRaytracerImage(rtOutput.m_primaryLinearViewZ.image)));
+        }
+
         // Volumetric Lighting
         dispatchVolumetrics(rtOutput);
         
         // Path Tracing
         dispatchPathTracing(rtOutput);
+
+        if (logRaytracerFrame) {
+          Logger::info(str::format(
+            "[Remix-RayTracer] frame=", currentFrameId,
+            " pathTraceDone albedo=", describeRaytracerImage(rtOutput.m_primaryAlbedo.image),
+            " normal=", describeRaytracerImage(rtOutput.m_primaryWorldShadingNormal.image),
+            " linearZ=", describeRaytracerImage(rtOutput.m_primaryLinearViewZ.image),
+            " directDiffuse=", describeRaytracerImage(rtOutput.m_primaryDirectDiffuseRadiance.image(Resources::AccessType::Read)),
+            " directSpecular=", describeRaytracerImage(rtOutput.m_primaryDirectSpecularRadiance.image(Resources::AccessType::Read))));
+        }
 
         // Neural Radiance Cache
         m_common->metaNeuralRadianceCache().dispatchTrainingAndResolve(*this, rtOutput);
@@ -682,6 +759,13 @@ namespace dxvk {
         // Demodulation
         dispatchDemodulate(rtOutput);
 
+        if (logRaytracerFrame) {
+          Logger::info(str::format(
+            "[Remix-RayTracer] frame=", currentFrameId,
+            " demodulateDone diffuse=", describeRaytracerImage(rtOutput.m_primaryDirectDiffuseRadiance.image(Resources::AccessType::Read)),
+            " specular=", describeRaytracerImage(rtOutput.m_primaryDirectSpecularRadiance.image(Resources::AccessType::Read))));
+        }
+
         // Note: Primary direct diffuse/specular radiance textures noisy and in a demodulated state after demodulation step.
         if (captureScreenImage && captureDebugImage) {
           takeScreenshot("noisyDiffuse", rtOutput.m_primaryDirectDiffuseRadiance.image(Resources::AccessType::Read));
@@ -691,6 +775,15 @@ namespace dxvk {
         // Denoising
         dispatchDenoise(rtOutput);
 
+        if (logRaytracerFrame) {
+          Logger::info(str::format(
+            "[Remix-RayTracer] frame=", currentFrameId,
+            " denoiseDone enabled=", RtxOptions::useDenoiser(),
+            " referenceMode=", RtxOptions::useDenoiserReferenceMode(),
+            " diffuse=", describeRaytracerImage(rtOutput.m_primaryDirectDiffuseRadiance.image(Resources::AccessType::Read)),
+            " specular=", describeRaytracerImage(rtOutput.m_primaryDirectSpecularRadiance.image(Resources::AccessType::Read))));
+        }
+
         // Note: Primary direct diffuse/specular radiance textures denoised but in a still demodulated state after denoising step.
         if (captureScreenImage && captureDebugImage) {
           takeScreenshot("denoisedDiffuse", rtOutput.m_primaryDirectDiffuseRadiance.image(Resources::AccessType::Read));
@@ -699,6 +792,13 @@ namespace dxvk {
 
         // Composition
         dispatchComposite(rtOutput);
+
+        if (logRaytracerFrame) {
+          Logger::info(str::format(
+            "[Remix-RayTracer] frame=", currentFrameId,
+            " compositeDone image=", describeRaytracerImage(rtOutput.m_compositeOutput.resource(Resources::AccessType::Read).image),
+            " extent=", rtOutput.m_compositeOutputExtent.width, "x", rtOutput.m_compositeOutputExtent.height));
+        }
 
         // Post composite Debug View that may overwrite Composite output
         dispatchReplaceCompositeWithDebugView(rtOutput);
@@ -769,6 +869,15 @@ namespace dxvk {
         // Debug view
         dispatchDebugView(srcImage, rtOutput, captureScreenImage);
 
+        if (logRaytracerFrame) {
+          Logger::info(str::format(
+            "[Remix-RayTracer] frame=", currentFrameId,
+            " final image=", describeRaytracerImage(srcImage),
+            " upscaler=", static_cast<uint32_t>(m_currentUpscaler),
+            " debugView=", m_common->metaDebugView().getDebugViewIndex(),
+            " captureDebug=", captureDebugImage));
+        }
+
         dispatchDLFG();
 
         // Blit to the game target
@@ -787,6 +896,11 @@ namespace dxvk {
         }
 
         raytracedThisFrame = true;
+      } else if (logRaytracerFrame) {
+        Logger::warn(str::format(
+          "[Remix-RayTracer] frame=", currentFrameId,
+          " skipped: scene preparation produced no surface buffer (instances=",
+          getSceneManager().getInstanceManager().getActiveCount(), ")"));
       }
 
       m_framesWithoutValidScene = 0;

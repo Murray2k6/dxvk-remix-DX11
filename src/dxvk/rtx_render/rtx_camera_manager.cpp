@@ -128,8 +128,32 @@ namespace dxvk {
       cameraType = CameraType::RenderToTexture;
     } else if (input.testCategoryFlags(InstanceCategories::Sky)) {
       cameraType = CameraType::Sky;
-    } else if (isViewModel(decomposeProjectionParams.fov, input.maxZ, frameId)) {
+    } else if (!input.getTransformData().exactReplacementCamera
+            && isViewModel(decomposeProjectionParams.fov, input.maxZ, frameId)) {
       cameraType = CameraType::ViewModel;
+    }
+
+    // The DX11 replacement-camera path submits exact post-VS clip positions
+    // in a camera-relative view-space world. Generic camera inference is still
+    // useful while that path is unavailable, but it must not win first-touch
+    // once exact captures are arriving. Keep the priority window short so a
+    // game can fall back automatically during menus, video, or a shader path
+    // that genuinely cannot be captured.
+    const bool exactReplacementMain = cameraType == CameraType::Main
+      && input.getTransformData().exactReplacementCamera;
+    const bool exactReplacementRecentlyActive =
+      m_lastExactReplacementMainCameraFrame != ~0u
+      && frameId >= m_lastExactReplacementMainCameraFrame
+      && frameId - m_lastExactReplacementMainCameraFrame <= 2u;
+    if (cameraType == CameraType::Main) {
+      if (exactReplacementMain) {
+        if (m_lastExactReplacementMainCameraFrame == ~0u) {
+          Logger::info("[RTX] CameraManager: exact DX11 replacement camera acquired; inferred raster cameras no longer get first-touch priority");
+        }
+        m_lastExactReplacementMainCameraFrame = frameId;
+      } else if (exactReplacementRecentlyActive) {
+        return CameraType::Unknown;
+      }
     }
     
     // Check fov consistency across frames
@@ -189,6 +213,17 @@ namespace dxvk {
       const bool usedViewportFallback = input.getTransformData().usedViewportFallbackProjection;
       m_mainCameraLastUpdateUsedViewportFallback = usedViewportFallback;
       m_mainCameraLastUpdateUsedCameraRelativeView = input.getTransformData().cameraRelativeView;
+      if (exactReplacementMain) {
+        static uint32_t s_exactReplacementWinnerLogs = 0;
+        if (s_exactReplacementWinnerLogs++ < 12u) {
+          Logger::info(str::format(
+            "[RTX] CameraManager: exact replacement camera won frame ", frameId,
+            " projectionDiag=", viewToProjection[0][0], ",",
+            viewToProjection[1][1], ",", viewToProjection[2][2],
+            " near=", decomposeProjectionParams.nearPlane,
+            " far=", decomposeProjectionParams.farPlane));
+        }
+      }
       if (!usedViewportFallback) {
         m_hasSeenRealMainCamera = true;
       }

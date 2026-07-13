@@ -79,7 +79,8 @@ namespace dxvk {
      */
     Rc<DxvkShader> compilePassthroughShader(
       const DxbcModuleInfo& moduleInfo,
-      const std::string&    fileName) const;
+      const std::string&    fileName,
+            bool            preserveSystemValues = false) const;
     
   private:
     

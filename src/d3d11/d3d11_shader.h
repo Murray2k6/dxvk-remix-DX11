@@ -37,6 +37,24 @@ namespace dxvk {
     std::array<D3D11PositionTransformMatrixBinding, 2> matrices;
   };
 
+  // Creation-time, shader-exact list of constant-buffer registers read by a
+  // vertex shader. Optimized shaders often do not contain a recognizable
+  // four-DP4 matrix chain, but their declared DXBC operands still tell us
+  // precisely which constants can affect SV_Position. Hashing this profile at
+  // draw time avoids replaying post-VS capture because unrelated bytes in a
+  // large engine cbuffer changed. Dynamic indexing is represented by one
+  // whole-buffer dependency for the affected slot.
+  struct D3D11ConstantBufferDependency {
+    uint32_t slot = 0;
+    uint32_t constantRegister = 0;
+    bool wholeBuffer = false;
+  };
+
+  struct D3D11ConstantBufferDependencyProfile {
+    std::vector<D3D11ConstantBufferDependency> dependencies;
+    bool complete = false;
+  };
+
   // DX11_V280_TEXCOORD_CAPTURE: shared state for building a stream-output
   // "capture" variant of a game vertex shader on demand. Some engines carry no
   // TEXCOORD stream in the input layout - the UVs exist only as VERTEX SHADER
@@ -55,6 +73,38 @@ namespace dxvk {
     DxbcOptions        options;
     std::string        semanticName;
     uint32_t           semanticIndex = 0;
+    Rc<DxvkShader>     shader;
+    bool               attempted = false;
+  };
+
+  // DX11_V290_POST_VS_POSITION_CAPTURE: some D3D11 engines perform skinning,
+  // morphing, instancing, and object/world/view transforms entirely inside the
+  // vertex shader, then expose a resulting pre-projection world/view position
+  // as a non-system POSITION output. The IA POSITION stream alone is insufficient
+  // for ray tracing in those games. Retain the original VS long enough to build
+  // a transform-feedback passthrough shader that captures POSITIONn.xyz.
+  enum class D3D11CapturedPositionSpace : uint8_t {
+    View,
+    World,
+  };
+
+  struct D3D11PositionCaptureState {
+    dxvk::mutex        mutex;
+    std::vector<char>  bytecode;
+    DxbcOptions        options;
+    std::string        semanticName;
+    uint32_t           semanticIndex = 0;
+    D3D11CapturedPositionSpace positionSpace = D3D11CapturedPositionSpace::View;
+    // SV_Position is the only vertex output guaranteed to contain the exact
+    // geometry the rasterizer consumed. When true, stream output stores xyzw
+    // clip coordinates and the RT interleaver unprojects them to view space.
+    bool               homogeneousClipSpace = false;
+    // Exact constant-buffer matrix proven by DXBC dataflow to transform this
+    // captured output into SV_Position. At draw time the DX11 layer factors it
+    // against the active projection to recover captured-position-to-view,
+    // avoiding semantic-name guesses about object/world/view space.
+    D3D11PositionTransformBinding clipTransform;
+    bool               loadedFromProfile = false;
     Rc<DxvkShader>     shader;
     bool               attempted = false;
   };
@@ -110,6 +160,27 @@ namespace dxvk {
       return m_texcoordCapture != nullptr;
     }
 
+    bool HasPositionCaptureCandidate() const {
+      return m_positionCapture != nullptr;
+    }
+
+    D3D11CapturedPositionSpace GetPositionCaptureSpace() const {
+      return m_positionCapture != nullptr
+        ? m_positionCapture->positionSpace
+        : D3D11CapturedPositionSpace::View;
+    }
+
+    bool IsPositionCaptureHomogeneousClipSpace() const {
+      return m_positionCapture != nullptr
+          && m_positionCapture->homogeneousClipSpace;
+    }
+
+    const D3D11PositionTransformBinding* GetPositionCaptureClipTransformBinding() const {
+      return m_positionCapture != nullptr && m_positionCapture->clipTransform.valid
+        ? &m_positionCapture->clipTransform
+        : nullptr;
+    }
+
     // DX11_V281_FIXED_FUNCTION: true when this pixel shader's instruction
     // stream contains discard (HLSL clip()/discard) - DX10/11/12's actual
     // alpha-test mechanism, parsed once from the DXBC at creation.
@@ -121,11 +192,19 @@ namespace dxvk {
       return m_positionTransform.valid ? &m_positionTransform : nullptr;
     }
 
+    const D3D11ConstantBufferDependencyProfile& GetConstantBufferDependencyProfile() const {
+      return m_constantBufferDependencies;
+    }
+
     // Lazily compiles and returns the xfb passthrough GS that captures the
     // VS's texcoord output (TEXCOORDn.xy, buffer 0, stride 8, rasterization
     // discarded). Returns nullptr if compilation failed or no candidate
     // exists. Thread-safe; compiles at most once per underlying shader.
     Rc<DxvkShader> GetTexcoordCaptureShader() const;
+
+    // Lazily compiles the pure stream-output GS used to capture the game VS's
+    // shader-computed pre-projection POSITIONn.xyz stream.
+    Rc<DxvkShader> GetPositionCaptureShader() const;
 
   private:
 
@@ -140,9 +219,14 @@ namespace dxvk {
     bool m_usesDiscard = false;
 
     D3D11PositionTransformBinding m_positionTransform;
+    D3D11ConstantBufferDependencyProfile m_constantBufferDependencies;
 
     // DX11_V280_TEXCOORD_CAPTURE (null for non-VS or VS without texcoord output)
     std::shared_ptr<D3D11TexcoordCaptureState> m_texcoordCapture;
+
+    // DX11_V290_POST_VS_POSITION_CAPTURE (null unless the output signature has
+    // a conservative position candidate such as POSITION1/VIEWPOSITION).
+    std::shared_ptr<D3D11PositionCaptureState> m_positionCapture;
 
   };
   
