@@ -97,9 +97,10 @@ namespace dxvk {
 
     // DX11_V228_ALBEDO_SELECTION: the generic albedo texture-selection reinforcement
     // (rtx.enableUnrealTextureFixes - boost strong-albedo mipmapped textures, demote scene/intermediate
-    // surfaces) now defaults ON for ANY game/engine, so real textures get picked over the neutral
-    // untextured placeholder without per-game config. Detect a few engines from the exe name and enable
-    // their additional quirk fixes; log everything for diagnostics. Explicit user/config still wins.
+    // surfaces) now defaults ON for ANY game/engine, so real textures are selected when they are
+    // actually bound while genuinely untextured geometry remains untextured. Detect a few engines
+    // from the exe name and enable their additional quirk fixes; log everything for diagnostics.
+    // Explicit user/config still wins.
     {
       std::string exeLower = env::getExeName();
       for (char& ch : exeLower) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));

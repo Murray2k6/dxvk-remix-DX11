@@ -129,6 +129,7 @@ namespace dxvk {
     uint32_t    varId     = 0;
     uint32_t    streamId  = 0;
     uint32_t    outputId  = 0;
+    DxbcSystemValue systemValue = DxbcSystemValue::None;
     DxbcRegMask srcMask   = 0;
     DxbcRegMask dstMask   = 0;
     uint32_t    location  = 0;
@@ -401,7 +402,7 @@ namespace dxvk {
      * corresponding xfb outputs, and sets up the
      * geometry shader for point-to-point mode.
      */
-    void processXfbPassthrough();
+    void processXfbPassthrough(bool preserveSystemValues = false);
     
     /**
      * \brief Finalizes the shader
@@ -1129,7 +1130,8 @@ namespace dxvk {
 
     void emitXfbOutputSetup(
             uint32_t                          streamId,
-            bool                              passthrough);
+            bool                              passthrough,
+            bool                              preserveSystemValues = false);
     
     ///////////////////////////////
     // Hull shader phase methods

@@ -829,7 +829,8 @@ namespace dxvk {
     ScopedCpuProfileZone();
     // When forceNormals is set, we can't use the fast interleaved copy path because
     // we need to change the vertex layout to include normal space.
-    if (input.isVertexDataInterleaved() && input.areFormatsGpuFriendly() && !forceNormals) {
+    if (input.isVertexDataInterleaved() && input.areFormatsGpuFriendly()
+     && !forceNormals && !input.postVsPositionIsHomogeneousClip) {
       const size_t vertexBufferSize = input.vertexCount * input.positionBuffer.stride();
       ctx->copyBuffer(output.historyBuffer[0], 0, input.positionBuffer.buffer(), input.positionBuffer.offset(), vertexBufferSize);
 
@@ -861,7 +862,7 @@ namespace dxvk {
     bool mustUseGPU = input.positionBuffer.isPendingGpuWrite() || input.positionBuffer.mapPtr() == nullptr;
 
     // Interleave vertex data
-    InterleaveGeometryArgs args;
+    InterleaveGeometryArgs args = {};
     assert(input.positionBuffer.offsetFromSlice() % 4 == 0);
     args.positionOffset = input.positionBuffer.offsetFromSlice() / 4;
     args.positionStride = input.positionBuffer.stride() / 4;
@@ -870,8 +871,14 @@ namespace dxvk {
       ONCE(Logger::err(str::format("[rtx-interleaver] Unsupported position buffer format (", args.positionFormat, ")")));
       return;
     }
-    args.hasNormals = input.normalBuffer.defined();
-    if (args.hasNormals) {
+    if (input.postVsPositionIsHomogeneousClip)
+      args.attributeFlags |= INTERLEAVE_GEOMETRY_FLAG_HOMOGENEOUS_CLIP;
+    args.clipToPosition = input.postVsClipToPosition;
+    // Homogeneous clip capture is written by transform feedback and requires
+    // the GPU interleaver for inverse-projection + perspective divide.
+    mustUseGPU |= input.postVsPositionIsHomogeneousClip;
+    bool hasNormals = input.normalBuffer.defined();
+    if (hasNormals) {
       mustUseGPU |= input.normalBuffer.isPendingGpuWrite() || input.normalBuffer.mapPtr() == nullptr;
       assert(input.normalBuffer.offsetFromSlice() % 4 == 0);
       args.normalOffset = input.normalBuffer.offsetFromSlice() / 4;
@@ -882,11 +889,14 @@ namespace dxvk {
         // DX11_V252: actually skip it. Leaving hasNormals set ran the decoder
         // on a format its switch has no case for - undefined behavior on the
         // CPU path (observed hard crash at the first accepted scene draw).
-        args.hasNormals = false;
+        hasNormals = false;
       }
     }
-    args.hasTexcoord = input.texcoordBuffer.defined();
-    if (args.hasTexcoord) {
+    if (hasNormals)
+      args.attributeFlags |= INTERLEAVE_GEOMETRY_FLAG_HAS_NORMALS;
+
+    bool hasTexcoord = input.texcoordBuffer.defined();
+    if (hasTexcoord) {
       mustUseGPU |= input.texcoordBuffer.isPendingGpuWrite() || input.texcoordBuffer.mapPtr() == nullptr;
       assert(input.texcoordBuffer.offsetFromSlice() % 4 == 0);
       args.texcoordOffset = input.texcoordBuffer.offsetFromSlice() / 4;
@@ -894,11 +904,14 @@ namespace dxvk {
       args.texcoordFormat = input.texcoordBuffer.vertexFormat();
       if (!interleaver::formatConversionFloatSupported(args.texcoordFormat)) {
         ONCE(Logger::warn(str::format("[rtx-interleaver] Unsupported texcoord buffer format (", args.texcoordFormat, "), skipping texcoord")));
-        args.hasTexcoord = false; // DX11_V252: see normals note - never decode unsupported formats
+        hasTexcoord = false; // DX11_V252: see normals note - never decode unsupported formats
       }
     }
-    args.hasColor0 = input.color0Buffer.defined();
-    if (args.hasColor0) {
+    if (hasTexcoord)
+      args.attributeFlags |= INTERLEAVE_GEOMETRY_FLAG_HAS_TEXCOORD;
+
+    bool hasColor0 = input.color0Buffer.defined();
+    if (hasColor0) {
       mustUseGPU |= input.color0Buffer.isPendingGpuWrite() || input.color0Buffer.mapPtr() == nullptr;
       assert(input.color0Buffer.offsetFromSlice() % 4 == 0);
       args.color0Offset = input.color0Buffer.offsetFromSlice() / 4;
@@ -906,15 +919,18 @@ namespace dxvk {
       args.color0Format = input.color0Buffer.vertexFormat();
       if (!interleaver::formatConversionUintSupported(args.color0Format)) {
         ONCE(Logger::warn(str::format("[rtx-interleaver] Unsupported color0 buffer format (", args.color0Format, "), skipping color0")));
-        args.hasColor0 = false; // DX11_V252: see normals note - never decode unsupported formats
+        hasColor0 = false; // DX11_V252: see normals note - never decode unsupported formats
       }
     }
+    if (hasColor0)
+      args.attributeFlags |= INTERLEAVE_GEOMETRY_FLAG_HAS_COLOR0;
 
     args.minVertexIndex = 0;
     assert(output.stride % 4 == 0);
     args.outputStride = output.stride / 4;
     args.vertexCount = input.vertexCount;
-    args.forceNormals = (forceNormals && !input.normalBuffer.defined()) ? 1 : 0;
+    if (forceNormals && !input.normalBuffer.defined())
+      args.attributeFlags |= INTERLEAVE_GEOMETRY_FLAG_FORCE_NORMALS;
 
     const uint32_t kNumVerticesToProcessOnCPU = 1024;
     const bool useGPU = input.vertexCount > kNumVerticesToProcessOnCPU || mustUseGPU;
@@ -923,11 +939,11 @@ namespace dxvk {
       ctx->bindResourceBuffer(INTERLEAVE_GEOMETRY_BINDING_OUTPUT, DxvkBufferSlice(output.buffer));
 
       ctx->bindResourceBuffer(INTERLEAVE_GEOMETRY_BINDING_POSITION_INPUT, input.positionBuffer);
-      if (args.hasNormals)
+      if (hasNormals)
         ctx->bindResourceBuffer(INTERLEAVE_GEOMETRY_BINDING_NORMAL_INPUT, input.normalBuffer);
-      if (args.hasTexcoord)
+      if (hasTexcoord)
         ctx->bindResourceBuffer(INTERLEAVE_GEOMETRY_BINDING_TEXCOORD_INPUT, input.texcoordBuffer);
-      if (args.hasColor0)
+      if (hasColor0)
         ctx->bindResourceBuffer(INTERLEAVE_GEOMETRY_BINDING_COLOR0_INPUT, input.color0Buffer);
 
       ctx->setPushConstantBank(DxvkPushConstantBank::RTX);

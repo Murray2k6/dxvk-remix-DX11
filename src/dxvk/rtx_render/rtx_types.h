@@ -332,6 +332,24 @@ struct RasterGeometry {
   GeometryHashes hashes;
   Future<GeometryHashes> futureGeometryHashes;
 
+  // DX11 post-VS capture cannot be read back on the CPU before BLAS
+  // submission. The stable identity lets DrawCallCache distinguish captured
+  // draws without its unsafe material-only heuristic. The output-state seed is
+  // combined with the original IA position hash when the hash future completes;
+  // it may additionally vary per frame for VS-skinned output.
+  XXH64_hash_t postVsCaptureIdentity = 0;
+  XXH64_hash_t postVsPositionHashSeed = 0;
+  bool hasPostVsPositionHashSeed = false;
+  // True only when the vertex contents themselves deform/change (skinning or
+  // a renameable IA stream). Camera/object movement changes instance
+  // placement, not the captured mesh, and must not force another BLAS.
+  bool postVsCapturedPositionsDynamic = false;
+  // Exact SV_Position capture stores homogeneous clip xyzw. The geometry
+  // interleaver applies this inverse projection and divides by w before the
+  // position reaches the BLAS, yielding the rasterizer's true view-space mesh.
+  bool postVsPositionIsHomogeneousClip = false;
+  Matrix4 postVsClipToPosition = Matrix4();
+
   // Actual vertex/index count (when applicable) as calculated by geo-engine
   uint32_t vertexCount = 0;
   uint32_t indexCount = 0;
@@ -573,6 +591,12 @@ struct DrawCallTransforms {
   // inverse camera block, so an unresolved camera is never mistaken for a
   // valid camera-relative one.
   bool cameraRelativeView = false;
+  // The DX11 vertex-capture path has recovered the rasterizer's exact
+  // homogeneous SV_Position and reconstructed it into a replacement
+  // view-space world. This candidate must outrank inferred raster-pass
+  // cameras, otherwise CameraManager's first-touch rule can lock the path
+  // tracer to a shadow/reflection/helper view for the entire frame.
+  bool exactReplacementCamera = false;
   // DX11_V285: set by the DX11 layer when the draw renders into an offscreen
   // color target (water reflection, environment cubemap, mirror pass) whose
   // extent matches neither the swapchain output nor the established scene

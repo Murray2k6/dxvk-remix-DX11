@@ -56,6 +56,10 @@ namespace dxvk {
     // Must be called with the context lock held.
     // EndFrame runs the RT pipeline writing output into backbuffer (called BEFORE recording the blit).
     void EndFrame(const Rc<DxvkImage>& backbuffer, VkExtent2D remixViewportExtent = { 0u, 0u });
+    // Queue the same final-image capture used by the Remix developer window.
+    // The swapchain WndProc uses this for Print Screen after consuming the key
+    // before it reaches the vanilla game.
+    void RequestScreenshot();
     // OnPresent registers the swapchain present image (called AFTER recording the blit).
     void OnPresent(const Rc<DxvkImage>& swapchainImage, VkExtent2D remixViewportExtent = { 0u, 0u });
 
@@ -169,6 +173,18 @@ namespace dxvk {
       // DX11_V280: no-TEXCOORD-layout draws whose UVs were recovered from the
       // vertex shader's output via the stream-out capture replay.
       uint32_t texcoordCaptured = 0;
+      // DX11_V290: draws whose true post-skinning/post-transform world/view
+      // positions were captured from the vertex shader for BLAS input.
+      uint32_t positionCaptured = 0;
+      // Camera-relative draws must never fall back to a guessed cbuffer world
+      // matrix when exact post-VS capture is unavailable. Mixing those two
+      // coordinate systems creates the giant enclosing planes/black rectangle
+      // failure. These draws are deliberately omitted instead.
+      uint32_t unsafeCameraRelativeSkipped = 0;
+      // Exact post-VS captures that could not be scheduled inside the bounded
+      // per-frame GPU work/allocation budget. Kept separate from structural
+      // capture failures so field logs show whether a scene needs more budget.
+      uint32_t positionCaptureBudgetRejected = 0;
       uint32_t position2D = 0;
       uint32_t noPositionBuffer = 0;
       uint32_t noIndexBuffer = 0;
@@ -259,12 +275,6 @@ namespace dxvk {
     // the two paths cannot drift apart again.
     void UpdateTrackedExtents(const Rc<DxvkImage>& outputImage, VkExtent2D remixViewportExtent);
 
-    // Synthetic placeholder textures for untextured draws, keyed by pixel
-    // shader instance, so those draws are listable / pickable / taggable in
-    // the texture tools. See getOrCreateUntexturedPlaceholder.
-    std::unordered_map<const void*, TextureRef> m_untexturedPlaceholders;
-    TextureRef getOrCreateUntexturedPlaceholder();
-
     Rc<DxvkSampler> getDefaultSampler() const;
 
     // DX11_V280_TEXCOORD_CAPTURE: recover texture coordinates for textured
@@ -277,6 +287,18 @@ namespace dxvk {
                                          bool indexed, UINT count, UINT start, INT base);
     uint32_t     m_texcoordCapturesThisFrame = 0;
     VkDeviceSize m_texcoordCaptureBytesThisFrame = 0;
+
+    // DX11_V290_POST_VS_POSITION_CAPTURE: re-evaluate shader-generated vertex
+    // positions into a device-local stream before the RT scene consumes them.
+    // This is required when IA POSITION is object space but skinning and all
+    // model/view transforms live only in the game VS.
+    bool TryCapturePositionsViaStreamOut(DrawCallState& dcs, RasterGeometry& geo,
+                                         bool indexed, UINT count, UINT start, INT base,
+                                         bool hasExternalInstanceTransform);
+    uint32_t     m_positionCapturesThisFrame = 0;
+    uint32_t     m_positionNewCaptureBuffersThisFrame = 0;
+    uint32_t     m_positionReplayCapturesThisFrame = 0;
+    VkDeviceSize m_positionCaptureBytesThisFrame = 0;
 
     // DX11_V286_GAMEPLAY_MATRIX_DUMP: env-free camera diagnostic. Steam's DRM
     // relaunch strips DXVK_REMIX_MTXDUMP from the child process, so the env
@@ -309,6 +331,28 @@ namespace dxvk {
     std::unordered_map<uint64_t, TexcoordCaptureEntry> m_texcoordCaptureCache;
     VkDeviceSize m_texcoordCaptureCacheBytes = 0;
     void SweepTexcoordCaptureCache(uint32_t currentFrame);
+
+    struct PositionCaptureEntry {
+      Rc<DxvkBuffer> buffer;
+      VkDeviceSize   capacity = 0;
+      uint32_t       lastUsedFrame = 0;
+      uint32_t       lastCapturedFrame = ~0u;
+      uint64_t       contractIdentity = 0;
+      uint64_t       transformStateIdentity = 0;
+      bool           hasTransformStateIdentity = false;
+      Matrix4        canonicalCapturedToWorld;
+      bool           hasCanonicalCapturedToWorld = false;
+      // Homogeneous clip coordinates must always be unprojected with the
+      // inverse projection from the capture that produced them. Keeping this
+      // pair together lets projection jitter/FOV changes reuse unchanged
+      // geometry without mixing old clip coordinates with a new projection.
+      Matrix4        capturedClipToPosition;
+      bool           hasCapturedClipToPosition = false;
+    };
+    std::unordered_map<uint64_t, PositionCaptureEntry> m_positionCaptureCache;
+    std::unordered_map<uint64_t, uint32_t> m_positionCaptureOccurrencesThisFrame;
+    VkDeviceSize m_positionCaptureCacheBytes = 0;
+    void SweepPositionCaptureCache(uint32_t currentFrame);
 
     // DX11_V285_HELPER_BUFFER_POOL: host-visible helper buffers (dynamic
     // vertex/index snapshots, format-conversion outputs, skinning streams)

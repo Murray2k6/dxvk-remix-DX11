@@ -355,11 +355,30 @@ function Repair-RemixApiLine79Line130Corruption {
   Copy-Item -LiteralPath $file -Destination $backup -Force
   $linesOut.Add(('Backed up current file to: {0}' -f $backup))
 
-  $restored = $false
+  # A clean working-tree copy is already the authoritative source.  The old
+  # repair path unconditionally ran `git checkout`, which both discarded local
+  # development changes and makes builds fail when the Git index is read-only
+  # (as it is in managed build environments).  Only restore when the current
+  # file actually contains the historical corruption signature.
+  $currentText = [System.IO.File]::ReadAllText($file)
+  $currentHead = ($currentText -split "`r?`n" | Select-Object -First 200) -join "`n"
+  $currentOpens = ([regex]::Matches($currentText, '\{')).Count
+  $currentCloses = ([regex]::Matches($currentText, '\}')).Count
+  $restored =
+    $currentText -match '"Add/remove function registration"' -and
+    $currentHead -notmatch '\bout_result\b|\binterf\b|REMIXAPI_ERROR_CODE_SUCCESS' -and
+    $currentText -notmatch 'DX11_BUILD_NONFATAL_REMIX_API_REGISTRATION_ASSERT|DX11_BUILD_OLD_UNSAFE_REMIX_API_REGISTRATION_ASSERT' -and
+    $currentOpens -eq $currentCloses
+
+  if ($restored) {
+    $linesOut.Add('OK: current rtx_remix_api.cpp passed corruption and structural checks; no restore required.')
+    Log "V106 current rtx_remix_api.cpp is clean; preserving working-tree source."
+  }
+
   $git = Get-Command git.exe -ErrorAction SilentlyContinue
   if (!$git) { $git = Get-Command git -ErrorAction SilentlyContinue }
 
-  if ($git) {
+  if (-not $restored -and $git) {
     Push-Location $BaseDir
     try {
       & $git.Source checkout -- ($rel -replace '\\','/') *> $null

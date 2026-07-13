@@ -211,17 +211,30 @@ namespace dxvk {
   }
 
 
-  void DxbcCompiler::processXfbPassthrough() {
+  void DxbcCompiler::processXfbPassthrough(bool preserveSystemValues) {
     m_module.setExecutionMode (m_entryPointId, spv::ExecutionModeInputPoints);
     m_module.setExecutionMode (m_entryPointId, spv::ExecutionModeOutputPoints);
     m_module.setOutputVertices(m_entryPointId, 1);
     m_module.setInvocations   (m_entryPointId, 1);
 
+    bool needsPerVertexInput = false;
     for (auto e = m_isgn->begin(); e != m_isgn->end(); e++) {
-      emitDclInput(e->registerId, 1,
-        e->componentMask, DxbcSystemValue::None,
-        DxbcInterpolationMode::Undefined);
+      if (preserveSystemValues && e->systemValue == DxbcSystemValue::Position) {
+        needsPerVertexInput = true;
+      } else {
+        emitDclInput(e->registerId, 1,
+          e->componentMask, DxbcSystemValue::None,
+          DxbcInterpolationMode::Undefined);
+      }
     }
+
+    // A vertex or domain shader's SV_Position is linked to the SPIR-V
+    // per-vertex BuiltIn Position block, not to a generic location. The normal
+    // D3D stream-output passthrough intentionally treats signature elements as
+    // generic registers, but the Remix position capture must retain this
+    // system-value linkage or it will record unrelated/undefined vertex data.
+    if (needsPerVertexInput)
+      emitDclInputPerVertex(1, "gs_vertex_in");
 
     // Figure out which streams to enable
     uint32_t streamMask = 0;
@@ -230,7 +243,7 @@ namespace dxvk {
       streamMask |= 1u << m_xfbVars[i].streamId;
     
     for (uint32_t streamId : bit::BitMask(streamMask)) {
-      emitXfbOutputSetup(streamId, true);
+      emitXfbOutputSetup(streamId, true, preserveSystemValues);
       m_module.opEmitVertex(m_module.constu32(streamId));
     }
 
@@ -7043,6 +7056,7 @@ namespace dxvk {
       xfbVar.varId = emitNewVariable(varInfo);
       xfbVar.streamId = xfbEntry->streamId;
       xfbVar.outputId = sigEntry->registerId;
+      xfbVar.systemValue = sigEntry->systemValue;
       xfbVar.srcMask = DxbcRegMask(srcComponentMask);
       xfbVar.dstMask = DxbcRegMask(dstComponentMask);
       m_xfbVars.push_back(xfbVar);
@@ -7073,17 +7087,29 @@ namespace dxvk {
 
   void DxbcCompiler::emitXfbOutputSetup(
           uint32_t                          streamId,
-          bool                              passthrough) {
+          bool                              passthrough,
+          bool                              preserveSystemValues) {
     for (size_t i = 0; i < m_xfbVars.size(); i++) {
       if (m_xfbVars[i].streamId == streamId) {
-        DxbcRegisterPointer srcPtr = passthrough
-          ? m_vRegs[m_xfbVars[i].outputId]
-          : m_oRegs[m_xfbVars[i].outputId];
+        DxbcRegisterValue value;
 
-        if (passthrough) {
-          srcPtr = emitArrayAccess(srcPtr,
-            spv::StorageClassInput,
-            m_module.constu32(0));
+        if (passthrough && preserveSystemValues
+         && m_xfbVars[i].systemValue == DxbcSystemValue::Position) {
+          value = emitGsSystemValueLoad(
+            DxbcSystemValue::Position, m_xfbVars[i].srcMask, 0);
+        } else {
+          DxbcRegisterPointer srcPtr = passthrough
+            ? m_vRegs[m_xfbVars[i].outputId]
+            : m_oRegs[m_xfbVars[i].outputId];
+
+          if (passthrough) {
+            srcPtr = emitArrayAccess(srcPtr,
+              spv::StorageClassInput,
+              m_module.constu32(0));
+          }
+
+          value = emitRegisterExtract(
+            emitValueLoad(srcPtr), m_xfbVars[i].srcMask);
         }
         
         DxbcRegisterPointer dstPtr;
@@ -7091,8 +7117,6 @@ namespace dxvk {
         dstPtr.type.ccount = m_xfbVars[i].dstMask.popCount();
         dstPtr.id = m_xfbVars[i].varId;
 
-        DxbcRegisterValue value = emitRegisterExtract(
-          emitValueLoad(srcPtr), m_xfbVars[i].srcMask);
         emitValueStore(dstPtr, value, m_xfbVars[i].dstMask);
       }
     }

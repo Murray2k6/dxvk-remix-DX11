@@ -318,7 +318,6 @@ namespace dxvk {
     RTX_OPTION("rtx", bool, enableUnrealTextureFixes, true, "DX11: applies generic albedo texture-selection reinforcement (boost strong-albedo mipmapped textures, demote scene/intermediate surfaces). Despite the legacy name this is engine-agnostic and helps any game/engine, so it defaults ON; set false to disable.");
     RTX_OPTION("rtx", bool, enableSource2Fixes, false, "DX11: applies Source 2 engine specific fixes when true.");
     RTX_OPTION("rtx", bool, ignoreSecondaryTextures, false, "DX11: only consider the primary color texture per draw when true.");
-    RTX_OPTION("rtx", bool, taggableUntexturedDraws, false, "DX11: allows untextured color-writing draws to receive a placeholder texture when true.");
     RTX_OPTION("rtx", bool, useInputAssemblerNormals, false, "DX11: sources vertex normals from the input assembler layout when true.");
     // Note: This time is in milliseconds, should be named something like millisecondDeltaBetweenFrames ideally, but keeping it as it is for now.
     RTX_OPTION_ENV("rtx", float, timeDeltaBetweenFrames, 0.f, "RTX_FRAME_TIME_DELTA_MS",

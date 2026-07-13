@@ -26,6 +26,48 @@ namespace dxvk
 {
 
 namespace {
+  bool postVsCaptureIdentityMatch(const DrawCallState& drawCall, const BlasEntry& blas) {
+    const XXH64_hash_t drawIdentity =
+      drawCall.getGeometryData().postVsCaptureIdentity;
+    return drawIdentity != kEmptyHash
+        && drawIdentity == blas.input.getGeometryData().postVsCaptureIdentity;
+  }
+
+  bool postVsCaptureInvolved(const DrawCallState& drawCall, const BlasEntry& blas) {
+    return drawCall.getGeometryData().postVsCaptureIdentity != kEmptyHash
+        || blas.input.getGeometryData().postVsCaptureIdentity != kEmptyHash;
+  }
+
+  void logPreventedMaterialOnlyReuse(
+      const DrawCallState& drawCall, const BlasEntry& blas,
+      bool materialHashesMatch) {
+    const bool vertexDataMatches =
+      drawCall.getGeometryData().getHashForRule<rules::VertexDataHash>()
+        == blas.input.getGeometryData().getHashForRule<rules::VertexDataHash>();
+    const bool boneHashesMatch =
+      drawCall.getSkinningState().boneHash == blas.input.getSkinningState().boneHash;
+    if (!materialHashesMatch
+     || (vertexDataMatches && boneHashesMatch)
+     || postVsCaptureIdentityMatch(drawCall, blas))
+      return;
+
+    static uint32_t s_logCount = 0;
+    if (s_logCount++ >= 32)
+      return;
+
+    Logger::warn(str::format(
+      "[RTX Geometry Identity] prevented material-only BLAS reuse: material=0x",
+      std::hex, drawCall.getMaterialData().getHash(),
+      " postVs=", postVsCaptureInvolved(drawCall, blas) ? 1 : 0,
+      " drawCapture=0x", drawCall.getGeometryData().postVsCaptureIdentity,
+      " cachedCapture=0x", blas.input.getGeometryData().postVsCaptureIdentity,
+      " drawVertex=0x",
+      drawCall.getGeometryData().hashes[HashComponents::VertexPosition],
+      " cachedVertex=0x",
+      blas.input.getGeometryData().hashes[HashComponents::VertexPosition],
+      std::dec));
+  }
+
   bool exactMatch(const DrawCallState& drawCall, BlasEntry& blas) {
     auto isSky = [](CameraType::Enum t) {
       return t == CameraType::Sky;
@@ -67,7 +109,19 @@ DrawCallCache::CacheState DrawCallCache::get(const DrawCallState& drawCall, Blas
     const bool boneHashesMatch = entry.input.getSkinningState().boneHash == drawCall.getSkinningState().boneHash;
     const bool materialHashesMatch = entry.input.getMaterialData().getHash() == drawCall.getMaterialData().getHash();
 
-    if (exactMatch(drawCall, entry) || !updatedThisFrame && (vertexDataMatches && boneHashesMatch || materialHashesMatch)) {
+    logPreventedMaterialOnlyReuse(drawCall, entry, materialHashesMatch);
+
+    const bool reusableCapturedOutput =
+      postVsCaptureIdentityMatch(drawCall, entry)
+      && (!updatedThisFrame
+       || !drawCall.getGeometryData().postVsCapturedPositionsDynamic);
+    const bool reusableLegacyOutput =
+      !postVsCaptureInvolved(drawCall, entry)
+      && !updatedThisFrame
+      && vertexDataMatches
+      && boneHashesMatch;
+
+    if (exactMatch(drawCall, entry) || reusableCapturedOutput || reusableLegacyOutput) {
       // Exact vertex match that is reusable for the current draw call,
       // or something that hasn't been updated this frame and is similar enough.
       // Matching the logic in the multi-element loop below.
@@ -81,49 +135,56 @@ DrawCallCache::CacheState DrawCallCache::get(const DrawCallState& drawCall, Blas
     }
   }
 
-  // Bucket has multiple BlasEntries
-
-  float bestScore = std::numeric_limits<float>::min();
-  Matrix4 newTransform = drawCall.getTransformData().objectToWorld;
-  const Vector3 newWorldPosition = drawCall.getGeometryData().boundingBox.getTransformedCentroid(newTransform);
+  // Bucket has multiple BlasEntries. Geometry may be reused only when its
+  // vertex/bone identity (or exact post-VS capture identity) matches. A material
+  // hash is shading state, never geometry identity: accepting it here attached
+  // faces and other textures to unrelated sky/terrain meshes in DX11 games.
+  const bool drawIsPostVsCaptured =
+    drawCall.getGeometryData().postVsCaptureIdentity != kEmptyHash;
 
   for (auto bucketIter = range.first; bucketIter != range.second; bucketIter++) {
     BlasEntry& blas  = bucketIter->second;
+    const bool cachedIsPostVsCaptured =
+      blas.input.getGeometryData().postVsCaptureIdentity != kEmptyHash;
+    const bool materialHashesMatch =
+      blas.input.getMaterialData().getHash() == drawCall.getMaterialData().getHash();
+    logPreventedMaterialOnlyReuse(drawCall, blas, materialHashesMatch);
+
     if (exactMatch(drawCall, blas)) {
       *out = &blas;
       return CacheState::kExisted;
     }
-    if (blas.frameLastTouched == m_device->getCurrentFrameId()) {
+    if (blas.frameLastTouched == m_device->getCurrentFrameId()
+     && (drawIsPostVsCaptured
+       ? drawCall.getGeometryData().postVsCapturedPositionsDynamic
+       : true)) {
       continue;
     }
-    // TODO these heuristics could use more refinement.
-    float score = 0;
-    if (blas.modifiedGeometryData.hashes[HashComponents::VertexPosition] == drawCall.getGeometryData().hashes[HashComponents::VertexPosition] &&
-        blas.input.getSkinningState().boneHash == drawCall.getSkinningState().boneHash) {
-      score += 1000.f;
+    if (drawIsPostVsCaptured != cachedIsPostVsCaptured)
+      continue;
+
+    if (drawIsPostVsCaptured) {
+      if (postVsCaptureIdentityMatch(drawCall, blas)) {
+        *out = &blas;
+        return CacheState::kExisted;
+      }
+      continue;
     }
-    if (blas.modifiedGeometryData.hashes[HashComponents::VertexTexcoord] == drawCall.getGeometryData().hashes[HashComponents::VertexTexcoord]) {
-      score += 1000.f;
-    }
-    if (blas.input.getMaterialData().getHash() == drawCall.getMaterialData().getHash()) {
-      score += 1000.f;
-    }
-    // TODO this is only checking the distance to the first instance that created the BlasEntry, not to
-    // each instance.  It also doesn't include the portal logic from InstanceManager.
-    Matrix4 oldTransform = blas.input.getTransformData().objectToWorld;
-    const Vector3 worldPosition = blas.input.getGeometryData().boundingBox.getTransformedCentroid(oldTransform);
-    score -= lengthSqr(newWorldPosition - worldPosition);
-    if (score > bestScore) {
-      bestScore = score;
+
+    const bool vertexDataMatches =
+      blas.input.getGeometryData().getHashForRule<rules::VertexDataHash>()
+        == drawCall.getGeometryData().getHashForRule<rules::VertexDataHash>();
+    const bool boneHashesMatch =
+      blas.input.getSkinningState().boneHash == drawCall.getSkinningState().boneHash;
+    if (vertexDataMatches && boneHashesMatch) {
       *out = &blas;
+      return CacheState::kExisted;
     }
   }
-  if (*out == nullptr) {
-    // Failed to find similar blas, so allocate a new one
-    *out = allocateEntry(hash, drawCall);
-    return CacheState::kNew;
-  }
-  return CacheState::kExisted;
+
+  // No exact geometry identity in this topology bucket.
+  *out = allocateEntry(hash, drawCall);
+  return CacheState::kNew;
 
 }
 

@@ -137,30 +137,61 @@ namespace interleaver {
 
     uint32_t writeOffset = 0;
 
-    float3 position = convert(cb.positionFormat, srcPosition, srcVertexIndex * cb.positionStride + cb.positionOffset);
+    const uint32_t srcPositionIndex =
+      srcVertexIndex * cb.positionStride + cb.positionOffset;
+    float3 position = convert(cb.positionFormat, srcPosition, srcPositionIndex);
+    if ((cb.attributeFlags & INTERLEAVE_GEOMETRY_FLAG_HOMOGENEOUS_CLIP) != 0) {
+#ifdef __cplusplus
+      const vec4 clip(srcPosition[srcPositionIndex + 0],
+                      srcPosition[srcPositionIndex + 1],
+                      srcPosition[srcPositionIndex + 2],
+                      srcPosition[srcPositionIndex + 3]);
+      const mat4& m = cb.clipToPosition;
+      const vec4 p = m.m[0] * clip.x + m.m[1] * clip.y
+                   + m.m[2] * clip.z + m.m[3] * clip.w;
+      if (std::isfinite(p.x) && std::isfinite(p.y)
+       && std::isfinite(p.z) && std::isfinite(p.w)
+       && std::abs(p.w) > 1.0e-20f) {
+        const float invW = 1.0f / p.w;
+        position = float3(p.x * invW, p.y * invW, p.z * invW);
+      } else {
+        position = float3(0.0f, 0.0f, 0.0f);
+      }
+#else
+      const float4 clip = float4(srcPosition[srcPositionIndex + 0],
+                                 srcPosition[srcPositionIndex + 1],
+                                 srcPosition[srcPositionIndex + 2],
+                                 srcPosition[srcPositionIndex + 3]);
+      const float4 p = mul(cb.clipToPosition, clip);
+      if (all(isfinite(p)) && abs(p.w) > 1.0e-20f)
+        position = p.xyz / p.w;
+      else
+        position = float3(0.0f, 0.0f, 0.0f);
+#endif
+    }
     dst[idx * cb.outputStride + writeOffset++] = position.x;
     dst[idx * cb.outputStride + writeOffset++] = position.y;
     dst[idx * cb.outputStride + writeOffset++] = position.z;
 
-    if (cb.hasNormals) {
+    if ((cb.attributeFlags & INTERLEAVE_GEOMETRY_FLAG_HAS_NORMALS) != 0) {
       float3 normals = convert(cb.normalFormat, srcNormal, srcVertexIndex * cb.normalStride + cb.normalOffset);
       dst[idx * cb.outputStride + writeOffset++] = normals.x;
       dst[idx * cb.outputStride + writeOffset++] = normals.y;
       dst[idx * cb.outputStride + writeOffset++] = normals.z;
-    } else if (cb.forceNormals) {
+    } else if ((cb.attributeFlags & INTERLEAVE_GEOMETRY_FLAG_FORCE_NORMALS) != 0) {
       // Reserve normal space with zeros; will be filled by smooth normals pass
       dst[idx * cb.outputStride + writeOffset++] = 0.0f;
       dst[idx * cb.outputStride + writeOffset++] = 0.0f;
       dst[idx * cb.outputStride + writeOffset++] = 0.0f;
     }
 
-    if (cb.hasTexcoord) {
+    if ((cb.attributeFlags & INTERLEAVE_GEOMETRY_FLAG_HAS_TEXCOORD) != 0) {
       float3 texcoords = convert(cb.texcoordFormat, srcTexcoord, srcVertexIndex * cb.texcoordStride + cb.texcoordOffset);
       dst[idx * cb.outputStride + writeOffset++] = texcoords.x;
       dst[idx * cb.outputStride + writeOffset++] = texcoords.y;
     }
 
-    if (cb.hasColor0) {
+    if ((cb.attributeFlags & INTERLEAVE_GEOMETRY_FLAG_HAS_COLOR0) != 0) {
       uint3 color0 = convert(cb.color0Format, srcColor0, srcVertexIndex * cb.color0Stride + cb.color0Offset);
       dst[idx * cb.outputStride + writeOffset++] = asfloat(color0.x);
     }

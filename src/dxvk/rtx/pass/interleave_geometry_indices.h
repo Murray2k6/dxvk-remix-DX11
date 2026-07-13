@@ -22,22 +22,22 @@
 #ifndef RTX_PASS_INTERLEAVE_GEOMETRY_INDICES_H_DX11V225
 #define RTX_PASS_INTERLEAVE_GEOMETRY_INDICES_H_DX11V225 // DX11_V225_GUARD
 
+#include "rtx/utility/shader_types.h"
+
 struct InterleaveGeometryArgs {
   uint32_t positionOffset;
   uint32_t positionStride;
   uint32_t positionFormat;
 
-  uint32_t hasNormals;
+  uint32_t attributeFlags;
   uint32_t normalOffset;
   uint32_t normalStride;
   uint32_t normalFormat;
 
-  uint32_t hasTexcoord;
   uint32_t texcoordOffset;
   uint32_t texcoordStride;
   uint32_t texcoordFormat;
 
-  uint32_t hasColor0;
   uint32_t color0Offset;
   uint32_t color0Stride;
   uint32_t color0Format;
@@ -45,8 +45,23 @@ struct InterleaveGeometryArgs {
   uint32_t minVertexIndex;
   uint32_t outputStride;
   uint32_t vertexCount;
-  uint32_t forceNormals; // When set, reserve normal space in output even if hasNormals is false (writes zeros)
+
+  mat4 clipToPosition;
 };
+
+// Five independent booleans previously consumed five uint32 push-constant
+// slots. Packing them keeps this structure at DXVK's hard 128-byte maximum
+// even with the exact 4x4 clip-to-position matrix.
+#define INTERLEAVE_GEOMETRY_FLAG_HAS_NORMALS       0x01u
+#define INTERLEAVE_GEOMETRY_FLAG_HAS_TEXCOORD      0x02u
+#define INTERLEAVE_GEOMETRY_FLAG_HAS_COLOR0        0x04u
+#define INTERLEAVE_GEOMETRY_FLAG_FORCE_NORMALS     0x08u
+#define INTERLEAVE_GEOMETRY_FLAG_HOMOGENEOUS_CLIP  0x10u
+
+#ifdef __cplusplus
+static_assert(sizeof(InterleaveGeometryArgs) == 128,
+              "InterleaveGeometryArgs must fit DXVK's 128-byte push-constant bank");
+#endif
 
 #define INTERLEAVE_GEOMETRY_BINDING_OUTPUT           0
 #define INTERLEAVE_GEOMETRY_BINDING_POSITION_INPUT   1

@@ -261,6 +261,10 @@ namespace dxvk {
     uint32_t m_screenshotFrameNum = -1;
     uint32_t m_terminateAppFrameNum = -1;
     uint32_t m_framesWithoutValidScene = 0;
+    // DX11 black-frame diagnostics.  The logger is intentionally rate-limited:
+    // it records the complete ray-tracing pipeline state without turning a
+    // high-draw-count game into a logging workload of its own.
+    uint32_t m_lastRaytracerDiagnosticFrame = kInvalidFrameIndex;
     IntegrateIndirectMode m_prevIntegrateIndirectMode = IntegrateIndirectMode::Count;
 
     DxvkRaytracingInstanceState m_rtState;

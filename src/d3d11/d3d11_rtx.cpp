@@ -153,6 +153,7 @@ namespace dxvk {
     }
 
     mat.updateCachedHash();
+
   }
 
   Rc<DxvkSampler> D3D11Rtx::getDefaultSampler() const {
@@ -523,17 +524,12 @@ namespace dxvk {
         entry.buffer   = std::move(newBuffer);
         entry.capacity = capacity;
         entry.lastCapturedFrame = ~0u;
-      } else {
-        // Reusing last frame's buffer: rotate to a fresh physical slice (the
-        // standard dxvk discard/rename pattern) so this frame's stream-out
-        // write can never race GPU reads of the previous frame's contents.
-        // Later reads (BLAS/interleave record at EndFrame) resolve the newest
-        // slice, which is exactly this frame's UVs.
-        auto freshSlice = entry.buffer->allocSlice();
-        m_context->EmitCs([cBuffer = entry.buffer, cSlice = freshSlice](DxvkContext* ctx) {
-          ctx->invalidateBuffer(cBuffer, cSlice);
-        });
       }
+
+      // This is a dedicated device-local transform-feedback allocation. Reuse
+      // it and rely on DxvkContext's XFB-write/shader-read barriers; renaming it
+      // every frame retired untracked physical slices and caused the same
+      // process-memory growth as the position capture path.
 
       m_context->EmitCs([cGs = std::move(captureGs),
                          cBuf = DxvkBufferSlice(entry.buffer, 0, captureBytes),
@@ -619,6 +615,987 @@ namespace dxvk {
         ++sCacheResetLog;
         Logger::info("[D3D11Rtx] V285: texcoord capture cache reset (over budget)");
       }
+    }
+  }
+
+  // DX11_V290_POST_VS_POSITION_CAPTURE: replay the game VS and capture its
+  // shader-computed pre-projection view position. This fixes the fundamental
+  // mismatch in programmable D3D11 games where the IA POSITION is only bind
+  // pose/object space while skinning and model/view transforms exist solely in
+  // shader code. Feeding the IA stream to Remix produces exploded full-screen
+  // quads, black moving rectangles, and a black/noisy G-buffer before lighting.
+  bool D3D11Rtx::TryCapturePositionsViaStreamOut(
+      DrawCallState& dcs, RasterGeometry& geo,
+      bool indexed, UINT count, UINT start, INT base,
+      bool hasExternalInstanceTransform) {
+    static const bool s_disabled = env::getEnvVar("DXVK_REMIX_POSITION_CAPTURE") == "0";
+    // Keep the existing developer-menu control authoritative. Previously the
+    // checkbox disabled terrain vertex capture but this path ignored it and
+    // continued replaying every VS, making diagnosis and safe fallback
+    // impossible.
+    if (s_disabled || !useVertexCapture())
+      return false;
+
+    // SubmitInstancedDraw currently expands application instances on the CPU.
+    // Replaying a non-instanced point draw would always evaluate SV_InstanceID
+    // zero, so leave those draws on the explicit instance-transform path rather
+    // than capturing one instance and accidentally applying its transform twice.
+    if (hasExternalInstanceTransform)
+      return false;
+
+    if (!m_context->m_device->features().extTransformFeedback.transformFeedback)
+      return false;
+
+    if (m_context->m_state.gs.shader != nullptr
+     || m_context->m_state.hs.shader != nullptr
+     || m_context->m_state.ds.shader != nullptr)
+      return false;
+
+    for (const auto& soTarget : m_context->m_state.so.targets) {
+      if (soTarget.buffer != nullptr)
+        return false;
+    }
+
+    // A synthesized viewport projection cannot convert a shader view-space
+    // stream back to the same world coordinate system as the main camera.
+    if (dcs.transformData.usedViewportFallbackProjection)
+      return false;
+
+    DxvkInputAssemblyState restoreIa = { VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, VK_FALSE, 0 };
+    switch (m_context->m_state.ia.primitiveTopology) {
+      case D3D_PRIMITIVE_TOPOLOGY_POINTLIST:
+        restoreIa = { VK_PRIMITIVE_TOPOLOGY_POINT_LIST, VK_FALSE, 0 };
+        break;
+      case D3D_PRIMITIVE_TOPOLOGY_LINELIST:
+        restoreIa = { VK_PRIMITIVE_TOPOLOGY_LINE_LIST, VK_FALSE, 0 };
+        break;
+      case D3D_PRIMITIVE_TOPOLOGY_LINESTRIP:
+        restoreIa = { VK_PRIMITIVE_TOPOLOGY_LINE_STRIP, VK_TRUE, 0 };
+        break;
+      case D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST:
+        restoreIa = { VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, VK_FALSE, 0 };
+        break;
+      case D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP:
+        restoreIa = { VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP, VK_TRUE, 0 };
+        break;
+      default:
+        return false;
+    }
+
+    static constexpr uint32_t     kMaxCaptureVerticesPerDraw = 2u << 20;
+    // Cold allocations and updates have separate limits. A newly captured draw
+    // also creates its first BLAS/history allocation, so admitting hundreds in
+    // one Ultra-mode loading frame can consume gigabytes even when the stream-
+    // output buffers themselves are small. Existing captures need a wider
+    // update lane so camera/skinning motion does not make warmed geometry
+    // flicker. The total ceiling still bounds GPU work for pathological scenes.
+    static constexpr uint32_t     kMaxCapturesPerFrame       = 384u;
+    static constexpr uint32_t     kMaxNewCaptureBuffersPerFrame = 96u;
+    static constexpr uint32_t     kMaxReplayCapturesPerFrame = 384u;
+    static constexpr VkDeviceSize kMaxCaptureBytesPerFrame   = 24ull << 20;
+    static constexpr size_t       kMaxCacheEntries           = 2048u;
+    static constexpr VkDeviceSize kMaxCacheBytes             = 64ull << 20;
+
+    const uint32_t vertexCount = geo.vertexCount;
+    if (vertexCount == 0 || vertexCount > kMaxCaptureVerticesPerDraw)
+      return false;
+
+    if (m_context->m_state.vs.shader == nullptr)
+      return false;
+    const D3D11CommonShader* commonVs = m_context->m_state.vs.shader->GetCommonShader();
+    if (commonVs == nullptr || !commonVs->HasPositionCaptureCandidate())
+      return false;
+
+    const bool capturesHomogeneousClip =
+      commonVs->IsPositionCaptureHomogeneousClipSpace();
+    const uint32_t captureStride = capturesHomogeneousClip ? 16u : 12u;
+    const VkDeviceSize captureBytes =
+      VkDeviceSize(vertexCount) * captureStride;
+    Matrix4 capturedClipToPosition;
+    if (capturesHomogeneousClip) {
+      // Exact SV_Position is already the complete result of the game's vertex
+      // transform.  Reconstruct the position directly in the replacement
+      // camera's view-space world.  Do NOT also apply objectToView here: that
+      // matrix is inferred independently and, when it is merely plausible
+      // rather than the exact shader transform, inverse(O2V) turns ordinary
+      // meshes into the giant camera-enclosing slabs seen in the RT G-buffer.
+      // inverse(P) * clip followed by the homogeneous divide is sufficient and
+      // is valid for every game whose raster projection was recovered.
+      const Matrix4 inverseProjection = inverse(dcs.transformData.viewToProjection);
+      capturedClipToPosition = inverseProjection;
+      for (uint32_t column = 0; column < 4; ++column) {
+        for (uint32_t row = 0; row < 4; ++row) {
+          if (!std::isfinite(capturedClipToPosition[column][row]))
+            return false;
+        }
+      }
+    }
+
+    Rc<DxvkShader> captureGs = commonVs->GetPositionCaptureShader();
+    if (captureGs == nullptr)
+      return false;
+
+    const D3D11CapturedPositionSpace positionSpace = commonVs->GetPositionCaptureSpace();
+    // SV_Position capture has no distinct non-system output to factor against
+    // clip space.  Its exact transform dependency is the original POSITION to
+    // SV_Position chain.  Using the output-to-clip binding here always returned
+    // null for the full-replacement camera path and forced every draw to replay
+    // forever.  Pre-projection profile captures still use their proven
+    // output-to-clip relationship.
+    const D3D11PositionTransformBinding* captureBinding = capturesHomogeneousClip
+      ? commonVs->GetPositionTransformBinding()
+      : commonVs->GetPositionCaptureClipTransformBinding();
+    const bool capturedSkinnedPositions =
+      geo.blendWeightBuffer.defined()
+      && geo.blendIndicesBuffer.defined()
+      && geo.numBonesPerVertex >= 2;
+
+    const uint32_t firstVertex = indexed ? uint32_t(std::max(base, 0)) : start;
+    std::array<bool, D3D11_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT> captureInputSlots = {};
+    if (m_context->m_state.ia.inputLayout != nullptr) {
+      for (const auto& semantic : m_context->m_state.ia.inputLayout->GetRtxSemantics()) {
+        if (semantic.inputSlot < captureInputSlots.size())
+          captureInputSlots[semantic.inputSlot] = true;
+      }
+    } else {
+      captureInputSlots.fill(true);
+    }
+
+    // Hash only the constant registers that DXBC dataflow proved feed the
+    // captured clip position.  This is an engine-independent transform-state
+    // profile: unchanged registers mean a rigid mesh's captured view-space
+    // vertices are still exact, while camera/object motion changes the hash and
+    // schedules one new replay.  It avoids both blind per-frame replay and
+    // guesses over unrelated cbuffer matrices.
+    uint64_t homogeneousTransformStateIdentity = 0;
+    bool hasHomogeneousTransformStateIdentity = false;
+    bool usedCompleteShaderStateIdentity = false;
+    bool usedShaderDependencyProfile = false;
+    if (capturesHomogeneousClip) {
+      uint64_t stateHash = 0x5356504f53495449ull; // "SVPOSITI"
+      bool readable = true;
+      const bool hasNarrowTransformBinding = captureBinding != nullptr
+        && captureBinding->matrixCount >= 1u
+        && captureBinding->matrixCount <= 2u;
+
+      auto hashBoundConstantRange = [&](const D3D11ConstantBufferBinding& cb,
+                                        size_t byteOffset,
+                                        size_t byteLength) {
+        if (cb.buffer == nullptr)
+          return false;
+        const auto mapped = cb.buffer->GetMappedSlice();
+        const uint8_t* ptr = reinterpret_cast<const uint8_t*>(mapped.mapPtr);
+        const size_t bufferSize = cb.buffer->Desc()->ByteWidth;
+        const size_t bindingBase = size_t(cb.constantOffset) * 16u;
+        const size_t bindingEnd = cb.constantCount > 0
+          ? std::min(bindingBase + size_t(cb.constantCount) * 16u, bufferSize)
+          : bufferSize;
+        const size_t begin = bindingBase + byteOffset;
+        const size_t end = begin + byteLength;
+        if (ptr == nullptr || begin < bindingBase || end < begin
+         || begin >= bindingEnd || end > bindingEnd || end > bufferSize)
+          return false;
+        stateHash = XXH3_64bits_withSeed(ptr + begin, byteLength, stateHash);
+        return true;
+      };
+
+      auto isExactProjectionRegister = [&](uint32_t slot, uint32_t shaderRegister) {
+        if (m_projStage != 0 || m_projSlot != slot || m_projOffset == SIZE_MAX)
+          return false;
+        const auto& cb = m_context->m_state.vs.constantBuffers[slot];
+        const size_t absoluteRegisterOffset =
+          size_t(cb.constantOffset) * 16u + size_t(shaderRegister) * 16u;
+        return absoluteRegisterOffset >= m_projOffset
+            && absoluteRegisterOffset < m_projOffset + 64u;
+      };
+
+      if (hasNarrowTransformBinding) {
+        stateHash = XXH3_64bits_withSeed(
+          &captureBinding->matrixCount, sizeof(captureBinding->matrixCount), stateHash);
+        for (uint32_t matrixIndex = 0;
+             matrixIndex < captureBinding->matrixCount && readable;
+             ++matrixIndex) {
+          const auto& matrixBinding = captureBinding->matrices[matrixIndex];
+          if (matrixBinding.constantBufferSlot
+              >= D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT) {
+            readable = false;
+            break;
+          }
+          const auto& cb = m_context->m_state.vs.constantBuffers[
+            matrixBinding.constantBufferSlot];
+          for (uint32_t row = 0; row < 4u && readable; ++row) {
+            const uint32_t reg = matrixBinding.constantRegisters[row];
+            if (reg == UINT32_MAX) {
+              static constexpr uint64_t kAffineRow = 0x414646494e45572full;
+              stateHash = XXH3_64bits_withSeed(
+                &kAffineRow, sizeof(kAffineRow), stateHash);
+            } else if (isExactProjectionRegister(
+                         matrixBinding.constantBufferSlot, reg)) {
+              // Clip coordinates and inverse projection are stored as one
+              // cache entry below. Pure projection jitter/FOV changes do not
+              // alter the reconstructed view-space mesh and must not replay it.
+              static constexpr uint64_t kProjectionRegister =
+                0x50524f4a524547ull;
+              stateHash = XXH3_64bits_withSeed(
+                &kProjectionRegister, sizeof(kProjectionRegister), stateHash);
+            } else {
+              readable = hashBoundConstantRange(cb, size_t(reg) * 16u, 16u);
+            }
+          }
+        }
+      } else {
+        const auto& dependencyProfile =
+          commonVs->GetConstantBufferDependencyProfile();
+        if (dependencyProfile.complete) {
+          // This is the general optimized-shader path. The profile is parsed
+          // once from actual DXBC operands, so it is game-independent and
+          // includes every statically addressed register the shader can read.
+          usedShaderDependencyProfile = true;
+          for (const auto& dependency : dependencyProfile.dependencies) {
+            if (dependency.slot >=
+                D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT) {
+              readable = false;
+              break;
+            }
+
+            stateHash = XXH3_64bits_withSeed(
+              &dependency.slot, sizeof(dependency.slot), stateHash);
+            const auto& cb = m_context->m_state.vs.constantBuffers[
+              dependency.slot];
+            if (cb.buffer == nullptr) {
+              static constexpr uint64_t kUnboundConstantBuffer =
+                0x554e424f554e44ull;
+              stateHash = XXH3_64bits_withSeed(
+                &kUnboundConstantBuffer,
+                sizeof(kUnboundConstantBuffer), stateHash);
+              continue;
+            }
+
+            const size_t bufferSize = cb.buffer->Desc()->ByteWidth;
+            const size_t bindingBase = size_t(cb.constantOffset) * 16u;
+            const size_t bindingEnd = cb.constantCount > 0
+              ? std::min(bindingBase + size_t(cb.constantCount) * 16u, bufferSize)
+              : bufferSize;
+            if (bindingBase >= bindingEnd) {
+              readable = false;
+              break;
+            }
+
+            if (!dependency.wholeBuffer) {
+              if (isExactProjectionRegister(
+                    dependency.slot, dependency.constantRegister)) {
+                static constexpr uint64_t kProjectionRegister =
+                  0x50524f4a524547ull;
+                stateHash = XXH3_64bits_withSeed(
+                  &kProjectionRegister, sizeof(kProjectionRegister), stateHash);
+              } else {
+                readable = hashBoundConstantRange(
+                  cb, size_t(dependency.constantRegister) * 16u, 16u);
+              }
+              if (!readable)
+                break;
+              continue;
+            }
+
+            // Dynamic indexing makes the whole visible slot relevant. Split
+            // around the exact projection block so TAA jitter remains a
+            // camera change, not a geometry/BLAS change.
+            const bool projectionInThisBinding =
+              m_projStage == 0 && m_projSlot == dependency.slot
+              && m_projOffset != SIZE_MAX
+              && m_projOffset >= bindingBase
+              && m_projOffset + 64u <= bindingEnd;
+            if (!projectionInThisBinding) {
+              readable = hashBoundConstantRange(
+                cb, 0u, bindingEnd - bindingBase);
+            } else {
+              const size_t projectionRelative = m_projOffset - bindingBase;
+              if (projectionRelative > 0u)
+                readable = hashBoundConstantRange(
+                  cb, 0u, projectionRelative);
+              if (readable && m_projOffset + 64u < bindingEnd) {
+                const size_t suffixRelative = projectionRelative + 64u;
+                readable = hashBoundConstantRange(
+                  cb, suffixRelative, bindingEnd - (m_projOffset + 64u));
+              }
+            }
+            if (!readable)
+              break;
+          }
+        } else {
+          // Only a dynamically selected cbuffer SLOT defeats the bounded
+          // profile. Preserve the exact conservative fallback for that case.
+          usedCompleteShaderStateIdentity = true;
+          bool anyConstantBuffer = false;
+          for (uint32_t slot = 0;
+               slot < D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT && readable;
+               ++slot) {
+            const auto& cb = m_context->m_state.vs.constantBuffers[slot];
+            if (cb.buffer == nullptr)
+              continue;
+            anyConstantBuffer = true;
+            const size_t bufferSize = cb.buffer->Desc()->ByteWidth;
+            const size_t bindingBase = size_t(cb.constantOffset) * 16u;
+            const size_t bindingEnd = cb.constantCount > 0
+              ? std::min(bindingBase + size_t(cb.constantCount) * 16u, bufferSize)
+              : bufferSize;
+            if (bindingBase >= bindingEnd) {
+              readable = false;
+              break;
+            }
+            stateHash = XXH3_64bits_withSeed(&slot, sizeof(slot), stateHash);
+            readable = hashBoundConstantRange(
+              cb, 0u, bindingEnd - bindingBase);
+          }
+          readable &= anyConstantBuffer;
+        }
+      }
+
+      // Dynamic IA buffers are host visible in DXVK. Hash precisely the vertex
+      // interval replayed by transform feedback, so WRITE_NO_OVERWRITE changes
+      // invalidate the capture while an unchanged renamed buffer does not create
+      // a new BLAS every frame. Device-local inputs retain their logical/physical
+      // allocation identity below and are immutable in the common static path.
+      for (uint32_t slot = 0; slot < captureInputSlots.size() && readable; ++slot) {
+        if (!captureInputSlots[slot])
+          continue;
+        const auto& vb = m_context->m_state.ia.vertexBuffers[slot];
+        if (vb.buffer == nullptr || vb.stride == 0)
+          continue;
+        stateHash = XXH3_64bits_withSeed(&slot, sizeof(slot), stateHash);
+        stateHash = XXH3_64bits_withSeed(&vb.offset, sizeof(vb.offset), stateHash);
+        stateHash = XXH3_64bits_withSeed(&vb.stride, sizeof(vb.stride), stateHash);
+        if (vb.buffer->GetMapMode() == D3D11_COMMON_BUFFER_MAP_MODE_NONE)
+          continue;
+        const DxvkBufferSliceHandle mapped = vb.buffer->GetMappedSlice();
+        const uint8_t* ptr = reinterpret_cast<const uint8_t*>(mapped.mapPtr);
+        const size_t bufferSize = vb.buffer->Desc()->ByteWidth;
+        const size_t begin = size_t(vb.offset) + size_t(firstVertex) * vb.stride;
+        const size_t byteLength = size_t(vertexCount) * vb.stride;
+        if (ptr == nullptr || begin >= bufferSize || byteLength > bufferSize - begin) {
+          readable = false;
+          break;
+        }
+        stateHash = XXH3_64bits_withSeed(ptr + begin, byteLength, stateHash);
+      }
+
+      // A vertex-stage SRV can contain animation/displacement data that is not
+      // represented by IA or cbuffers. Until its resource content hash is wired
+      // into this state key, keep that uncommon path strictly per-frame.
+      for (const auto& view : m_context->m_state.vs.shaderResources.views) {
+        if (view != nullptr) {
+          readable = false;
+          break;
+        }
+      }
+      if (readable) {
+        homogeneousTransformStateIdentity = stateHash != 0
+          ? stateHash : 0x9e3779b97f4a7c15ull;
+        hasHomogeneousTransformStateIdentity = true;
+      }
+    }
+    // Homogeneous output is reconstructed into CURRENT view space, so camera
+    // and rigid-object motion changes the mesh vertices and requires a replay.
+    // This intentionally trades coverage for correctness under the bounded
+    // capture budget: an omitted draw cannot occlude the valid scene, while a
+    // stale or guessed transform can cover the entire camera with a false wall.
+    bool captureMustReplayEveryFrame = capturedSkinnedPositions
+      || (capturesHomogeneousClip && !hasHomogeneousTransformStateIdentity);
+    // View-space vertices bake placement into the BLAS, so the draw cache must
+    // keep separate same-frame BLAS slots for separate instances even when the
+    // transform-register state allowed the capture replay itself to be reused.
+    const bool capturedDynamicPositions = capturesHomogeneousClip
+      || captureMustReplayEveryFrame;
+    const Matrix4 originalObjectToWorld = dcs.transformData.objectToWorld;
+    const Matrix4 originalObjectToView = dcs.transformData.objectToView;
+    Matrix4 capturedToWorld;
+    Matrix4 capturedToView;
+    if (capturesHomogeneousClip) {
+      // The BLAS vertices are current view-space positions.  Both the RT camera
+      // and instance placement are therefore identity; projection is the only
+      // transform shared with rasterization.  This is the full replacement
+      // camera path and has no dependency on an engine's world-matrix layout.
+      capturedToWorld = Matrix4();
+      capturedToView = Matrix4();
+    } else if (positionSpace == D3D11CapturedPositionSpace::World) {
+      // The VS output already lives in the game's world coordinate system.
+      // Applying inverse(view) here would transform it a second time and is the
+      // precise cause of camera-following slabs/black rectangles.
+      capturedToWorld = Matrix4();
+      capturedToView = dcs.transformData.worldToView;
+    } else {
+      // A genuine view-space output becomes stable RT world space through the
+      // inverse of the exact camera view matrix used for this draw.
+      capturedToWorld = inverse(dcs.transformData.worldToView);
+      capturedToView = Matrix4();
+      for (uint32_t column = 0; column < 4; ++column) {
+        for (uint32_t row = 0; row < 4; ++row) {
+          if (!std::isfinite(capturedToWorld[column][row]))
+            return false;
+        }
+      }
+    }
+
+    // The profile selects which VS output to capture; its world/view label is
+    // only a compatibility fallback. Prefer the exact matrix that DXBC
+    // dataflow proved transforms this output into SV_Position. Factoring that
+    // matrix C against Remix's active projection P yields captured-to-view
+    // A = inverse(P) * C. Composing inverse(gameView) * A then recovers the
+    // correct object/world transform for view-, world-, and object-space
+    // outputs without engine-specific matrix layouts.
+    bool usedShaderProvenCaptureTransform = false;
+    if (!capturesHomogeneousClip
+     && captureBinding != nullptr
+     && captureBinding->matrixCount >= 1u
+     && captureBinding->matrixCount <= 2u) {
+      auto finiteMatrix = [](const Matrix4& matrix) {
+        for (uint32_t column = 0; column < 4; ++column) {
+          for (uint32_t row = 0; row < 4; ++row) {
+            if (!std::isfinite(matrix[column][row]))
+              return false;
+          }
+        }
+        return true;
+      };
+      auto readShaderMatrix = [&](const D3D11PositionTransformMatrixBinding& matrixBinding,
+                                  Matrix4& matrix) {
+        if (matrixBinding.constantBufferSlot
+            >= D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT)
+          return false;
+        const auto& cb = m_context->m_state.vs.constantBuffers[
+          matrixBinding.constantBufferSlot];
+        if (cb.buffer == nullptr)
+          return false;
+
+        const auto mapped = cb.buffer->GetMappedSlice();
+        const uint8_t* ptr = reinterpret_cast<const uint8_t*>(mapped.mapPtr);
+        const size_t bufferSize = cb.buffer->Desc()->ByteWidth;
+        const size_t bindingBase = size_t(cb.constantOffset) * 16u;
+        const size_t bindingEnd = cb.constantCount > 0
+          ? std::min(bindingBase + size_t(cb.constantCount) * 16u, bufferSize)
+          : bufferSize;
+        if (ptr == nullptr || bindingBase >= bindingEnd)
+          return false;
+
+        for (uint32_t row = 0; row < 4; ++row) {
+          const size_t offset = bindingBase
+            + size_t(matrixBinding.constantRegisters[row]) * 16u;
+          if (offset + 16u > bindingEnd || offset + 16u > bufferSize)
+            return false;
+          std::memcpy(matrix[row].data, ptr + offset, 16u);
+        }
+        return finiteMatrix(matrix);
+      };
+      auto affineScore = [&](const Matrix4& candidate) -> float {
+        if (!finiteMatrix(candidate))
+          return -1.0e30f;
+        const float affineError =
+            std::abs(candidate[0][3])
+          + std::abs(candidate[1][3])
+          + std::abs(candidate[2][3])
+          + std::abs(candidate[3][3] - 1.0f);
+        if (affineError > 0.03f)
+          return -1.0e30f;
+
+        float score = 30.0f - affineError * 500.0f;
+        Vector3 axes[3];
+        for (uint32_t column = 0; column < 3; ++column) {
+          const float lengthSq =
+              candidate[0][column] * candidate[0][column]
+            + candidate[1][column] * candidate[1][column]
+            + candidate[2][column] * candidate[2][column];
+          if (!std::isfinite(lengthSq)
+           || lengthSq < 1.0e-10f || lengthSq > 1.0e10f)
+            return -1.0e30f;
+          const float invLength = 1.0f / std::sqrt(lengthSq);
+          axes[column] = Vector3(
+            candidate[0][column] * invLength,
+            candidate[1][column] * invLength,
+            candidate[2][column] * invLength);
+        }
+        const float shear = std::abs(dot(axes[0], axes[1]))
+                          + std::abs(dot(axes[0], axes[2]))
+                          + std::abs(dot(axes[1], axes[2]));
+        if (shear > 1.5f)
+          return -1.0e30f;
+        return score - shear * 2.0f;
+      };
+
+      std::array<Matrix4, 2> shaderMatrices;
+      bool readable = true;
+      for (uint32_t i = 0; i < captureBinding->matrixCount; ++i)
+        readable &= readShaderMatrix(captureBinding->matrices[i], shaderMatrices[i]);
+
+      if (readable) {
+        Matrix4 captureToClip;
+        bool captureToClipValid = false;
+        if (captureBinding->matrixCount == 1u) {
+          // DXBC dp4 consumes each cbuffer vector as one mathematical row.
+          // Matrix4 stores mathematical columns, so the exact transform is the
+          // transpose of the four vectors copied from the cbuffer.
+          captureToClip = transpose(shaderMatrices[0]);
+          captureToClipValid = finiteMatrix(captureToClip);
+        } else {
+          const Matrix4 captureFromBase = transpose(shaderMatrices[0]);
+          const Matrix4 clipFromBase = transpose(shaderMatrices[1]);
+          const Matrix4 inverseCaptureFromBase = inverse(captureFromBase);
+          if (finiteMatrix(inverseCaptureFromBase)) {
+            // captured = A * base, clip = B * base, therefore
+            // clip = B * inverse(A) * captured. Matrix order is proven by the
+            // DXBC dp4 dataflow; accepting the reverse order merely because it
+            // also looked affine selected a plausible but spatially wrong
+            // camera and produced the giant wall/black-rectangle frame.
+            captureToClip = clipFromBase * inverseCaptureFromBase;
+            captureToClipValid = finiteMatrix(captureToClip);
+          }
+        }
+
+        const Matrix4 inverseProjection = inverse(dcs.transformData.viewToProjection);
+        const Matrix4 inverseView = inverse(dcs.transformData.worldToView);
+        if (captureToClipValid
+         && finiteMatrix(inverseProjection) && finiteMatrix(inverseView)) {
+          const Matrix4 provenCapturedToView = inverseProjection * captureToClip;
+          const float provenScore = affineScore(provenCapturedToView);
+          if (provenScore > -1.0e20f) {
+            const Matrix4 bestCapturedToWorld = inverseView * provenCapturedToView;
+            if (finiteMatrix(bestCapturedToWorld)) {
+              capturedToView = provenCapturedToView;
+              capturedToWorld = bestCapturedToWorld;
+              usedShaderProvenCaptureTransform = true;
+
+              static uint32_t sCaptureTransformLogs = 0;
+              if (sCaptureTransformLogs++ < 24u) {
+                const auto& clipMatrixBinding = captureBinding->matrices[
+                  captureBinding->matrixCount - 1u];
+                Logger::info(str::format(
+                  "[D3D11Rtx] shader-proven captured-to-view: vs=",
+                  commonVs->GetName(), " matrices=", captureBinding->matrixCount,
+                  " clipCb=", clipMatrixBinding.constantBufferSlot, " clipRegs=",
+                  clipMatrixBinding.constantRegisters[0], ",",
+                  clipMatrixBinding.constantRegisters[1], ",",
+                  clipMatrixBinding.constantRegisters[2], ",",
+                  clipMatrixBinding.constantRegisters[3],
+                  " factorScore=", provenScore,
+                  " toViewTranslation=",
+                  provenCapturedToView[3][0], ",",
+                  provenCapturedToView[3][1], ",",
+                  provenCapturedToView[3][2],
+                  " profileSpace=",
+                  positionSpace == D3D11CapturedPositionSpace::World
+                    ? "world" : "view"));
+              }
+            }
+          }
+        }
+      }
+    }
+
+    // Keep the output identity separate from the capture-buffer storage key.
+    // The identity describes the draw contract, not the current allocation
+    // backing that contract. Dynamic D3D11 buffers are routinely renamed, so
+    // including their object addresses here made one mesh acquire a new BLAS
+    // identity every frame and eventually allowed cached material/geometry
+    // associations to drift. Original vertex contents are incorporated by
+    // RasterGeometry::finalizeGeometryHashes; slot/offset/stride still separate
+    // distinct streams that share the same shader and draw range.
+    const std::string shaderIdentity = commonVs->GetName();
+    uint64_t outputIdentity = XXH3_64bits(
+      shaderIdentity.data(), shaderIdentity.size());
+    auto mixOutputIdentity = [&outputIdentity](uint64_t v) {
+      outputIdentity ^= v + 0x9e3779b97f4a7c15ull
+        + (outputIdentity << 6) + (outputIdentity >> 2);
+    };
+    mixOutputIdentity(firstVertex);
+    mixOutputIdentity(vertexCount);
+    mixOutputIdentity(positionSpace == D3D11CapturedPositionSpace::World ? 1u : 0u);
+    mixOutputIdentity(capturesHomogeneousClip ? 0x434c495034ull : 0x5052455033ull);
+    mixOutputIdentity(usedShaderProvenCaptureTransform ? 0x50524f56454eull : 0x46414c4c4241434bull);
+    for (uint32_t slot = 0; slot < D3D11_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT; ++slot) {
+      if (!captureInputSlots[slot])
+        continue;
+      const auto& vb = m_context->m_state.ia.vertexBuffers[slot];
+      if (vb.buffer == nullptr)
+        continue;
+      mixOutputIdentity(slot);
+      mixOutputIdentity(vb.offset);
+      mixOutputIdentity(vb.stride);
+    }
+    // Homogeneous capture is converted back to the mesh's pre-instance space,
+    // so placement/camera matrices must not become part of BLAS identity. The
+    // original IA content hash is folded in asynchronously below. Legacy
+    // pre-projection capture still needs its explicit transform contract.
+    const uint64_t captureContractIdentity = capturesHomogeneousClip
+      ? outputIdentity
+      : XXH3_64bits_withSeed(
+          &originalObjectToWorld, sizeof(originalObjectToWorld), outputIdentity);
+
+    // Capture-buffer storage must never be keyed by global draw order or by a
+    // physical rename slice. Both change routinely between frames. Start with
+    // the exact logical draw contract and logical D3D11 input buffers; repeated
+    // occurrences of that same contract receive a small per-contract ordinal
+    // below, so same-frame instances cannot overwrite one another.
+    uint64_t cacheKey = captureContractIdentity;
+    auto mixCacheKey = [&cacheKey](uint64_t value) {
+      cacheKey ^= value + 0x9e3779b97f4a7c15ull
+        + (cacheKey << 6) + (cacheKey >> 2);
+    };
+    for (uint32_t slot = 0; slot < D3D11_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT; ++slot) {
+      if (!captureInputSlots[slot])
+        continue;
+      const auto& vb = m_context->m_state.ia.vertexBuffers[slot];
+      if (vb.buffer == nullptr)
+        continue;
+      mixCacheKey(slot);
+      mixCacheKey(uint64_t(reinterpret_cast<uintptr_t>(vb.buffer.ptr())));
+      mixCacheKey(uint64_t(vb.offset));
+      mixCacheKey(uint64_t(vb.stride));
+    }
+    if (capturesHomogeneousClip) {
+      const uint64_t contractKey = cacheKey;
+      const uint32_t occurrence =
+        m_positionCaptureOccurrencesThisFrame[contractKey]++;
+      mixCacheKey(occurrence);
+    }
+    if (cacheKey == 0)
+      cacheKey = 0x9e3779b97f4a7c15ull;
+
+    const uint32_t curFrame = m_context->m_device->getCurrentFrameId();
+    VkDeviceSize desiredCapacity = 4096u;
+    while (desiredCapacity < captureBytes)
+      desiredCapacity <<= 1;
+
+    auto existing = m_positionCaptureCache.find(cacheKey);
+    const VkDeviceSize existingCapacity = existing != m_positionCaptureCache.end()
+      ? existing->second.capacity
+      : 0u;
+    const VkDeviceSize additionalCapacity = desiredCapacity > existingCapacity
+      ? desiredCapacity - existingCapacity
+      : 0u;
+
+    // Keep this cache strictly bounded. Whole-cache resets were unsafe: they
+    // released hundreds of capture buffers while transform-feedback and BLAS
+    // commands were still in flight, causing allocation spikes and device loss.
+    // Evict only least-recently-used entries not referenced this frame; command
+    // list Rc references preserve their physical lifetime until GPU completion.
+    while (m_positionCaptureCacheBytes + additionalCapacity > kMaxCacheBytes
+        || (existing == m_positionCaptureCache.end()
+         && m_positionCaptureCache.size() >= kMaxCacheEntries)) {
+      auto oldest = m_positionCaptureCache.end();
+      for (auto it = m_positionCaptureCache.begin(); it != m_positionCaptureCache.end(); ++it) {
+        if (it->first == cacheKey || it->second.lastUsedFrame == curFrame)
+          continue;
+        if (oldest == m_positionCaptureCache.end()
+         || it->second.lastUsedFrame < oldest->second.lastUsedFrame)
+          oldest = it;
+      }
+      if (oldest == m_positionCaptureCache.end())
+        return false;
+      m_positionCaptureCacheBytes -= oldest->second.capacity;
+      m_positionCaptureCache.erase(oldest);
+      existing = m_positionCaptureCache.find(cacheKey);
+    }
+
+    PositionCaptureEntry& entry = existing != m_positionCaptureCache.end()
+      ? existing->second
+      : m_positionCaptureCache.emplace(cacheKey, PositionCaptureEntry()).first->second;
+    if (entry.contractIdentity != captureContractIdentity) {
+      entry.contractIdentity = captureContractIdentity;
+      entry.lastCapturedFrame = ~0u;
+      entry.hasTransformStateIdentity = false;
+      entry.hasCanonicalCapturedToWorld = false;
+      entry.hasCapturedClipToPosition = false;
+    }
+
+    // A rigid mesh captured against a real, persistent world/view camera must
+    // not be overwritten whenever the camera moves. Preserve the first captured
+    // view coordinate system and its matching inverse-view transform as one
+    // canonical object space. Camera-relative replacement-camera captures are
+    // classified dynamic above because their virtual world itself moves with
+    // the camera; skinned and host-visible/renameable inputs are dynamic too.
+    // Legacy pre-projection view-space capture needs a canonical coordinate
+    // pair. Exact homogeneous capture reconstructs object space and must keep
+    // the CURRENT rigid instance placement; freezing camera-relative O2V here
+    // is what created camera-following slabs in the earlier implementation.
+    if (!capturedDynamicPositions && !capturesHomogeneousClip) {
+      if (!entry.hasCanonicalCapturedToWorld) {
+        entry.canonicalCapturedToWorld = capturedToWorld;
+        entry.hasCanonicalCapturedToWorld = true;
+      }
+      capturedToWorld = entry.canonicalCapturedToWorld;
+    }
+
+    const bool haveUsableBuffer = entry.buffer != nullptr && entry.capacity >= captureBytes;
+    const bool transformStateMatches = capturesHomogeneousClip
+      && hasHomogeneousTransformStateIdentity
+      && entry.hasTransformStateIdentity
+      && entry.transformStateIdentity == homogeneousTransformStateIdentity;
+    const bool captureIsCurrent = haveUsableBuffer
+      && entry.lastCapturedFrame != ~0u
+      && (captureMustReplayEveryFrame
+        ? entry.lastCapturedFrame == curFrame
+        : (!capturesHomogeneousClip || transformStateMatches));
+    entry.lastUsedFrame = curFrame;
+
+    if (!captureIsCurrent) {
+      const bool needsNewCaptureBuffer = !haveUsableBuffer;
+      const bool totalBudgetExhausted =
+        m_positionCapturesThisFrame >= kMaxCapturesPerFrame;
+      const bool classBudgetExhausted = needsNewCaptureBuffer
+        ? m_positionNewCaptureBuffersThisFrame >= kMaxNewCaptureBuffersPerFrame
+        : m_positionReplayCapturesThisFrame >= kMaxReplayCapturesPerFrame;
+      if (totalBudgetExhausted || classBudgetExhausted
+       || m_positionCaptureBytesThisFrame + captureBytes > kMaxCaptureBytesPerFrame) {
+        ++m_submitRejectStats.positionCaptureBudgetRejected;
+        static uint32_t sPositionCaptureBudgetLogCount = 0;
+        if (sPositionCaptureBudgetLogCount < 24) {
+          ++sPositionCaptureBudgetLogCount;
+          Logger::warn(str::format(
+            "[D3D11Rtx][position-capture] exact capture budget exhausted: draws=",
+            m_positionCapturesThisFrame, "/", kMaxCapturesPerFrame,
+            " new=", m_positionNewCaptureBuffersThisFrame, "/",
+            kMaxNewCaptureBuffersPerFrame,
+            " replay=", m_positionReplayCapturesThisFrame, "/",
+            kMaxReplayCapturesPerFrame,
+            " requestedClass=", needsNewCaptureBuffer ? "new" : "replay",
+            " bytesMiB=", m_positionCaptureBytesThisFrame >> 20,
+            "/", kMaxCaptureBytesPerFrame >> 20,
+            " requestedKiB=", captureBytes >> 10,
+            " vertices=", vertexCount,
+            " indexed=", indexed ? 1 : 0,
+            " count=", count,
+            " start=", start,
+            " base=", base,
+            " cameraRelative=", dcs.transformData.cameraRelativeView ? 1 : 0));
+        }
+        if (entry.buffer == nullptr)
+          m_positionCaptureCache.erase(cacheKey);
+        return false;
+      }
+
+      if (!haveUsableBuffer) {
+        DxvkBufferCreateInfo info;
+        info.size   = desiredCapacity;
+        info.usage  = VK_BUFFER_USAGE_TRANSFORM_FEEDBACK_BUFFER_BIT_EXT
+                    | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT
+                    | VK_BUFFER_USAGE_TRANSFER_SRC_BIT
+                    | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT;
+        info.stages = VK_PIPELINE_STAGE_TRANSFORM_FEEDBACK_BIT_EXT
+                    | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT
+                    | VK_PIPELINE_STAGE_TRANSFER_BIT;
+        info.access = VK_ACCESS_TRANSFORM_FEEDBACK_WRITE_BIT_EXT
+                    | VK_ACCESS_SHADER_READ_BIT
+                    | VK_ACCESS_TRANSFER_READ_BIT;
+
+        Rc<DxvkBuffer> newBuffer = m_context->m_device->createBuffer(
+          info, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+          DxvkMemoryStats::Category::RTXBuffer, "dx11 post-vs position capture");
+        if (newBuffer == nullptr) {
+          if (entry.buffer == nullptr)
+            m_positionCaptureCache.erase(cacheKey);
+          return false;
+        }
+        m_positionCaptureCacheBytes += desiredCapacity - entry.capacity;
+        entry.buffer = std::move(newBuffer);
+        entry.capacity = desiredCapacity;
+        entry.lastCapturedFrame = ~0u;
+        entry.hasCapturedClipToPosition = false;
+      }
+
+      // Transform feedback is the sole writer and the following BLAS build is
+      // the consumer. Reuse the dedicated device-local allocation and let
+      // DxvkContext insert the write/read barriers. Calling allocSlice() here
+      // renamed every camera-relative mesh every frame; those retired physical
+      // allocations were not represented by m_positionCaptureCacheBytes and
+      // grew process memory until Vulkan reported VK_ERROR_DEVICE_LOST.
+
+      m_context->EmitCs([cGs = std::move(captureGs),
+                         cBuf = DxvkBufferSlice(entry.buffer, 0, captureBytes),
+                         cCount = vertexCount,
+                         cFirst = firstVertex,
+                         cRestoreIa = restoreIa](DxvkContext* ctx) {
+        const DxvkInputAssemblyState pointIa = { VK_PRIMITIVE_TOPOLOGY_POINT_LIST, VK_FALSE, 0 };
+        ctx->bindShader(VK_SHADER_STAGE_GEOMETRY_BIT, cGs);
+        ctx->bindXfbBuffer(0, cBuf, DxvkBufferSlice());
+        ctx->setInputAssemblyState(pointIa);
+        ctx->draw(cCount, 1, cFirst, 0);
+        ctx->bindShader(VK_SHADER_STAGE_GEOMETRY_BIT, nullptr);
+        ctx->bindXfbBuffer(0, DxvkBufferSlice(), DxvkBufferSlice());
+        ctx->setInputAssemblyState(cRestoreIa);
+      });
+
+      entry.lastCapturedFrame = curFrame;
+      if (capturesHomogeneousClip) {
+        entry.capturedClipToPosition = capturedClipToPosition;
+        entry.hasCapturedClipToPosition = true;
+      }
+      if (capturesHomogeneousClip && hasHomogeneousTransformStateIdentity) {
+        entry.transformStateIdentity = homogeneousTransformStateIdentity;
+        entry.hasTransformStateIdentity = true;
+      } else {
+        entry.hasTransformStateIdentity = false;
+      }
+      ++m_positionCapturesThisFrame;
+      if (needsNewCaptureBuffer)
+        ++m_positionNewCaptureBuffersThisFrame;
+      else
+        ++m_positionReplayCapturesThisFrame;
+      m_positionCaptureBytesThisFrame += captureBytes;
+    }
+
+    if (capturesHomogeneousClip) {
+      // Never combine clip coordinates from an earlier capture with the
+      // current frame's inverse projection. That mismatch is a moving box/
+      // overlap around the camera. Projection-only changes deliberately reuse
+      // the paired matrix stored with the captured buffer.
+      if (!entry.hasCapturedClipToPosition)
+        return false;
+      capturedClipToPosition = entry.capturedClipToPosition;
+    }
+
+    const RasterBuffer capturedPositions(
+      DxvkBufferSlice(entry.buffer, 0, captureBytes),
+      0, captureStride,
+      capturesHomogeneousClip
+        ? VK_FORMAT_R32G32B32A32_SFLOAT
+        : VK_FORMAT_R32G32B32_SFLOAT);
+    geo.positionBuffer = capturedPositions;
+    dcs.geometryData.positionBuffer = capturedPositions;
+    geo.postVsPositionIsHomogeneousClip = capturesHomogeneousClip;
+    dcs.geometryData.postVsPositionIsHomogeneousClip = capturesHomogeneousClip;
+    geo.postVsCapturedPositionsDynamic = capturedDynamicPositions;
+    dcs.geometryData.postVsCapturedPositionsDynamic = capturedDynamicPositions;
+    if (capturesHomogeneousClip) {
+      geo.postVsClipToPosition = capturedClipToPosition;
+      dcs.geometryData.postVsClipToPosition = capturedClipToPosition;
+    }
+
+    // The VS has already performed skinning and every object/view transform.
+    // Do not run Remix skinning or transform the original object-space normals
+    // a second time. Missing normals are regenerated from the captured geometry.
+    geo.normalBuffer = RasterBuffer();
+    geo.blendWeightBuffer = RasterBuffer();
+    geo.blendIndicesBuffer = RasterBuffer();
+    geo.numBonesPerVertex = 0;
+    geo.boundingBox.invalidate();
+    dcs.geometryData.normalBuffer = RasterBuffer();
+    dcs.geometryData.blendWeightBuffer = RasterBuffer();
+    dcs.geometryData.blendIndicesBuffer = RasterBuffer();
+    dcs.geometryData.numBonesPerVertex = 0;
+    dcs.geometryData.boundingBox.invalidate();
+    dcs.futureSkinningData = Future<SkinningData>();
+    dcs.skinningData = SkinningData();
+
+    // Build a camera-independent identity for the captured output. Hashing all
+    // VS constant bytes included view/projection matrices, forcing a fresh BLAS
+    // for every static object on every camera movement until the process ran out
+    // of memory. The original IA position hash is combined later; objectToWorld
+    // separates placed instances, while skinned or renameable input is explicitly
+    // dynamic because its deformation has already been baked by the captured VS.
+    XXH64_hash_t outputHash = captureContractIdentity;
+    if (!capturedDynamicPositions && !capturesHomogeneousClip) {
+      // If a cache entry is evicted and later recreated under another camera,
+      // the new canonical view space must not reuse a BLAS containing vertices
+      // from the old one.
+      outputHash = XXH3_64bits_withSeed(
+        &capturedToWorld, sizeof(capturedToWorld), outputHash);
+    }
+    if (outputHash == 0)
+      outputHash = 0x9e3779b97f4a7c15ull;
+    geo.postVsCaptureIdentity = outputHash;
+    dcs.geometryData.postVsCaptureIdentity = outputHash;
+
+    // Dynamic output is already animated/renamed before it reaches the capture
+    // stream, so update its cached vertices and refit its BLAS every frame.
+    // Rigid view-space output instead uses the immutable canonical pair above.
+    if (capturesHomogeneousClip && hasHomogeneousTransformStateIdentity) {
+      outputHash = XXH3_64bits_withSeed(
+        &homogeneousTransformStateIdentity,
+        sizeof(homogeneousTransformStateIdentity), outputHash);
+    } else if (captureMustReplayEveryFrame) {
+      outputHash = XXH3_64bits_withSeed(&curFrame, sizeof(curFrame), outputHash);
+    }
+    if (outputHash == 0)
+      outputHash = 0x9e3779b97f4a7c15ull;
+    geo.postVsPositionHashSeed = outputHash;
+    geo.hasPostVsPositionHashSeed = true;
+    dcs.geometryData.postVsPositionHashSeed = outputHash;
+    dcs.geometryData.hasPostVsPositionHashSeed = true;
+
+    dcs.transformData.objectToWorld = capturedToWorld;
+    dcs.transformData.objectToView = capturedToView;
+    if (capturesHomogeneousClip) {
+      dcs.transformData.worldToView = Matrix4();
+      // Keep this marker set so RtxContext does not reinterpret the identity
+      // view as an unresolved/pre-combined game camera and decompose it again.
+      dcs.transformData.cameraRelativeView = true;
+      dcs.transformData.exactReplacementCamera = true;
+    } else {
+      dcs.transformData.cameraRelativeView = false;
+      dcs.transformData.exactReplacementCamera = false;
+    }
+
+    static uint32_t sPositionCaptureLogCount = 0;
+    if (sPositionCaptureLogCount < 24) {
+      ++sPositionCaptureLogCount;
+      Logger::info(str::format(
+        "[D3D11Rtx] V290: captured post-VS positions for RT geometry (space=",
+        positionSpace == D3D11CapturedPositionSpace::World ? "world" : "view",
+        ", verts=",
+        vertexCount, ", indexed=", indexed ? 1 : 0,
+        ", homogeneousClip=", capturesHomogeneousClip ? 1 : 0,
+        ", dynamic=", capturedDynamicPositions ? 1 : 0,
+        ", replayEveryFrame=", captureMustReplayEveryFrame ? 1 : 0,
+        ", transformState=", hasHomogeneousTransformStateIdentity ? 1 : 0,
+        ", transformStateSource=",
+        usedCompleteShaderStateIdentity ? "complete" :
+          (usedShaderDependencyProfile ? "dxbc-profile" : "proven"),
+        ", vs=", commonVs->GetName(),
+        ", drawId=", dcs.drawCallID,
+        ", count=", count,
+        ", start=", start,
+        ", base=", base,
+        ", projectionDiag=",
+        dcs.transformData.viewToProjection[0][0], ",",
+        dcs.transformData.viewToProjection[1][1], ",",
+        dcs.transformData.viewToProjection[2][2],
+        ", objectToViewTranslation=",
+        originalObjectToView[3][0], ",",
+        originalObjectToView[3][1], ",",
+        originalObjectToView[3][2], ")"));
+    }
+    return true;
+  }
+
+  void D3D11Rtx::SweepPositionCaptureCache(uint32_t currentFrame) {
+    static constexpr uint32_t     kEvictAfterFrames = 120u;
+    static constexpr VkDeviceSize kMaxCacheBytes    = 64ull << 20;
+
+    const bool overBudget = m_positionCaptureCacheBytes > kMaxCacheBytes;
+    if (!overBudget && (currentFrame & 63u) != 0u)
+      return;
+
+    for (auto it = m_positionCaptureCache.begin(); it != m_positionCaptureCache.end();) {
+      if (it->second.lastUsedFrame + kEvictAfterFrames < currentFrame) {
+        m_positionCaptureCacheBytes -= it->second.capacity;
+        it = m_positionCaptureCache.erase(it);
+      } else {
+        ++it;
+      }
+    }
+
+    // Allocation enforces this cap. If accounting ever drifts over it, evict
+    // entries individually; never clear buffers that may still be referenced
+    // by in-flight capture or BLAS work.
+    while (m_positionCaptureCacheBytes > kMaxCacheBytes
+        && !m_positionCaptureCache.empty()) {
+      auto oldest = m_positionCaptureCache.begin();
+      for (auto it = std::next(m_positionCaptureCache.begin());
+           it != m_positionCaptureCache.end(); ++it) {
+        if (it->second.lastUsedFrame < oldest->second.lastUsedFrame)
+          oldest = it;
+      }
+      m_positionCaptureCacheBytes -= oldest->second.capacity;
+      m_positionCaptureCache.erase(oldest);
     }
   }
 
@@ -3783,86 +4760,6 @@ namespace dxvk {
     return future;
   }
 
-  TextureRef D3D11Rtx::getOrCreateUntexturedPlaceholder() {
-    const auto& ps = m_context->m_state.ps;
-    const void* cacheKey = ps.shader.ptr();
-
-    auto it = m_untexturedPlaceholders.find(cacheKey);
-    if (it != m_untexturedPlaceholders.end())
-      return it->second;
-
-    // Hash from the pixel shader's content-derived key so the placeholder
-    // hash is identical across runs and machines (required for rtx.conf
-    // tags to persist); shaderless draws share a single fixed identity.
-    XXH64_hash_t hash;
-    if (ps.shader != nullptr) {
-      const std::string keyName = ps.shader->GetCommonShader()->GetShader()->getShaderKey().toString();
-      hash = XXH3_64bits(keyName.data(), keyName.size());
-    } else {
-      static const char kFixedKey[] = "remix-dx11-untextured";
-      hash = XXH3_64bits(kFixedKey, sizeof(kFixedKey) - 1);
-    }
-    if (hash == 0ull)
-      hash = 1ull;
-
-    DxvkImageCreateInfo info = {};
-    info.type        = VK_IMAGE_TYPE_2D;
-    info.format      = VK_FORMAT_R8G8B8A8_UNORM;
-    info.flags       = 0;
-    info.sampleCount = VK_SAMPLE_COUNT_1_BIT;
-    info.extent      = { 4u, 4u, 1u };
-    info.numLayers   = 1;
-    info.mipLevels   = 1;
-    info.usage       = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
-    info.stages      = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT
-                     | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT
-                     | VK_PIPELINE_STAGE_TRANSFER_BIT;
-    info.access      = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
-    info.tiling      = VK_IMAGE_TILING_OPTIMAL;
-    info.layout      = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-
-    Rc<DxvkImage> image = m_context->m_device->createImage(
-      info, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
-      DxvkMemoryStats::Category::AppTexture, "remix untextured placeholder");
-    image->setHash(hash);
-
-    DxvkImageViewCreateInfo viewInfo = {};
-    viewInfo.type      = VK_IMAGE_VIEW_TYPE_2D;
-    viewInfo.format    = info.format;
-    viewInfo.usage     = VK_IMAGE_USAGE_SAMPLED_BIT;
-    viewInfo.aspect    = VK_IMAGE_ASPECT_COLOR_BIT;
-    viewInfo.minLevel  = 0;
-    viewInfo.numLevels = 1;
-    viewInfo.minLayer  = 0;
-    viewInfo.numLayers = 1;
-
-    Rc<DxvkImageView> view = m_context->m_device->createImageView(image, viewInfo);
-
-    // Solid white at full alpha: Modulate(white, x) == x, so attaching the
-    // placeholder cannot change the rendered result of any combiner path.
-    m_context->EmitCs([cImage = image](DxvkContext* ctx) {
-      // Neutral 70% gray rather than pure white: a full-albedo surface is
-      // non-physical and lets path-traced light bounce without loss - rooms
-      // full of untextured geometry blow out to white. Gray keeps the
-      // modulate identity close (slightly darkens vertex-colored untextured
-      // surfaces) while keeping bounce energy sane.
-      static const uint32_t kGrayPixels[16] = {
-        0xFFB4B4B4u, 0xFFB4B4B4u, 0xFFB4B4B4u, 0xFFB4B4B4u,
-        0xFFB4B4B4u, 0xFFB4B4B4u, 0xFFB4B4B4u, 0xFFB4B4B4u,
-        0xFFB4B4B4u, 0xFFB4B4B4u, 0xFFB4B4B4u, 0xFFB4B4B4u,
-        0xFFB4B4B4u, 0xFFB4B4B4u, 0xFFB4B4B4u, 0xFFB4B4B4u };
-      ctx->updateImage(cImage,
-        VkImageSubresourceLayers { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
-        VkOffset3D { 0, 0, 0 },
-        VkExtent3D { 4u, 4u, 1u },
-        (void*) kGrayPixels, 4u * 4u, 4u * 4u * 4u);
-    });
-
-    TextureRef ref(view);
-    m_untexturedPlaceholders.emplace(cacheKey, ref);
-    return ref;
-  }
-
   void D3D11Rtx::FillMaterialData(LegacyMaterialData& mat) const {
     const auto& ps = m_context->m_state.ps;
     uint32_t textureID = 0;
@@ -4345,30 +5242,11 @@ namespace dxvk {
       }
     }
 
-    // Untextured draws are invisible to every texture tool: no hash in the
-    // browser, nothing for viewport object picking to hit, nothing to tag as
-    // ignore/UI/sky. With ray tracing on, an untextured surface that fills
-    // the screen is therefore impossible to select or remove from inside the
-    // UI. Attach a tiny solid-white placeholder whose hash derives from the
-    // pixel shader identity: white modulates to the same visual result as
-    // the untextured path, the hash is stable across runs and GPUs, and the
-    // draw becomes a first-class taggable citizen (including ignore-tags
-    // that remove it entirely).
-    // Depth-only prepass and shadow draws bind no color target; attaching a
-    // placeholder there turned invisible prepass geometry into solid albedo
-    // surfaces inside the path-traced scene (observed as a blown-out white
-    // screen in Unity titles, whose prepass draws have zero texture
-    // candidates). Only color-writing draws get the placeholder.
-    const bool writesColor = m_context->m_state.om.renderTargetViews[0].ptr() != nullptr;
-    if (textureID == 0 && writesColor && RtxOptions::taggableUntexturedDraws()) {
-      TextureRef placeholder = const_cast<D3D11Rtx*>(this)->getOrCreateUntexturedPlaceholder();
-      if (placeholder.getImageViewRc() != nullptr) {
-        mat.colorTextures[0] = std::move(placeholder);
-        mat.colorTextureSlot[0] = kInvalidResourceSlot;
-        mat.samplers[0] = getDefaultSampler();
-        textureID = 1;
-      }
-    }
+    // A draw with no real game texture stays genuinely untextured. It remains
+    // full path-traced geometry and uses the legacy material's constant/vertex
+    // albedo path, but receives no synthetic image and therefore no invented
+    // texture hash. Texture tagging and replacement remain exclusively tied to
+    // actual game textures or explicit user-authored material data.
 
     if (doLog) {
       Logger::info(str::format("[D3D11Rtx] FillMaterialData draw #", s_logCount,
@@ -4469,6 +5347,42 @@ namespace dxvk {
     }
 
     mat.updateCachedHash();
+
+    // DX11 authoring contract: source textures identify/tag materials, but do
+    // not shade captured geometry automatically. Keep every safe source image
+    // registered in the Remix texture browser above and retain the primary
+    // source hash so a user-authored replacement still resolves. The legacy
+    // surface itself is intentionally textureless and opaque until that
+    // replacement exists. This prevents the game raster/albedo from appearing
+    // mixed into the path-traced scene and stops heuristic slot selection from
+    // painting faces, sky, or terrain with another draw's texture.
+    const XXH64_hash_t sourceMaterialHash = mat.getHash();
+    for (uint32_t textureIndex = 0;
+         textureIndex < LegacyMaterialData::kMaxSupportedTextures;
+         ++textureIndex) {
+      mat.colorTextures[textureIndex] = TextureRef();
+      mat.samplers[textureIndex] = nullptr;
+      mat.colorTextureSlot[textureIndex] = kInvalidResourceSlot;
+    }
+    mat.textureColorArg1Source = RtTextureArgSource::TFactor;
+    mat.textureColorArg2Source = RtTextureArgSource::None;
+    mat.textureColorOperation = DxvkRtTextureOperation::SelectArg1;
+    mat.textureAlphaArg1Source = RtTextureArgSource::TFactor;
+    mat.textureAlphaArg2Source = RtTextureArgSource::None;
+    mat.textureAlphaOperation = DxvkRtTextureOperation::SelectArg1;
+    mat.tFactor = 0xffffffffu;
+    mat.alphaTestEnabled = false;
+    mat.blendMode.enableBlending = false;
+    mat.setHashOverride(sourceMaterialHash);
+
+    static uint32_t sTexturelessAuthoringLogCount = 0;
+    if (sourceMaterialHash != kEmptyHash && sTexturelessAuthoringLogCount < 12u) {
+      ++sTexturelessAuthoringLogCount;
+      Logger::info(str::format(
+        "[D3D11Rtx] Textureless RT authoring material: sourceTagHash=0x",
+        std::hex, sourceMaterialHash, std::dec,
+        " source remains available in Remix texture browser"));
+    }
   }
 
   void D3D11Rtx::SubmitDraw(bool indexed,
@@ -4848,6 +5762,9 @@ namespace dxvk {
     uint32_t drawVertexCount;
     uint32_t hashStart = 0;
     uint32_t hashCount;
+    bool indexRangeCpuVisible = false;
+    bool indexRangeExact = !indexed;
+    bool usedWholeVertexBufferFallback = false;
     if (!indexed) {
       // Non-indexed: relative vertices [0, count) after the start offset.
       if (count > maxVBVertices) {
@@ -4865,6 +5782,7 @@ namespace dxvk {
       uint32_t maxIndexPlusOne = 0;
       const uint32_t idxStrideBytes = std::max(idxBuffer.stride(), 1u);
       const void* idxScan = idxBuffer.defined() ? idxBuffer.mapPtr(0) : nullptr;
+      indexRangeCpuVisible = idxScan != nullptr;
       const uint32_t idxAvail = idxBuffer.defined()
         ? static_cast<uint32_t>(idxBuffer.length() / idxStrideBytes)
         : 0u;
@@ -4911,6 +5829,7 @@ namespace dxvk {
       }
       if (maxIndexPlusOne > 0) {
         // Exact maximum known - size the vertex range to it.
+        indexRangeExact = true;
         drawVertexCount = std::min(maxIndexPlusOne, maxVBVertices);
       } else {
         // Index data not CPU-readable (or draw too large to scan). Index values
@@ -4926,6 +5845,7 @@ namespace dxvk {
           ++m_submitRejectStats.vertexRangeRejected;
           return;
         }
+        usedWholeVertexBufferFallback = true;
         drawVertexCount = maxVBVertices;
       }
       hashCount = std::min(drawVertexCount, count);
@@ -4936,6 +5856,32 @@ namespace dxvk {
       hashCount = std::min(count, maxVBVertices);
     hashCount = std::min(hashCount, kMaxHashedVertices);
     geo.vertexCount = drawVertexCount;
+
+    // Persistent geometry-contract telemetry. GPU-only index buffers are
+    // common, but when their exact maximum is unavailable this draw must cover
+    // the entire remaining shared VB. Those ranges are the primary capture
+    // cost driver and were previously invisible except as unexplained 200k
+    // vertex replays. Log the exact addressing contract, not texture/material
+    // hashes, so one line is sufficient to diagnose offset/base mistakes.
+    if (indexed && (usedWholeVertexBufferFallback || drawVertexCount >= 65536u)) {
+      static uint32_t sLargeIndexedRangeLogCount = 0;
+      if (sLargeIndexedRangeLogCount < 48) {
+        ++sLargeIndexedRangeLogCount;
+        Logger::info(str::format(
+          "[D3D11Rtx][geometry-range] indexed draw: indices=", count,
+          " startIndex=", start,
+          " baseVertex=", base,
+          " indexStride=", idxBuffer.stride(),
+          " indexCpuVisible=", indexRangeCpuVisible ? 1 : 0,
+          " exactMax=", indexRangeExact ? 1 : 0,
+          " wholeVbFallback=", usedWholeVertexBufferFallback ? 1 : 0,
+          " vertices=", drawVertexCount,
+          " maxVbVertices=", maxVBVertices,
+          " positionStride=", posBuffer.stride(),
+          " positionSemanticOffset=", posBuffer.offsetFromSlice(),
+          " topology=", static_cast<uint32_t>(vkTopology)));
+      }
+    }
 
     // DX11_V250_DYNAMIC_BUFFER_SNAPSHOT: DrawCallStates are queued and the RT
     // scene is recorded at EndFrame, but D3D11 dynamic buffers are renamed
@@ -6408,16 +7354,32 @@ namespace dxvk {
     // and rendered black. When the draw carries vertex colors: untextured
     // draws select the vertex color directly; textured draws use the classic
     // fixed-function default, Modulate(texture, vertex color).
-    if (geo.color0Buffer.defined()) {
-      if (!dcs.materialData.usesTexture()) {
-        dcs.materialData.textureColorArg1Source = RtTextureArgSource::VertexColor0;
-        dcs.materialData.textureColorOperation  = DxvkRtTextureOperation::SelectArg1;
-        dcs.materialData.textureAlphaArg1Source = RtTextureArgSource::VertexColor0;
-        dcs.materialData.textureAlphaOperation  = DxvkRtTextureOperation::SelectArg1;
-      } else {
-        dcs.materialData.textureColorArg2Source = RtTextureArgSource::VertexColor0;
-        dcs.materialData.textureColorOperation  = DxvkRtTextureOperation::Modulate;
-      }
+    if (!dcs.materialData.usesTexture()) {
+      const XXH64_hash_t sourceTagHash = dcs.materialData.getHash();
+      // No image is created or bound here. Untextured geometry remains a real
+      // path-traced surface and reads its albedo from actual vertex color when
+      // present, otherwise from an opaque-white material constant. Selecting
+      // Texture with no image is undefined in the legacy combiner and was the
+      // direct reason genuinely untextured models could render black.
+      const RtTextureArgSource untexturedSource = geo.color0Buffer.defined()
+        ? RtTextureArgSource::VertexColor0
+        : RtTextureArgSource::TFactor;
+      dcs.materialData.textureColorArg1Source = untexturedSource;
+      dcs.materialData.textureColorArg2Source = RtTextureArgSource::None;
+      dcs.materialData.textureColorOperation  = DxvkRtTextureOperation::SelectArg1;
+      // Vertex alpha in modern DX11 layouts is frequently padding or baked
+      // data. With no real texture/PS alpha available, keep the path-traced
+      // surface opaque instead of allowing an incidental zero to erase it.
+      dcs.materialData.textureAlphaArg1Source = RtTextureArgSource::TFactor;
+      dcs.materialData.textureAlphaArg2Source = RtTextureArgSource::None;
+      dcs.materialData.textureAlphaOperation  = DxvkRtTextureOperation::SelectArg1;
+      dcs.materialData.tFactor = 0xffffffffu;
+      // Preserve the source texture's authoring/tag hash even though the
+      // image itself is intentionally absent from the base RT material.
+      dcs.materialData.setHashOverride(sourceTagHash);
+    } else if (geo.color0Buffer.defined()) {
+      dcs.materialData.textureColorArg2Source = RtTextureArgSource::VertexColor0;
+      dcs.materialData.textureColorOperation  = DxvkRtTextureOperation::Modulate;
       dcs.materialData.updateCachedHash();
     }
 
@@ -6606,6 +7568,44 @@ namespace dxvk {
       }
     }
 
+    // Recover the exact position the rasterizer saw only after every
+    // screen-space, missing-shader, and significance rejection has completed.
+    // Replaying rejected draws consumed the old capture budget before real
+    // scene geometry and created needless capture-buffer/BLAS pressure.
+    const uint32_t captureBudgetRejectsBefore =
+      m_submitRejectStats.positionCaptureBudgetRejected;
+    const bool capturedExactPositions = TryCapturePositionsViaStreamOut(
+      dcs, geo, indexed, count, start, base, instanceTransform != nullptr);
+    const bool exactCaptureBudgetRejected =
+      m_submitRejectStats.positionCaptureBudgetRejected != captureBudgetRejectsBefore;
+    if (capturedExactPositions) {
+      ++m_submitRejectStats.positionCaptured;
+    } else if (exactCaptureBudgetRejected
+            || (dcs.transformData.cameraRelativeView
+            && instanceTransform == nullptr
+            && dcs.usesVertexShader)) {
+      // A camera-relative camera defines the RT world as current view space.
+      // IA object-space positions combined with a guessed generic cbuffer
+      // matrix do not belong to that world. Submitting them anyway is worse
+      // than a missing mesh: their triangles become the enclosing slabs and
+      // camera-following black rectangle that occlude every valid hit.
+      ++m_submitRejectStats.unsafeCameraRelativeSkipped;
+      static uint32_t sUnsafeCameraRelativeSkipLogCount = 0;
+      if (sUnsafeCameraRelativeSkipLogCount < 32) {
+        ++sUnsafeCameraRelativeSkipLogCount;
+        Logger::warn(str::format(
+          "[D3D11Rtx][position-capture] skipped unsafe uncaptured draw: reason=",
+          exactCaptureBudgetRejected ? "budget" : "camera-relative",
+          " count=",
+          count,
+          " indexed=", indexed ? 1 : 0,
+          " start=", start,
+          " base=", base,
+          " drawId=", dcs.drawCallID));
+      }
+      return;
+    }
+
     DrawParameters params;
     params.instanceCount = 1;
     params.vertexCount   = indexed ? 0 : count;
@@ -6780,6 +7780,12 @@ namespace dxvk {
     }
   }
 
+  void D3D11Rtx::RequestScreenshot() {
+    m_context->EmitCs([](DxvkContext*) {
+      RtxContext::triggerScreenshot(false);
+    });
+  }
+
   void D3D11Rtx::EndFrame(const Rc<DxvkImage>& backbuffer, VkExtent2D remixViewportExtent) {
     // DX11_V263_CRASH_FILTER_SAFE: games install their own unhandled-exception
     // filter during startup, replacing ours; periodically re-assert so the
@@ -6809,10 +7815,16 @@ namespace dxvk {
     // DX11_V280: per-frame stream-out capture budget.
     m_texcoordCapturesThisFrame = 0;
     m_texcoordCaptureBytesThisFrame = 0;
+    m_positionCapturesThisFrame = 0;
+    m_positionNewCaptureBuffersThisFrame = 0;
+    m_positionReplayCapturesThisFrame = 0;
+    m_positionCaptureBytesThisFrame = 0;
+    m_positionCaptureOccurrencesThisFrame.clear();
 
     // DX11_V285: age out capture buffers for meshes no longer drawn, and
     // return provably-released helper buffers to the reuse pool.
     SweepTexcoordCaptureCache(m_context->m_device->getCurrentFrameId());
+    SweepPositionCaptureCache(m_context->m_device->getCurrentFrameId());
     RecycleHelperBuffers();
 
     UpdateTrackedExtents(backbuffer, remixViewportExtent);
@@ -6895,6 +7907,7 @@ namespace dxvk {
 
     const uint32_t sceneAcceptedDraws = m_submitRejectStats.sceneAccepted;
     const uint32_t realSceneAcceptedDraws = m_submitRejectStats.realSceneAccepted;
+    const uint32_t sceneCandidateDraws = m_submitRejectStats.sceneCandidates;
     const uint32_t trustedSceneAcceptedDraws = realSceneAcceptedDraws > 0
       ? realSceneAcceptedDraws
       : (m_hasSeenRealSceneProjection ? 0u : sceneAcceptedDraws);
@@ -6946,6 +7959,9 @@ namespace dxvk {
         " noTexcoord=", m_submitRejectStats.noTexcoordLayout,
         " texgen=", m_submitRejectStats.texcoordGenerated,
         " texCapture=", m_submitRejectStats.texcoordCaptured,
+        " posCapture=", m_submitRejectStats.positionCaptured,
+        " posCaptureBudget=", m_submitRejectStats.positionCaptureBudgetRejected,
+        " cameraRelativeUnsafe=", m_submitRejectStats.unsafeCameraRelativeSkipped,
         " noPosSem=", m_submitRejectStats.noPositionSemantic,
         " pos2D=", m_submitRejectStats.position2D,
         " noPosBuffer=", m_submitRejectStats.noPositionBuffer,
@@ -6962,7 +7978,9 @@ namespace dxvk {
         " helperRetired=", m_helperRetired.size(),
         " helperFree=", m_helperFree.size(),
         " uvCacheMiB=", m_texcoordCaptureCacheBytes >> 20,
-        " uvCacheEntries=", m_texcoordCaptureCache.size()));
+        " uvCacheEntries=", m_texcoordCaptureCache.size(),
+        " posCacheMiB=", m_positionCaptureCacheBytes >> 20,
+        " posCacheEntries=", m_positionCaptureCache.size()));
     }
 
     ResetCommandListState();
@@ -6977,7 +7995,7 @@ namespace dxvk {
     ++m_axisDetectFrame;
 
     const bool allowResizeCameraCarryover = m_resizeTransitionFramesRemaining > 0;
-    m_context->EmitCs([backbuffer, draws, acceptedDraws, sceneAcceptedDraws, realSceneAcceptedDraws, trustedSceneAcceptedDraws, allowResizeCameraCarryover](DxvkContext* ctx) {
+    m_context->EmitCs([backbuffer, draws, acceptedDraws, sceneAcceptedDraws, realSceneAcceptedDraws, sceneCandidateDraws, trustedSceneAcceptedDraws, allowResizeCameraCarryover](DxvkContext* ctx) {
       RtxContext* rtx = static_cast<RtxContext*>(ctx);
       const uint32_t fid = rtx->getDevice()->getCurrentFrameId();
       bool camValid = rtx->getSceneManager().getCamera().isValid(fid);
@@ -7034,9 +8052,19 @@ namespace dxvk {
           " draws=", draws, " camValid=", camValid ? 1 : 0));
       }
 
-      const bool hasAcceptedSceneDraws = draws > 0 || acceptedDraws > 0;
-      const bool hasGameSceneDraws = trustedSceneAcceptedDraws > 0 || acceptedDraws > 0;
+      // Only a draw that passed the scene classifier may start RTX.
+      // Generic accepted draws include Bink/video quads and startup branding;
+      // treating those as a scene replaced Bethesda/publisher presentation
+      // frames with an empty composite before the first real camera existed.
       const bool previousSceneAvailable = rtx->getSceneManager().isPreviousFrameSceneAvailable();
+      // Once a path-traced scene exists, scene candidates must stay on the RT
+      // path even when a bounded capture/BLAS budget temporarily rejects all
+      // of them. Falling back to the current raster backbuffer on those frames
+      // produced the reported raster/path-trace overlap and flicker. Pure
+      // screen-space startup/video frames have no scene candidates and still
+      // pass through normally.
+      const bool hasGameSceneDraws = trustedSceneAcceptedDraws > 0
+        || (previousSceneAvailable && sceneCandidateDraws > 0);
 
       // DX11_V274_REQUIRE_REAL_VIEW_TO_INJECT: RtCamera::isValid() only checks
       // the camera was touched this frame - it is TRUE even when the view
@@ -7073,7 +8101,7 @@ namespace dxvk {
             backbuffer != nullptr,
             hasGameSceneDraws,
             hasRealCamera,
-            previousSceneAvailable && hasAcceptedSceneDraws);
+            previousSceneAvailable && hasGameSceneDraws);
 
       if (!shouldInjectRtx) {
         static uint32_t sStartupPassThroughLogCount = 0;

@@ -23,6 +23,9 @@ namespace dxvk {
   // Per-HWND map so the static WndProc callback can find its swapchain.
   static std::mutex                                    g_d3d11WndProcMutex;
   static std::unordered_map<HWND, D3D11SwapChain*>    g_d3d11WndProcMap;
+  static std::atomic_bool                              g_remixScreenshotRequested { false };
+  static std::atomic_bool                              g_printScreenPolledDown { false };
+  static std::atomic<uint64_t>                         g_lastPrintScreenMessageMs { 0u };
 
   // Primary swap chain: only this one renders the Remix UI overlay and drives
   // RT frame boundaries (EndFrame / OnPresent).  Multi-device games (Unity,
@@ -84,6 +87,26 @@ namespace dxvk {
     }
 
     return hasNonModifier && matchedTriggerKey;
+  }
+
+  static bool isPrintScreenMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
+    if ((msg == WM_KEYDOWN || msg == WM_KEYUP
+      || msg == WM_SYSKEYDOWN || msg == WM_SYSKEYUP)
+     && wParam == VK_SNAPSHOT)
+      return true;
+
+    if (msg != WM_INPUT)
+      return false;
+
+    RAWINPUT input = {};
+    UINT inputSize = sizeof(input);
+    const UINT read = GetRawInputData(
+      reinterpret_cast<HRAWINPUT>(lParam), RID_INPUT,
+      &input, &inputSize, sizeof(RAWINPUTHEADER));
+    return read != UINT(-1)
+        && read >= sizeof(RAWINPUTHEADER) + sizeof(RAWKEYBOARD)
+        && input.header.dwType == RIM_TYPEKEYBOARD
+        && input.data.keyboard.VKey == VK_SNAPSHOT;
   }
 
   static VkExtent2D getWindowClientExtent(HWND window) {
@@ -208,6 +231,23 @@ namespace dxvk {
 
       auto& gui = sc->m_device->getCommon()->getImgui();
       gui.switchMenu(static_cast<UIType>(wParam), lParam != 0, false);
+      --recursionDepth;
+      return 0;
+    }
+
+    // Print Screen belongs to Remix for an injected DX11 title. Queue the
+    // exact same final-image path as the Developer Settings button and consume
+    // both legacy and raw-input forms so the vanilla game cannot also save its
+    // pre-Remix raster backbuffer. Some keyboards emit raw + legacy and/or only
+    // a key-up; a short message debounce turns all of those into one capture.
+    if (sc != nullptr && isPrintScreenMessage(msg, wParam, lParam)) {
+      const uint64_t nowMs = GetTickCount64();
+      const uint64_t previousMs = g_lastPrintScreenMessageMs.exchange(
+        nowMs, std::memory_order_relaxed);
+      if (previousMs == 0u || nowMs - previousMs >= 250u) {
+        g_remixScreenshotRequested.store(true, std::memory_order_release);
+        Logger::info("[D3D11SwapChain] Print Screen routed to Remix screenshot capture");
+      }
       --recursionDepth;
       return 0;
     }
@@ -690,6 +730,16 @@ namespace dxvk {
     const uint32_t thisSceneDraws = immediateContext->m_rtx.getAcceptedSceneDrawCount();
     m_lastPresentDrawCount = thisDraws;
 
+    // Fallback for games/window systems that do not deliver keyboard messages
+    // to the hooked WndProc. Rising-edge polling requests Remix capture; the
+    // WndProc path above remains responsible for blocking vanilla handling.
+    const bool printScreenDown =
+      (::GetAsyncKeyState(VK_SNAPSHOT) & 0x8000) != 0;
+    const bool printScreenWasDown = g_printScreenPolledDown.exchange(
+      printScreenDown, std::memory_order_relaxed);
+    if (printScreenDown && !printScreenWasDown)
+      g_remixScreenshotRequested.store(true, std::memory_order_release);
+
     if (thisSceneDraws > 0u) {
       if (m_scenePresentStreak < kRemixOverlayArmSceneFrames)
         ++m_scenePresentStreak;
@@ -946,6 +996,10 @@ namespace dxvk {
     // contains the ray-traced composite when the blitter copies it to the
     // Vulkan swap chain image.
     if (isPrimary) {
+      if (g_remixScreenshotRequested.exchange(false, std::memory_order_acq_rel)) {
+        immediateContext->m_rtx.RequestScreenshot();
+        Logger::info("[D3D11SwapChain] Remix screenshot request queued for the primary composite");
+      }
       immediateContext->m_rtx.EndFrame(m_swapImage, getImageExtent2D(m_swapImage));
     }
 
