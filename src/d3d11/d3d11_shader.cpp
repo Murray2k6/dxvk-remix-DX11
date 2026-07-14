@@ -1077,7 +1077,8 @@ namespace dxvk {
     const void*  pBytecode,
     size_t       length,
     std::string& outName,
-    uint32_t&    outIndex) {
+    uint32_t&    outIndex,
+    std::vector<D3D11TexcoordSemantic>* outSemantics = nullptr) {
     const uint8_t* bytes = reinterpret_cast<const uint8_t*>(pBytecode);
     if (bytes == nullptr || length < 0x20)
       return false;
@@ -1167,6 +1168,13 @@ namespace dxvk {
         for (auto& c : upper)
           c = char(::toupper(static_cast<unsigned char>(c)));
 
+        if (outSemantics != nullptr) {
+          D3D11TexcoordSemantic semantic;
+          semantic.semanticName.assign(name, n);
+          semantic.semanticIndex = semanticIdx;
+          outSemantics->push_back(std::move(semantic));
+        }
+
         int score = 0;
         if (upper.find("TEXCOORD") != std::string::npos)
           score = 3;
@@ -1196,6 +1204,117 @@ namespace dxvk {
     }
 
     return false;
+  }
+
+  // Follow pixel-shader dataflow from texture sample coordinates back to the
+  // declared input register. Optimizing HLSL compilers routinely place the
+  // diffuse UV in TEXCOORD1/2 while TEXCOORD0 carries fog, lighting, or world
+  // data, so selecting the lowest VS output cannot be correct across engines.
+  // The analysis is deliberately conservative: a temporary carries the union
+  // of input registers that feed it, and the most frequently sampled matching
+  // float input wins for each texture resource slot.
+  static void parseDxbcSampledTexcoords(
+    const DxbcModule& module,
+    std::array<D3D11SampledTexcoordSemantic,
+      D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT>& outSemantics) {
+    const Rc<DxbcIsgn> inputSignature = module.isgn();
+    if (inputSignature == nullptr)
+      return;
+
+    static constexpr uint32_t kMaxTrackedInputs = 64u;
+    using InputDependencies = uint64_t;
+    std::unordered_map<uint32_t, InputDependencies> tempDependencies;
+    std::array<std::array<uint16_t, kMaxTrackedInputs>,
+      D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT> sampleCounts = {};
+
+    auto dependenciesFor = [&](const DxbcRegister& reg) -> InputDependencies {
+      if (reg.idxDim == 0)
+        return 0;
+      const uint32_t registerId = uint32_t(reg.idx[0].offset);
+      if (reg.type == DxbcOperandType::Input && registerId < kMaxTrackedInputs)
+        return InputDependencies(1) << registerId;
+      if (reg.type == DxbcOperandType::Temp) {
+        const auto entry = tempDependencies.find(registerId);
+        return entry != tempDependencies.end() ? entry->second : 0;
+      }
+      return 0;
+    };
+
+    DxbcCodeSlice slice = module.instructionSlice();
+    DxbcDecodeContext decoder;
+    while (!slice.atEnd()) {
+      decoder.decodeInstruction(slice);
+      const DxbcShaderInstruction& ins = decoder.getInstruction();
+
+      const bool samplesTexture =
+           ins.opClass == DxbcInstClass::TextureSample
+        || ins.opClass == DxbcInstClass::TextureGather;
+      if (samplesTexture && ins.srcCount >= 3u
+       && ins.src[1].type == DxbcOperandType::Resource
+       && ins.src[1].idxDim > 0) {
+        const uint32_t resourceSlot = uint32_t(ins.src[1].idx[0].offset);
+        if (resourceSlot < sampleCounts.size()) {
+          InputDependencies dependencies = dependenciesFor(ins.src[0]);
+          for (uint32_t input = 0; input < kMaxTrackedInputs; ++input) {
+            if ((dependencies & (InputDependencies(1) << input)) != 0
+             && sampleCounts[resourceSlot][input] != UINT16_MAX)
+              ++sampleCounts[resourceSlot][input];
+          }
+        }
+      }
+
+      InputDependencies sourceDependencies = 0;
+      if (!samplesTexture) {
+        for (uint32_t source = 0; source < ins.srcCount; ++source)
+          sourceDependencies |= dependenciesFor(ins.src[source]);
+      }
+      for (uint32_t destination = 0; destination < ins.dstCount; ++destination) {
+        const DxbcRegister& dst = ins.dst[destination];
+        if (dst.type != DxbcOperandType::Temp || dst.idxDim == 0)
+          continue;
+        const uint32_t registerId = uint32_t(dst.idx[0].offset);
+        // Preserve dependencies from untouched components on partial writes.
+        if (dst.mask.popCount() < 4u)
+          tempDependencies[registerId] |= sourceDependencies;
+        else
+          tempDependencies[registerId] = sourceDependencies;
+      }
+    }
+
+    for (uint32_t resourceSlot = 0; resourceSlot < sampleCounts.size(); ++resourceSlot) {
+      const DxbcSgnEntry* best = nullptr;
+      uint16_t bestCount = 0;
+      int bestNameScore = -1;
+      for (uint32_t input = 0; input < kMaxTrackedInputs; ++input) {
+        const uint16_t count = sampleCounts[resourceSlot][input];
+        if (count == 0)
+          continue;
+        const DxbcSgnEntry* candidate = inputSignature->findByRegister(input);
+        if (candidate == nullptr
+         || candidate->systemValue != DxbcSystemValue::None
+         || candidate->componentType != DxbcScalarType::Float32
+         || candidate->componentMask.minComponents() < 2u)
+          continue;
+
+        std::string upper = candidate->semanticName;
+        for (auto& c : upper)
+          c = char(::toupper(static_cast<unsigned char>(c)));
+        const int nameScore = upper.find("TEXCOORD") != std::string::npos ? 3
+          : (upper.compare(0, 2, "UV") == 0 ? 2
+          : (upper.find("TEX") != std::string::npos ? 1 : 0));
+        if (best == nullptr || count > bestCount
+         || (count == bestCount && nameScore > bestNameScore)) {
+          best = candidate;
+          bestCount = count;
+          bestNameScore = nameScore;
+        }
+      }
+      if (best != nullptr) {
+        outSemantics[resourceSlot].semanticName = best->semanticName;
+        outSemantics[resourceSlot].semanticIndex = best->semanticIndex;
+        outSemantics[resourceSlot].valid = true;
+      }
+    }
   }
 
   // DX11_V290_POST_VS_POSITION_CAPTURE: find a conservative non-system output
@@ -1360,6 +1479,9 @@ namespace dxvk {
     
     DxbcModule module(reader);
 
+    if (pShaderKey->type() == VK_SHADER_STAGE_FRAGMENT_BIT)
+      parseDxbcSampledTexcoords(module, m_sampledTexcoordSemantics);
+
     if (pShaderKey->type() == VK_SHADER_STAGE_VERTEX_BIT) {
       m_positionTransform = findPositionTransformBinding(module);
       m_constantBufferDependencies = findConstantBufferDependencies(module);
@@ -1446,7 +1568,10 @@ namespace dxvk {
      && BytecodeLength <= (1u << 20)) {
       std::string semanticName;
       uint32_t semanticIndex = 0;
-      if (parseDxbcOutputTexcoord(pShaderBytecode, BytecodeLength, semanticName, semanticIndex)) {
+      std::vector<D3D11TexcoordSemantic> outputSemantics;
+      if (parseDxbcOutputTexcoord(pShaderBytecode, BytecodeLength,
+                                  semanticName, semanticIndex,
+                                  &outputSemantics)) {
         m_texcoordCapture = std::make_shared<D3D11TexcoordCaptureState>();
         m_texcoordCapture->bytecode.assign(
           reinterpret_cast<const char*>(pShaderBytecode),
@@ -1472,11 +1597,61 @@ namespace dxvk {
       m_positionCapture->positionSpace = D3D11CapturedPositionSpace::View;
       m_positionCapture->homogeneousClipSpace = true;
       m_positionCapture->loadedFromProfile = false;
+      m_positionCapture->texcoordSemantics = std::move(outputSemantics);
       if (m_texcoordCapture != nullptr) {
         m_positionCapture->texcoordSemanticName = std::move(semanticName);
         m_positionCapture->texcoordSemanticIndex = semanticIndex;
       }
     }
+  }
+
+  bool D3D11CommonShader::GetSampledTexcoordSemantic(
+      uint32_t resourceSlot,
+      std::string& semanticName,
+      uint32_t& semanticIndex) const {
+    if (resourceSlot >= m_sampledTexcoordSemantics.size()
+     || !m_sampledTexcoordSemantics[resourceSlot].valid)
+      return false;
+    semanticName = m_sampledTexcoordSemantics[resourceSlot].semanticName;
+    semanticIndex = m_sampledTexcoordSemantics[resourceSlot].semanticIndex;
+    return true;
+  }
+
+  bool D3D11CommonShader::ResolvePositionCaptureTexcoord(
+      const std::string& requestedName,
+      uint32_t requestedIndex,
+      std::string& semanticName,
+      uint32_t& semanticIndex) const {
+    if (m_positionCapture == nullptr)
+      return false;
+
+    auto namesEqual = [](const std::string& a, const std::string& b) {
+      if (a.size() != b.size())
+        return false;
+      for (size_t i = 0; i < a.size(); ++i) {
+        if (::toupper(static_cast<unsigned char>(a[i]))
+         != ::toupper(static_cast<unsigned char>(b[i])))
+          return false;
+      }
+      return true;
+    };
+
+    if (!requestedName.empty()) {
+      for (const auto& candidate : m_positionCapture->texcoordSemantics) {
+        if (candidate.semanticIndex == requestedIndex
+         && namesEqual(candidate.semanticName, requestedName)) {
+          semanticName = candidate.semanticName;
+          semanticIndex = candidate.semanticIndex;
+          return true;
+        }
+      }
+    }
+
+    if (m_positionCapture->texcoordSemanticName.empty())
+      return false;
+    semanticName = m_positionCapture->texcoordSemanticName;
+    semanticIndex = m_positionCapture->texcoordSemanticIndex;
+    return true;
   }
 
 
@@ -1540,15 +1715,22 @@ namespace dxvk {
   }
 
 
-  Rc<DxvkShader> D3D11CommonShader::GetPositionCaptureShader() const {
+  Rc<DxvkShader> D3D11CommonShader::GetPositionCaptureShader(
+      const std::string& texcoordSemanticName,
+      uint32_t texcoordSemanticIndex) const {
     const std::shared_ptr<D3D11PositionCaptureState>& state = m_positionCapture;
     if (state == nullptr)
       return nullptr;
 
     std::lock_guard<dxvk::mutex> lock(state->mutex);
-    if (state->attempted)
-      return state->shader;
-    state->attempted = true;
+    uint64_t variantKey = XXH3_64bits(
+      texcoordSemanticName.data(), texcoordSemanticName.size());
+    variantKey = XXH3_64bits_withSeed(
+      &texcoordSemanticIndex, sizeof(texcoordSemanticIndex), variantKey);
+    D3D11PositionCaptureVariant& variant = state->variants[variantKey];
+    if (variant.attempted)
+      return variant.shader;
+    variant.attempted = true;
 
     try {
       DxbcReader reader(state->bytecode.data(), state->bytecode.size());
@@ -1556,7 +1738,7 @@ namespace dxvk {
 
       DxbcXfbInfo xfb = {};
       const uint32_t positionBytes = state->homogeneousClipSpace ? 16u : 12u;
-      const bool captureTexcoord = !state->texcoordSemanticName.empty();
+      const bool captureTexcoord = !texcoordSemanticName.empty();
       xfb.entryCount = captureTexcoord ? 2 : 1;
       xfb.entries[0].semanticName   = state->semanticName.c_str();
       xfb.entries[0].semanticIndex  = state->semanticIndex;
@@ -1566,8 +1748,8 @@ namespace dxvk {
       xfb.entries[0].bufferId       = 0;
       xfb.entries[0].offset         = 0;
       if (captureTexcoord) {
-        xfb.entries[1].semanticName   = state->texcoordSemanticName.c_str();
-        xfb.entries[1].semanticIndex  = state->texcoordSemanticIndex;
+        xfb.entries[1].semanticName   = texcoordSemanticName.c_str();
+        xfb.entries[1].semanticIndex  = texcoordSemanticIndex;
         xfb.entries[1].componentIndex = 0;
         xfb.entries[1].componentCount = 2;
         xfb.entries[1].streamId       = 0;
@@ -1584,14 +1766,16 @@ namespace dxvk {
 
       Rc<DxvkShader> gs = module.compilePassthroughShader(
         info, "dx11_position_capture_gs", true);
-      static constexpr char kPositionCaptureKey[] = "dx11-position-texcoord-capture-system-value-v2";
+      const std::string captureContract = str::format(
+        "dx11-position-texcoord-capture-system-value-v3:",
+        texcoordSemanticName, ":", texcoordSemanticIndex);
       const Sha1Data shaderKeyData[] = {
         { state->bytecode.data(), state->bytecode.size() },
-        { kPositionCaptureKey, sizeof(kPositionCaptureKey) - 1 },
+        { captureContract.data(), captureContract.size() },
       };
       gs->setShaderKey(DxvkShaderKey(VK_SHADER_STAGE_GEOMETRY_BIT,
         Sha1Hash::compute(2, shaderKeyData)));
-      state->shader = gs;
+      variant.shader = gs;
 
       Logger::info(str::format(
         "[Remix-DX11] V290: post-VS position capture GS built (semantic=",
@@ -1602,16 +1786,14 @@ namespace dxvk {
           ? "exact-sv-position"
           : (state->loadedFromProfile ? "profile" : "auto-discovery"),
         ", texcoord=", captureTexcoord
-          ? str::format(state->texcoordSemanticName, state->texcoordSemanticIndex)
+          ? str::format(texcoordSemanticName, texcoordSemanticIndex)
           : "none", ")"));
     } catch (const DxvkError& e) {
       Logger::warn(str::format(
         "[Remix-DX11] V290: position capture GS compile failed: ", e.message()));
     }
 
-    state->bytecode.clear();
-    state->bytecode.shrink_to_fit();
-    return state->shader;
+    return variant.shader;
   }
 
 

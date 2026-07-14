@@ -45,7 +45,7 @@ namespace dxvk {
     void initialize();
     void release();
 
-    void waitForShaderPrewarm();
+    void waitForShaderPrewarm(bool showProgressDialog = false);
 
     bool getWarmupComplete() const {
       return m_warmupComplete;
@@ -56,7 +56,7 @@ namespace dxvk {
     bool m_assetsLoaded = false;
 
     void loadAssets();
-    void startPrewarmShaders();
+    bool startPrewarmShaders();
 
     dxvk::thread m_asyncAssetLoadThread;
 

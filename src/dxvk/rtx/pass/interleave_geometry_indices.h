@@ -49,9 +49,8 @@ struct InterleaveGeometryArgs {
   mat4 clipToPosition;
 };
 
-// Five independent booleans previously consumed five uint32 push-constant
-// slots. Packing them keeps this structure at DXVK's hard 128-byte maximum
-// even with the exact 4x4 clip-to-position matrix.
+// Pack feature bits so the exact clip-to-position matrix still fits within
+// DXVK's hard 128-byte push-constant limit.
 #define INTERLEAVE_GEOMETRY_FLAG_HAS_NORMALS       0x01u
 #define INTERLEAVE_GEOMETRY_FLAG_HAS_TEXCOORD      0x02u
 #define INTERLEAVE_GEOMETRY_FLAG_HAS_COLOR0        0x04u

@@ -43,6 +43,8 @@ namespace dxvk {
     RTX_OPTION("rtx", bool, useWorldMatricesForShaders, true, "Use captured world/view matrices when reconstructing transforms for programmable-shader draws.");
     RTX_OPTION("rtx", bool, allowCubemaps, false, "Allow cubemap render targets/draws to be considered for ray tracing.");
     RTX_OPTION("rtx", bool, orthographicIsUI, true, "Treat draws with an orthographic projection as UI and skip them from the ray traced scene.");
+    RTX_OPTION("rtx", bool, projectionYFlipOverride, false, "Override automatic projection Y-axis detection. Enable this when a game engine's clip-space Y convention is detected incorrectly.");
+    RTX_OPTION("rtx", bool, projectionYFlip, true, "Flip the ray-traced projection Y axis when rtx.projectionYFlipOverride is enabled. This is commonly required by Unity games that use a negative Y projection scale.");
     RTX_OPTION("rtx", float, integerTexcoordScale, 1.0f / 2048.0f, "Scale applied when decoding fixed-point integer (SINT/UINT) texcoord vertex formats to floating point UVs. Engines that store UVs as 16-bit integers use an engine-specific divisor; 1/2048 fits common fixed-point conventions (Saints Row IV: TEXCOORD0 = R16G16_SINT). Adjust per game in rtx.conf if textures tile incorrectly.");
     RTX_OPTION("rtx", float, fallbackCameraFovDegrees, 60.0f, "Vertical field of view (degrees) of the synthesized fallback camera used when no projection matrix is found in any constant buffer. Tune per game in rtx.conf when the traced image looks zoomed relative to the raster view. Clamped to [20, 140].");
 
@@ -138,6 +140,8 @@ namespace dxvk {
     bool                                 m_zUpSettled    = false;
     bool                                 m_lhSettled     = false;
     bool                                 m_yFlipSettled  = false;
+    bool                                 m_projectionYFlipOverrideWasEnabled = false;
+    bool                                 m_projectionYFlipOverrideInitialized = false;
     static constexpr int kVoteThreshold  = 5; // votes needed to settle
     mutable Rc<DxvkSampler>              m_defaultSampler;
 
@@ -214,6 +218,13 @@ namespace dxvk {
     };
 
     SubmitRejectStats                    m_submitRejectStats;
+    // Screen-space UI is raster composition, not ray-traced world geometry.
+    // Keep the texture hashes discoverable for manual categorization, but
+    // preserve draw order by either injecting immediately before the first
+    // late UI draw or passing an early-UI frame through unchanged.
+    bool                                 m_rasterUiSeenThisFrame = false;
+    bool                                 m_midFrameRtxInjected = false;
+    bool                                 m_forceRasterPassThroughThisFrame = false;
     bool                                 m_hasSeenRealSceneProjection = false;
     uint32_t                             m_drawsSinceFlush = 0;
     uint32_t                             m_resizeTransitionFramesRemaining = 0;

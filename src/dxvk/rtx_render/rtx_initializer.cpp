@@ -37,6 +37,214 @@
 #include "rtx_debug_view.h"
 
 namespace dxvk {
+  namespace {
+    class ShaderPrewarmDialog {
+    public:
+      ShaderPrewarmDialog() = default;
+      ShaderPrewarmDialog(const ShaderPrewarmDialog&) = delete;
+      ShaderPrewarmDialog& operator=(const ShaderPrewarmDialog&) = delete;
+
+      ~ShaderPrewarmDialog() {
+        close();
+      }
+
+      void open() {
+        if (m_thread.joinable())
+          return;
+
+        m_thread = dxvk::thread([this] {
+          env::setThreadName("rtx-shader-dialog");
+          run();
+        });
+
+        const uint64_t waitStart = ::GetTickCount64();
+        while (!m_ready.load(std::memory_order_acquire)
+            && ::GetTickCount64() - waitStart < 2000u) {
+          ::Sleep(1);
+        }
+      }
+
+      void update(uint32_t pending, uint64_t elapsedMs) {
+        m_pending.store(pending, std::memory_order_release);
+        m_elapsedMs.store(elapsedMs, std::memory_order_release);
+
+        uint32_t observedMaximum = m_maxPending.load(std::memory_order_acquire);
+        while (pending > observedMaximum
+            && !m_maxPending.compare_exchange_weak(
+                 observedMaximum, pending, std::memory_order_release,
+                 std::memory_order_acquire)) {
+        }
+
+        const HWND hwnd = m_hwnd.load(std::memory_order_acquire);
+        if (hwnd != nullptr)
+          ::InvalidateRect(hwnd, nullptr, FALSE);
+      }
+
+      void close() {
+        const HWND hwnd = m_hwnd.load(std::memory_order_acquire);
+        if (hwnd != nullptr)
+          ::PostMessageW(hwnd, WM_CLOSE, 0, 0);
+        if (m_thread.joinable())
+          m_thread.join();
+      }
+
+    private:
+      static LRESULT CALLBACK windowProc(
+          HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
+        ShaderPrewarmDialog* self = reinterpret_cast<ShaderPrewarmDialog*>(
+          ::GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+
+        if (message == WM_NCCREATE) {
+          const auto* create = reinterpret_cast<const CREATESTRUCTW*>(lParam);
+          self = static_cast<ShaderPrewarmDialog*>(create->lpCreateParams);
+          ::SetWindowLongPtrW(
+            hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(self));
+        }
+
+        switch (message) {
+          case WM_ERASEBKGND:
+            return 1;
+
+          case WM_PAINT:
+            if (self != nullptr) {
+              self->paint(hwnd);
+              return 0;
+            }
+            break;
+
+          case WM_CLOSE:
+            ::DestroyWindow(hwnd);
+            return 0;
+
+          case WM_NCDESTROY:
+            if (self != nullptr)
+              self->m_hwnd.store(nullptr, std::memory_order_release);
+            ::PostQuitMessage(0);
+            return 0;
+
+          default:
+            break;
+        }
+
+        return ::DefWindowProcW(hwnd, message, wParam, lParam);
+      }
+
+      void paint(HWND hwnd) {
+        PAINTSTRUCT paint = {};
+        HDC dc = ::BeginPaint(hwnd, &paint);
+        RECT client = {};
+        ::GetClientRect(hwnd, &client);
+
+        HBRUSH background = ::CreateSolidBrush(RGB(28, 30, 34));
+        ::FillRect(dc, &client, background);
+        ::DeleteObject(background);
+
+        ::SetBkMode(dc, TRANSPARENT);
+        ::SetTextColor(dc, RGB(245, 245, 245));
+
+        HFONT titleFont = ::CreateFontW(
+          -22, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
+          DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+          CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+        HFONT bodyFont = ::CreateFontW(
+          -16, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+          DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+          CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+
+        HFONT previousFont = static_cast<HFONT>(::SelectObject(dc, titleFont));
+        RECT titleRect = { 24, 22, client.right - 24, 54 };
+        ::DrawTextW(dc, L"Please wait", -1, &titleRect,
+          DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+
+        ::SelectObject(dc, bodyFont);
+        ::SetTextColor(dc, RGB(205, 210, 218));
+        RECT bodyRect = { 24, 58, client.right - 24, 84 };
+        ::DrawTextW(dc, L"RTX Remix is compiling path-tracing shaders before game initialization.",
+          -1, &bodyRect, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+
+        const uint32_t pending = m_pending.load(std::memory_order_acquire);
+        const uint32_t maximum = m_maxPending.load(std::memory_order_acquire);
+        const uint64_t elapsed = m_elapsedMs.load(std::memory_order_acquire);
+        wchar_t status[128] = {};
+        _snwprintf_s(status, _TRUNCATE,
+          L"%u shader pipeline%s remaining  |  %llu.%01llu seconds",
+          pending, pending == 1u ? L"" : L"s",
+          static_cast<unsigned long long>(elapsed / 1000u),
+          static_cast<unsigned long long>((elapsed % 1000u) / 100u));
+        RECT statusRect = { 24, 91, client.right - 24, 118 };
+        ::DrawTextW(dc, status, -1, &statusRect,
+          DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+
+        RECT bar = { 24, 129, client.right - 24, 148 };
+        HBRUSH barBackground = ::CreateSolidBrush(RGB(61, 65, 72));
+        ::FillRect(dc, &bar, barBackground);
+        ::DeleteObject(barBackground);
+
+        if (maximum > 0u) {
+          const uint32_t completed = maximum > pending ? maximum - pending : 0u;
+          RECT fill = bar;
+          fill.right = fill.left + static_cast<LONG>(
+            (uint64_t(bar.right - bar.left) * completed) / maximum);
+          HBRUSH progress = ::CreateSolidBrush(RGB(118, 185, 0));
+          ::FillRect(dc, &fill, progress);
+          ::DeleteObject(progress);
+        }
+
+        ::SelectObject(dc, previousFont);
+        ::DeleteObject(titleFont);
+        ::DeleteObject(bodyFont);
+        ::EndPaint(hwnd, &paint);
+      }
+
+      void run() {
+        static constexpr wchar_t kClassName[] =
+          L"RtxRemixShaderPrewarmDialog";
+        const HINSTANCE instance = ::GetModuleHandleW(nullptr);
+        WNDCLASSEXW windowClass = {};
+        windowClass.cbSize = sizeof(windowClass);
+        windowClass.lpfnWndProc = &ShaderPrewarmDialog::windowProc;
+        windowClass.hInstance = instance;
+        windowClass.hCursor = ::LoadCursorW(nullptr, MAKEINTRESOURCEW(32514));
+        windowClass.hbrBackground = nullptr;
+        windowClass.lpszClassName = kClassName;
+        ::RegisterClassExW(&windowClass);
+
+        constexpr int width = 570;
+        constexpr int height = 215;
+        const int x = (::GetSystemMetrics(SM_CXSCREEN) - width) / 2;
+        const int y = (::GetSystemMetrics(SM_CYSCREEN) - height) / 2;
+        const HWND hwnd = ::CreateWindowExW(
+          WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
+          kClassName,
+          L"RTX Remix Shader Compiler",
+          WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
+          x, y, width, height,
+          nullptr, nullptr, instance, this);
+
+        m_hwnd.store(hwnd, std::memory_order_release);
+        m_ready.store(true, std::memory_order_release);
+        if (hwnd == nullptr)
+          return;
+
+        ::ShowWindow(hwnd, SW_SHOWNORMAL);
+        ::UpdateWindow(hwnd);
+
+        MSG message = {};
+        while (::GetMessageW(&message, nullptr, 0, 0) > 0) {
+          ::TranslateMessage(&message);
+          ::DispatchMessageW(&message);
+        }
+      }
+
+      std::atomic<HWND> m_hwnd { nullptr };
+      std::atomic<bool> m_ready { false };
+      std::atomic<uint32_t> m_pending { 0u };
+      std::atomic<uint32_t> m_maxPending { 0u };
+      std::atomic<uint64_t> m_elapsedMs { 0u };
+      dxvk::thread m_thread;
+    };
+  }
+
   RtxInitializer::RtxInitializer(DxvkDevice* device)
   : CommonDeviceObject(device) { 
   }
@@ -131,7 +339,12 @@ namespace dxvk {
 
     // Kick off shader prewarming
     Logger::info("[Remix-DX11][init] starting shader prewarm...");
-    startPrewarmShaders();
+    const bool prewarmStarted = startPrewarmShaders();
+
+    if (prewarmStarted && RtxOptions::Shader::waitForPrewarmOnBoot()) {
+      Logger::info("[Remix-DX11][init] waiting for boot shader prewarm before game initialization...");
+      waitForShaderPrewarm(RtxOptions::Shader::showPrewarmDialog());
+    }
 
     // Load assets (if any) as early as possible
     Logger::info("[Remix-DX11][init] loading assets...");
@@ -156,7 +369,7 @@ namespace dxvk {
     if (!asyncShaderFinalizing()) {
       // Wait for all prewarming to complete before calling "RTX initialized"
       Logger::info("[Remix-DX11][init] waiting for shader prewarm...");
-      waitForShaderPrewarm();
+      waitForShaderPrewarm(false);
     }
     Logger::info("[Remix-DX11][init] RtxInitializer::initialize() complete.");
   }
@@ -188,7 +401,7 @@ namespace dxvk {
     m_assetsLoaded = true;
   }
 
-  void RtxInitializer::startPrewarmShaders() {
+  bool RtxInitializer::startPrewarmShaders() {
     // If we want to run without shader prewarming, then pipelines will be built inline with other GPU work on first use (typically means
     // long stutters whenever a yet to be compiled pipeline comes into use).
     // DX11_V228_CROSS_VENDOR: bulk RT-pipeline shader prewarming crashes/deadlocks at LAUNCH across
@@ -219,14 +432,11 @@ namespace dxvk {
     // vendor so the game ALWAYS boots ("any game must work"); pipelines warm up
     // in the background and RT engages once they are ready. Re-enable for
     // benchmarking / prewarm testing with env DXVK_REMIX_PREWARM=1.
-    bool doPrewarm = false;
-    const std::string prewarmOverride = env::getEnvVar("DXVK_REMIX_PREWARM");
-    if (prewarmOverride == "1")
-      doPrewarm = true;
+    const bool doPrewarm = RtxOptions::Shader::prewarmOnBoot();
 
     if (!asyncShaderPrewarming() || !doPrewarm) {
-      Logger::info("[Remix-DX11][init] shader prewarm disabled (AMD deadlock / Intel Arc launch-crash WAR); pipelines compile inline on first use.");
-      return;
+      Logger::info("[Remix-DX11][init] shader prewarm disabled by configuration; pipelines will compile asynchronously on first use.");
+      return false;
     }
     Logger::info("[Remix-DX11][init] shader prewarm ENABLED (prewarming RT pipelines up front to avoid first-frame inline-compile stutter/crash).");
 
@@ -241,9 +451,14 @@ namespace dxvk {
 
     // Prewarm the rest of the pipelines that can be done automatically
     AutoShaderPipelinePrewarmer::prewarmComputePipelines(pCommon->pipelineManager());
+
+    Logger::info(str::format(
+      "[Remix-DX11][init] shader prewarm registration complete; pendingPipelines=",
+      pCommon->pipelineManager().remixShaderCompilationCount()));
+    return true;
   }
 
-  void RtxInitializer::waitForShaderPrewarm() {
+  void RtxInitializer::waitForShaderPrewarm(bool showProgressDialog) {
     if (m_warmupComplete) {
       return;
     }
@@ -257,12 +472,27 @@ namespace dxvk {
     constexpr uint64_t kPrewarmTimeoutMs = 120000; // 2 minutes
     const uint64_t startMs = ::GetTickCount64();
     bool timedOut = false;
+    ShaderPrewarmDialog progressDialog;
+    if (showProgressDialog)
+      progressDialog.open();
+
     while (m_device->getCommon()->pipelineManager().isCompilingShaders()) {
-      if (::GetTickCount64() - startMs >= kPrewarmTimeoutMs) {
+      const uint64_t elapsedMs = ::GetTickCount64() - startMs;
+      if (showProgressDialog) {
+        progressDialog.update(
+          m_device->getCommon()->pipelineManager().remixShaderCompilationCount(),
+          elapsedMs);
+      }
+      if (elapsedMs >= kPrewarmTimeoutMs) {
         timedOut = true;
         break;
       }
-      Sleep(1);
+      Sleep(10);
+    }
+
+    if (showProgressDialog) {
+      progressDialog.update(0u, ::GetTickCount64() - startMs);
+      progressDialog.close();
     }
 
     if (timedOut) {

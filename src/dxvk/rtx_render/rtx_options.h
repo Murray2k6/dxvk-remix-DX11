@@ -399,6 +399,12 @@ namespace dxvk {
                      "By default Remix only prewarms shaders which may actually be used at runtime or are accessible by user-facing graphics menus rather than all shader variants accessible by changing options in the developer menu.\n"
                      "This has the benefit of minimizing shader compilation cost for typical users, but may cause shader compilation stalls when changing various options in the developer menu. As such, this option is useful to enable during development to minimize these stalls.\n"
                      "Do note however that enabling this option will have a significant performance impact whenever shaders are uncached (e.g. on first load) due to requiring many more shaders to be compiled. As such using the enviornment variable to set this option locally on a developer's machine is recommended over a configuration file change to ensure it is not accidently enabled for users.");
+      RTX_OPTION_ENV("rtx.shader", bool, prewarmOnBoot, true, "DXVK_REMIX_PREWARM",
+                     "Registers the Remix path-tracing pipeline set with the asynchronous compiler during startup so required shaders are compiled before their first rendered use. Disable only when diagnosing a driver-specific compiler failure.");
+      RTX_OPTION("rtx.shader", bool, waitForPrewarmOnBoot, true,
+                 "Waits for boot shader prewarming to finish before Remix completes game initialization. The wait is bounded so a driver compiler failure cannot hang startup forever.");
+      RTX_OPTION("rtx.shader", bool, showPrewarmDialog, true,
+                 "Shows a responsive native Please Wait window with live shader count while boot shader prewarming is running before the game can render Remix's in-game UI.");
       RTX_OPTION_ENV("rtx.shader", bool, enableAsyncCompilation, true, "RTX_ENABLE_ASYNC_COMPILATION",
                  "When set to true shader compilation (especially that of prewarming) will be done asynchronously rather than blocking.\n"
                  "Typically shader prewarming with async finalization is done to attempt to compile all required shader variants before they are used, often by overlapping this work with a startup sequence (e.g. a game's loading screen). Often times however this prewarming takes longer than the time available, or an application may not have a startup sequence to begin with and immediately begin using Remix shaders.\n"

@@ -394,6 +394,9 @@ namespace dxvk {
     m_drawCallID = 0;
     m_drawsSinceFlush = 0;
     m_submitRejectStats = {};
+    m_rasterUiSeenThisFrame = false;
+    m_midFrameRtxInjected = false;
+    m_forceRasterPassThroughThisFrame = false;
   }
 
   // DX11_V280_TEXCOORD_CAPTURE: engine-agnostic recovery of texture
@@ -778,7 +781,25 @@ namespace dxvk {
     const bool capturesHomogeneousClip =
       commonVs->IsPositionCaptureHomogeneousClipSpace();
     const uint32_t positionBytes = capturesHomogeneousClip ? 16u : 12u;
-    const bool captureIncludesTexcoord = commonVs->PositionCaptureIncludesTexcoord();
+    std::string requestedTexcoordName;
+    uint32_t requestedTexcoordIndex = 0;
+    const D3D11CommonShader* commonPs =
+      m_context->m_state.ps.shader != nullptr
+        ? m_context->m_state.ps.shader->GetCommonShader()
+        : nullptr;
+    const uint32_t colorTextureSlot =
+      dcs.materialData.getColorTextureSlot(0);
+    const bool hasPsSampledTexcoord = commonPs != nullptr
+      && colorTextureSlot < D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT
+      && commonPs->GetSampledTexcoordSemantic(
+           colorTextureSlot, requestedTexcoordName, requestedTexcoordIndex);
+
+    std::string captureTexcoordName;
+    uint32_t captureTexcoordIndex = 0;
+    const bool captureIncludesTexcoord =
+      commonVs->ResolvePositionCaptureTexcoord(
+        requestedTexcoordName, requestedTexcoordIndex,
+        captureTexcoordName, captureTexcoordIndex);
     const uint32_t captureStride = positionBytes
       + (captureIncludesTexcoord ? 8u : 0u);
     const VkDeviceSize captureBytes =
@@ -803,6 +824,33 @@ namespace dxvk {
       // this mode and deliberately ignores clip.z, so reversed-Z and unknown
       // game near/far planes cannot turn the reconstructed scene inside out.
       capturedClipUsesWDepth = dcs.transformData.usedViewportFallbackProjection;
+      if (capturedClipUsesWDepth) {
+        // The XYW reconstruction below defines one complete replacement
+        // camera space independent of the source engine: +X right, +Y up and
+        // +Z forward (clip.w is positive visible depth).  Keep Remix's scene
+        // convention synchronized with that generated geometry.  The older
+        // matrix-vote path cannot settle for optimized shaders that expose
+        // only a combined object-to-clip transform, leaving Remix at its RH
+        // default while the replacement geometry is LH; free-camera motion,
+        // culling and orientation then appear mirrored in Unity and any other
+        // engine using this exact-capture fallback.
+        const RtxOptionLayer* derived = RtxOptionLayer::getDerivedLayer();
+        RtxOptions::leftHandedCoordinateSystemObject().setDeferred(true, derived);
+        RtxOptions::zUpObject().setDeferred(false, derived);
+        const bool replacementYFlip = projectionYFlipOverride()
+          ? projectionYFlip()
+          : false;
+        RtCamera::correctProjectionYFlipObject().setDeferred(replacementYFlip, derived);
+
+        static uint32_t sReplacementAxisProfileLogCount = 0;
+        if (sReplacementAxisProfileLogCount < 4u) {
+          ++sReplacementAxisProfileLogCount;
+          Logger::info(
+            str::format(
+              "[D3D11Rtx] Exact clip-W replacement profile selected: LH, Y-up, projection Y ",
+              replacementYFlip ? "flipped (manual override)" : "unflipped"));
+        }
+      }
       for (uint32_t column = 0; column < 4; ++column) {
         for (uint32_t row = 0; row < 4; ++row) {
           if (!std::isfinite(capturedClipToPosition[column][row]))
@@ -811,9 +859,27 @@ namespace dxvk {
       }
     }
 
-    Rc<DxvkShader> captureGs = commonVs->GetPositionCaptureShader();
+    Rc<DxvkShader> captureGs = commonVs->GetPositionCaptureShader(
+      captureTexcoordName, captureTexcoordIndex);
     if (captureGs == nullptr)
       return false;
+
+    if (captureIncludesTexcoord) {
+      static uint32_t sPsLinkedUvSelectionLogCount = 0;
+      if (sPsLinkedUvSelectionLogCount < 64u) {
+        ++sPsLinkedUvSelectionLogCount;
+        Logger::info(str::format(
+          "[D3D11Rtx][uv-link] selected ",
+          captureTexcoordName, captureTexcoordIndex,
+          " for color resource t", colorTextureSlot,
+          " psProven=", hasPsSampledTexcoord ? 1 : 0,
+          " requested=", hasPsSampledTexcoord
+            ? str::format(requestedTexcoordName, requestedTexcoordIndex)
+            : "none",
+          " vs=", commonVs->GetName(),
+          " ps=", commonPs != nullptr ? commonPs->GetName() : "none"));
+      }
+    }
 
     const D3D11CapturedPositionSpace positionSpace = commonVs->GetPositionCaptureSpace();
     // SV_Position capture has no distinct non-system output to factor against
@@ -1311,6 +1377,11 @@ namespace dxvk {
     }
     mixOutputIdentity(positionSpace == D3D11CapturedPositionSpace::World ? 1u : 0u);
     mixOutputIdentity(capturesHomogeneousClip ? 0x434c495034ull : 0x5052455033ull);
+    if (captureIncludesTexcoord) {
+      mixOutputIdentity(XXH3_64bits(
+        captureTexcoordName.data(), captureTexcoordName.size()));
+      mixOutputIdentity(captureTexcoordIndex);
+    }
     mixOutputIdentity(usedShaderProvenCaptureTransform ? 0x50524f56454eull : 0x46414c4c4241434bull);
     mixOutputIdentity(replayFirstInstance);
     mixOutputIdentity(capturedClipUsesWDepth ? 0x574445505448ull : 0x4d4154524958ull);
@@ -4202,20 +4273,47 @@ namespace dxvk {
     // plausible projection and either a non-identity view matrix or a camera-
     // relative identity view proven by the coherent frame-block checks above.
     // This avoids locking the session to helper, shadow, or other projections.
+    const bool yFlipOverrideEnabled = projectionYFlipOverride();
+    if (!m_projectionYFlipOverrideInitialized
+     || yFlipOverrideEnabled != m_projectionYFlipOverrideWasEnabled) {
+      m_projectionYFlipOverrideInitialized = true;
+      m_projectionYFlipOverrideWasEnabled = yFlipOverrideEnabled;
+
+      if (!yFlipOverrideEnabled) {
+        // Returning to Auto must gather fresh evidence rather than restoring a
+        // potentially stale decision made by a loading screen or prior scene.
+        m_yFlipVotes = 0;
+        m_yFlipSettled = false;
+      }
+
+      Logger::info(str::format(
+        "[D3D11Rtx][axis] projection Y mode changed: ",
+        yFlipOverrideEnabled
+          ? (projectionYFlip() ? "manual flip" : "manual normal")
+          : "automatic detection"));
+    }
+
+    if (yFlipOverrideEnabled) {
+      RtCamera::correctProjectionYFlipObject().setDeferred(
+        projectionYFlip(), RtxOptionLayer::getDerivedLayer());
+    }
+
     if (projSlot != UINT32_MAX
      && (!isIdentityExact(transforms.worldToView) || transforms.cameraRelativeView)) {
-      const bool canVote = !m_yFlipSettled || !m_lhSettled;
+      const bool canVote = (!yFlipOverrideEnabled && !m_yFlipSettled) || !m_lhSettled;
 
       if (canVote) {
         m_axisDetected = true;
 
         const Matrix4& projection = transforms.viewToProjection;
 
-        m_yFlipVotes += projectionWasFlippedY ? 1 : -1;
-        if (!m_yFlipSettled && std::abs(m_yFlipVotes) >= kVoteThreshold) {
-          m_yFlipSettled = true;
-          const bool yFlip = m_yFlipVotes > 0;
-          RtCamera::correctProjectionYFlipObject().setDeferred(yFlip, RtxOptionLayer::getDerivedLayer());
+        if (!yFlipOverrideEnabled) {
+          m_yFlipVotes += projectionWasFlippedY ? 1 : -1;
+          if (!m_yFlipSettled && std::abs(m_yFlipVotes) >= kVoteThreshold) {
+            m_yFlipSettled = true;
+            const bool yFlip = m_yFlipVotes > 0;
+            RtCamera::correctProjectionYFlipObject().setDeferred(yFlip, RtxOptionLayer::getDerivedLayer());
+          }
         }
 
         DecomposeProjectionParams dpp;
@@ -5598,6 +5696,17 @@ namespace dxvk {
     }
 
     ++m_submitRejectStats.total;
+
+    // Once this frame has crossed onto its raster-overlay path, do not spend
+    // GPU/CPU work capturing more screen-space triangles into the RT scene.
+    // Still enumerate every bound texture so the Remix texture grid, manual
+    // hash categories and capture/export tooling continue to see UI atlases.
+    if (m_midFrameRtxInjected || m_forceRasterPassThroughThisFrame) {
+      LegacyMaterialData rasterMaterial;
+      FillMaterialData(rasterMaterial);
+      ++m_submitRejectStats.screenSpaceUiSkip;
+      return;
+    }
 
     // forceInjection overflow guard: when injection is forced but the
     // previous frame produced zero scene instances, only the first
@@ -7029,7 +7138,26 @@ namespace dxvk {
        || !isIdentityExact(dcs.transformData.worldToView))
         return false;
 
-      if (count > 12)
+      // Unity batches a complete Canvas into one indexed draw. Granny's menu,
+      // for example, is 5,040 indices; a fullscreen-quad-only limit silently
+      // admitted that Canvas as world geometry. Keep a generous corruption
+      // guard without assuming that UI is always one quad.
+      if (count < 3 || count > 262144)
+        return false;
+
+      // A screen Canvas is composited and does not write scene depth. Requiring
+      // the actual blend state keeps opaque fallback-camera world geometry out
+      // of this classifier even when matrix recovery is incomplete.
+      if (zWriteEnable)
+        return false;
+
+      D3D11BlendState* blendState = m_context->m_state.om.cbState;
+      if (blendState == nullptr)
+        return false;
+
+      D3D11_BLEND_DESC1 blendDesc = {};
+      blendState->GetDesc1(&blendDesc);
+      if (!blendDesc.RenderTarget[0].BlendEnable)
         return false;
 
       const auto& omState = m_context->m_state.om;
@@ -7051,15 +7179,6 @@ namespace dxvk {
           rtHeight = rtvView->image()->info().extent.height;
         }
       }
-
-      auto isBlockCompressed = [](DXGI_FORMAT fmt) {
-        return (fmt >= DXGI_FORMAT_BC1_TYPELESS && fmt <= DXGI_FORMAT_BC1_UNORM_SRGB)
-            || (fmt >= DXGI_FORMAT_BC2_TYPELESS && fmt <= DXGI_FORMAT_BC2_UNORM_SRGB)
-            || (fmt >= DXGI_FORMAT_BC3_TYPELESS && fmt <= DXGI_FORMAT_BC3_UNORM_SRGB)
-            || (fmt >= DXGI_FORMAT_BC4_TYPELESS && fmt <= DXGI_FORMAT_BC4_SNORM)
-            || (fmt >= DXGI_FORMAT_BC5_TYPELESS && fmt <= DXGI_FORMAT_BC5_SNORM)
-            || (fmt >= DXGI_FORMAT_BC6H_TYPELESS && fmt <= DXGI_FORMAT_BC7_UNORM_SRGB);
-      };
 
       uint32_t candidateCount = 0;
       uint32_t uiLikeCount = 0;
@@ -7086,8 +7205,6 @@ namespace dxvk {
           && imgInfo.extent.width == rtWidth
           && imgInfo.extent.height == rtHeight;
         const bool hasMips = imgInfo.mipLevels > 1;
-        const bool bc = isBlockCompressed(srvDesc.Format);
-
         bool isCurrentRT = false;
         for (DxvkImage* boundRT : boundRTImages) {
           if (boundRT == view->image().ptr()) {
@@ -7110,7 +7227,10 @@ namespace dxvk {
           clampSampler = !isWrapMode(sampDesc.AddressU) && !isWrapMode(sampDesc.AddressV);
         }
 
-        if (!hasMips && !bc && clampSampler)
+        // UI atlases may legitimately be BC-compressed (the observed Unity
+        // menu atlas is BC1). Compression says nothing about coordinate space;
+        // non-mipped clamp sampling is the reliable atlas signal here.
+        if (!hasMips && clampSampler)
           ++uiLikeCount;
       }
 
@@ -7169,13 +7289,17 @@ namespace dxvk {
       return;
     }
 
-    if (allowViewportFallbackScreenSpaceReject && isLikelyScreenSpaceUiPass()) {
-      ++m_submitRejectStats.screenSpaceUiSkip;
+    // Strong per-draw Canvas evidence is safe before a scene camera exists and
+    // is precisely what startup/menu frames need. Composite heuristics remain
+    // camera-gated above, but UI must not be admitted as the first fake scene.
+    const bool likelyScreenSpaceUiPass =
+      !renderDocAttached && isLikelyScreenSpaceUiPass();
+    if (likelyScreenSpaceUiPass) {
       static uint32_t sScreenSpaceUiSkipLogCount = 0;
       if (sScreenSpaceUiSkipLogCount < 8) {
         ++sScreenSpaceUiSkipLogCount;
         Logger::info(str::format(
-          "[D3D11Rtx] Skipping screen-space UI pass: viewport fallback camera + identity transforms + atlas-style textures (count=",
+          "[D3D11Rtx] Detected screen-space UI pass for WorldUI routing: viewport fallback camera + identity transforms + atlas-style textures (count=",
           count,
           ", zEnable=",
           zEnable ? 1 : 0,
@@ -7183,7 +7307,6 @@ namespace dxvk {
           zWriteEnable ? 1 : 0,
           ")"));
       }
-      return;
     }
 
     if (renderDocAttached && dcs.transformData.usedViewportFallbackProjection) {
@@ -7244,6 +7367,132 @@ namespace dxvk {
     // do not pay the material/texture selection cost.
     FillMaterialData(dcs.materialData);
 
+    // The DX11 bridge builds its LegacyMaterialData directly from the bound
+    // SRVs, unlike the original D3D11 path.  Category evaluation therefore has
+    // to happen after FillMaterialData has selected the final color texture.
+    // Without this call the Remix UI could persist a selected texture hash,
+    // but every submitted DrawCallState kept an empty category bitset: terrain,
+    // sky, ignore, player-model, decal, particle, and UI tagging were all
+    // observable no-ops.
+    dcs.setupCategoriesForTexture();
+
+    const XXH64_hash_t categorizedTextureHash =
+      dcs.materialData.getColorTexture().getImageHash();
+    const uint64_t categoryBits = dcs.getCategoryFlags().raw();
+    if (categoryBits != 0u) {
+      static uint32_t sTextureCategoryApplyLogCount = 0;
+      if (sTextureCategoryApplyLogCount < 64u) {
+        ++sTextureCategoryApplyLogCount;
+        Logger::info(str::format(
+          "[D3D11Rtx][texture-category] applied hash=0x",
+          std::hex, categorizedTextureHash,
+          " categories=0x", categoryBits,
+          std::dec,
+          " drawId=", dcs.drawCallID,
+          " count=", count,
+          " indexed=", indexed ? 1 : 0));
+      }
+    }
+
+    // Match the established Remix/D3D11 contract: an Ignore-tagged texture is
+    // intentionally absent from the RT scene.  Merely carrying the category
+    // into InstanceManager is insufficient because Ignore is an admission
+    // category, not a shading flag.
+    if (dcs.testCategoryFlags(InstanceCategories::Ignore)) {
+      static uint32_t sIgnoredTextureDrawLogCount = 0;
+      if (sIgnoredTextureDrawLogCount < 32u) {
+        ++sIgnoredTextureDrawLogCount;
+        Logger::info(str::format(
+          "[D3D11Rtx][texture-category] skipped Ignore-tagged draw hash=0x",
+          std::hex, categorizedTextureHash, std::dec,
+          " drawId=", dcs.drawCallID));
+      }
+      return;
+    }
+
+    if (likelyScreenSpaceUiPass) {
+      const bool explicitlyWorldRouted =
+           dcs.testCategoryFlags(InstanceCategories::WorldUI)
+        || dcs.testCategoryFlags(InstanceCategories::WorldMatte)
+        || dcs.testCategoryFlags(InstanceCategories::Particle)
+        || dcs.testCategoryFlags(InstanceCategories::Beam);
+
+      // Manual texture-hash categories are authoritative. An explicitly tagged
+      // world UI/material continues through the RT/export path. Untagged
+      // screen UI keeps its real texture hash registered by FillMaterialData,
+      // but its triangles stay on the raster layer where they belong.
+      if (!explicitlyWorldRouted) {
+        m_rasterUiSeenThisFrame = true;
+        ++m_submitRejectStats.screenSpaceUiSkip;
+
+        Rc<DxvkImage> uiTarget;
+        auto* rtv0 = m_context->m_state.om.renderTargetViews[0].ptr();
+        if (rtv0 != nullptr) {
+          Rc<DxvkImageView> uiTargetView = rtv0->GetImageView();
+          if (uiTargetView != nullptr)
+            uiTarget = uiTargetView->image();
+        }
+
+        const uint32_t expectedWidth = m_lastOutputExtent.width > 0u
+          ? m_lastOutputExtent.width
+          : m_lastRemixViewportExtent.width;
+        const uint32_t expectedHeight = m_lastOutputExtent.height > 0u
+          ? m_lastOutputExtent.height
+          : m_lastRemixViewportExtent.height;
+        const VkExtent3D uiTargetExtent = uiTarget != nullptr
+          ? uiTarget->info().extent
+          : VkExtent3D { 0u, 0u, 0u };
+        const bool fullOutputTarget = uiTarget != nullptr
+          && (expectedWidth == 0u || uiTargetExtent.width == expectedWidth)
+          && (expectedHeight == 0u || uiTargetExtent.height == expectedHeight);
+        const bool realSceneBeforeUi = m_submitRejectStats.realSceneAccepted > 0u;
+        const bool stablePreviousScene =
+          sceneManager.isPreviousFrameSceneAvailable();
+
+        if (realSceneBeforeUi && stablePreviousScene && fullOutputTarget) {
+          // SubmitDraw runs immediately before D3D11 queues the application's
+          // draw. Queue RTX now, after all scene draws and before this Canvas;
+          // the application's UI draw then lands on top of the final image.
+          m_context->EmitCs([uiTarget](DxvkContext* ctx) {
+            static_cast<RtxContext*>(ctx)->injectRTX(0, uiTarget);
+          });
+          m_midFrameRtxInjected = true;
+
+          static uint32_t sUiLayerMidFrameLogCount = 0;
+          if (sUiLayerMidFrameLogCount < 32u) {
+            ++sUiLayerMidFrameLogCount;
+            Logger::info(str::format(
+              "[D3D11Rtx][ui-layer] queued RTX before raster UI: count=",
+              count,
+              " textureHash=0x", std::hex, categorizedTextureHash, std::dec,
+              " target=", uiTargetExtent.width, "x", uiTargetExtent.height,
+              " realScene=", m_submitRejectStats.realSceneAccepted,
+              " previousScene=", stablePreviousScene ? 1 : 0));
+          }
+        } else {
+          // UI appeared before a trustworthy 3D scene (menus, startup logos,
+          // loading screens), or on a helper target. Preserve the complete
+          // raster frame instead of overwriting it with stale/partial RTX.
+          m_forceRasterPassThroughThisFrame = true;
+
+          static uint32_t sUiLayerPassThroughLogCount = 0;
+          if (sUiLayerPassThroughLogCount < 32u) {
+            ++sUiLayerPassThroughLogCount;
+            Logger::info(str::format(
+              "[D3D11Rtx][ui-layer] raster pass-through: UI preceded a trustworthy scene: count=",
+              count,
+              " textureHash=0x", std::hex, categorizedTextureHash, std::dec,
+              " target=", uiTargetExtent.width, "x", uiTargetExtent.height,
+              " expected=", expectedWidth, "x", expectedHeight,
+              " realScene=", m_submitRejectStats.realSceneAccepted,
+              " previousScene=", stablePreviousScene ? 1 : 0));
+          }
+        }
+
+        return;
+      }
+    }
+
     const uint32_t tinyFallbackPrimitiveCount = dcs.geometryData.calculatePrimitiveCount();
     const bool tinyFallbackHasSceneDepthSignal =
       dcs.zEnable && (dcs.zWriteEnable || dcs.maxZ >= 0.99f);
@@ -7254,22 +7503,17 @@ namespace dxvk {
       tinyFallbackPrimitiveCount <= 2u &&
       !tinyFallbackHasSceneDepthSignal;
 
-    if (tinyFallbackMicroRaster) {
-      ++m_submitRejectStats.screenSpaceGarbageSkip;
+    if (tinyFallbackMicroRaster && !likelyScreenSpaceUiPass) {
+      ++m_submitRejectStats.screenSpaceUiSkip;
       static uint32_t sTinyFallbackMicroRasterLogCount = 0;
-      if (sTinyFallbackMicroRasterLogCount < 16) {
+      if (sTinyFallbackMicroRasterLogCount < 16u) {
         ++sTinyFallbackMicroRasterLogCount;
         Logger::info(str::format(
           "[D3D11Rtx] Skipping tiny fallback-camera micro-raster draw before RT submission: count=",
-          count,
-          ", indexed=",
-          indexed ? 1 : 0,
-          ", primitives=",
-          tinyFallbackPrimitiveCount,
-          ", zEnable=",
-          dcs.zEnable ? 1 : 0,
-          ", zWrite=",
-          dcs.zWriteEnable ? 1 : 0));
+          count, ", indexed=", indexed ? 1 : 0,
+          ", primitives=", tinyFallbackPrimitiveCount,
+          ", zEnable=", dcs.zEnable ? 1 : 0,
+          ", zWrite=", dcs.zWriteEnable ? 1 : 0));
       }
       return;
     }
@@ -7737,10 +7981,42 @@ namespace dxvk {
         && !cameraManager.hasSeenRealMainCamera()
         && hasSceneDepthSignal
         && primitiveCount >= 32u;
+      const bool isSceneCandidate = hasSceneDepthSignal
+        && primitiveCount >= 1u
+        && ((hasRealProjection && hasViewOrStrongProjection) || strongViewportFallbackScene);
 
-      if (hasSceneDepthSignal
-       && primitiveCount >= 1u
-       && ((hasRealProjection && hasViewOrStrongProjection) || strongViewportFallbackScene)) {
+      if (cameraManager.hasSeenRealMainCamera() && !isSceneCandidate) {
+        // Bounded admission telemetry for the remaining camera-enclosing slab
+        // failure.  This records structural signals only (no per-vertex dump),
+        // so a live game run can identify the non-scene draw family without
+        // turning the hot path logger into a performance problem.
+        static uint32_t sNonSceneAdmissionLogCount = 0;
+        if (sNonSceneAdmissionLogCount < 96u) {
+          ++sNonSceneAdmissionLogCount;
+          Logger::info(str::format(
+            "[D3D11Rtx][admission] accepted non-scene draw",
+            " drawId=", dcs.drawCallID,
+            " count=", count,
+            " indexed=", indexed ? 1 : 0,
+            " primitives=", primitiveCount,
+            " zEnable=", dcs.zEnable ? 1 : 0,
+            " zWrite=", dcs.zWriteEnable ? 1 : 0,
+            " minZ=", dcs.minZ,
+            " maxZ=", dcs.maxZ,
+            " fallbackCamera=", dcs.transformData.usedViewportFallbackProjection ? 1 : 0,
+            " identityWorld=", isIdentityExact(dcs.transformData.objectToWorld) ? 1 : 0,
+            " identityView=", isIdentityExact(dcs.transformData.worldToView) ? 1 : 0,
+            " cameraRelative=", dcs.transformData.cameraRelativeView ? 1 : 0,
+            " textured=", dcs.materialData.usesTexture() ? 1 : 0,
+            " textureHash=0x", std::hex,
+            dcs.materialData.getColorTexture().getImageHash(),
+            " materialHash=0x", dcs.materialData.getHash(),
+            " categories=0x", dcs.getCategoryFlags().raw(),
+            std::dec));
+        }
+      }
+
+      if (isSceneCandidate) {
 
         // UE-style significance culling: this draw is a scene candidate. Count
         // it, and if the budgeting loop has armed a distance threshold, drop
@@ -8127,9 +8403,13 @@ namespace dxvk {
     }
     m_prevFrameSceneCandidates = m_submitRejectStats.sceneCandidates;
 
+
     const uint32_t sceneAcceptedDraws = m_submitRejectStats.sceneAccepted;
     const uint32_t realSceneAcceptedDraws = m_submitRejectStats.realSceneAccepted;
     const uint32_t sceneCandidateDraws = m_submitRejectStats.sceneCandidates;
+    const bool rasterUiSeen = m_rasterUiSeenThisFrame;
+    const bool midFrameRtxInjected = m_midFrameRtxInjected;
+    const bool forceRasterPassThrough = m_forceRasterPassThroughThisFrame;
     const uint32_t trustedSceneAcceptedDraws = realSceneAcceptedDraws > 0
       ? realSceneAcceptedDraws
       : (m_hasSeenRealSceneProjection ? 0u : sceneAcceptedDraws);
@@ -8202,7 +8482,10 @@ namespace dxvk {
         " uvCacheMiB=", m_texcoordCaptureCacheBytes >> 20,
         " uvCacheEntries=", m_texcoordCaptureCache.size(),
         " posCacheMiB=", m_positionCaptureCacheBytes >> 20,
-        " posCacheEntries=", m_positionCaptureCache.size()));
+        " posCacheEntries=", m_positionCaptureCache.size(),
+        " rasterUi=", rasterUiSeen ? 1 : 0,
+        " uiMidInject=", midFrameRtxInjected ? 1 : 0,
+        " uiPassThrough=", forceRasterPassThrough ? 1 : 0));
     }
 
     ResetCommandListState();
@@ -8217,7 +8500,7 @@ namespace dxvk {
     ++m_axisDetectFrame;
 
     const bool allowResizeCameraCarryover = m_resizeTransitionFramesRemaining > 0;
-    m_context->EmitCs([backbuffer, draws, acceptedDraws, sceneAcceptedDraws, realSceneAcceptedDraws, sceneCandidateDraws, trustedSceneAcceptedDraws, allowResizeCameraCarryover](DxvkContext* ctx) {
+    m_context->EmitCs([backbuffer, draws, acceptedDraws, sceneAcceptedDraws, realSceneAcceptedDraws, sceneCandidateDraws, trustedSceneAcceptedDraws, allowResizeCameraCarryover, rasterUiSeen, midFrameRtxInjected, forceRasterPassThrough](DxvkContext* ctx) {
       RtxContext* rtx = static_cast<RtxContext*>(ctx);
       const uint32_t fid = rtx->getDevice()->getCurrentFrameId();
       bool camValid = rtx->getSceneManager().getCamera().isValid(fid);
@@ -8319,7 +8602,9 @@ namespace dxvk {
           " draws=", draws, " (set DXVK_REMIX_MTXDUMP=1 to capture matrices for view-detection fix)"));
       }
 
-      const bool shouldInjectRtx = shouldInjectD3D11RtxFrame(
+      const bool shouldInjectRtx = !forceRasterPassThrough
+        && !midFrameRtxInjected
+        && shouldInjectD3D11RtxFrame(
             backbuffer != nullptr,
             hasGameSceneDraws,
             hasRealCamera,
@@ -8346,6 +8631,12 @@ namespace dxvk {
             camValid ? 1 : 0,
             " previousScene=",
             previousSceneAvailable ? 1 : 0,
+            " rasterUi=",
+            rasterUiSeen ? 1 : 0,
+            " uiMidInject=",
+            midFrameRtxInjected ? 1 : 0,
+            " uiPassThrough=",
+            forceRasterPassThrough ? 1 : 0,
             " backbuffer=",
             backbuffer != nullptr ? 1 : 0));
         }

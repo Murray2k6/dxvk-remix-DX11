@@ -77,6 +77,22 @@ namespace dxvk {
     bool               attempted = false;
   };
 
+  struct D3D11TexcoordSemantic {
+    std::string semanticName;
+    uint32_t    semanticIndex = 0;
+  };
+
+  struct D3D11PositionCaptureVariant {
+    Rc<DxvkShader> shader;
+    bool           attempted = false;
+  };
+
+  struct D3D11SampledTexcoordSemantic {
+    std::string semanticName;
+    uint32_t    semanticIndex = 0;
+    bool        valid = false;
+  };
+
   // DX11_V290_POST_VS_POSITION_CAPTURE: some D3D11 engines perform skinning,
   // morphing, instancing, and object/world/view transforms entirely inside the
   // vertex shader, then expose a resulting pre-projection world/view position
@@ -105,14 +121,17 @@ namespace dxvk {
     // avoids a second full vertex-shader replay.
     std::string        texcoordSemanticName;
     uint32_t           texcoordSemanticIndex = 0;
+    // All non-system float2-or-larger VS outputs. The bound pixel shader's
+    // sample dataflow selects one at draw time; TEXCOORD0 is only the fallback
+    // when a shader does not expose a traceable texture-coordinate input.
+    std::vector<D3D11TexcoordSemantic> texcoordSemantics;
     // Exact constant-buffer matrix proven by DXBC dataflow to transform this
     // captured output into SV_Position. At draw time the DX11 layer factors it
     // against the active projection to recover captured-position-to-view,
     // avoiding semantic-name guesses about object/world/view space.
     D3D11PositionTransformBinding clipTransform;
     bool               loadedFromProfile = false;
-    Rc<DxvkShader>     shader;
-    bool               attempted = false;
+    std::unordered_map<uint64_t, D3D11PositionCaptureVariant> variants;
   };
 
   /**
@@ -183,8 +202,23 @@ namespace dxvk {
 
     bool PositionCaptureIncludesTexcoord() const {
       return m_positionCapture != nullptr
-          && !m_positionCapture->texcoordSemanticName.empty();
+          && !m_positionCapture->texcoordSemantics.empty();
     }
+
+    // Returns the PS input semantic proven to feed sampling from the given
+    // resource slot. This metadata belongs to pixel shaders; callers may ask
+    // any common shader and receive false when no mapping exists.
+    bool GetSampledTexcoordSemantic(uint32_t resourceSlot,
+                                    std::string& semanticName,
+                                    uint32_t& semanticIndex) const;
+
+    // Resolves a requested PS input semantic against this VS's actual output
+    // signature. If the requested semantic is unavailable, returns the
+    // shader's best texcoord-like fallback rather than inventing UVs.
+    bool ResolvePositionCaptureTexcoord(const std::string& requestedName,
+                                        uint32_t requestedIndex,
+                                        std::string& semanticName,
+                                        uint32_t& semanticIndex) const;
 
     const D3D11PositionTransformBinding* GetPositionCaptureClipTransformBinding() const {
       return m_positionCapture != nullptr && m_positionCapture->clipTransform.valid
@@ -215,7 +249,8 @@ namespace dxvk {
 
     // Lazily compiles the pure stream-output GS used to capture the game VS's
     // shader-computed pre-projection POSITIONn.xyz stream.
-    Rc<DxvkShader> GetPositionCaptureShader() const;
+    Rc<DxvkShader> GetPositionCaptureShader(const std::string& texcoordSemanticName,
+                                            uint32_t texcoordSemanticIndex) const;
 
   private:
 
@@ -228,6 +263,9 @@ namespace dxvk {
 
     // DX11_V281_FIXED_FUNCTION (parsed for pixel shaders only)
     bool m_usesDiscard = false;
+
+    std::array<D3D11SampledTexcoordSemantic,
+      D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT> m_sampledTexcoordSemantics = {};
 
     D3D11PositionTransformBinding m_positionTransform;
     D3D11ConstantBufferDependencyProfile m_constantBufferDependencies;
