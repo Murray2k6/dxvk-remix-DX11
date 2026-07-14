@@ -396,30 +396,68 @@ namespace dxvk {
   // while d3d11.dll's own dxvk copy ran vkCreateInstance concurrently in the
   // same driver (in-driver lock inversion). A NAMED kernel mutex serializes
   // the whole construction window (vkCreateInstance + adapter enumeration)
-  // across every dxvk copy in the process. Kernel mutexes are recursive per
-  // thread, so ICD re-entry on the creating thread cannot self-deadlock.
+  // across every dxvk copy in the process. A paired manual-reset event exposes
+  // the construction window to the other DLL as well: kernel mutex ownership
+  // is recursive on the creating thread, so a Vulkan ICD callback into the
+  // local D3D11CoreCreateDevice could otherwise acquire the mutex recursively
+  // and start a nested instance. FFXV does exactly that during NVIDIA physical-
+  // device enumeration. D3D11 uses the event to forward that internal adapter
+  // probe to the real system runtime instead of recursively entering DXVK.
   // Bounded wait: after 120s we log and proceed rather than hang forever.
   namespace {
+    std::string makeCrossDllInstanceObjectName(const char* suffix) {
+      return str::format("Local\\RemixDx11VkInstance_", GetCurrentProcessId(), "_", suffix);
+    }
+
     struct RemixCrossDllInstanceLock {
-      HANDLE handle = nullptr;
-      bool   owned  = false;
+      HANDLE mutexHandle = nullptr;
+      HANDLE stateEvent = nullptr;
+      bool   owned = false;
+      bool   markedConstruction = false;
+
       RemixCrossDllInstanceLock() {
-        handle = ::CreateMutexA(nullptr, FALSE, "Local\\RemixDx11VkInstanceCreate");
-        if (handle != nullptr) {
-          const DWORD wait = ::WaitForSingleObject(handle, 120000);
+        const std::string mutexName = makeCrossDllInstanceObjectName("CreateMutex");
+        mutexHandle = ::CreateMutexA(nullptr, FALSE, mutexName.c_str());
+        if (mutexHandle != nullptr) {
+          const DWORD wait = ::WaitForSingleObject(mutexHandle, 120000);
           owned = (wait == WAIT_OBJECT_0 || wait == WAIT_ABANDONED);
-          if (!owned)
+          if (!owned) {
             Logger::warn("[Remix-DX11][init] cross-DLL instance lock timed out after 120s; continuing unserialized");
+          } else {
+            const std::string eventName = makeCrossDllInstanceObjectName("ConstructionActive");
+            stateEvent = ::CreateEventA(nullptr, TRUE, FALSE, eventName.c_str());
+            if (stateEvent != nullptr
+             && ::WaitForSingleObject(stateEvent, 0) != WAIT_OBJECT_0) {
+              markedConstruction = ::SetEvent(stateEvent) != FALSE;
+            }
+          }
         }
       }
+
       ~RemixCrossDllInstanceLock() {
-        if (handle != nullptr) {
+        if (stateEvent != nullptr) {
+          if (markedConstruction)
+            ::ResetEvent(stateEvent);
+          ::CloseHandle(stateEvent);
+        }
+        if (mutexHandle != nullptr) {
           if (owned)
-            ::ReleaseMutex(handle);
-          ::CloseHandle(handle);
+            ::ReleaseMutex(mutexHandle);
+          ::CloseHandle(mutexHandle);
         }
       }
     };
+  }
+
+  bool DxvkInstance::isCrossDllInstanceConstructionInProgress() {
+    const std::string eventName = makeCrossDllInstanceObjectName("ConstructionActive");
+    HANDLE event = ::OpenEventA(SYNCHRONIZE, FALSE, eventName.c_str());
+    if (event == nullptr)
+      return false;
+
+    const bool active = ::WaitForSingleObject(event, 0) == WAIT_OBJECT_0;
+    ::CloseHandle(event);
+    return active;
   }
 
   Rc<DxvkInstance> DxvkInstance::getOrCreateSharedInstance() {
