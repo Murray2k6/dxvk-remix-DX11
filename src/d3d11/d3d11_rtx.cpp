@@ -335,6 +335,61 @@ namespace dxvk {
     SubmitInstancedDraw(true, indexCountPerInstance, startIndex, baseVertex, instanceCount, startInstance);
   }
 
+  void D3D11Rtx::OnDrawInstancedIndirect(ID3D11Buffer* argumentBuffer, UINT argumentOffset) {
+    if (argumentBuffer == nullptr)
+      return;
+
+    const auto* buffer = static_cast<D3D11Buffer*>(argumentBuffer);
+    const auto mapped = buffer->GetMappedSlice();
+    const uint8_t* bytes = reinterpret_cast<const uint8_t*>(mapped.mapPtr);
+    const size_t byteWidth = buffer->Desc()->ByteWidth;
+    if (bytes == nullptr || argumentOffset > byteWidth
+     || sizeof(D3D11_DRAW_INSTANCED_INDIRECT_ARGS) > byteWidth - argumentOffset) {
+      static uint32_t sGpuIndirectLogCount = 0;
+      if (sGpuIndirectLogCount++ < 8u) {
+        Logger::info(
+          "[D3D11Rtx] GPU-only DrawInstancedIndirect arguments are not CPU-visible at record time; "
+          "leaving the raster draw untouched instead of submitting guessed RTX geometry");
+      }
+      return;
+    }
+
+    D3D11_DRAW_INSTANCED_INDIRECT_ARGS args = {};
+    std::memcpy(&args, bytes + argumentOffset, sizeof(args));
+    if (args.VertexCountPerInstance == 0u || args.InstanceCount == 0u)
+      return;
+    SubmitInstancedDraw(false, args.VertexCountPerInstance,
+      args.StartVertexLocation, 0, args.InstanceCount, args.StartInstanceLocation);
+  }
+
+  void D3D11Rtx::OnDrawIndexedInstancedIndirect(ID3D11Buffer* argumentBuffer, UINT argumentOffset) {
+    if (argumentBuffer == nullptr)
+      return;
+
+    const auto* buffer = static_cast<D3D11Buffer*>(argumentBuffer);
+    const auto mapped = buffer->GetMappedSlice();
+    const uint8_t* bytes = reinterpret_cast<const uint8_t*>(mapped.mapPtr);
+    const size_t byteWidth = buffer->Desc()->ByteWidth;
+    if (bytes == nullptr || argumentOffset > byteWidth
+     || sizeof(D3D11_DRAW_INDEXED_INSTANCED_INDIRECT_ARGS) > byteWidth - argumentOffset) {
+      static uint32_t sGpuIndexedIndirectLogCount = 0;
+      if (sGpuIndexedIndirectLogCount++ < 8u) {
+        Logger::info(
+          "[D3D11Rtx] GPU-only DrawIndexedInstancedIndirect arguments are not CPU-visible at record time; "
+          "leaving the raster draw untouched instead of submitting guessed RTX geometry");
+      }
+      return;
+    }
+
+    D3D11_DRAW_INDEXED_INSTANCED_INDIRECT_ARGS args = {};
+    std::memcpy(&args, bytes + argumentOffset, sizeof(args));
+    if (args.IndexCountPerInstance == 0u || args.InstanceCount == 0u)
+      return;
+    SubmitInstancedDraw(true, args.IndexCountPerInstance,
+      args.StartIndexLocation, args.BaseVertexLocation,
+      args.InstanceCount, args.StartInstanceLocation);
+  }
+
   void D3D11Rtx::ResetCommandListState() {
     m_drawCallID = 0;
     m_drawsSinceFlush = 0;
@@ -439,6 +494,8 @@ namespace dxvk {
     const VkDeviceSize captureBytes = VkDeviceSize(vertexCount) * 8u;
 
     if (m_context->m_state.vs.shader == nullptr)
+      return false;
+    if (isIdentityExact(dcs.transformData.viewToProjection))
       return false;
     const D3D11CommonShader* commonVs = m_context->m_state.vs.shader->GetCommonShader();
     if (commonVs == nullptr || !commonVs->HasTexcoordCaptureCandidate())
@@ -627,7 +684,9 @@ namespace dxvk {
   bool D3D11Rtx::TryCapturePositionsViaStreamOut(
       DrawCallState& dcs, RasterGeometry& geo,
       bool indexed, UINT count, UINT start, INT base,
-      bool hasExternalInstanceTransform) {
+      bool hasExternalInstanceTransform,
+      UINT replayFirstInstance,
+      bool requireIndexedFlatten) {
     static const bool s_disabled = env::getEnvVar("DXVK_REMIX_POSITION_CAPTURE") == "0";
     // Keep the existing developer-menu control authoritative. Previously the
     // checkbox disabled terrain vertex capture but this path ignored it and
@@ -655,11 +714,6 @@ namespace dxvk {
       if (soTarget.buffer != nullptr)
         return false;
     }
-
-    // A synthesized viewport projection cannot convert a shader view-space
-    // stream back to the same world coordinate system as the main camera.
-    if (dcs.transformData.usedViewportFallbackProjection)
-      return false;
 
     DxvkInputAssemblyState restoreIa = { VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, VK_FALSE, 0 };
     switch (m_context->m_state.ia.primitiveTopology) {
@@ -696,7 +750,22 @@ namespace dxvk {
     static constexpr size_t       kMaxCacheEntries           = 2048u;
     static constexpr VkDeviceSize kMaxCacheBytes             = 64ull << 20;
 
-    const uint32_t vertexCount = geo.vertexCount;
+    // Device-local index buffers cannot be scanned on the submit thread. The
+    // old fallback replayed the entire shared vertex buffer for every indexed
+    // sub-draw, even when the draw referenced only one triangle. Besides being
+    // incorrect (unrelated vertices entered the BLAS), this turned a few dozen
+    // indices into thousands of VS/XFB invocations and eventually stalled the
+    // frame. For triangle lists, replay the real indexed point stream on the GPU
+    // and use transform feedback's compact output as a non-indexed triangle
+    // list. The ordering and duplicates exactly match the application's index
+    // sequence; no CPU readback or guessed range is involved.
+    const bool flattenIndexed = requireIndexedFlatten
+      && indexed
+      && m_context->m_state.ia.primitiveTopology == D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+    if (requireIndexedFlatten && !flattenIndexed)
+      return false;
+
+    const uint32_t vertexCount = flattenIndexed ? count : geo.vertexCount;
     if (vertexCount == 0 || vertexCount > kMaxCaptureVerticesPerDraw)
       return false;
 
@@ -712,6 +781,7 @@ namespace dxvk {
     const VkDeviceSize captureBytes =
       VkDeviceSize(vertexCount) * captureStride;
     Matrix4 capturedClipToPosition;
+    bool capturedClipUsesWDepth = false;
     if (capturesHomogeneousClip) {
       // Exact SV_Position is already the complete result of the game's vertex
       // transform.  Reconstruct the position directly in the replacement
@@ -723,6 +793,13 @@ namespace dxvk {
       // is valid for every game whose raster projection was recovered.
       const Matrix4 inverseProjection = inverse(dcs.transformData.viewToProjection);
       capturedClipToPosition = inverseProjection;
+      // Optimized Unity and other engine shaders frequently expose only a
+      // combined object-to-clip transform. A viewport-derived replacement
+      // projection is still sufficient because visible perspective vertices
+      // carry exact linear camera depth in clip.w. The interleaver uses XYW in
+      // this mode and deliberately ignores clip.z, so reversed-Z and unknown
+      // game near/far planes cannot turn the reconstructed scene inside out.
+      capturedClipUsesWDepth = dcs.transformData.usedViewportFallbackProjection;
       for (uint32_t column = 0; column < 4; ++column) {
         for (uint32_t row = 0; row < 4; ++row) {
           if (!std::isfinite(capturedClipToPosition[column][row]))
@@ -750,12 +827,17 @@ namespace dxvk {
       && geo.blendIndicesBuffer.defined()
       && geo.numBonesPerVertex >= 2;
 
-    const uint32_t firstVertex = indexed ? uint32_t(std::max(base, 0)) : start;
+    const uint32_t firstVertex = flattenIndexed
+      ? 0u
+      : (indexed ? uint32_t(std::max(base, 0)) : start);
     std::array<bool, D3D11_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT> captureInputSlots = {};
+    std::array<bool, D3D11_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT> capturePerInstanceSlots = {};
     if (m_context->m_state.ia.inputLayout != nullptr) {
       for (const auto& semantic : m_context->m_state.ia.inputLayout->GetRtxSemantics()) {
-        if (semantic.inputSlot < captureInputSlots.size())
+        if (semantic.inputSlot < captureInputSlots.size()) {
           captureInputSlots[semantic.inputSlot] = true;
+          capturePerInstanceSlots[semantic.inputSlot] |= semantic.perInstance;
+        }
       }
     } else {
       captureInputSlots.fill(true);
@@ -773,6 +855,8 @@ namespace dxvk {
     bool usedShaderDependencyProfile = false;
     if (capturesHomogeneousClip) {
       uint64_t stateHash = 0x5356504f53495449ull; // "SVPOSITI"
+      stateHash = XXH3_64bits_withSeed(
+        &replayFirstInstance, sizeof(replayFirstInstance), stateHash);
       bool readable = true;
       const bool hasNarrowTransformBinding = captureBinding != nullptr
         && captureBinding->matrixCount >= 1u
@@ -970,8 +1054,14 @@ namespace dxvk {
         const DxvkBufferSliceHandle mapped = vb.buffer->GetMappedSlice();
         const uint8_t* ptr = reinterpret_cast<const uint8_t*>(mapped.mapPtr);
         const size_t bufferSize = vb.buffer->Desc()->ByteWidth;
-        const size_t begin = size_t(vb.offset) + size_t(firstVertex) * vb.stride;
-        const size_t byteLength = size_t(vertexCount) * vb.stride;
+        const bool perInstance = capturePerInstanceSlots[slot];
+        const size_t elementIndex = perInstance
+          ? size_t(replayFirstInstance)
+          : size_t(firstVertex);
+        const size_t begin = size_t(vb.offset) + elementIndex * vb.stride;
+        const size_t byteLength = perInstance
+          ? size_t(vb.stride)
+          : size_t(vertexCount) * vb.stride;
         if (ptr == nullptr || begin >= bufferSize || byteLength > bufferSize - begin) {
           readable = false;
           break;
@@ -1207,9 +1297,20 @@ namespace dxvk {
     };
     mixOutputIdentity(firstVertex);
     mixOutputIdentity(vertexCount);
+    mixOutputIdentity(flattenIndexed ? 0x494e4458464c4154ull : 0x564552544558524eull);
+    if (flattenIndexed) {
+      mixOutputIdentity(start);
+      mixOutputIdentity(static_cast<uint32_t>(base));
+      const auto& ib = m_context->m_state.ia.indexBuffer;
+      mixOutputIdentity(uint64_t(reinterpret_cast<uintptr_t>(ib.buffer.ptr())));
+      mixOutputIdentity(ib.offset);
+      mixOutputIdentity(static_cast<uint32_t>(ib.format));
+    }
     mixOutputIdentity(positionSpace == D3D11CapturedPositionSpace::World ? 1u : 0u);
     mixOutputIdentity(capturesHomogeneousClip ? 0x434c495034ull : 0x5052455033ull);
     mixOutputIdentity(usedShaderProvenCaptureTransform ? 0x50524f56454eull : 0x46414c4c4241434bull);
+    mixOutputIdentity(replayFirstInstance);
+    mixOutputIdentity(capturedClipUsesWDepth ? 0x574445505448ull : 0x4d4154524958ull);
     for (uint32_t slot = 0; slot < D3D11_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT; ++slot) {
       if (!captureInputSlots[slot])
         continue;
@@ -1249,6 +1350,15 @@ namespace dxvk {
       mixCacheKey(uint64_t(reinterpret_cast<uintptr_t>(vb.buffer.ptr())));
       mixCacheKey(uint64_t(vb.offset));
       mixCacheKey(uint64_t(vb.stride));
+    }
+    if (flattenIndexed) {
+      const auto& ib = m_context->m_state.ia.indexBuffer;
+      mixCacheKey(uint64_t(reinterpret_cast<uintptr_t>(ib.buffer.ptr())));
+      mixCacheKey(uint64_t(ib.offset));
+      mixCacheKey(uint64_t(static_cast<uint32_t>(ib.format)));
+      mixCacheKey(uint64_t(start));
+      mixCacheKey(uint64_t(static_cast<uint32_t>(base)));
+      mixCacheKey(uint64_t(count));
     }
     if (capturesHomogeneousClip) {
       const uint64_t contractKey = cacheKey;
@@ -1304,6 +1414,7 @@ namespace dxvk {
       entry.hasTransformStateIdentity = false;
       entry.hasCanonicalCapturedToWorld = false;
       entry.hasCapturedClipToPosition = false;
+      entry.capturedClipUsesWDepth = false;
     }
 
     // A rigid mesh captured against a real, persistent world/view camera must
@@ -1412,12 +1523,20 @@ namespace dxvk {
                          cBuf = DxvkBufferSlice(entry.buffer, 0, captureBytes),
                          cCount = vertexCount,
                          cFirst = firstVertex,
-                         cRestoreIa = restoreIa](DxvkContext* ctx) {
+                         cRestoreIa = restoreIa,
+                         cFirstInstance = replayFirstInstance,
+                         cFlattenIndexed = flattenIndexed,
+                         cStartIndex = start,
+                         cBaseVertex = base](DxvkContext* ctx) {
         const DxvkInputAssemblyState pointIa = { VK_PRIMITIVE_TOPOLOGY_POINT_LIST, VK_FALSE, 0 };
         ctx->bindShader(VK_SHADER_STAGE_GEOMETRY_BIT, cGs);
         ctx->bindXfbBuffer(0, cBuf, DxvkBufferSlice());
         ctx->setInputAssemblyState(pointIa);
-        ctx->draw(cCount, 1, cFirst, 0);
+        if (cFlattenIndexed) {
+          ctx->drawIndexed(cCount, 1, cStartIndex, cBaseVertex, cFirstInstance);
+        } else {
+          ctx->draw(cCount, 1, cFirst, cFirstInstance);
+        }
         ctx->bindShader(VK_SHADER_STAGE_GEOMETRY_BIT, nullptr);
         ctx->bindXfbBuffer(0, DxvkBufferSlice(), DxvkBufferSlice());
         ctx->setInputAssemblyState(cRestoreIa);
@@ -1427,6 +1546,7 @@ namespace dxvk {
       if (capturesHomogeneousClip) {
         entry.capturedClipToPosition = capturedClipToPosition;
         entry.hasCapturedClipToPosition = true;
+        entry.capturedClipUsesWDepth = capturedClipUsesWDepth;
       }
       if (capturesHomogeneousClip && hasHomogeneousTransformStateIdentity) {
         entry.transformStateIdentity = homogeneousTransformStateIdentity;
@@ -1450,6 +1570,7 @@ namespace dxvk {
       if (!entry.hasCapturedClipToPosition)
         return false;
       capturedClipToPosition = entry.capturedClipToPosition;
+      capturedClipUsesWDepth = entry.capturedClipUsesWDepth;
     }
 
     const RasterBuffer capturedPositions(
@@ -1460,8 +1581,28 @@ namespace dxvk {
         : VK_FORMAT_R32G32B32_SFLOAT);
     geo.positionBuffer = capturedPositions;
     dcs.geometryData.positionBuffer = capturedPositions;
+    if (flattenIndexed) {
+      // XFB emitted one vertex per index in triangle-list order. The original
+      // index buffer must not be applied a second time. Original per-vertex
+      // attribute streams are indexed in the old domain and therefore cannot
+      // be paired with this compact stream; position capture already clears
+      // normals below, and textureless authoring uses the retained source image
+      // only as a selectable/taggable material identity rather than sampling it.
+      geo.indexBuffer = RasterBuffer();
+      geo.indexCount = 0;
+      geo.vertexCount = vertexCount;
+      geo.texcoordBuffer = RasterBuffer();
+      geo.color0Buffer = RasterBuffer();
+      dcs.geometryData.indexBuffer = RasterBuffer();
+      dcs.geometryData.indexCount = 0;
+      dcs.geometryData.vertexCount = vertexCount;
+      dcs.geometryData.texcoordBuffer = RasterBuffer();
+      dcs.geometryData.color0Buffer = RasterBuffer();
+    }
     geo.postVsPositionIsHomogeneousClip = capturesHomogeneousClip;
     dcs.geometryData.postVsPositionIsHomogeneousClip = capturesHomogeneousClip;
+    geo.postVsClipUsesWDepth = capturesHomogeneousClip && capturedClipUsesWDepth;
+    dcs.geometryData.postVsClipUsesWDepth = capturesHomogeneousClip && capturedClipUsesWDepth;
     geo.postVsCapturedPositionsDynamic = capturedDynamicPositions;
     dcs.geometryData.postVsCapturedPositionsDynamic = capturedDynamicPositions;
     if (capturesHomogeneousClip) {
@@ -1529,6 +1670,11 @@ namespace dxvk {
       // view as an unresolved/pre-combined game camera and decompose it again.
       dcs.transformData.cameraRelativeView = true;
       dcs.transformData.exactReplacementCamera = true;
+      // The geometry and camera now form one exact replacement coordinate
+      // system. Treat it as a real camera even when the projection was derived
+      // from the viewport; the old fallback marker would make EndFrame reject
+      // this valid path and leave optimized Unity scenes permanently raster-only.
+      dcs.transformData.usedViewportFallbackProjection = false;
     } else {
       dcs.transformData.cameraRelativeView = false;
       dcs.transformData.exactReplacementCamera = false;
@@ -1542,7 +1688,10 @@ namespace dxvk {
         positionSpace == D3D11CapturedPositionSpace::World ? "world" : "view",
         ", verts=",
         vertexCount, ", indexed=", indexed ? 1 : 0,
+        ", indexedFlatten=", flattenIndexed ? 1 : 0,
         ", homogeneousClip=", capturesHomogeneousClip ? 1 : 0,
+        ", clipWDepth=", capturedClipUsesWDepth ? 1 : 0,
+        ", firstInstance=", replayFirstInstance,
         ", dynamic=", capturedDynamicPositions ? 1 : 0,
         ", replayEveryFrame=", captureMustReplayEveryFrame ? 1 : 0,
         ", transformState=", hasHomogeneousTransformStateIdentity ? 1 : 0,
@@ -1600,9 +1749,65 @@ namespace dxvk {
   }
 
   void D3D11Rtx::SubmitInstancedDraw(bool indexed, UINT count, UINT start, INT base,
-                                      UINT instanceCount, UINT startInstance) {
+                                       UINT instanceCount, UINT startInstance) {
     if (instanceCount <= 1) {
       SubmitDraw(indexed, count, start, base);
+      return;
+    }
+
+    // Unity, Unreal, Godot and many proprietary engines perform instancing in
+    // the vertex shader (SV_InstanceID, per-instance IA rows, cbuffers or VS
+    // SRVs). The old CPU matrix fit handled only one of those layouts and then
+    // disabled post-VS capture, so the most important engine geometry was sent
+    // to RTX with guessed transforms or collapsed to one point. When the shader
+    // can be replayed, evaluate each selected instance with its real base
+    // instance and capture exact SV_Position instead. No engine or executable
+    // names are involved.
+    bool canCaptureExactInstances = useVertexCapture()
+      && m_context->m_device->features().extTransformFeedback.transformFeedback
+      && m_context->m_state.vs.shader != nullptr
+      && m_context->m_state.gs.shader == nullptr
+      && m_context->m_state.hs.shader == nullptr
+      && m_context->m_state.ds.shader == nullptr;
+    for (const auto& soTarget : m_context->m_state.so.targets)
+      canCaptureExactInstances &= soTarget.buffer == nullptr;
+    if (canCaptureExactInstances) {
+      const D3D11CommonShader* commonVs =
+        m_context->m_state.vs.shader->GetCommonShader();
+      canCaptureExactInstances = commonVs != nullptr
+        && commonVs->HasPositionCaptureCandidate();
+    }
+
+    if (canCaptureExactInstances) {
+      // A single draw containing tens of thousands of grass instances must not
+      // expand into tens of thousands of CPU submissions (the previous Unity
+      // hang). Keep a uniformly distributed, deterministic working set. The
+      // global capture cache/budgets warm this set incrementally across frames.
+      static constexpr UINT kMaxExactInstancesPerDraw = 512u;
+      const UINT requestedLimit = std::max(1u, RtxOptions::maxInstanceSubmissions());
+      const UINT selectedCount = std::min(
+        instanceCount, std::min(requestedLimit, kMaxExactInstancesPerDraw));
+      auto selectedInstance = [&](UINT selectedIndex) {
+        if (selectedCount <= 1u || selectedCount == instanceCount)
+          return startInstance + selectedIndex;
+        const uint64_t relative = uint64_t(selectedIndex)
+          * uint64_t(instanceCount - 1u) / uint64_t(selectedCount - 1u);
+        return UINT(uint64_t(startInstance) + relative);
+      };
+
+      static uint32_t sExactInstanceLogCount = 0;
+      if (sExactInstanceLogCount++ < 12u) {
+        Logger::info(str::format(
+          "[D3D11Rtx] Exact shader-profile instancing: sourceInstances=",
+          instanceCount, " selected=", selectedCount,
+          " startInstance=", startInstance,
+          " indexed=", indexed ? 1 : 0));
+      }
+
+      for (UINT i = 0; i < selectedCount; ++i) {
+        SubmitDraw(indexed, count, start, base, nullptr,
+          selectedInstance(i), true);
+      }
       return;
     }
 
@@ -5349,21 +5554,16 @@ namespace dxvk {
     mat.updateCachedHash();
 
     // DX11 authoring contract: source textures identify/tag materials, but do
-    // not shade captured geometry automatically. Keep every safe source image
-    // registered in the Remix texture browser above and retain the primary
-    // source hash so a user-authored replacement still resolves. The legacy
-    // surface itself is intentionally textureless and opaque until that
-    // replacement exists. This prevents the game raster/albedo from appearing
-    // mixed into the path-traced scene and stops heuristic slot selection from
-    // painting faces, sky, or terrain with another draw's texture.
+    // not shade captured geometry automatically. The TextureRef itself must
+    // remain attached to the material: Remix's viewport picker, texture list,
+    // replacement resolver and per-texture settings all follow that live
+    // association, not only the cached material hash. Clearing these references
+    // made geometry grey but also made it impossible to select/tag its source
+    // texture. Keep the references and samplers as authoring metadata while the
+    // TFactor combiner below makes the base path-traced surface opaque white.
+    // A user-authored replacement can therefore resolve normally without the
+    // game's raster/albedo being painted onto untagged RT geometry.
     const XXH64_hash_t sourceMaterialHash = mat.getHash();
-    for (uint32_t textureIndex = 0;
-         textureIndex < LegacyMaterialData::kMaxSupportedTextures;
-         ++textureIndex) {
-      mat.colorTextures[textureIndex] = TextureRef();
-      mat.samplers[textureIndex] = nullptr;
-      mat.colorTextureSlot[textureIndex] = kInvalidResourceSlot;
-    }
     mat.textureColorArg1Source = RtTextureArgSource::TFactor;
     mat.textureColorArg2Source = RtTextureArgSource::None;
     mat.textureColorOperation = DxvkRtTextureOperation::SelectArg1;
@@ -5381,7 +5581,7 @@ namespace dxvk {
       Logger::info(str::format(
         "[D3D11Rtx] Textureless RT authoring material: sourceTagHash=0x",
         std::hex, sourceMaterialHash, std::dec,
-        " source remains available in Remix texture browser"));
+        " source texture remains attached for viewport selection/tagging"));
     }
   }
 
@@ -5389,7 +5589,9 @@ namespace dxvk {
                              UINT count,
                              UINT start,
                              INT  base,
-                             const Matrix4* instanceTransform) {
+                             const Matrix4* instanceTransform,
+                             UINT replayFirstInstance,
+                             bool requireExactPositionCapture) {
     if (m_pGeometryWorkers == nullptr) {
       const bool isDeferredContext = m_context->GetType() == D3D11_DEVICE_CONTEXT_DEFERRED;
       const uint32_t cores = std::max(2u, std::thread::hardware_concurrency());
@@ -7575,12 +7777,16 @@ namespace dxvk {
     const uint32_t captureBudgetRejectsBefore =
       m_submitRejectStats.positionCaptureBudgetRejected;
     const bool capturedExactPositions = TryCapturePositionsViaStreamOut(
-      dcs, geo, indexed, count, start, base, instanceTransform != nullptr);
+      dcs, geo, indexed, count, start, base,
+      instanceTransform != nullptr, replayFirstInstance,
+      usedWholeVertexBufferFallback);
     const bool exactCaptureBudgetRejected =
       m_submitRejectStats.positionCaptureBudgetRejected != captureBudgetRejectsBefore;
     if (capturedExactPositions) {
       ++m_submitRejectStats.positionCaptured;
-    } else if (exactCaptureBudgetRejected
+    } else if (requireExactPositionCapture
+            || usedWholeVertexBufferFallback
+            || exactCaptureBudgetRejected
             || (dcs.transformData.cameraRelativeView
             && instanceTransform == nullptr
             && dcs.usesVertexShader)) {
@@ -7595,12 +7801,15 @@ namespace dxvk {
         ++sUnsafeCameraRelativeSkipLogCount;
         Logger::warn(str::format(
           "[D3D11Rtx][position-capture] skipped unsafe uncaptured draw: reason=",
-          exactCaptureBudgetRejected ? "budget" : "camera-relative",
+          exactCaptureBudgetRejected ? "budget"
+            : (usedWholeVertexBufferFallback ? "gpu-index-flatten-required"
+              : (requireExactPositionCapture ? "instanced-exact-required" : "camera-relative")),
           " count=",
           count,
           " indexed=", indexed ? 1 : 0,
           " start=", start,
           " base=", base,
+          " firstInstance=", replayFirstInstance,
           " drawId=", dcs.drawCallID));
       }
       return;
@@ -7608,10 +7817,15 @@ namespace dxvk {
 
     DrawParameters params;
     params.instanceCount = 1;
-    params.vertexCount   = indexed ? 0 : count;
-    params.indexCount    = indexed ? count : 0;
-    params.firstIndex    = indexed ? start : 0;
-    params.vertexOffset  = indexed ? static_cast<uint32_t>(std::max(base, 0)) : start;
+    const bool submitIndexed = indexed && dcs.geometryData.indexBuffer.defined();
+    params.vertexCount   = submitIndexed ? 0 : count;
+    params.indexCount    = submitIndexed ? count : 0;
+    // SubmitDraw already folds StartIndexLocation and BaseVertexLocation (or
+    // StartVertexLocation) into RasterBuffer slice offsets above. Reapplying
+    // them here double-offsets sky/terrain helper draws and can read beyond the
+    // compact capture. The RT-facing buffers always begin at element zero.
+    params.firstIndex    = 0;
+    params.vertexOffset  = 0;
 
     m_context->EmitCs([params, dcs](DxvkContext* ctx) mutable {
       static_cast<RtxContext*>(ctx)->commitGeometryToRT(params, dcs);

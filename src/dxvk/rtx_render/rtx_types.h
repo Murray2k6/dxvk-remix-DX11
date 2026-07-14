@@ -348,6 +348,12 @@ struct RasterGeometry {
   // interleaver applies this inverse projection and divides by w before the
   // position reaches the BLAS, yielding the rasterizer's true view-space mesh.
   bool postVsPositionIsHomogeneousClip = false;
+  // A standalone projection is not always present in optimized Unity and
+  // other engine shaders. In that case homogeneous clip W is still the exact
+  // positive camera depth for every visible D3D11 perspective vertex. Rebuild
+  // canonical view positions from clip XYW instead of trying to linearize the
+  // unknown (and possibly reversed-Z) clip Z with a guessed near/far pair.
+  bool postVsClipUsesWDepth = false;
   Matrix4 postVsClipToPosition = Matrix4();
 
   // Actual vertex/index count (when applicable) as calculated by geo-engine

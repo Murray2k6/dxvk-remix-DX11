@@ -61,6 +61,12 @@ namespace dxvk {
     // DXVK_REMIX_SHARED_INSTANCE=0 reverts to per-call instances.
     static Rc<DxvkInstance> getOrCreateSharedInstance();
 
+    // True while either dxgi.dll or d3d11.dll in this process is constructing
+    // its shared Vulkan instance and enumerating physical devices. This state
+    // is backed by a named kernel event because dxvk is statically linked into
+    // both DLLs and ordinary C++ statics are not shared between them.
+    static bool isCrossDllInstanceConstructionInProgress();
+
     /**
      * \brief Vulkan instance functions
      * \returns Vulkan instance functions
