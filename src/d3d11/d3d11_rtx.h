@@ -51,6 +51,8 @@ namespace dxvk {
     void OnDrawIndexed(UINT indexCount, UINT startIndex, INT baseVertex);
     void OnDrawInstanced(UINT vertexCountPerInstance, UINT instanceCount, UINT startVertex, UINT startInstance);
     void OnDrawIndexedInstanced(UINT indexCountPerInstance, UINT instanceCount, UINT startIndex, INT baseVertex, UINT startInstance);
+    void OnDrawInstancedIndirect(ID3D11Buffer* argumentBuffer, UINT argumentOffset);
+    void OnDrawIndexedInstancedIndirect(ID3D11Buffer* argumentBuffer, UINT argumentOffset);
     void ResetCommandListState();
 
     // Must be called with the context lock held.
@@ -294,7 +296,9 @@ namespace dxvk {
     // model/view transforms live only in the game VS.
     bool TryCapturePositionsViaStreamOut(DrawCallState& dcs, RasterGeometry& geo,
                                          bool indexed, UINT count, UINT start, INT base,
-                                         bool hasExternalInstanceTransform);
+                                         bool hasExternalInstanceTransform,
+                                         UINT replayFirstInstance,
+                                         bool requireIndexedFlatten);
     uint32_t     m_positionCapturesThisFrame = 0;
     uint32_t     m_positionNewCaptureBuffersThisFrame = 0;
     uint32_t     m_positionReplayCapturesThisFrame = 0;
@@ -348,6 +352,7 @@ namespace dxvk {
       // geometry without mixing old clip coordinates with a new projection.
       Matrix4        capturedClipToPosition;
       bool           hasCapturedClipToPosition = false;
+      bool           capturedClipUsesWDepth = false;
     };
     std::unordered_map<uint64_t, PositionCaptureEntry> m_positionCaptureCache;
     std::unordered_map<uint64_t, uint32_t> m_positionCaptureOccurrencesThisFrame;
@@ -376,7 +381,9 @@ namespace dxvk {
     void RecycleHelperBuffers();
 
     void SubmitDraw(bool indexed, UINT count, UINT start, INT base,
-                    const Matrix4* instanceTransform = nullptr);
+                    const Matrix4* instanceTransform = nullptr,
+                    UINT replayFirstInstance = 0,
+                    bool requireExactPositionCapture = false);
     void SubmitInstancedDraw(bool indexed, UINT count, UINT start, INT base,
                              UINT instanceCount, UINT startInstance);
     DrawCallTransforms ExtractTransforms();

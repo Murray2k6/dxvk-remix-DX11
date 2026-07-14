@@ -1228,6 +1228,7 @@ namespace dxvk {
           ID3D11Buffer*   pBufferForArgs,
           UINT            AlignedByteOffsetForArgs) {
     D3D11DeviceLock lock = LockContext();
+    m_rtx.OnDrawIndexedInstancedIndirect(pBufferForArgs, AlignedByteOffsetForArgs);
     SetDrawBuffers(pBufferForArgs, nullptr);
 
     if (!ValidateDrawBufferSize(pBufferForArgs, AlignedByteOffsetForArgs, sizeof(VkDrawIndexedIndirectCommand)))
@@ -1262,6 +1263,7 @@ namespace dxvk {
           ID3D11Buffer*   pBufferForArgs,
           UINT            AlignedByteOffsetForArgs) {
     D3D11DeviceLock lock = LockContext();
+    m_rtx.OnDrawInstancedIndirect(pBufferForArgs, AlignedByteOffsetForArgs);
     SetDrawBuffers(pBufferForArgs, nullptr);
 
     if (!ValidateDrawBufferSize(pBufferForArgs, AlignedByteOffsetForArgs, sizeof(VkDrawIndirectCommand)))

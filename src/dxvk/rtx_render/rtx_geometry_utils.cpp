@@ -873,6 +873,8 @@ namespace dxvk {
     }
     if (input.postVsPositionIsHomogeneousClip)
       args.attributeFlags |= INTERLEAVE_GEOMETRY_FLAG_HOMOGENEOUS_CLIP;
+    if (input.postVsClipUsesWDepth)
+      args.attributeFlags |= INTERLEAVE_GEOMETRY_FLAG_CLIP_W_DEPTH;
     args.clipToPosition = input.postVsClipToPosition;
     // Homogeneous clip capture is written by transform feedback and requires
     // the GPU interleaver for inverse-projection + perspective divide.
