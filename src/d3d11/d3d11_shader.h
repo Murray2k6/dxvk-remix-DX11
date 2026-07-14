@@ -99,6 +99,12 @@ namespace dxvk {
     // geometry the rasterizer consumed. When true, stream output stores xyzw
     // clip coordinates and the RT interleaver unprojects them to view space.
     bool               homogeneousClipSpace = false;
+    // When the vertex shader also exposes a TEXCOORD output, capture it in the
+    // same interleaved transform-feedback record as SV_Position. This keeps UVs
+    // in the exact post-index-expansion domain consumed by the rasterizer and
+    // avoids a second full vertex-shader replay.
+    std::string        texcoordSemanticName;
+    uint32_t           texcoordSemanticIndex = 0;
     // Exact constant-buffer matrix proven by DXBC dataflow to transform this
     // captured output into SV_Position. At draw time the DX11 layer factors it
     // against the active projection to recover captured-position-to-view,
@@ -173,6 +179,11 @@ namespace dxvk {
     bool IsPositionCaptureHomogeneousClipSpace() const {
       return m_positionCapture != nullptr
           && m_positionCapture->homogeneousClipSpace;
+    }
+
+    bool PositionCaptureIncludesTexcoord() const {
+      return m_positionCapture != nullptr
+          && !m_positionCapture->texcoordSemanticName.empty();
     }
 
     const D3D11PositionTransformBinding* GetPositionCaptureClipTransformBinding() const {

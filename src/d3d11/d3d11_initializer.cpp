@@ -174,7 +174,7 @@ namespace dxvk {
     // Creation data is the texture's identity for its whole lifetime;
     // runtime uploads (UpdateSubresource/Unmap/Copy chokepoints) must not
     // re-mix it or streamed sub-rect updates would churn the hash.
-    pTexture->MarkAllSubresourcesHashed();
+    pTexture->MarkImageHashEstablished();
   }
   // NV-DXVK end
 

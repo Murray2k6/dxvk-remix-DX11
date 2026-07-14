@@ -638,15 +638,16 @@ namespace dxvk {
       // Dynamic textures filled through Map/Unmap never pass the
       // UpdateSubresource hash chokepoint, so they kept image hash 0 and the
       // Remix material system could not key on them. Establish the identity
-      // from the first mapped upload of each subresource; later re-maps
-      // (video frames, atlas streaming) leave the hash untouched so it stays
-      // stable across frames.
+      // from the first complete mapped upload. Later mips, layers and re-maps
+      // (video frames, atlas streaming) leave the hash untouched so texture
+      // tags keep one immutable key.
       Rc<DxvkImage> image = pResource->GetImage();
       if (image != nullptr
-       && (aspectMask & VK_IMAGE_ASPECT_COLOR_BIT)
-       && pResource->TryMarkSubresourceHashed(Subresource)) {
+       && (aspectMask & VK_IMAGE_ASPECT_COLOR_BIT)) {
         const DxvkBufferSliceHandle mappedSlice = pResource->GetMappedSlice(Subresource);
-        if (mappedSlice.mapPtr != nullptr) {
+        if (mappedSlice.mapPtr != nullptr
+         && image->getHash() == 0ull
+         && pResource->TryClaimImageHash()) {
           constexpr size_t kMaxTexelHashBytes = 65536;
           const size_t hashLen = std::min<size_t>(size_t(mappedSlice.length), kMaxTexelHashBytes);
           const VkFormat packedFormat = pResource->GetPackedFormat();
@@ -657,11 +658,7 @@ namespace dxvk {
           contentHash = XXH3_64bits_withSeed(&extent, sizeof(extent), contentHash);
           contentHash = XXH3_64bits_withSeed(&Subresource, sizeof(Subresource), contentHash);
 
-          const XXH64_hash_t existing = image->getHash();
-          if (existing == 0ull)
-            image->setHash(contentHash != 0ull ? contentHash : 1ull);
-          else
-            image->setHash(XXH64(&contentHash, sizeof(contentHash), existing));
+          image->setHash(contentHash != 0ull ? contentHash : 1ull);
         }
       }
       // NV-DXVK end

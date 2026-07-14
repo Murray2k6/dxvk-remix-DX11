@@ -241,30 +241,24 @@ namespace dxvk {
 
     // NV-DXVK start: DX11_V258_TEXTURE_HASH_STABILITY
     /**
-     * \brief Marks a subresource as having contributed to the image hash
+     * \brief Atomically claims establishment of the image identity
      *
-     * The Remix material/replacement system keys on a content-derived image
-     * hash that must stay stable across frames and runs. Each subresource
-     * may contribute to that identity exactly once (its first full upload);
-     * later re-uploads of the same subresource (video frames, atlas
-     * streaming) must not perturb the hash. Subresource indices past 63
-     * alias onto the low bits, which only costs identity entropy on exotic
-     * >64-subresource textures.
-     * \returns \c true if this is the first time the subresource is marked
+     * A Remix texture/category hash is an immutable asset identifier, not a
+     * running checksum of streamed mips. The first complete color upload wins;
+     * every later mip/layer/frame keeps that identity so viewport selections,
+     * tags and replacements cannot drift while the game streams the texture.
      */
-    bool TryMarkSubresourceHashed(UINT Subresource) {
-      const uint64_t bit = 1ull << (Subresource & 63u);
-      return !(m_hashedSubresources.fetch_or(bit, std::memory_order_relaxed) & bit);
+    bool TryClaimImageHash() {
+      uint64_t expected = 0ull;
+      return m_imageHashClaimed.compare_exchange_strong(
+        expected, ~0ull, std::memory_order_acq_rel, std::memory_order_relaxed);
     }
 
     /**
-     * \brief Marks every subresource as a hash contributor
-     *
-     * Used when creation-time initial data establishes the identity so
-     * later runtime uploads never re-mix it.
+     * \brief Records that creation data established the image identity
      */
-    void MarkAllSubresourcesHashed() {
-      m_hashedSubresources.store(~0ull, std::memory_order_relaxed);
+    void MarkImageHashEstablished() {
+      m_imageHashClaimed.store(~0ull, std::memory_order_release);
     }
     // NV-DXVK end
 
@@ -423,7 +417,7 @@ namespace dxvk {
     std::vector<MappedInfo>       m_mapInfo;
 
     // NV-DXVK start: DX11_V258_TEXTURE_HASH_STABILITY
-    std::atomic<uint64_t>         m_hashedSubresources = { 0ull };
+    std::atomic<uint64_t>         m_imageHashClaimed = { 0ull };
     // NV-DXVK end
 
     MappedBuffer CreateMappedBuffer(

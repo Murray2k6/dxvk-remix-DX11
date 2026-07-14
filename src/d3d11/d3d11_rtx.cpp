@@ -777,7 +777,10 @@ namespace dxvk {
 
     const bool capturesHomogeneousClip =
       commonVs->IsPositionCaptureHomogeneousClipSpace();
-    const uint32_t captureStride = capturesHomogeneousClip ? 16u : 12u;
+    const uint32_t positionBytes = capturesHomogeneousClip ? 16u : 12u;
+    const bool captureIncludesTexcoord = commonVs->PositionCaptureIncludesTexcoord();
+    const uint32_t captureStride = positionBytes
+      + (captureIncludesTexcoord ? 8u : 0u);
     const VkDeviceSize captureBytes =
       VkDeviceSize(vertexCount) * captureStride;
     Matrix4 capturedClipToPosition;
@@ -1581,23 +1584,34 @@ namespace dxvk {
         : VK_FORMAT_R32G32B32_SFLOAT);
     geo.positionBuffer = capturedPositions;
     dcs.geometryData.positionBuffer = capturedPositions;
+    const RasterBuffer capturedTexcoords = captureIncludesTexcoord
+      ? RasterBuffer(
+          DxvkBufferSlice(entry.buffer, 0, captureBytes),
+          positionBytes, captureStride, VK_FORMAT_R32G32_SFLOAT)
+      : RasterBuffer();
+    if (captureIncludesTexcoord) {
+      geo.texcoordBuffer = capturedTexcoords;
+      dcs.geometryData.texcoordBuffer = capturedTexcoords;
+    }
     if (flattenIndexed) {
       // XFB emitted one vertex per index in triangle-list order. The original
       // index buffer must not be applied a second time. Original per-vertex
       // attribute streams are indexed in the old domain and therefore cannot
-      // be paired with this compact stream; position capture already clears
-      // normals below, and textureless authoring uses the retained source image
-      // only as a selectable/taggable material identity rather than sampling it.
+      // be paired with this compact stream. TEXCOORD is the exception: it was
+      // emitted beside position by the same indexed replay and is already in
+      // the exact flattened domain.
       geo.indexBuffer = RasterBuffer();
       geo.indexCount = 0;
       geo.vertexCount = vertexCount;
-      geo.texcoordBuffer = RasterBuffer();
       geo.color0Buffer = RasterBuffer();
       dcs.geometryData.indexBuffer = RasterBuffer();
       dcs.geometryData.indexCount = 0;
       dcs.geometryData.vertexCount = vertexCount;
-      dcs.geometryData.texcoordBuffer = RasterBuffer();
       dcs.geometryData.color0Buffer = RasterBuffer();
+      if (!captureIncludesTexcoord) {
+        geo.texcoordBuffer = RasterBuffer();
+        dcs.geometryData.texcoordBuffer = RasterBuffer();
+      }
     }
     geo.postVsPositionIsHomogeneousClip = capturesHomogeneousClip;
     dcs.geometryData.postVsPositionIsHomogeneousClip = capturesHomogeneousClip;
@@ -5551,38 +5565,11 @@ namespace dxvk {
       }
     }
 
+    // Preserve the game's real sampled albedo and alpha contract. Texture
+    // categorization and replacements key on this same live TextureRef/hash;
+    // replacing the combiner with opaque-white TFactor made every path-traced
+    // surface washed out and hid the visible result of dev-menu tagging.
     mat.updateCachedHash();
-
-    // DX11 authoring contract: source textures identify/tag materials, but do
-    // not shade captured geometry automatically. The TextureRef itself must
-    // remain attached to the material: Remix's viewport picker, texture list,
-    // replacement resolver and per-texture settings all follow that live
-    // association, not only the cached material hash. Clearing these references
-    // made geometry grey but also made it impossible to select/tag its source
-    // texture. Keep the references and samplers as authoring metadata while the
-    // TFactor combiner below makes the base path-traced surface opaque white.
-    // A user-authored replacement can therefore resolve normally without the
-    // game's raster/albedo being painted onto untagged RT geometry.
-    const XXH64_hash_t sourceMaterialHash = mat.getHash();
-    mat.textureColorArg1Source = RtTextureArgSource::TFactor;
-    mat.textureColorArg2Source = RtTextureArgSource::None;
-    mat.textureColorOperation = DxvkRtTextureOperation::SelectArg1;
-    mat.textureAlphaArg1Source = RtTextureArgSource::TFactor;
-    mat.textureAlphaArg2Source = RtTextureArgSource::None;
-    mat.textureAlphaOperation = DxvkRtTextureOperation::SelectArg1;
-    mat.tFactor = 0xffffffffu;
-    mat.alphaTestEnabled = false;
-    mat.blendMode.enableBlending = false;
-    mat.setHashOverride(sourceMaterialHash);
-
-    static uint32_t sTexturelessAuthoringLogCount = 0;
-    if (sourceMaterialHash != kEmptyHash && sTexturelessAuthoringLogCount < 12u) {
-      ++sTexturelessAuthoringLogCount;
-      Logger::info(str::format(
-        "[D3D11Rtx] Textureless RT authoring material: sourceTagHash=0x",
-        std::hex, sourceMaterialHash, std::dec,
-        " source texture remains attached for viewport selection/tagging"));
-    }
   }
 
   void D3D11Rtx::SubmitDraw(bool indexed,
@@ -7585,8 +7572,55 @@ namespace dxvk {
       dcs.materialData.updateCachedHash();
     }
 
+    bool deferTexcoordRecoveryToPositionCapture = false;
+    auto applyMissingTexcoordFallback = [&]() {
+      if (dcs.transformData.texgenMode != TexGenMode::None)
+        return;
+
+      // Prefer real vertex colors to a constant when the VS exposes no usable
+      // UV output at all. This path is only reached after both the combined
+      // position/UV replay and the dedicated UV replay are unavailable.
+      const RtTextureArgSource albedoSource =
+        geo.color0Buffer.defined() ? RtTextureArgSource::VertexColor0
+                                   : RtTextureArgSource::TFactor;
+      dcs.materialData.textureColorArg1Source  = albedoSource;
+      dcs.materialData.textureColorOperation   = DxvkRtTextureOperation::SelectArg1;
+      dcs.materialData.textureColorArg2Source  = RtTextureArgSource::None;
+      dcs.materialData.textureAlphaArg1Source  = RtTextureArgSource::TFactor;
+      dcs.materialData.textureAlphaOperation   = DxvkRtTextureOperation::SelectArg1;
+      dcs.materialData.textureAlphaArg2Source  = RtTextureArgSource::None;
+      dcs.materialData.tFactor = 0xffffffffu;
+      dcs.materialData.updateCachedHash();
+      ++m_submitRejectStats.texcoordGenerated;
+
+      static uint32_t sTexcoordFallbackLogCount = 0;
+      if (sTexcoordFallbackLogCount < 12) {
+        ++sTexcoordFallbackLogCount;
+        const XXH64_hash_t texHash =
+          dcs.materialData.getColorTexture().getImageHash();
+        Logger::info(str::format(
+          "[D3D11Rtx] Textured draw has no recoverable TEXCOORD; using final flat albedo fallback (",
+          geo.color0Buffer.defined() ? "vertex color" : "TFactor white",
+          ", count=", count,
+          ", indexed=", indexed ? 1 : 0,
+          ", fallbackCamera=",
+          dcs.transformData.usedViewportFallbackProjection ? 1 : 0,
+          ", textureHash=0x", std::hex, texHash, std::dec, ")"));
+      }
+    };
+
     if (!geo.texcoordBuffer.defined() && dcs.materialData.usesTexture()) {
       ++m_submitRejectStats.noTexcoordLayout;
+
+      const D3D11CommonShader* activeCommonVs =
+        m_context->m_state.vs.shader != nullptr
+          ? m_context->m_state.vs.shader->GetCommonShader()
+          : nullptr;
+      const bool combinedPositionUvCandidate = activeCommonVs != nullptr
+        && activeCommonVs->PositionCaptureIncludesTexcoord()
+        && m_context->m_state.gs.shader == nullptr
+        && m_context->m_state.hs.shader == nullptr
+        && m_context->m_state.ds.shader == nullptr;
 
       const uint32_t primitiveCountNoUv = dcs.geometryData.calculatePrimitiveCount();
       const bool noUvHasSceneDepthSignal = dcs.zEnable
@@ -7602,7 +7636,8 @@ namespace dxvk {
         return;
       }
 
-      if (dcs.transformData.usedViewportFallbackProjection) {
+      if (dcs.transformData.usedViewportFallbackProjection
+       && !combinedPositionUvCandidate) {
       ++m_submitRejectStats.screenSpaceGarbageSkip;
       static uint32_t sDx11V124NoUvFallbackSkipLogCount = 0;
       if (sDx11V124NoUvFallbackSkipLogCount < 16) {
@@ -7645,54 +7680,16 @@ namespace dxvk {
       // actual texture with correct coordinates. Only when capture is not
       // possible (no texcoord VS output, GS/tessellation active, budget
       // exhausted, xfb unsupported) does the flat-albedo fallback apply.
-      if (TryCaptureTexcoordsViaStreamOut(dcs, geo, indexed, count, start, base)) {
+      if (combinedPositionUvCandidate) {
+        // The later exact-position replay emits SV_Position and TEXCOORD into
+        // one interleaved record. Deferring avoids a duplicate VS/XFB pass and,
+        // for indexed flattening, guarantees both attributes use the same
+        // expanded vertex order.
+        deferTexcoordRecoveryToPositionCapture = true;
+      } else if (TryCaptureTexcoordsViaStreamOut(dcs, geo, indexed, count, start, base)) {
         ++m_submitRejectStats.texcoordCaptured;
-      } else if (dcs.transformData.texgenMode == TexGenMode::None) {
-        // Prefer the draw's own vertex colors when present: they are real
-        // per-vertex data that needs no texture coordinates, so they make a
-        // faithful flat albedo. Only fall back to the neutral TFactor constant
-        // when there are no vertex colors either.
-        const RtTextureArgSource albedoSource =
-          geo.color0Buffer.defined() ? RtTextureArgSource::VertexColor0
-                                     : RtTextureArgSource::TFactor;
-        dcs.materialData.textureColorArg1Source  = albedoSource;
-        dcs.materialData.textureColorOperation   = DxvkRtTextureOperation::SelectArg1;
-        dcs.materialData.textureColorArg2Source  = RtTextureArgSource::None;
-        dcs.materialData.textureAlphaArg1Source  = albedoSource;
-        dcs.materialData.textureAlphaOperation   = DxvkRtTextureOperation::SelectArg1;
-        dcs.materialData.textureAlphaArg2Source  = RtTextureArgSource::None;
-        // tFactor is ARGB packed; the shader decodes it as .bgra. 0xffffffff =
-        // opaque white (1,1,1,1), a neutral albedo: the surface is shaded purely
-        // by the path tracer's lighting/GI with no baked color bias. This is the
-        // least surprising default for geometry whose real texture we cannot
-        // sample correctly.
-        dcs.materialData.tFactor = 0xffffffffu;
-        dcs.materialData.updateCachedHash();
-        ++m_submitRejectStats.texcoordGenerated;
-
-        static uint32_t sTexcoordFallbackLogCount = 0;
-        if (sTexcoordFallbackLogCount < 12) {
-          ++sTexcoordFallbackLogCount;
-          // Prove the bound texture is still captured/indexed despite the flat
-          // albedo override: the image hash is what the Remix dev-menu texture
-          // browser and all per-texture settings (ignore/hide/sky/decal/...)
-          // key on, so reporting it here confirms the asset pipeline is intact
-          // for these no-UV draws. A hash of 0 means FillMaterialData found no
-          // usable color texture candidate for this draw (a separate issue).
-          const XXH64_hash_t texHash = dcs.materialData.getColorTexture().getImageHash();
-          Logger::info(str::format(
-            "[D3D11Rtx] Textured draw has no TEXCOORD semantic; using flat albedo (",
-            geo.color0Buffer.defined() ? "vertex color" : "TFactor white",
-            ") instead of view-position texgen (count=",
-            count,
-            ", indexed=",
-            indexed ? 1 : 0,
-            ", fallbackCamera=",
-            dcs.transformData.usedViewportFallbackProjection ? 1 : 0,
-            ", textureHash=0x", std::hex, texHash, std::dec,
-            ", textureCaptured=", texHash != 0 ? 1 : 0,
-            ")"));
-        }
+      } else {
+        applyMissingTexcoordFallback();
       }
     }
 
@@ -7813,6 +7810,17 @@ namespace dxvk {
           " drawId=", dcs.drawCallID));
       }
       return;
+    }
+
+    if (deferTexcoordRecoveryToPositionCapture
+     && !geo.texcoordBuffer.defined()) {
+      // Position capture may be unavailable for a safe non-camera-relative
+      // draw (budget/capability/profile). Retain coverage by trying the legacy
+      // dedicated UV replay before using the explicit flat fallback.
+      if (TryCaptureTexcoordsViaStreamOut(dcs, geo, indexed, count, start, base))
+        ++m_submitRejectStats.texcoordCaptured;
+      else
+        applyMissingTexcoordFallback();
     }
 
     DrawParameters params;
