@@ -3184,8 +3184,12 @@ namespace dxvk {
     if (riid == __uuidof(ID3D11Debug))
       return E_NOINTERFACE;      
     
-    // Undocumented interfaces that are queried by some games
-    if (riid == GUID{0xd56e2a4c,0x5127,0x8437,{0x65,0x8a,0x98,0xc5,0xbb,0x78,0x94,0x98}})
+    // Undocumented/private interfaces that are queried speculatively by some
+    // games. These are not DXGI or D3D11 interfaces and must remain unsupported,
+    // but logging every probe can produce hundreds of thousands of lines per
+    // minute in Unreal Engine titles and materially stall the render thread.
+    if (riid == GUID{0xd56e2a4c,0x5127,0x8437,{0x65,0x8a,0x98,0xc5,0xbb,0x78,0x94,0x98}}
+     || riid == GUID{0xbc09d320,0xca95,0x452a,{0xb7,0xb2,0x5c,0x94,0xa4,0xf0,0x7d,0x07}})
       return E_NOINTERFACE;
     
     Logger::info("D3D11DXGIDevice::QueryInterface: Unknown interface query");
