@@ -54,6 +54,7 @@ struct InterleaveGeometryArgs {
 #define INTERLEAVE_GEOMETRY_FLAG_HAS_COLOR0        0x04u
 #define INTERLEAVE_GEOMETRY_FLAG_FORCE_NORMALS     0x08u
 #define INTERLEAVE_GEOMETRY_FLAG_HOMOGENEOUS_CLIP  0x10u
+#define INTERLEAVE_GEOMETRY_FLAG_CLIP_W_DEPTH       0x20u
 
 #ifdef __cplusplus
 static_assert(sizeof(InterleaveGeometryArgs) == 128,

@@ -147,26 +147,52 @@ namespace interleaver {
                       srcPosition[srcPositionIndex + 2],
                       srcPosition[srcPositionIndex + 3]);
       const mat4& m = cb.clipToPosition;
-      const vec4 p = m.m[0] * clip.x + m.m[1] * clip.y
-                   + m.m[2] * clip.z + m.m[3] * clip.w;
-      if (std::isfinite(p.x) && std::isfinite(p.y)
-       && std::isfinite(p.z) && std::isfinite(p.w)
-       && std::abs(p.w) > 1.0e-20f) {
-        const float invW = 1.0f / p.w;
-        position = float3(p.x * invW, p.y * invW, p.z * invW);
+      if ((cb.attributeFlags & INTERLEAVE_GEOMETRY_FLAG_CLIP_W_DEPTH) != 0) {
+        const float invXScale = m.m[0].x;
+        const float invYScale = m.m[1].y;
+        if (std::isfinite(clip.x) && std::isfinite(clip.y)
+         && std::isfinite(clip.w) && std::isfinite(invXScale)
+         && std::isfinite(invYScale) && std::abs(clip.w) > 1.0e-20f) {
+          position = float3(clip.x * invXScale,
+                            clip.y * invYScale,
+                            clip.w);
+        } else {
+          position = float3(0.0f, 0.0f, 0.0f);
+        }
       } else {
-        position = float3(0.0f, 0.0f, 0.0f);
+        const vec4 p = m.m[0] * clip.x + m.m[1] * clip.y
+                     + m.m[2] * clip.z + m.m[3] * clip.w;
+        if (std::isfinite(p.x) && std::isfinite(p.y)
+         && std::isfinite(p.z) && std::isfinite(p.w)
+         && std::abs(p.w) > 1.0e-20f) {
+          const float invW = 1.0f / p.w;
+          position = float3(p.x * invW, p.y * invW, p.z * invW);
+        } else {
+          position = float3(0.0f, 0.0f, 0.0f);
+        }
       }
 #else
       const float4 clip = float4(srcPosition[srcPositionIndex + 0],
                                  srcPosition[srcPositionIndex + 1],
                                  srcPosition[srcPositionIndex + 2],
                                  srcPosition[srcPositionIndex + 3]);
-      const float4 p = mul(cb.clipToPosition, clip);
-      if (all(isfinite(p)) && abs(p.w) > 1.0e-20f)
-        position = p.xyz / p.w;
-      else
-        position = float3(0.0f, 0.0f, 0.0f);
+      if ((cb.attributeFlags & INTERLEAVE_GEOMETRY_FLAG_CLIP_W_DEPTH) != 0) {
+        const float invXScale = cb.clipToPosition[0][0];
+        const float invYScale = cb.clipToPosition[1][1];
+        if (all(isfinite(float4(clip.x, clip.y, clip.w, invXScale)))
+         && isfinite(invYScale) && abs(clip.w) > 1.0e-20f)
+          position = float3(clip.x * invXScale,
+                            clip.y * invYScale,
+                            clip.w);
+        else
+          position = float3(0.0f, 0.0f, 0.0f);
+      } else {
+        const float4 p = mul(cb.clipToPosition, clip);
+        if (all(isfinite(p)) && abs(p.w) > 1.0e-20f)
+          position = p.xyz / p.w;
+        else
+          position = float3(0.0f, 0.0f, 0.0f);
+      }
 #endif
     }
     dst[idx * cb.outputStride + writeOffset++] = position.x;
