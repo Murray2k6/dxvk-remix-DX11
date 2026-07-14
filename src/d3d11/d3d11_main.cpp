@@ -252,8 +252,8 @@ void logRemixDx11BuildBanner() {
     return;
   dxvk::Logger::info("=====================================================");
   dxvk::Logger::info(dxvk::str::format("[Remix-DX11] build stamp: ", __DATE__, " ", __TIME__));
-  dxvk::Logger::info("[Remix-DX11] fixes: nrcVendorFallback texcoordSINT SR4viewport budgetHeadroom inputSeparation noSyntheticTexture revertedDLSSGuard initStepLogging allVendorPrewarmSkip anyGameAlbedoFix significanceCullingOptIn gpuSceneUI remixapiExport taauDefaultAllVendors rtxOptionsNullGuard rtxOptionsRootCreate intelFseSwapchainFix steamOverlayVkDisable wsiSelfDeadlockPump vramLeakDiag restoreIconicWindow intelFifoPresent intelForceFSEallowed gdiInteropPresent frameLatencyHandleGuard noUvFlatAlbedo baseVertexGeometry gpuSceneBBox perVendorPresent gdiWsiFallback nrcOptIn nvidiaPrewarm rawInputHandoff noInfiniteWaits nonblockingRtPipelines tlasFirewall interleaverFormatNorm dynamicVbSnapshot color0Norm interleaverSkipGuard intUvDecode menuPassthrough migrationPersists fullresTargetGuard viewInProjCbuffer fallbackRadianceTame textureHashStability bridgeTextureContentHash skinningNameGate preciseCamera vpConfirmOncePerFrame crashFilterSafe nrdDenoiserPayload strongerDenoising bridgePresentCamera bootMarkerLogCleanup vertexColorFormats texcoordFormats pickResolveLog nrdRobustLoad menuToggleDebounce uiDisplayMatchesSurface noBlackFromVertexColor nrdDenoiserSafeDefault useRealAlbedo requireRealViewToInject noPrewarmByDefault noStackedInstanceCopies noDepthOnlyGeometry skyAutoDetect realShaderModel colorNameGate mirroredWinding launcherBypass nrdOn globalTonemap texcoordCaptureSO v271SubmitFix dx11FixedFunction bootBreadcrumb sysDllExports satelliteDelayLoad eacAdvisory sharedVkInstance vkCreateInstanceMarkers crossDllInstanceLock borrowDxgiInstance adapterEnumMarkers texcoordCaptureReuse offscreenCameraGate instRowStrideClamp censusOnGrowth helperBufferPool gpMatrixDump lightCensus submitSummaryPeriodic half4PositionInterleave cameraRelativeView exactCameraPriority firstTouchCameraMetadata indexBoundsFirewall allRayQueryDx11 ommSafeDefault captureBudgetComplete raySafeTwoSided boundedRtScene preemptibleBlasBatches shaderProvenObjectToView");
-  dxvk::Logger::info("[Remix-DX11] camera/runtime: replacementViewCamera tempMoveTransformProof shaderScopedWorldScan cameraRelativeSkinning dxbcTransformProfile pairedClipProjection pacedColdCaptures texturelessRtAuthoring noRasterSceneFallback remixScreenshotKey startupBrandingPassthrough FSR_REMOVED");
+  dxvk::Logger::info("[Remix-DX11] fixes: nrcVendorFallback texcoordSINT SR4viewport budgetHeadroom inputSeparation noSyntheticTexture revertedDLSSGuard initStepLogging allVendorPrewarmSkip anyGameAlbedoFix significanceCullingOptIn gpuSceneUI remixapiExport taauDefaultAllVendors rtxOptionsNullGuard rtxOptionsRootCreate intelFseSwapchainFix steamOverlayVkDisable wsiSelfDeadlockPump vramLeakDiag restoreIconicWindow intelFifoPresent intelForceFSEallowed gdiInteropPresent frameLatencyHandleGuard noUvFlatAlbedo baseVertexGeometry gpuSceneBBox perVendorPresent gdiWsiFallback nrcOptIn nvidiaPrewarm rawInputHandoff noInfiniteWaits nonblockingRtPipelines tlasFirewall interleaverFormatNorm dynamicVbSnapshot color0Norm interleaverSkipGuard intUvDecode menuPassthrough migrationPersists fullresTargetGuard viewInProjCbuffer fallbackRadianceTame textureHashStability bridgeTextureContentHash skinningNameGate preciseCamera vpConfirmOncePerFrame crashFilterSafe nrdDenoiserPayload strongerDenoising bridgePresentCamera bootMarkerLogCleanup vertexColorFormats texcoordFormats pickResolveLog nrdRobustLoad menuToggleDebounce uiDisplayMatchesSurface noBlackFromVertexColor nrdDenoiserSafeDefault useRealAlbedo requireRealViewToInject noPrewarmByDefault noStackedInstanceCopies noDepthOnlyGeometry skyAutoDetect realShaderModel colorNameGate mirroredWinding launcherBypass nrdOn globalTonemap texcoordCaptureSO v271SubmitFix dx11FixedFunction bootBreadcrumb sysDllExports satelliteDelayLoad eacAdvisory sharedVkInstance vkCreateInstanceMarkers crossDllInstanceLock crossDllDriverReentryBypass borrowDxgiInstance adapterEnumMarkers texcoordCaptureReuse offscreenCameraGate instRowStrideClamp censusOnGrowth helperBufferPool gpMatrixDump lightCensus submitSummaryPeriodic half4PositionInterleave cameraRelativeView exactCameraPriority firstTouchCameraMetadata indexBoundsFirewall allRayQueryDx11 ommSafeDefault captureBudgetComplete raySafeTwoSided boundedRtScene preemptibleBlasBatches shaderProvenObjectToView");
+  dxvk::Logger::info("[Remix-DX11] camera/runtime: replacementViewCamera tempMoveTransformProof shaderScopedWorldScan cameraRelativeSkinning dxbcTransformProfile pairedClipProjection pacedColdCaptures exactDirectInstancing hostVisibleIndirectCapture gpuIndexedPositionFlatten clipWReplacementProjection selectableTexturelessRtAuthoring unrealPrivateProbeSilence noRasterSceneFallback remixScreenshotKey startupBrandingPassthrough FSR_REMOVED");
   dxvk::Logger::info("[Remix-DX11] if this line is absent or older than your last build, the game loaded a STALE d3d11.dll.");
   // DX11_V282: anti-cheat advisory (detection + guidance only; Remix cannot
   // and must not run under an active anti-cheat).
@@ -593,6 +593,25 @@ extern "C" {
       dxvkInstance = dxgiVkAdapter->GetDXVKInstance();
     } else {
       Logger::warn("D3D11CoreCreateDevice: Adapter is not a DXVK adapter");
+
+      // DX11_V291_CROSS_DLL_DRIVER_REENTRY_BYPASS: Vulkan ICDs may probe D3D11
+      // while dxgi.dll is still inside vkEnumeratePhysicalDevices. Because this
+      // d3d11.dll is ahead of the system runtime in the DLL search path, that
+      // internal probe reaches us with a native/system adapter. Starting DXVK
+      // here creates a second Vulkan instance recursively on the same thread;
+      // FFXV's NVIDIA path then deadlocks the outer adapter enumeration against
+      // the nested vkCreateInstance. The process-wide construction event is
+      // shared by our dxgi.dll and d3d11.dll, unlike C++ statics. Forward only
+      // this foreign-adapter re-entry to the real system D3D11 runtime. The
+      // game's later call uses the completed DXVK adapter and stays in Remix.
+      if (DxvkInstance::isCrossDllInstanceConstructionInProgress()) {
+        Logger::info(
+          "[Remix-DX11][init] Vulkan adapter enumeration re-entered D3D11 with a foreign adapter; "
+          "forwarding the driver probe to system D3D11 to prevent recursive instance creation");
+        return forwardToSystemD3D11CoreCreateDevice(
+          pFactory, pAdapter, Flags, pFeatureLevels, FeatureLevels, ppDevice);
+      }
+
       DXGI_ADAPTER_DESC desc;
       pAdapter->GetDesc(&desc);
 
