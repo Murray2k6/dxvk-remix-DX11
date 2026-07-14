@@ -1452,7 +1452,7 @@ namespace dxvk {
           reinterpret_cast<const char*>(pShaderBytecode),
           reinterpret_cast<const char*>(pShaderBytecode) + BytecodeLength);
         m_texcoordCapture->options = pDxbcModuleInfo->options;
-        m_texcoordCapture->semanticName = std::move(semanticName);
+        m_texcoordCapture->semanticName = semanticName;
         m_texcoordCapture->semanticIndex = semanticIndex;
       }
 
@@ -1472,6 +1472,10 @@ namespace dxvk {
       m_positionCapture->positionSpace = D3D11CapturedPositionSpace::View;
       m_positionCapture->homogeneousClipSpace = true;
       m_positionCapture->loadedFromProfile = false;
+      if (m_texcoordCapture != nullptr) {
+        m_positionCapture->texcoordSemanticName = std::move(semanticName);
+        m_positionCapture->texcoordSemanticIndex = semanticIndex;
+      }
     }
   }
 
@@ -1551,7 +1555,9 @@ namespace dxvk {
       DxbcModule module(reader);
 
       DxbcXfbInfo xfb = {};
-      xfb.entryCount = 1;
+      const uint32_t positionBytes = state->homogeneousClipSpace ? 16u : 12u;
+      const bool captureTexcoord = !state->texcoordSemanticName.empty();
+      xfb.entryCount = captureTexcoord ? 2 : 1;
       xfb.entries[0].semanticName   = state->semanticName.c_str();
       xfb.entries[0].semanticIndex  = state->semanticIndex;
       xfb.entries[0].componentIndex = 0;
@@ -1559,7 +1565,16 @@ namespace dxvk {
       xfb.entries[0].streamId       = 0;
       xfb.entries[0].bufferId       = 0;
       xfb.entries[0].offset         = 0;
-      xfb.strides[0] = state->homogeneousClipSpace ? 16 : 12;
+      if (captureTexcoord) {
+        xfb.entries[1].semanticName   = state->texcoordSemanticName.c_str();
+        xfb.entries[1].semanticIndex  = state->texcoordSemanticIndex;
+        xfb.entries[1].componentIndex = 0;
+        xfb.entries[1].componentCount = 2;
+        xfb.entries[1].streamId       = 0;
+        xfb.entries[1].bufferId       = 0;
+        xfb.entries[1].offset         = positionBytes;
+      }
+      xfb.strides[0] = positionBytes + (captureTexcoord ? 8u : 0u);
       xfb.rasterizedStream = -1;
 
       DxbcModuleInfo info;
@@ -1569,7 +1584,7 @@ namespace dxvk {
 
       Rc<DxvkShader> gs = module.compilePassthroughShader(
         info, "dx11_position_capture_gs", true);
-      static constexpr char kPositionCaptureKey[] = "dx11-position-capture-system-value-v1";
+      static constexpr char kPositionCaptureKey[] = "dx11-position-texcoord-capture-system-value-v2";
       const Sha1Data shaderKeyData[] = {
         { state->bytecode.data(), state->bytecode.size() },
         { kPositionCaptureKey, sizeof(kPositionCaptureKey) - 1 },
@@ -1585,7 +1600,10 @@ namespace dxvk {
           ? "world" : "view",
         ", source=", state->homogeneousClipSpace
           ? "exact-sv-position"
-          : (state->loadedFromProfile ? "profile" : "auto-discovery"), ")"));
+          : (state->loadedFromProfile ? "profile" : "auto-discovery"),
+        ", texcoord=", captureTexcoord
+          ? str::format(state->texcoordSemanticName, state->texcoordSemanticIndex)
+          : "none", ")"));
     } catch (const DxvkError& e) {
       Logger::warn(str::format(
         "[Remix-DX11] V290: position capture GS compile failed: ", e.message()));

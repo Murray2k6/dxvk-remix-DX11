@@ -3475,11 +3475,11 @@ namespace dxvk {
     // into the DEFAULT texture) never passes the UpdateSubresource or Unmap
     // hash chokepoints, so those destination textures kept image hash 0 and
     // the Remix material system could not key on them. Establish the identity
-    // here on the first full-subresource copy into each destination
-    // subresource: from the source image's content hash when it has one, or
+    // here on the first full-subresource copy into the destination image:
+    // from the source image's content hash when it has one, or
     // from the staging texture's CPU-visible packed texels. Later copies into
-    // an already-hashed subresource never re-mix, keeping the hash stable
-    // across frames for render-to-texture and streaming patterns.
+    // an already-identified image never re-mix, keeping the hash stable across
+    // frames, mip streaming and render-to-texture update patterns.
     if (dstIsImage
      && (dstFormatInfo->aspectMask & VK_IMAGE_ASPECT_COLOR_BIT)
      && DstOffset.x == 0 && DstOffset.y == 0 && DstOffset.z == 0
@@ -3487,7 +3487,7 @@ namespace dxvk {
      && dstExtent.height == dstMipExtent.height
      && dstExtent.depth  == dstMipExtent.depth) {
       Rc<DxvkImage> dstImage = pDstTexture->GetImage();
-      if (dstImage != nullptr) {
+      if (dstImage != nullptr && dstImage->getHash() == 0ull) {
         const Rc<DxvkImage> srcImage = srcIsImage ? pSrcTexture->GetImage() : nullptr;
         const XXH64_hash_t srcImageHash = srcImage != nullptr ? srcImage->getHash() : 0ull;
         constexpr size_t kMaxTexelHashBytes = 32768;
@@ -3506,8 +3506,6 @@ namespace dxvk {
             // copy from a hashed source can still establish it.
             if (srcImageHash == 0ull)
               continue;
-            if (!pDstTexture->TryMarkSubresourceHashed(dstSubresource))
-              continue;
             contentHash = srcImageHash;
           } else {
             // Staging-to-image: hash the CPU-visible packed texels the copy
@@ -3518,8 +3516,6 @@ namespace dxvk {
             const DxvkBufferSliceHandle srcSlice = pSrcTexture->GetMappedSlice(srcSubresource);
             if (srcSlice.mapPtr == nullptr)
               continue;
-            if (!pDstTexture->TryMarkSubresourceHashed(dstSubresource))
-              continue;
             contentHash = XXH3_64bits(srcSlice.mapPtr,
               std::min<size_t>(size_t(srcSlice.length), kMaxTexelHashBytes));
           }
@@ -3528,11 +3524,9 @@ namespace dxvk {
           contentHash = XXH3_64bits_withSeed(&dstMipExtent, sizeof(dstMipExtent), contentHash);
           contentHash = XXH3_64bits_withSeed(&dstSubresource, sizeof(dstSubresource), contentHash);
 
-          const XXH64_hash_t existing = dstImage->getHash();
-          if (existing == 0ull)
+          if (pDstTexture->TryClaimImageHash())
             dstImage->setHash(contentHash != 0ull ? contentHash : 1ull);
-          else
-            dstImage->setHash(XXH64(&contentHash, sizeof(contentHash), existing));
+          break;
         }
       }
     }
@@ -3849,16 +3843,16 @@ namespace dxvk {
     // identity: partial box updates are streaming region fills, not the
     // texture's identity. Depth/stencil aspects are skipped.
     //
-    // DX11_V258_TEXTURE_HASH_STABILITY: each subresource contributes to the
-    // identity exactly once (its first full upload). Without this guard,
-    // textures re-uploaded every frame (video, streamed atlases) mixed a new
-    // value into the hash on every upload, so their material hash never
-    // stabilized - replacements and texture tags could not key on them.
+    // DX11_V258_TEXTURE_HASH_STABILITY: the first complete upload establishes
+    // one immutable image identity. Without this guard, later streamed mips,
+    // video frames and atlas updates changed the material hash after a user
+    // tagged it, so replacements no longer matched the selected texture.
     if ((formatInfo->aspectMask & VK_IMAGE_ASPECT_COLOR_BIT)
-     && pDstBox == nullptr
-     && pDstTexture->TryMarkSubresourceHashed(DstSubresource)) {
+     && pDstBox == nullptr) {
       Rc<DxvkImage> dstImage = pDstTexture->GetImage();
-      if (dstImage != nullptr) {
+      if (dstImage != nullptr
+       && dstImage->getHash() == 0ull
+       && pDstTexture->TryClaimImageHash()) {
         // Cap the bytes hashed per upload for performance (mirrors the capped
         // geometry-index hash in rtx_hashing.cpp). 64 KiB is enough entropy for
         // stable identity while bounding CPU cost on large BC textures.
@@ -3871,15 +3865,7 @@ namespace dxvk {
         contentHash = XXH3_64bits_withSeed(&extent, sizeof(extent), contentHash);
         contentHash = XXH3_64bits_withSeed(&DstSubresource, sizeof(DstSubresource), contentHash);
 
-        const XXH64_hash_t existing = dstImage->getHash();
-        if (existing == 0u) {
-          // First (typically mip 0) upload: this is the texture's identity.
-          dstImage->setHash(contentHash != 0u ? contentHash : 1u);
-        } else {
-          // Subsequent full-subresource uploads (other mips/layers): mix in so
-          // the identity reflects the full texture, not just the first slice.
-          dstImage->setHash(XXH64(&contentHash, sizeof(contentHash), existing));
-        }
+        dstImage->setHash(contentHash != 0u ? contentHash : 1u);
       }
     }
     // NV-DXVK end
