@@ -394,11 +394,9 @@ namespace dxvk {
                  "When set to true shaders will be automatically recompiled when any shader file is updated (saved for instance) in addition to the usual manual recompilation trigger.\n"
                  "This option is mainly meant for development use and should not be set for user-facing operation.");
 
-      RTX_OPTION_ENV("rtx.shader", bool, prewarmAllVariants, false, "RTX_PREWARM_ALL_VARIANTS",
-                     "When set to true, all variants of shaders will be prewarmed at launch. Only takes effect when rtx.initializer.asyncShaderPrewarming is set to true.\n"
-                     "By default Remix only prewarms shaders which may actually be used at runtime or are accessible by user-facing graphics menus rather than all shader variants accessible by changing options in the developer menu.\n"
-                     "This has the benefit of minimizing shader compilation cost for typical users, but may cause shader compilation stalls when changing various options in the developer menu. As such, this option is useful to enable during development to minimize these stalls.\n"
-                     "Do note however that enabling this option will have a significant performance impact whenever shaders are uncached (e.g. on first load) due to requiring many more shaders to be compiled. As such using the enviornment variable to set this option locally on a developer's machine is recommended over a configuration file change to ensure it is not accidently enabled for users.");
+      RTX_OPTION_ENV("rtx.shader", bool, prewarmAllVariants, true, "RTX_PREWARM_ALL_VARIANTS",
+                     "Prewarms every Remix shader variant in the injected game process after an external game launcher has handed off and before Remix completes game initialization. Only takes effect when rtx.initializer.asyncShaderPrewarming is true.\n"
+                     "Disable only to diagnose a driver compiler problem or reduce first-run compilation time; disabled variants compile asynchronously when first selected.");
       RTX_OPTION_ENV("rtx.shader", bool, prewarmOnBoot, true, "DXVK_REMIX_PREWARM",
                      "Registers the Remix path-tracing pipeline set with the asynchronous compiler during startup so required shaders are compiled before their first rendered use. Disable only when diagnosing a driver-specific compiler failure.");
       RTX_OPTION("rtx.shader", bool, waitForPrewarmOnBoot, true,

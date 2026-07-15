@@ -689,6 +689,7 @@ namespace dxvk {
       bool indexed, UINT count, UINT start, INT base,
       bool hasExternalInstanceTransform,
       UINT replayFirstInstance,
+      UINT replayInstanceCount,
       bool requireIndexedFlatten) {
     static const bool s_disabled = env::getEnvVar("DXVK_REMIX_POSITION_CAPTURE") == "0";
     // Keep the existing developer-menu control authoritative. Previously the
@@ -698,11 +699,11 @@ namespace dxvk {
     if (s_disabled || !useVertexCapture())
       return false;
 
-    // SubmitInstancedDraw currently expands application instances on the CPU.
-    // Replaying a non-instanced point draw would always evaluate SV_InstanceID
-    // zero, so leave those draws on the explicit instance-transform path rather
-    // than capturing one instance and accidentally applying its transform twice.
-    if (hasExternalInstanceTransform)
+    // Explicit CPU instance transforms have already consumed the application's
+    // instance state. Replaying them here would evaluate SV_InstanceID again and
+    // apply placement twice. Shader-profile batches, on the other hand, pass the
+    // original FirstInstance/InstanceCount and must be evaluated as one draw.
+    if (hasExternalInstanceTransform || replayInstanceCount == 0)
       return false;
 
     if (!m_context->m_device->features().extTransformFeedback.transformFeedback)
@@ -740,18 +741,20 @@ namespace dxvk {
     }
 
     static constexpr uint32_t     kMaxCaptureVerticesPerDraw = 2u << 20;
-    // Cold allocations and updates have separate limits. A newly captured draw
-    // also creates its first BLAS/history allocation, so admitting hundreds in
-    // one Ultra-mode loading frame can consume gigabytes even when the stream-
-    // output buffers themselves are small. Existing captures need a wider
-    // update lane so camera/skinning motion does not make warmed geometry
-    // flicker. The total ceiling still bounds GPU work for pathological scenes.
-    static constexpr uint32_t     kMaxCapturesPerFrame       = 384u;
-    static constexpr uint32_t     kMaxNewCaptureBuffersPerFrame = 96u;
-    static constexpr uint32_t     kMaxReplayCapturesPerFrame = 384u;
-    static constexpr VkDeviceSize kMaxCaptureBytesPerFrame   = 24ull << 20;
-    static constexpr size_t       kMaxCacheEntries           = 2048u;
-    static constexpr VkDeviceSize kMaxCacheBytes             = 64ull << 20;
+    // Cold allocations and updates have separate limits. Exact instanced draws
+    // are now one capture per game batch rather than one per instance, so a
+    // wider cold lane no longer recreates the old thousands-of-BLAS explosion.
+    // Hello Neighbor's first real scene contains roughly 475 valid compact
+    // captures before its large instance batches; the old 96-entry lane dropped
+    // those batches even though only 1 MiB of the byte budget had been used.
+    // Keep both an object-count ceiling and the byte/cache ceilings below so a
+    // pathological title is still bounded while normal scene startup is whole.
+    static constexpr uint32_t     kMaxCapturesPerFrame       = 768u;
+    static constexpr uint32_t     kMaxNewCaptureBuffersPerFrame = 512u;
+    static constexpr uint32_t     kMaxReplayCapturesPerFrame = 768u;
+    static constexpr VkDeviceSize kMaxCaptureBytesPerFrame   = 128ull << 20;
+    static constexpr size_t       kMaxCacheEntries           = 4096u;
+    static constexpr VkDeviceSize kMaxCacheBytes             = 384ull << 20;
 
     // Device-local index buffers cannot be scanned on the submit thread. The
     // old fallback replayed the entire shared vertex buffer for every indexed
@@ -762,15 +765,29 @@ namespace dxvk {
     // and use transform feedback's compact output as a non-indexed triangle
     // list. The ordering and duplicates exactly match the application's index
     // sequence; no CPU readback or guessed range is involved.
-    const bool flattenIndexed = requireIndexedFlatten
-      && indexed
-      && m_context->m_state.ia.primitiveTopology == D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+    const bool multiInstanceCapture = replayInstanceCount > 1u;
+    const bool triangleList =
+      m_context->m_state.ia.primitiveTopology == D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+    // Multiple instances are concatenated in the transform-feedback stream.
+    // Only independent triangle lists can be concatenated without inventing
+    // cross-instance strip primitives. Indexed batches must also be flattened,
+    // since the application's one-instance index buffer cannot address the
+    // appended copies.
+    if (multiInstanceCapture && !triangleList)
+      return false;
+
+    const bool flattenIndexed = indexed && triangleList
+      && (requireIndexedFlatten || multiInstanceCapture);
     if (requireIndexedFlatten && !flattenIndexed)
       return false;
 
-    const uint32_t vertexCount = flattenIndexed ? count : geo.vertexCount;
-    if (vertexCount == 0 || vertexCount > kMaxCaptureVerticesPerDraw)
+    const uint32_t verticesPerInstance = flattenIndexed ? count : geo.vertexCount;
+    const uint64_t totalVertexCount =
+      uint64_t(verticesPerInstance) * uint64_t(replayInstanceCount);
+    if (verticesPerInstance == 0 || totalVertexCount == 0
+     || totalVertexCount > kMaxCaptureVerticesPerDraw)
       return false;
+    const uint32_t vertexCount = uint32_t(totalVertexCount);
 
     if (m_context->m_state.vs.shader == nullptr)
       return false;
@@ -926,6 +943,8 @@ namespace dxvk {
       uint64_t stateHash = 0x5356504f53495449ull; // "SVPOSITI"
       stateHash = XXH3_64bits_withSeed(
         &replayFirstInstance, sizeof(replayFirstInstance), stateHash);
+      stateHash = XXH3_64bits_withSeed(
+        &replayInstanceCount, sizeof(replayInstanceCount), stateHash);
       bool readable = true;
       const bool hasNarrowTransformBinding = captureBinding != nullptr
         && captureBinding->matrixCount >= 1u
@@ -1129,8 +1148,8 @@ namespace dxvk {
           : size_t(firstVertex);
         const size_t begin = size_t(vb.offset) + elementIndex * vb.stride;
         const size_t byteLength = perInstance
-          ? size_t(vb.stride)
-          : size_t(vertexCount) * vb.stride;
+          ? size_t(vb.stride) * size_t(replayInstanceCount)
+          : size_t(verticesPerInstance) * vb.stride;
         if (ptr == nullptr || begin >= bufferSize || byteLength > bufferSize - begin) {
           readable = false;
           break;
@@ -1366,6 +1385,7 @@ namespace dxvk {
     };
     mixOutputIdentity(firstVertex);
     mixOutputIdentity(vertexCount);
+    mixOutputIdentity(replayInstanceCount);
     mixOutputIdentity(flattenIndexed ? 0x494e4458464c4154ull : 0x564552544558524eull);
     if (flattenIndexed) {
       mixOutputIdentity(start);
@@ -1595,7 +1615,8 @@ namespace dxvk {
 
       m_context->EmitCs([cGs = std::move(captureGs),
                          cBuf = DxvkBufferSlice(entry.buffer, 0, captureBytes),
-                         cCount = vertexCount,
+                         cCount = verticesPerInstance,
+                         cInstanceCount = replayInstanceCount,
                          cFirst = firstVertex,
                          cRestoreIa = restoreIa,
                          cFirstInstance = replayFirstInstance,
@@ -1607,9 +1628,9 @@ namespace dxvk {
         ctx->bindXfbBuffer(0, cBuf, DxvkBufferSlice());
         ctx->setInputAssemblyState(pointIa);
         if (cFlattenIndexed) {
-          ctx->drawIndexed(cCount, 1, cStartIndex, cBaseVertex, cFirstInstance);
+          ctx->drawIndexed(cCount, cInstanceCount, cStartIndex, cBaseVertex, cFirstInstance);
         } else {
-          ctx->draw(cCount, 1, cFirst, cFirstInstance);
+          ctx->draw(cCount, cInstanceCount, cFirst, cFirstInstance);
         }
         ctx->bindShader(VK_SHADER_STAGE_GEOMETRY_BIT, nullptr);
         ctx->bindXfbBuffer(0, DxvkBufferSlice(), DxvkBufferSlice());
@@ -1664,13 +1685,11 @@ namespace dxvk {
       geo.texcoordBuffer = capturedTexcoords;
       dcs.geometryData.texcoordBuffer = capturedTexcoords;
     }
-    if (flattenIndexed) {
-      // XFB emitted one vertex per index in triangle-list order. The original
-      // index buffer must not be applied a second time. Original per-vertex
-      // attribute streams are indexed in the old domain and therefore cannot
-      // be paired with this compact stream. TEXCOORD is the exception: it was
-      // emitted beside position by the same indexed replay and is already in
-      // the exact flattened domain.
+    if (flattenIndexed || multiInstanceCapture) {
+      // XFB emitted one compact vertex stream containing every selected
+      // instance. The original one-instance index/attribute streams cannot be
+      // applied to that appended domain. TEXCOORD is the exception: it was
+      // emitted beside position by the same replay and already matches it.
       geo.indexBuffer = RasterBuffer();
       geo.indexCount = 0;
       geo.vertexCount = vertexCount;
@@ -1777,6 +1796,7 @@ namespace dxvk {
         ", homogeneousClip=", capturesHomogeneousClip ? 1 : 0,
         ", clipWDepth=", capturedClipUsesWDepth ? 1 : 0,
         ", firstInstance=", replayFirstInstance,
+        ", instanceCount=", replayInstanceCount,
         ", dynamic=", capturedDynamicPositions ? 1 : 0,
         ", replayEveryFrame=", captureMustReplayEveryFrame ? 1 : 0,
         ", transformState=", hasHomogeneousTransformStateIdentity ? 1 : 0,
@@ -1802,7 +1822,7 @@ namespace dxvk {
 
   void D3D11Rtx::SweepPositionCaptureCache(uint32_t currentFrame) {
     static constexpr uint32_t     kEvictAfterFrames = 120u;
-    static constexpr VkDeviceSize kMaxCacheBytes    = 64ull << 20;
+    static constexpr VkDeviceSize kMaxCacheBytes    = 384ull << 20;
 
     const bool overBudget = m_positionCaptureCacheBytes > kMaxCacheBytes;
     if (!overBudget && (currentFrame & 63u) != 0u)
@@ -1844,10 +1864,10 @@ namespace dxvk {
     // the vertex shader (SV_InstanceID, per-instance IA rows, cbuffers or VS
     // SRVs). The old CPU matrix fit handled only one of those layouts and then
     // disabled post-VS capture, so the most important engine geometry was sent
-    // to RTX with guessed transforms or collapsed to one point. When the shader
-    // can be replayed, evaluate each selected instance with its real base
-    // instance and capture exact SV_Position instead. No engine or executable
-    // names are involved.
+    // to RTX with guessed transforms or collapsed to one point. Replay the
+    // original instance range in bounded GPU batches, preserving the game's
+    // real SV_InstanceID and per-instance input streams without creating one
+    // CPU capture buffer and one BLAS submission per instance.
     bool canCaptureExactInstances = useVertexCapture()
       && m_context->m_device->features().extTransformFeedback.transformFeedback
       && m_context->m_state.vs.shader != nullptr
@@ -1863,35 +1883,37 @@ namespace dxvk {
         && commonVs->HasPositionCaptureCandidate();
     }
 
+    canCaptureExactInstances &=
+      m_context->m_state.ia.primitiveTopology == D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+
     if (canCaptureExactInstances) {
-      // A single draw containing tens of thousands of grass instances must not
-      // expand into tens of thousands of CPU submissions (the previous Unity
-      // hang). Keep a uniformly distributed, deterministic working set. The
-      // global capture cache/budgets warm this set incrementally across frames.
-      static constexpr UINT kMaxExactInstancesPerDraw = 512u;
+      // Bound pathological vegetation draws while retaining every instance in
+      // ordinary Unity/Unreal batches. Each replay is also capped at two million
+      // emitted vertices, matching the capture allocator's hard safety limit.
+      static constexpr UINT kMaxExactInstancesPerDraw = 4096u;
+      static constexpr UINT kMaxCaptureVerticesPerBatch = 2u << 20;
       const UINT requestedLimit = std::max(1u, RtxOptions::maxInstanceSubmissions());
       const UINT selectedCount = std::min(
         instanceCount, std::min(requestedLimit, kMaxExactInstancesPerDraw));
-      auto selectedInstance = [&](UINT selectedIndex) {
-        if (selectedCount <= 1u || selectedCount == instanceCount)
-          return startInstance + selectedIndex;
-        const uint64_t relative = uint64_t(selectedIndex)
-          * uint64_t(instanceCount - 1u) / uint64_t(selectedCount - 1u);
-        return UINT(uint64_t(startInstance) + relative);
-      };
+      const UINT instancesPerBatch = std::max(1u, std::min(
+        selectedCount, kMaxCaptureVerticesPerBatch / std::max(1u, count)));
+      const UINT batchCount =
+        (selectedCount + instancesPerBatch - 1u) / instancesPerBatch;
 
       static uint32_t sExactInstanceLogCount = 0;
       if (sExactInstanceLogCount++ < 12u) {
         Logger::info(str::format(
           "[D3D11Rtx] Exact shader-profile instancing: sourceInstances=",
           instanceCount, " selected=", selectedCount,
+          " batches=", batchCount,
           " startInstance=", startInstance,
           " indexed=", indexed ? 1 : 0));
       }
 
-      for (UINT i = 0; i < selectedCount; ++i) {
+      for (UINT offset = 0; offset < selectedCount; offset += instancesPerBatch) {
+        const UINT batchInstances = std::min(instancesPerBatch, selectedCount - offset);
         SubmitDraw(indexed, count, start, base, nullptr,
-          selectedInstance(i), true);
+          startInstance + offset, batchInstances, true);
       }
       return;
     }
@@ -5676,6 +5698,7 @@ namespace dxvk {
                              INT  base,
                              const Matrix4* instanceTransform,
                              UINT replayFirstInstance,
+                             UINT replayInstanceCount,
                              bool requireExactPositionCapture) {
     if (m_pGeometryWorkers == nullptr) {
       const bool isDeferredContext = m_context->GetType() == D3D11_DEVICE_CONTEXT_DEFERRED;
@@ -8051,7 +8074,7 @@ namespace dxvk {
       m_submitRejectStats.positionCaptureBudgetRejected;
     const bool capturedExactPositions = TryCapturePositionsViaStreamOut(
       dcs, geo, indexed, count, start, base,
-      instanceTransform != nullptr, replayFirstInstance,
+      instanceTransform != nullptr, replayFirstInstance, replayInstanceCount,
       usedWholeVertexBufferFallback);
     const bool exactCaptureBudgetRejected =
       m_submitRejectStats.positionCaptureBudgetRejected != captureBudgetRejectsBefore;
@@ -8059,7 +8082,6 @@ namespace dxvk {
       ++m_submitRejectStats.positionCaptured;
     } else if (requireExactPositionCapture
             || usedWholeVertexBufferFallback
-            || exactCaptureBudgetRejected
             || (dcs.transformData.cameraRelativeView
             && instanceTransform == nullptr
             && dcs.usesVertexShader)) {
@@ -8074,7 +8096,7 @@ namespace dxvk {
         ++sUnsafeCameraRelativeSkipLogCount;
         Logger::warn(str::format(
           "[D3D11Rtx][position-capture] skipped unsafe uncaptured draw: reason=",
-          exactCaptureBudgetRejected ? "budget"
+          requireExactPositionCapture && exactCaptureBudgetRejected ? "budget"
             : (usedWholeVertexBufferFallback ? "gpu-index-flatten-required"
               : (requireExactPositionCapture ? "instanced-exact-required" : "camera-relative")),
           " count=",
@@ -8083,6 +8105,7 @@ namespace dxvk {
           " start=", start,
           " base=", base,
           " firstInstance=", replayFirstInstance,
+          " instanceCount=", replayInstanceCount,
           " drawId=", dcs.drawCallID));
       }
       return;
@@ -8102,7 +8125,8 @@ namespace dxvk {
     DrawParameters params;
     params.instanceCount = 1;
     const bool submitIndexed = indexed && dcs.geometryData.indexBuffer.defined();
-    params.vertexCount   = submitIndexed ? 0 : count;
+    params.vertexCount   = submitIndexed ? 0
+      : (capturedExactPositions ? dcs.geometryData.vertexCount : count);
     params.indexCount    = submitIndexed ? count : 0;
     // SubmitDraw already folds StartIndexLocation and BaseVertexLocation (or
     // StartVertexLocation) into RasterBuffer slice offsets above. Reapplying

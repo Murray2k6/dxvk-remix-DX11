@@ -124,6 +124,10 @@ namespace dxvk {
       return m_workerBusy.load() > 0;
     }
 
+    uint32_t shaderCompilationCount() const {
+      return m_workerCompilationCount.load();
+    }
+
 // NV-DXVK start
     uint32_t remixShaderCompilationCount() const {
       return m_workerCompilingRemixShaders.load();
@@ -183,9 +187,10 @@ namespace dxvk {
     // NV-DXVK start: do not compile same shader multiple times
     std::unordered_set<size_t>        m_workerItemsInFlight;  // stores hashes for work items in the queue
     // NV-DXVK end
-    std::atomic<uint32_t>             m_workerBusy;
+    std::atomic<uint32_t>             m_workerBusy = { 0 };
+    std::atomic<uint32_t>             m_workerCompilationCount = { 0 };
     // NV-DXVK start
-    std::atomic<uint32_t>             m_workerCompilingRemixShaders;
+    std::atomic<uint32_t>             m_workerCompilingRemixShaders = { 0 };
     // NV-DXVK end
     std::vector<dxvk::thread>         m_workerThreads;
 

@@ -309,6 +309,7 @@ namespace dxvk {
                                          bool indexed, UINT count, UINT start, INT base,
                                          bool hasExternalInstanceTransform,
                                          UINT replayFirstInstance,
+                                         UINT replayInstanceCount,
                                          bool requireIndexedFlatten);
     uint32_t     m_positionCapturesThisFrame = 0;
     uint32_t     m_positionNewCaptureBuffersThisFrame = 0;
@@ -394,6 +395,7 @@ namespace dxvk {
     void SubmitDraw(bool indexed, UINT count, UINT start, INT base,
                     const Matrix4* instanceTransform = nullptr,
                     UINT replayFirstInstance = 0,
+                    UINT replayInstanceCount = 1,
                     bool requireExactPositionCapture = false);
     void SubmitInstancedDraw(bool indexed, UINT count, UINT start, INT base,
                              UINT instanceCount, UINT startInstance);

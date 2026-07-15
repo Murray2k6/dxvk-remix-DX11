@@ -20,6 +20,8 @@
 * DEALINGS IN THE SOFTWARE.
 */
 #pragma once
+#include <functional>
+
 #include "../../util/rc/util_rc_ptr.h"
 #include "rtx_option.h"
 #include "rtx_common_object.h"
@@ -46,6 +48,13 @@ namespace dxvk {
     void release();
 
     void waitForShaderPrewarm(bool showProgressDialog = false);
+
+    using GameShaderRegistrar = std::function<void(
+      const std::function<void(uint32_t)>&)>;
+
+    void prewarmCachedGameShaders(
+      uint32_t cachedShaderCount,
+      const GameShaderRegistrar& registerShaders);
 
     bool getWarmupComplete() const {
       return m_warmupComplete;

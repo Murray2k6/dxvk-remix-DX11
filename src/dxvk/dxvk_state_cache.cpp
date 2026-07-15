@@ -23,6 +23,8 @@
 #include "dxvk_pipemanager.h"
 #include "dxvk_state_cache.h"
 
+#include <filesystem>
+
 namespace dxvk {
 
   static const Sha1Hash       g_nullHash      = Sha1Hash::compute(nullptr, 0);
@@ -326,6 +328,7 @@ namespace dxvk {
 
       // NV-DXVK start: do not compile same shader multiple times
       if (m_workerItemsInFlight.count(item.hash()) == 0) {
+        ++m_workerCompilationCount;
         if (item.isRemixShader) {
           ++m_workerCompilingRemixShaders;
         }
@@ -387,6 +390,7 @@ namespace dxvk {
     // Do not compile same shader multiple times
     if (m_workerItemsInFlight.count(item.hash()) == 0) {
       assert(item.isRemixShader);
+      ++m_workerCompilationCount;
       ++m_workerCompilingRemixShaders;
 
       m_workerQueue.push(item);
@@ -1068,6 +1072,8 @@ namespace dxvk {
 
       compilePipelines(item);
 
+      --m_workerCompilationCount;
+
 // NV-DXVK start
       if (item.isRemixShader) {
         --m_workerCompilingRemixShaders;
@@ -1130,7 +1136,18 @@ namespace dxvk {
 
 
   std::string DxvkStateCache::getCacheDir() const {
-    return env::getEnvVar("DXVK_STATE_CACHE_PATH");
+    const std::string configuredPath =
+      env::getEnvVar("DXVK_STATE_CACHE_PATH");
+    if (!configuredPath.empty())
+      return configuredPath;
+
+    // Keep the pipeline-state map with the raw per-stage DXBC cache beside
+    // the real game executable. Together these two files let the next launch
+    // recreate every previously observed graphics/compute pipeline before the
+    // D3D11 device is returned to the game, even when its working directory is
+    // a launcher or a different engine subdirectory.
+    return (std::filesystem::path(env::getExePath()).parent_path()
+      / "rtx-remix" / "cache").string();
   }
 
 

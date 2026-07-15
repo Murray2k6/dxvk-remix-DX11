@@ -139,6 +139,8 @@ namespace dxvk {
      */
     bool isCompilingShaders() const;
 
+    uint32_t shaderCompilationCount() const;
+
 // NV-DXVK start
     uint32_t remixShaderCompilationCount() const;
 // NV-DXVK end

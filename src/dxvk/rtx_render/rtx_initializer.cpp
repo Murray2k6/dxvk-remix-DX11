@@ -159,7 +159,7 @@ namespace dxvk {
         ::SelectObject(dc, bodyFont);
         ::SetTextColor(dc, RGB(205, 210, 218));
         RECT bodyRect = { 24, 58, client.right - 24, 84 };
-        ::DrawTextW(dc, L"RTX Remix is compiling path-tracing shaders before game initialization.",
+        ::DrawTextW(dc, L"RTX Remix is compiling cached game and path-tracing shaders before game initialization.",
           -1, &bodyRect, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
 
         const uint32_t pending = m_pending.load(std::memory_order_acquire);
@@ -438,7 +438,11 @@ namespace dxvk {
       Logger::info("[Remix-DX11][init] shader prewarm disabled by configuration; pipelines will compile asynchronously on first use.");
       return false;
     }
-    Logger::info("[Remix-DX11][init] shader prewarm ENABLED (prewarming RT pipelines up front to avoid first-frame inline-compile stutter/crash).");
+    Logger::info(str::format(
+      "[Remix-DX11][init] shader prewarm ENABLED in game process after launcher handoff (allVariants=",
+      RtxOptions::Shader::prewarmAllVariants() ? 1 : 0,
+      ", waitingBeforeGameInit=",
+      RtxOptions::Shader::waitForPrewarmOnBoot() ? 1 : 0, ")."));
 
     DxvkObjects* pCommon = m_device->getCommon();
 
@@ -463,28 +467,54 @@ namespace dxvk {
       return;
     }
 
-    // DX11_V247_NO_INFINITE_WAITS: this wait used to be unbounded. If a pipeline
-    // compile wedges in the driver (the historical reason prewarm was disabled on
-    // AMD/Intel), the game hangs at startup as a black, non-responding window.
-    // Bound the wait generously - normal prewarm finishes well within this - and
-    // on timeout continue launching: remaining pipelines compile inline on first
-    // use, which at worst stutters instead of hanging the process.
-    constexpr uint64_t kPrewarmTimeoutMs = 120000; // 2 minutes
+    // Full-variant prewarming can legitimately take several minutes on an empty
+    // driver cache. A fixed total timeout released the game halfway through that
+    // work, contradicting the all-variants setting and moving the remaining
+    // stalls into gameplay. Wait for the Remix count to reach zero as long as it
+    // is making progress. A separate no-progress timeout still protects launch
+    // from a genuinely wedged driver/compiler without penalizing slow machines.
+    constexpr uint64_t kRegularPrewarmTimeoutMs = 120000;
+    constexpr uint64_t kNoProgressTimeoutMs = 180000;
+    constexpr uint64_t kProgressLogIntervalMs = 5000;
     const uint64_t startMs = ::GetTickCount64();
-    bool timedOut = false;
+    uint64_t lastProgressMs = startMs;
+    uint64_t lastProgressLogMs = startMs;
+    const bool fullVariantPrewarm = RtxOptions::Shader::prewarmAllVariants();
+    auto& pipelineManager = m_device->getCommon()->pipelineManager();
+    uint32_t pendingPipelines = pipelineManager.remixShaderCompilationCount();
+    bool aborted = false;
+    bool stalled = false;
     ShaderPrewarmDialog progressDialog;
-    if (showProgressDialog)
+    if (showProgressDialog) {
+      progressDialog.update(pendingPipelines, 0u);
       progressDialog.open();
+    }
 
-    while (m_device->getCommon()->pipelineManager().isCompilingShaders()) {
-      const uint64_t elapsedMs = ::GetTickCount64() - startMs;
-      if (showProgressDialog) {
-        progressDialog.update(
-          m_device->getCommon()->pipelineManager().remixShaderCompilationCount(),
-          elapsedMs);
+    while (pendingPipelines > 0u) {
+      const uint64_t nowMs = ::GetTickCount64();
+      const uint64_t elapsedMs = nowMs - startMs;
+      const uint32_t currentPending =
+        pipelineManager.remixShaderCompilationCount();
+      if (currentPending != pendingPipelines) {
+        pendingPipelines = currentPending;
+        lastProgressMs = nowMs;
       }
-      if (elapsedMs >= kPrewarmTimeoutMs) {
-        timedOut = true;
+
+      if (showProgressDialog)
+        progressDialog.update(pendingPipelines, elapsedMs);
+
+      if (nowMs - lastProgressLogMs >= kProgressLogIntervalMs) {
+        Logger::info(str::format(
+          "[Remix-DX11][init] shader prewarm progress: pendingPipelines=",
+          pendingPipelines, " elapsedMs=", elapsedMs));
+        lastProgressLogMs = nowMs;
+      }
+
+      stalled = nowMs - lastProgressMs >= kNoProgressTimeoutMs;
+      const bool regularTimeout = !fullVariantPrewarm
+        && elapsedMs >= kRegularPrewarmTimeoutMs;
+      if (stalled || regularTimeout) {
+        aborted = true;
         break;
       }
       Sleep(10);
@@ -495,12 +525,107 @@ namespace dxvk {
       progressDialog.close();
     }
 
-    if (timedOut) {
-      Logger::err("[Remix-DX11][init] shader prewarm did not finish within 120s - continuing launch; remaining pipelines compile inline on first use.");
+    const uint64_t totalElapsedMs = ::GetTickCount64() - startMs;
+    if (aborted) {
+      Logger::err(str::format(
+        "[Remix-DX11][init] shader prewarm aborted: reason=",
+        stalled ? "no-progress-180s" : "regular-time-limit-120s",
+        " remainingPipelines=", pendingPipelines,
+        " elapsedMs=", totalElapsedMs,
+        "; continuing launch so a driver compiler failure cannot hang the game."));
+    } else {
+      Logger::info(str::format(
+        "[Remix-DX11][init] shader prewarm complete: pendingPipelines=0 elapsedMs=",
+        totalElapsedMs));
     }
 
     DxvkRaytracingPipeline::releaseFinalizer();
 
     m_warmupComplete = true;
+  }
+
+  void RtxInitializer::prewarmCachedGameShaders(
+      uint32_t cachedShaderCount,
+      const GameShaderRegistrar& registerShaders) {
+    if (cachedShaderCount == 0u || !registerShaders)
+      return;
+
+    constexpr uint64_t kNoProgressTimeoutMs = 180000;
+    constexpr uint64_t kProgressLogIntervalMs = 5000;
+    const uint64_t startMs = ::GetTickCount64();
+    ShaderPrewarmDialog progressDialog;
+    const bool showDialog = RtxOptions::Shader::showPrewarmDialog();
+
+    if (showDialog) {
+      progressDialog.update(cachedShaderCount, 0u);
+      progressDialog.open();
+    }
+
+    Logger::info(str::format(
+      "[Remix-DX11][game-shader-cache] pre-init preload started: cachedShaders=",
+      cachedShaderCount));
+
+    registerShaders([&](uint32_t remainingShaders) {
+      if (showDialog)
+        progressDialog.update(
+          remainingShaders, ::GetTickCount64() - startMs);
+    });
+
+    auto& pipelineManager = m_device->getCommon()->pipelineManager();
+    uint32_t pendingPipelines = pipelineManager.shaderCompilationCount();
+    uint64_t lastProgressMs = ::GetTickCount64();
+    uint64_t lastProgressLogMs = lastProgressMs;
+    bool stalled = false;
+
+    if (showDialog)
+      progressDialog.update(pendingPipelines, ::GetTickCount64() - startMs);
+
+    Logger::info(str::format(
+      "[Remix-DX11][game-shader-cache] cached shader registration complete; pendingPipelines=",
+      pendingPipelines));
+
+    while (pendingPipelines > 0u) {
+      const uint64_t nowMs = ::GetTickCount64();
+      const uint64_t elapsedMs = nowMs - startMs;
+      const uint32_t currentPending =
+        pipelineManager.shaderCompilationCount();
+      if (currentPending != pendingPipelines) {
+        pendingPipelines = currentPending;
+        lastProgressMs = nowMs;
+      }
+
+      if (showDialog)
+        progressDialog.update(pendingPipelines, elapsedMs);
+
+      if (nowMs - lastProgressLogMs >= kProgressLogIntervalMs) {
+        Logger::info(str::format(
+          "[Remix-DX11][game-shader-cache] pipeline prewarm progress: pendingPipelines=",
+          pendingPipelines, " elapsedMs=", elapsedMs));
+        lastProgressLogMs = nowMs;
+      }
+
+      if (nowMs - lastProgressMs >= kNoProgressTimeoutMs) {
+        stalled = true;
+        break;
+      }
+      ::Sleep(10);
+    }
+
+    if (showDialog) {
+      progressDialog.update(0u, ::GetTickCount64() - startMs);
+      progressDialog.close();
+    }
+
+    const uint64_t elapsedMs = ::GetTickCount64() - startMs;
+    if (stalled) {
+      Logger::err(str::format(
+        "[Remix-DX11][game-shader-cache] pipeline prewarm stopped after no progress for 180 seconds; remainingPipelines=",
+        pendingPipelines, " elapsedMs=", elapsedMs,
+        "; continuing launch so a driver compiler failure cannot hang the game."));
+    } else {
+      Logger::info(str::format(
+        "[Remix-DX11][game-shader-cache] pre-init preload complete: pendingPipelines=0 elapsedMs=",
+        elapsedMs));
+    }
   }
 }
