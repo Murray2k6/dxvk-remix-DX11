@@ -34,13 +34,13 @@
 #include <string>
 
 namespace nrd {
-  using pfnCreateInstance = Result(*)(const InstanceCreationDesc& instanceCreationDesc, Instance*& instance);
-  using pfnDestroyInstance = void (*)(Instance& instance);
-  using pfnGetLibraryDesc = const LibraryDesc& (*)();
-  using pfnGetInstanceDesc = const InstanceDesc& (*)(const Instance& instance);
-  using pfnSetCommonSettings = Result (*)(Instance& instance, const CommonSettings& commonSettings);
-  using pfnSetDenoiserSettings = Result (*)(Instance& instance, Identifier identifier, const void* denoiserSettings);
-  using pfnGetComputeDispatches = Result (*)(Instance& instance, const Identifier* identifiers, uint32_t identifiersNum, const DispatchDesc*& dispatchDescs, uint32_t& dispatchDescsNum);
+  using pfnCreateInstance = Result (NRD_CALL *)(const InstanceCreationDesc& instanceCreationDesc, Instance*& instance);
+  using pfnDestroyInstance = void (NRD_CALL *)(Instance& instance);
+  using pfnGetLibraryDesc = const LibraryDesc& (NRD_CALL *)();
+  using pfnGetInstanceDesc = const InstanceDesc& (NRD_CALL *)(const Instance& instance);
+  using pfnSetCommonSettings = Result (NRD_CALL *)(Instance& instance, const CommonSettings& commonSettings);
+  using pfnSetDenoiserSettings = Result (NRD_CALL *)(Instance& instance, Identifier identifier, const void* denoiserSettings);
+  using pfnGetComputeDispatches = Result (NRD_CALL *)(Instance& instance, const Identifier* identifiers, uint32_t identifiersNum, const DispatchDesc*& dispatchDescs, uint32_t& dispatchDescsNum);
   using pfnGetResourceTypeString = const char* (*)(ResourceType resourceType);
   using pfnGetDenoiserString = const char* (*)(Denoiser denoiser);
 
@@ -150,7 +150,7 @@ namespace nrd {
     // denoises instead of silently disabling.
     if (desc.versionMajor != NRD_VERSION_MAJOR || desc.versionMinor != NRD_VERSION_MINOR) {
       dxvk::Logger::err(dxvk::str::format(
-        "[Remix-DX11] NRD.dll ABI mismatch: loaded v", desc.versionMajor, ".", desc.versionMinor, ".", desc.versionBuild,
+        "[Remix-DX11] NRD.dll ABI mismatch: loaded v", uint32_t(desc.versionMajor), ".", uint32_t(desc.versionMinor), ".", uint32_t(desc.versionBuild),
         " but built against v", NRD_VERSION_MAJOR, ".", NRD_VERSION_MINOR, ".", NRD_VERSION_BUILD,
         " - denoiser disabled. Ship the matching NRD.dll."));
       FreeLibrary(hNRD);
@@ -158,7 +158,7 @@ namespace nrd {
     }
     if (desc.versionBuild != NRD_VERSION_BUILD) {
       dxvk::Logger::warn(dxvk::str::format(
-        "[Remix-DX11] NRD.dll build mismatch: loaded v", desc.versionMajor, ".", desc.versionMinor, ".", desc.versionBuild,
+        "[Remix-DX11] NRD.dll build mismatch: loaded v", uint32_t(desc.versionMajor), ".", uint32_t(desc.versionMinor), ".", uint32_t(desc.versionBuild),
         " vs built v", NRD_VERSION_MAJOR, ".", NRD_VERSION_MINOR, ".", NRD_VERSION_BUILD,
         " - proceeding (ABI-compatible)."));
     }
@@ -166,7 +166,7 @@ namespace nrd {
     // DX11_V264: positive confirmation - every log now states denoiser status.
     dxvk::Logger::info(dxvk::str::format(
       "[Remix-DX11] NRD denoiser loaded: v",
-      desc.versionMajor, ".", desc.versionMinor, ".", desc.versionBuild));
+      uint32_t(desc.versionMajor), ".", uint32_t(desc.versionMinor), ".", uint32_t(desc.versionBuild)));
 
     return hNRD;
   }

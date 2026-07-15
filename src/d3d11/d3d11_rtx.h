@@ -27,6 +27,8 @@
 #include "../util/util_matrix.h"
 #include "../util/util_threadpool.h"
 
+#include <unordered_set>
+
 namespace dxvk {
 
   class D3D11DeviceContext;
@@ -49,12 +51,13 @@ namespace dxvk {
     RTX_OPTION("rtx", float, fallbackCameraFovDegrees, 60.0f, "Vertical field of view (degrees) of the synthesized fallback camera used when no projection matrix is found in any constant buffer. Tune per game in rtx.conf when the traced image looks zoomed relative to the raster view. Clamped to [20, 140].");
 
     void Initialize();
-    void OnDraw(UINT vertexCount, UINT startVertex);
-    void OnDrawIndexed(UINT indexCount, UINT startIndex, INT baseVertex);
-    void OnDrawInstanced(UINT vertexCountPerInstance, UINT instanceCount, UINT startVertex, UINT startInstance);
-    void OnDrawIndexedInstanced(UINT indexCountPerInstance, UINT instanceCount, UINT startIndex, INT baseVertex, UINT startInstance);
-    void OnDrawInstancedIndirect(ID3D11Buffer* argumentBuffer, UINT argumentOffset);
-    void OnDrawIndexedInstancedIndirect(ID3D11Buffer* argumentBuffer, UINT argumentOffset);
+    bool OnDrawAuto();
+    bool OnDraw(UINT vertexCount, UINT startVertex);
+    bool OnDrawIndexed(UINT indexCount, UINT startIndex, INT baseVertex);
+    bool OnDrawInstanced(UINT vertexCountPerInstance, UINT instanceCount, UINT startVertex, UINT startInstance);
+    bool OnDrawIndexedInstanced(UINT indexCountPerInstance, UINT instanceCount, UINT startIndex, INT baseVertex, UINT startInstance);
+    bool OnDrawInstancedIndirect(ID3D11Buffer* argumentBuffer, UINT argumentOffset);
+    bool OnDrawIndexedInstancedIndirect(ID3D11Buffer* argumentBuffer, UINT argumentOffset);
     void ResetCommandListState();
 
     // Must be called with the context lock held.
@@ -225,7 +228,17 @@ namespace dxvk {
     bool                                 m_rasterUiSeenThisFrame = false;
     bool                                 m_midFrameRtxInjected = false;
     bool                                 m_forceRasterPassThroughThisFrame = false;
+    // Native raster is required while the game constructs its frame and for
+    // proven late UI, but it must not execute for scene/helper draws after the
+    // RTX composite has already replaced the color target. This per-API-draw
+    // decision is consumed by D3D11DeviceContext before it queues the native
+    // draw command.
+    bool                                 m_allowNativeRasterForCurrentDraw = true;
     bool                                 m_hasSeenRealSceneProjection = false;
+    // Learned only from a real projection whose aspect agrees with the
+    // established output. Once learned, square reflection/probe cameras can no
+    // longer masquerade as the primary camera on a widescreen swap chain.
+    bool                                 m_hasSeenOutputAspectCompatibleProjection = false;
     uint32_t                             m_drawsSinceFlush = 0;
     uint32_t                             m_resizeTransitionFramesRemaining = 0;
 
@@ -315,6 +328,12 @@ namespace dxvk {
     uint32_t     m_positionNewCaptureBuffersThisFrame = 0;
     uint32_t     m_positionReplayCapturesThisFrame = 0;
     VkDeviceSize m_positionCaptureBytesThisFrame = 0;
+    uint64_t     m_positionCaptureVerticesSinceSubmission = 0;
+    // One detailed line per distinct position-capture contract. Unlike the
+    // old process-global 24-line counter, this remains useful after a long
+    // menu and identifies the exact gameplay shader/draw admitted before a
+    // driver reset without logging every hot-path occurrence.
+    std::unordered_set<uint64_t> m_positionCaptureContractsLogged;
 
     // DX11_V286_GAMEPLAY_MATRIX_DUMP: env-free camera diagnostic. Steam's DRM
     // relaunch strips DXVK_REMIX_MTXDUMP from the child process, so the env
@@ -397,6 +416,7 @@ namespace dxvk {
                     UINT replayFirstInstance = 0,
                     UINT replayInstanceCount = 1,
                     bool requireExactPositionCapture = false);
+    void BeginNativeRasterDrawRouting();
     void SubmitInstancedDraw(bool indexed, UINT count, UINT start, INT base,
                              UINT instanceCount, UINT startInstance);
     DrawCallTransforms ExtractTransforms();

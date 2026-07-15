@@ -90,6 +90,7 @@ namespace dxvk {
   struct D3D11SampledTexcoordSemantic {
     std::string semanticName;
     uint32_t    semanticIndex = 0;
+    uint32_t    componentIndex = 0;
     bool        valid = false;
   };
 
@@ -108,6 +109,10 @@ namespace dxvk {
     dxvk::mutex        mutex;
     std::vector<char>  bytecode;
     DxbcOptions        options;
+    // Stable application shader identity used by the capture logger.  Keeping
+    // it with the shared state also makes lazy GS compilation attributable
+    // after the original D3D11 shader wrapper has been copied or released.
+    std::string        shaderName;
     std::string        semanticName;
     uint32_t           semanticIndex = 0;
     D3D11CapturedPositionSpace positionSpace = D3D11CapturedPositionSpace::View;
@@ -210,15 +215,28 @@ namespace dxvk {
     // any common shader and receive false when no mapping exists.
     bool GetSampledTexcoordSemantic(uint32_t resourceSlot,
                                     std::string& semanticName,
-                                    uint32_t& semanticIndex) const;
+                                    uint32_t& semanticIndex,
+                                    uint32_t& componentIndex) const;
 
-    // Resolves a requested PS input semantic against this VS's actual output
-    // signature. If the requested semantic is unavailable, returns the
-    // shader's best texcoord-like fallback rather than inventing UVs.
+    bool HasCompleteSampledResourceProfile() const {
+      return m_sampledResourceProfileComplete;
+    }
+
+    bool SamplesResourceSlot(uint32_t resourceSlot) const {
+      return resourceSlot < m_sampledResourceSlots.size()
+          && m_sampledResourceSlots[resourceSlot];
+    }
+
+    // Resolves a requested PS input semantic and component pair against this
+    // VS's actual output signature. An explicit resource-slot contract is
+    // exact-or-fail; only the legacy no-contract path may use the shader's
+    // generic texcoord-like fallback.
     bool ResolvePositionCaptureTexcoord(const std::string& requestedName,
                                         uint32_t requestedIndex,
+                                        uint32_t requestedComponent,
                                         std::string& semanticName,
-                                        uint32_t& semanticIndex) const;
+                                        uint32_t& semanticIndex,
+                                        uint32_t& componentIndex) const;
 
     const D3D11PositionTransformBinding* GetPositionCaptureClipTransformBinding() const {
       return m_positionCapture != nullptr && m_positionCapture->clipTransform.valid
@@ -250,7 +268,8 @@ namespace dxvk {
     // Lazily compiles the pure stream-output GS used to capture the game VS's
     // shader-computed pre-projection POSITIONn.xyz stream.
     Rc<DxvkShader> GetPositionCaptureShader(const std::string& texcoordSemanticName,
-                                            uint32_t texcoordSemanticIndex) const;
+                                            uint32_t texcoordSemanticIndex,
+                                            uint32_t texcoordComponentIndex) const;
 
   private:
 
@@ -266,6 +285,9 @@ namespace dxvk {
 
     std::array<D3D11SampledTexcoordSemantic,
       D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT> m_sampledTexcoordSemantics = {};
+    std::array<bool,
+      D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT> m_sampledResourceSlots = {};
+    bool m_sampledResourceProfileComplete = false;
 
     D3D11PositionTransformBinding m_positionTransform;
     D3D11ConstantBufferDependencyProfile m_constantBufferDependencies;

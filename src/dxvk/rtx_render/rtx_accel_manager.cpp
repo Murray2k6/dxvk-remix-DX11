@@ -1790,14 +1790,47 @@ namespace dxvk {
       // the same queue submission has produced nvlddmkm Event 153 followed by
       // VK_ERROR_DEVICE_LOST.  Bound both the Vulkan call and the queue
       // submission, while preserving every BLAS in the scene.
-      static constexpr uint32_t kMaxBlasesPerSubmission = 16u;
+      // Keep a bounded GPU scheduling unit without turning every small BLAS
+      // into its own queue submission.  Per-BLAS submission caused dozens of
+      // flushes in ordinary Unreal frames and still ended in Event 153.  The
+      // primitive ceiling remains authoritative for expensive builds.
+      static constexpr uint32_t kMaxBlasesPerSubmission = 8u;
+      static constexpr uint64_t kMaxPrimitivesPerSubmission = 64u * 1024u;
       const uint32_t buildCount = static_cast<uint32_t>(blasToBuild.size());
-      for (uint32_t first = 0; first < buildCount; first += kMaxBlasesPerSubmission) {
-        const uint32_t batchCount = std::min(kMaxBlasesPerSubmission, buildCount - first);
+      uint32_t submissionCount = 0;
+      for (uint32_t first = 0; first < buildCount;) {
+        uint32_t batchCount = 0;
+        uint64_t batchPrimitives = 0;
+        while (first + batchCount < buildCount
+            && batchCount < kMaxBlasesPerSubmission) {
+          const uint32_t candidate = first + batchCount;
+          uint64_t candidatePrimitives = 0;
+          const VkAccelerationStructureBuildRangeInfoKHR* ranges =
+            blasRangesToBuild[candidate];
+          if (ranges != nullptr) {
+            for (uint32_t geometry = 0;
+                 geometry < blasToBuild[candidate].geometryCount;
+                 ++geometry) {
+              candidatePrimitives += ranges[geometry].primitiveCount;
+            }
+          }
+
+          // Always admit one BLAS so a single large mesh makes progress.  Any
+          // additional BLAS must keep this queue submission below both limits.
+          if (batchCount > 0u
+           && batchPrimitives + candidatePrimitives
+                > kMaxPrimitivesPerSubmission) {
+            break;
+          }
+          batchPrimitives += candidatePrimitives;
+          ++batchCount;
+        }
+
         ctx->vkCmdBuildAccelerationStructuresKHR(
           batchCount,
           blasToBuild.data() + first,
           blasRangesToBuild.data() + first);
+        ++submissionCount;
 
         if (first + batchCount < buildCount) {
           // Make this batch's writes available to all later AS work, then end
@@ -1873,6 +1906,7 @@ namespace dxvk {
             VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR |
               VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR);
         }
+        first += batchCount;
       }
 
       static uint32_t sBatchedBuildLogs = 0;
@@ -1880,8 +1914,7 @@ namespace dxvk {
         ++sBatchedBuildLogs;
         Logger::info(str::format(
           "[RTX][BLAS] split ", buildCount, " builds across ",
-          (buildCount + kMaxBlasesPerSubmission - 1u) /
-            kMaxBlasesPerSubmission,
+          submissionCount,
           " watchdog-safe submissions; scratchMiB=",
           totalScratchMemory >> 20));
       }

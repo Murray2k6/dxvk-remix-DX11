@@ -722,7 +722,11 @@ extern "C" {
     }
     
     if (flId == FeatureLevels) {
-      Logger::err("D3D11CoreCreateDevice: Requested feature level not supported");
+      // Engines routinely issue a deliberately unsupported device-creation
+      // probe before creating the real rendering device. E_INVALIDARG is the
+      // required result; keep it out of the error stream so live diagnostics
+      // reserve errors for failed creation of the actual device.
+      Logger::info("D3D11CoreCreateDevice: requested feature-level probe is unsupported; returning E_INVALIDARG");
       return E_INVALIDARG;
     }
     

@@ -940,6 +940,25 @@ namespace dxvk {
     if (callInjectRtx) {
       // Fallback inject (is a no-op if already injected this frame, or no valid RT scene)
       injectRTX(cachedReflexFrameId, targetImage);
+    } else if (m_frameLastInjected != m_device->getCurrentFrameId()) {
+      // A raster pass-through frame still submitted candidate geometry to the
+      // Remix scene before its UI/loading classification was known. It must
+      // therefore finalize the non-rendered RT frame as well. Without this,
+      // SceneManager::onFrameEnd never clears the per-frame bindless buffer
+      // table; Unreal menu/scene transitions accumulated it to the 65,525
+      // entry limit, then prepared an invalid/empty surface set and lost the
+      // Vulkan device while UE's render thread waited indefinitely.
+      const uint32_t transientBufferCount =
+        static_cast<uint32_t>(getSceneManager().getBufferTable().size());
+      static uint32_t sRasterPassThroughFinalizeLogCount = 0;
+      if (transientBufferCount > 0u && sRasterPassThroughFinalizeLogCount < 16u) {
+        ++sRasterPassThroughFinalizeLogCount;
+        Logger::info(str::format(
+          "[Remix-RayTracer] finalizing raster pass-through frame without injection: frame=",
+          m_device->getCurrentFrameId(),
+          " transientBuffers=", transientBufferCount));
+      }
+      onInjectRtxFrameEnd(false);
     }
 
 #ifdef REMIX_DEVELOPMENT

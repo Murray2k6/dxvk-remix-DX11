@@ -3458,13 +3458,21 @@ namespace dxvk {
           IUnknown* const*      ppResources,
           DXGI_RESIDENCY*       pResidencyStatus,
           UINT                  NumResources) {
-    static bool s_errorShown = false;
-
-    if (!std::exchange(s_errorShown, true))
-      Logger::err("D3D11DXGIDevice::QueryResourceResidency: Stub");
+    // A zero-length query has no input or output elements, so accept it even
+    // when the caller supplies null arrays. Capability/residency probes in
+    // Unreal use this form while initializing the renderer.
+    if (NumResources == 0)
+      return S_OK;
     
     if (!ppResources || !pResidencyStatus)
       return E_INVALIDARG;
+
+    // DXVK owns residency through Vulkan memory allocation rather than the
+    // native DXGI offer/reclaim model. Resources visible through this device
+    // are therefore fully resident from the D3D11 caller's perspective.
+    static bool s_behaviorLogged = false;
+    if (!std::exchange(s_behaviorLogged, true))
+      Logger::info("D3D11DXGIDevice::QueryResourceResidency: reporting DXVK-managed resources as fully resident");
 
     for (uint32_t i = 0; i < NumResources; i++)
       pResidencyStatus[i] = DXGI_RESIDENCY_FULLY_RESIDENT;
