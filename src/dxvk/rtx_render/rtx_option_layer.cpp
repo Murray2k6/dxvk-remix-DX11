@@ -684,6 +684,7 @@ namespace dxvk {
     }
     if (!rtxLayers.empty()) {
       s_rtxConfLayer = rtxLayers.back();
+      s_baseRtxConfLayer = s_rtxConfLayer;
     }
 
     // 4. baseGameMod rtx.conf layer - only if mod path is detected (overrides rtx.conf)
@@ -718,6 +719,23 @@ namespace dxvk {
     Logger::info("RtxOption system layer initialization complete.");
 
     return s_mergedConfig;
+  }
+
+  bool RtxOptionLayer::setRtxConfLayerOverride(RtxOptionLayer* layer) {
+    if (layer == nullptr || !layer->hasSaveableConfigFile()) {
+      Logger::err("[RTX Option]: Refusing invalid rtx.conf layer override.");
+      return false;
+    }
+    if (s_baseRtxConfLayer == nullptr)
+      s_baseRtxConfLayer = s_rtxConfLayer;
+    s_rtxConfLayer = layer;
+    Logger::info(str::format("[RTX Option]: Developer-menu edits now target per-title config '",
+                             layer->getFilePath(), "'."));
+    return true;
+  }
+
+  void RtxOptionLayer::clearRtxConfLayerOverride() {
+    s_rtxConfLayer = s_baseRtxConfLayer;
   }
 
 }  // namespace dxvk

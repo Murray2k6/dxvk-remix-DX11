@@ -140,6 +140,9 @@ namespace dxvk {
     }
 
     XXH64_hash_t getImageHash() const {
+      if (m_imageHashOverride != 0)
+        return m_imageHashOverride;
+
       XXH64_hash_t result = 0;
       if (const DxvkImageView* resolvedImageView = getImageView()) {
         result = resolvedImageView->image()->getHash();
@@ -155,6 +158,13 @@ namespace dxvk {
       }
 
       return result;
+    }
+
+    // An authenticated emulator provider can expose a guest-memory content
+    // hash which is stable even when the host renderer recycles one D3D image
+    // for many guest textures. Native textures leave this at zero.
+    void setImageHashOverride(XXH64_hash_t hash) {
+      m_imageHashOverride = hash;
     }
 
     size_t getUniqueKey() const {
@@ -193,6 +203,7 @@ namespace dxvk {
     Rc<ManagedTexture> m_managedTexture;
 
     size_t m_uniqueKey = kInvalidTextureKey;
+    XXH64_hash_t m_imageHashOverride = 0;
   };
 
   struct TextureUtils {

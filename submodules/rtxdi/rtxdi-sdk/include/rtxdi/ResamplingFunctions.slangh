@@ -173,7 +173,12 @@ void RTXDI_SampleRandomLights(
   // Get importance sampling parameters for portals, assume <= 4 portals
   float totalPortalPdf;
   float4 sampleThreshold;
-  RAB_GetPortalSamplingProbablity(surface, totalPortalPdf, sampleThreshold);
+  /* DX11_V219_RTXDI_ROBUST_REAL_LVALUE_PATCH */
+  float totalPortalPdfFloatV219 = float(totalPortalPdf);
+  float4 sampleThresholdFloatV219 = float4(sampleThreshold);
+  RAB_GetPortalSamplingProbablity(surface, totalPortalPdfFloatV219, sampleThresholdFloatV219);
+  totalPortalPdf = half(totalPortalPdfFloatV219);
+  sampleThreshold = half4(sampleThresholdFloatV219);
 
   RAB_LightSample selectedSample = RAB_EmptyLightSample();
 
@@ -1569,7 +1574,10 @@ VolumeReSTIR_Reservoir VolumeReSTIR_SpatialResampling(inout RAB_RandomSamplerSta
             // Note: Currently set to the invalid Ray Portal index until we support cross-portal lighting here.
             uint8_t sampledTransportPortalIndex = RTXDI_INVALID_PORTAL_INDEX;
             float3 attenuation = float3(0.0f);
-            const bool visible = RAB_VolumeReSTIR_TraceNEEVisibility(selectedSampleAtNeighbour, sampledTransportPortalIndex, rabVolumeVisibilityContext, rabNeighbourVolumeInteraction, attenuation);
+            /* DX11_V219_RTXDI_ROBUST_VOLUME_ATTENUATION_LVALUE */
+            float3 attenuationNeighbourFloatV219 = float3(attenuation);
+            const bool visible = RAB_VolumeReSTIR_TraceNEEVisibility(selectedSampleAtNeighbour, sampledTransportPortalIndex, rabVolumeVisibilityContext, rabNeighbourVolumeInteraction, attenuationNeighbourFloatV219);
+            attenuation = half3(attenuationNeighbourFloatV219);
       
             if (!visible || all(attenuation <= float3(0.0f)))
             {
@@ -1650,7 +1658,10 @@ VolumeReSTIR_Reservoir VolumeReSTIR_TemporalResampling(inout RAB_RandomSamplerSt
         // Note: Currently set to the invalid Ray Portal index until we support cross-portal lighting here.
         uint8_t sampledTransportPortalIndex = RTXDI_INVALID_PORTAL_INDEX;
         float3 attenuation = float3(0.0f);
-        const bool visible = RAB_VolumeReSTIR_TraceNEEVisibility(selectedSampleAtTemporal, sampledTransportPortalIndex, rabVolumeVisibilityContext, rabPrevVolumeInteraction, attenuation);
+        /* DX11_V219_RTXDI_ROBUST_VOLUME_ATTENUATION_LVALUE */
+        float3 attenuationTemporalFloatV219 = float3(attenuation);
+        const bool visible = RAB_VolumeReSTIR_TraceNEEVisibility(selectedSampleAtTemporal, sampledTransportPortalIndex, rabVolumeVisibilityContext, rabPrevVolumeInteraction, attenuationTemporalFloatV219);
+        attenuation = half3(attenuationTemporalFloatV219);
       
         if (!visible || all(attenuation <= float3(0.0f)))
         {

@@ -141,10 +141,6 @@ namespace interleaver {
       srcVertexIndex * cb.positionStride + cb.positionOffset;
     float3 position = convert(cb.positionFormat, srcPosition, srcPositionIndex);
     if ((cb.attributeFlags & INTERLEAVE_GEOMETRY_FLAG_HOMOGENEOUS_CLIP) != 0) {
-      // SV_Position is homogeneous clip space. Apply the exact inverse
-      // projection captured with the draw, then perform the perspective divide
-      // before the data reaches the BLAS. This reconstructs the rasterizer's
-      // post-skinning/post-instancing view position for arbitrary DX11 shaders.
 #ifdef __cplusplus
       const vec4 clip(srcPosition[srcPositionIndex + 0],
                       srcPosition[srcPositionIndex + 1],
@@ -152,11 +148,6 @@ namespace interleaver {
                       srcPosition[srcPositionIndex + 3]);
       const mat4& m = cb.clipToPosition;
       if ((cb.attributeFlags & INTERLEAVE_GEOMETRY_FLAG_CLIP_W_DEPTH) != 0) {
-        // For an optimized shader with no standalone projection, clip.w is
-        // still the exact perspective depth used by D3D clipping. The inverse
-        // fallback projection supplies only the canonical XY scales; ignoring
-        // clip.z avoids interpreting a game's reversed-Z value with guessed
-        // near/far planes.
         const float invXScale = m.m[0].x;
         const float invYScale = m.m[1].y;
         if (std::isfinite(clip.x) && std::isfinite(clip.y)

@@ -49,8 +49,6 @@ struct InterleaveGeometryArgs {
   mat4 clipToPosition;
 };
 
-// Pack feature bits so the exact clip-to-position matrix still fits within
-// DXVK's hard 128-byte push-constant limit.
 #define INTERLEAVE_GEOMETRY_FLAG_HAS_NORMALS       0x01u
 #define INTERLEAVE_GEOMETRY_FLAG_HAS_TEXCOORD      0x02u
 #define INTERLEAVE_GEOMETRY_FLAG_HAS_COLOR0        0x04u

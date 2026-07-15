@@ -13,6 +13,7 @@
 #include "d3d11_depth_stencil.h"
 #include "d3d11_blend.h"
 #include "d3d11_rasterizer.h"
+#include "../../include/remix/emulator_draw_abi.h"
 
 #include "../dxvk/imgui/dxvk_imgui.h"
 #include "../dxvk/rtx_render/rtx_context.h"
@@ -22,6 +23,8 @@
 #include "../dxvk/rtx_render/rtx_scene_manager.h"
 #include "../dxvk/rtx_render/rtx_light_manager.h"
 #include "../dxvk/rtx_render/rtx_matrix_helpers.h"
+#include "../dxvk/rtx_render/rtx_option_manager.h"
+#include "../util/util_filesys.h"
 
 #include <cstring>
 #include <cctype>
@@ -31,6 +34,10 @@
 #include <limits>
 #include <vector>
 #include <set>
+#include <filesystem>
+#include <mutex>
+#include <optional>
+#include <cstdio>
 
 // DX11_V263_CRASH_FILTER_SAFE: defined in d3d11_main.cpp. Re-installs the
 // log-only, chained unhandled-exception filter so a game crash handler
@@ -83,6 +90,129 @@ namespace dxvk {
       }
 
       return packedScreenXy && packedScreenZ;
+    }
+
+    std::optional<remix::emulator::DrawMetadataV1>
+    readEmulatorDrawMetadata(D3D11DeviceContext* context) {
+      remix::emulator::DrawMetadataV1 metadata = {};
+      UINT size = sizeof(metadata);
+      const HRESULT result = context->GetPrivateData(
+        remix::emulator::kDrawMetadataGuid, &size, &metadata);
+      if (FAILED(result) || size != sizeof(metadata))
+        return std::nullopt;
+      if (!remix::emulator::validate(metadata)) {
+        static uint32_t s_invalidMetadataLogCount = 0;
+        if (s_invalidMetadataLogCount++ < 8u) {
+          Logger::warn(str::format(
+            "[D3D11Rtx][emulator-profile] Rejected invalid emulator draw metadata: hr=0x",
+            std::hex, static_cast<uint32_t>(result), std::dec,
+            " size=", size,
+            " magic=0x", std::hex, metadata.magic, std::dec,
+            " abi=", metadata.abiMajor, ".", metadata.abiMinor));
+        }
+        return std::nullopt;
+      }
+      return metadata;
+    }
+
+    const char* emulatorProviderName(remix::emulator::Provider provider) {
+      switch (provider) {
+        case remix::emulator::Provider::Pcsx2: return "pcsx2";
+        case remix::emulator::Provider::Dolphin: return "dolphin";
+        case remix::emulator::Provider::Xenia: return "xenia";
+        case remix::emulator::Provider::Ppsspp: return "ppsspp";
+        case remix::emulator::Provider::Cemu: return "cemu";
+        case remix::emulator::Provider::DuckStation: return "duckstation";
+        default: return "unknown";
+      }
+    }
+
+    bool activateEmulatorProfile(const remix::emulator::DrawMetadataV1& metadata) {
+      struct State {
+        std::mutex mutex;
+        std::string key;
+        RtxOptionLayer* layer = nullptr;
+      };
+      static State state;
+
+      char crcBuffer[9] = { };
+      std::snprintf(crcBuffer, sizeof(crcBuffer), "%08X", metadata.gameCrc);
+      const std::string crc = crcBuffer;
+      const char* providerName = emulatorProviderName(metadata.provider);
+      const std::string titleKey = str::format(metadata.gameSerial, "_", crc);
+      const std::string profileKey = str::format(providerName, "_", titleKey);
+
+      std::lock_guard<std::mutex> lock(state.mutex);
+      if (state.layer != nullptr && state.key == profileKey)
+        return true;
+
+      if (state.layer != nullptr) {
+        if (state.layer->hasUnsavedChanges())
+          state.layer->save();
+        RtxOptionLayer::clearRtxConfLayerOverride();
+        RtxOptionManager::releaseLayer(state.layer);
+        state.layer = nullptr;
+        state.key.clear();
+        util::RtxFileSys::clearEmulatedGameProfileRoot();
+      }
+
+      const std::filesystem::path profileRoot =
+        util::RtxFileSys::rootPath() / "rtx-remix" / "emulators" /
+        providerName / titleKey;
+      // Keep configs beside the host executable, matching normal PC-game
+      // Remix deployment. The ID suffix prevents one emulator's titles from
+      // overwriting one another while retaining ordinary rtx.* syntax.
+      const std::filesystem::path configPath = util::RtxFileSys::rootPath()
+        / str::format("rtx.", titleKey, ".conf");
+      if (!util::createDirectories(profileRoot))
+        return false;
+
+      if (!std::filesystem::exists(configPath)) {
+        auto config = util::createDirectoriesAndOpenFile(configPath);
+        if (!config)
+          return false;
+        *config << "# Standard RTX Remix configuration for PCSX2 title "
+                << metadata.gameSerial << " (CRC " << crc << ").\n"
+                << "# Texture categories edited in the Remix developer menu and\n"
+                << "# exporter-compatible rtx.* settings are saved in this file.\n";
+      }
+
+      const std::string layerName = str::format(providerName, " ", titleKey, " rtx.conf");
+      state.layer = RtxOptionManager::acquireLayer(
+        configPath.string(),
+        { kDefaultDynamicRtxOptionLayerPriority, layerName },
+        1.0f, 0.1f, false, nullptr);
+      if (state.layer == nullptr ||
+          !RtxOptionLayer::setRtxConfLayerOverride(state.layer)) {
+        RtxOptionManager::releaseLayer(state.layer);
+        state.layer = nullptr;
+        return false;
+      }
+
+      util::RtxFileSys::setEmulatedGameProfileRoot(profileRoot);
+      state.key = profileKey;
+      Logger::info(str::format(
+        "[D3D11Rtx][emulator-profile] Activated authenticated emulator title '",
+        profileKey, "': config=", configPath.string(),
+        " captures=", (profileRoot / "captures").string(),
+        " (standard Remix USD exporter)."));
+      return true;
+    }
+
+    Matrix4 makeEmulatorProjection(float viewportWidth, float viewportHeight) {
+      const float aspect = viewportWidth > 0.0f && viewportHeight > 0.0f
+        ? viewportWidth / viewportHeight : 4.0f / 3.0f;
+      const float fovY = 60.0f * (3.14159265f / 180.0f);
+      const float nearZ = 0.1f;
+      const float farZ = 10000.0f;
+      const float yScale = 1.0f / std::tan(fovY * 0.5f);
+      const float xScale = yScale / aspect;
+      const float q = farZ / (farZ - nearZ);
+      return Matrix4(
+        Vector4(xScale, 0.0f,   0.0f,       0.0f),
+        Vector4(0.0f,   yScale, 0.0f,       0.0f),
+        Vector4(0.0f,   0.0f,   q,          1.0f),
+        Vector4(0.0f,   0.0f,  -nearZ * q, 0.0f));
     }
 
     bool shouldInjectD3D11RtxFrame(bool hasBackbuffer,
@@ -5424,7 +5554,9 @@ namespace dxvk {
     return future;
   }
 
-  void D3D11Rtx::FillMaterialData(LegacyMaterialData& mat) const {
+  void D3D11Rtx::FillMaterialData(
+      LegacyMaterialData& mat,
+      XXH64_hash_t primaryTextureHashOverride) const {
     const auto& ps = m_context->m_state.ps;
     const D3D11CommonShader* commonPs = ps.shader != nullptr
       ? ps.shader->GetCommonShader()
@@ -5970,6 +6102,9 @@ namespace dxvk {
       ++s_logCount;
     }
 
+    if (textureID > 0 && primaryTextureHashOverride != 0)
+      mat.colorTextures[0].setImageHashOverride(primaryTextureHashOverride);
+
     for (uint32_t textureIndex = 0; textureIndex < textureID; ++textureIndex) {
       const Rc<DxvkImageView> imageView = mat.colorTextures[textureIndex].getImageViewRc();
       const XXH64_hash_t textureHash = mat.colorTextures[textureIndex].getImageHash();
@@ -6091,6 +6226,22 @@ namespace dxvk {
 
     ++m_submitRejectStats.total;
 
+    // Emulator integration is authenticated per draw through a versioned
+    // ID3D11DeviceContext private-data ABI. No metadata means the normal PC
+    // game path below is byte-for-byte unchanged.
+    const auto emulatorMetadata = readEmulatorDrawMetadata(m_context);
+    const bool authenticatedEmulatorDraw = emulatorMetadata.has_value();
+    const bool pcsx2PostTransformDraw = authenticatedEmulatorDraw
+      && emulatorMetadata->provider == remix::emulator::Provider::Pcsx2
+      && emulatorMetadata->coordinateSpace ==
+         remix::emulator::CoordinateSpace::Pcsx2GsPostTransform;
+    if (authenticatedEmulatorDraw) {
+      m_authenticatedEmulatorHost = true;
+      m_postTransformEmulatorHost = false;
+      m_forceRasterPassThroughThisFrame = false;
+      activateEmulatorProfile(*emulatorMetadata);
+    }
+
     // PCSX2 renders PS2 GS commands after the guest CPU/VU has already applied
     // its model/view/projection transform. The D3D11 input is packed screen
     // XY/depth, and VS_EXPAND variants fetch the same record through
@@ -6099,7 +6250,7 @@ namespace dxvk {
     // hashes, and build an enclosing slab/black rectangle. Once this capability
     // has been identified, keep the guest image as raster while still walking
     // bound textures so Remix's texture browser and hash tagging remain usable.
-    if (m_postTransformEmulatorHost) {
+    if (m_postTransformEmulatorHost && !m_authenticatedEmulatorHost) {
       m_forceRasterPassThroughThisFrame = true;
       LegacyMaterialData rasterMaterial;
       FillMaterialData(rasterMaterial);
@@ -6111,7 +6262,7 @@ namespace dxvk {
     // GPU/CPU work capturing more screen-space triangles into the RT scene.
     // Still enumerate every bound texture so the Remix texture grid, manual
     // hash categories and capture/export tooling continue to see UI atlases.
-    if (m_forceRasterPassThroughThisFrame) {
+    if (m_forceRasterPassThroughThisFrame && !m_authenticatedEmulatorHost) {
       LegacyMaterialData rasterMaterial;
       FillMaterialData(rasterMaterial);
       ++m_submitRejectStats.screenSpaceUiSkip;
@@ -6219,7 +6370,21 @@ namespace dxvk {
 
     D3D11InputLayout* layout = m_context->m_state.ia.inputLayout.ptr();
     if (!layout) {
-      if (isPcsx2HostProcess()) {
+      if (authenticatedEmulatorDraw) {
+        // VS-expanded PCSX2 draws fetch GS records through SV_VertexID from a
+        // StructuredBuffer. The explicit handshake is valid, but there is no
+        // IA stream to decode into a BLAS. Keep only this draw on raster; the
+        // PCSX2 integration disables VS expansion for capture-capable draws.
+        LegacyMaterialData rasterMaterial;
+        FillMaterialData(rasterMaterial);
+        ++m_submitRejectStats.postTransformEmulator;
+        static uint32_t s_expandedEmulatorDrawLogCount = 0;
+        if (s_expandedEmulatorDrawLogCount++ < 8u) {
+          Logger::warn(
+            "[D3D11Rtx][emulator-profile] Authenticated PCSX2 draw used VS-expanded/no-layout input; preserving raster draw. DisableVertexShaderExpand is required for Remix scene capture.");
+        }
+        return;
+      } else if (isPcsx2HostProcess() && !m_authenticatedEmulatorHost) {
         m_postTransformEmulatorHost = true;
         m_forceRasterPassThroughThisFrame = true;
         ++m_submitRejectStats.postTransformEmulator;
@@ -6236,7 +6401,8 @@ namespace dxvk {
 
     const auto& semantics = layout->GetRtxSemantics();
 
-    if (isPcsx2HostProcess() && isPcsx2GsVertexLayout(semantics)) {
+    if (!m_authenticatedEmulatorHost
+     && isPcsx2HostProcess() && isPcsx2GsVertexLayout(semantics)) {
       m_postTransformEmulatorHost = true;
       m_forceRasterPassThroughThisFrame = true;
       ++m_submitRejectStats.postTransformEmulator;
@@ -6257,6 +6423,37 @@ namespace dxvk {
     const D3D11RtxSemantic* tcSem  = selectBestSemantic(semantics, scoreTexcoordSemantic, { posSem });
     if (!tcSem)
       tcSem = selectBestSemantic(semantics, scoreTexcoordFallbackSemantic, { posSem });
+
+    auto findSemantic = [&](const char* name, uint32_t index) -> const D3D11RtxSemantic* {
+      for (const D3D11RtxSemantic& semantic : semantics) {
+        if (semantic.index == index && semanticNameStartsWith(semantic, name))
+          return &semantic;
+      }
+      return nullptr;
+    };
+    const D3D11RtxSemantic* emulatorDepthSem = nullptr;
+    const D3D11RtxSemantic* emulatorQSem = nullptr;
+    if (pcsx2PostTransformDraw) {
+      // PCSX2's fixed-function GS contract is explicit in the ABI. Do not let
+      // generic semantic scoring accidentally select POSITION1 as XY or the
+      // Q channel as UV.
+      posSem = findSemantic("POSITION", 0);
+      emulatorDepthSem = findSemantic("POSITION", 1);
+      emulatorQSem = findSemantic("TEXCOORD", 1);
+      tcSem = findSemantic("TEXCOORD",
+        (emulatorMetadata->flags & remix::emulator::DrawFlagFixedUv) ? 2u : 0u);
+      if (posSem == nullptr || emulatorDepthSem == nullptr
+       || posSem->format != VK_FORMAT_R16G16_UINT
+       || emulatorDepthSem->format != VK_FORMAT_R32_UINT) {
+        ++m_submitRejectStats.positionFormatRejected;
+        static uint32_t s_badPcsx2LayoutLogCount = 0;
+        if (s_badPcsx2LayoutLogCount++ < 8u) {
+          Logger::warn(
+            "[D3D11Rtx][emulator-profile] Authenticated PCSX2 draw did not expose the declared R16G16_UINT XY + R32_UINT Z contract; preserving native draw.");
+        }
+        return;
+      }
+    }
 
     if (tcSem
      && !semanticNameStartsWith(*tcSem, "TEXCOORD")
@@ -6337,6 +6534,8 @@ namespace dxvk {
       ++m_submitRejectStats.noPositionBuffer;
       return;
     }
+    RasterBuffer emulatorDepthBuffer = makeVertexBuffer(emulatorDepthSem);
+    RasterBuffer emulatorQBuffer = makeVertexBuffer(emulatorQSem);
 
     // Normal buffer: only submit if enabled and the interleaver can convert.
     // Supported: R16G16_SFLOAT(83), R32G32_SFLOAT(103), R32G32B32_SFLOAT(106),
@@ -6587,6 +6786,135 @@ namespace dxvk {
       hashCount = std::min(count, maxVBVertices);
     hashCount = std::min(hashCount, kMaxHashedVertices);
     geo.vertexCount = drawVertexCount;
+
+    // PCSX2 delivers guest vertices after the game has already projected them
+    // into the PS2 GS screen/depth domain. Reconstruct a canonical view-space
+    // surface from that exact clip-space result. This preserves the on-screen
+    // position/depth relationship for Remix capture and export without
+    // pretending that unavailable guest world matrices were recovered.
+    if (pcsx2PostTransformDraw) {
+      const uint8_t* xyBase = reinterpret_cast<const uint8_t*>(
+        posBuffer.mapPtr(posBuffer.offsetFromSlice()));
+      const uint8_t* zBase = emulatorDepthBuffer.defined()
+        ? reinterpret_cast<const uint8_t*>(emulatorDepthBuffer.mapPtr(
+            emulatorDepthBuffer.offsetFromSlice()))
+        : nullptr;
+      const uint32_t xyStride = posBuffer.stride();
+      const uint32_t zStride = emulatorDepthBuffer.stride();
+      const size_t xyReadable = posBuffer.length() > posBuffer.offsetFromSlice()
+        ? posBuffer.length() - posBuffer.offsetFromSlice() : 0;
+      const size_t zReadable = emulatorDepthBuffer.length() > emulatorDepthBuffer.offsetFromSlice()
+        ? emulatorDepthBuffer.length() - emulatorDepthBuffer.offsetFromSlice() : 0;
+
+      if (xyBase == nullptr || zBase == nullptr || xyStride == 0 || zStride == 0
+       || drawVertexCount > (1u << 20)) {
+        ++m_submitRejectStats.positionFormatRejected;
+        return;
+      }
+
+      const Matrix4 projection = makeEmulatorProjection(
+        emulatorMetadata->viewportWidth, emulatorMetadata->viewportHeight);
+      const float xScale = projection[0][0];
+      const float yScale = projection[1][1];
+      const float q = projection[2][2];
+      const float nearQ = -projection[3][2];
+      const float depthScale = std::isfinite(emulatorMetadata->depthScale)
+                            && emulatorMetadata->depthScale > 0.0f
+        ? emulatorMetadata->depthScale : std::ldexp(1.0f, -32);
+      const VkDeviceSize dstSize = VkDeviceSize(drawVertexCount) * 12u;
+      Rc<DxvkBuffer> dst = AcquireHostVisibleHelperBuffer(
+        dstSize, "d3d11 rtx PCSX2 GS positions");
+      float* out = dst != nullptr ? reinterpret_cast<float*>(dst->mapPtr(0)) : nullptr;
+      if (out == nullptr) {
+        ++m_submitRejectStats.positionFormatRejected;
+        return;
+      }
+
+      for (uint32_t vertex = 0; vertex < drawVertexCount; ++vertex) {
+        const size_t xyOffset = size_t(vertex) * xyStride;
+        const size_t zOffset = size_t(vertex) * zStride;
+        float viewX = 0.0f, viewY = 0.0f, viewZ = 0.1f;
+        if (xyOffset + 4u <= xyReadable && zOffset + 4u <= zReadable) {
+          const uint16_t* xy = reinterpret_cast<const uint16_t*>(xyBase + xyOffset);
+          const uint32_t gsDepth = *reinterpret_cast<const uint32_t*>(zBase + zOffset);
+          const float ndcX = (float(xy[0]) - 0.05f) * emulatorMetadata->vertexScale[0]
+                           - emulatorMetadata->vertexOffset[0];
+          const float ndcY = (float(xy[1]) - 0.05f) * -emulatorMetadata->vertexScale[1]
+                           + emulatorMetadata->vertexOffset[1];
+          const float ndcZ = std::clamp(float(gsDepth) * depthScale, 0.0f, 0.999999f);
+          viewZ = std::clamp(nearQ / std::max(q - ndcZ, 1.0e-6f), 0.1f, 10000.0f);
+          viewX = ndcX * viewZ / xScale;
+          viewY = ndcY * viewZ / yScale;
+        }
+        out[vertex * 3u + 0u] = viewX;
+        out[vertex * 3u + 1u] = viewY;
+        out[vertex * 3u + 2u] = viewZ;
+      }
+      posBuffer = RasterBuffer(DxvkBufferSlice(dst, 0, dstSize),
+                               0, 12u, VK_FORMAT_R32G32B32_SFLOAT);
+      geo.positionBuffer = posBuffer;
+
+      // Decode the same texture coordinates consumed by PCSX2's tfx shader.
+      // Fixed UV uses (UV-TextureOffset)*TextureScale; ST uses (ST-
+      // TextureOffset)/Q. The output is ordinary float2 UV data understood by
+      // Remix's interleaver and USD exporter.
+      if ((emulatorMetadata->flags & remix::emulator::DrawFlagTextured)
+       && tcBuffer.defined()) {
+        const uint8_t* uvBase = reinterpret_cast<const uint8_t*>(
+          tcBuffer.mapPtr(tcBuffer.offsetFromSlice()));
+        const uint32_t uvStride = tcBuffer.stride();
+        const size_t uvReadable = tcBuffer.length() > tcBuffer.offsetFromSlice()
+          ? tcBuffer.length() - tcBuffer.offsetFromSlice() : 0;
+        const uint8_t* qBase = emulatorQBuffer.defined()
+          ? reinterpret_cast<const uint8_t*>(emulatorQBuffer.mapPtr(
+              emulatorQBuffer.offsetFromSlice())) : nullptr;
+        const uint32_t qStride = emulatorQBuffer.stride();
+        const size_t qReadable = emulatorQBuffer.defined()
+          && emulatorQBuffer.length() > emulatorQBuffer.offsetFromSlice()
+          ? emulatorQBuffer.length() - emulatorQBuffer.offsetFromSlice() : 0;
+        const bool fixedUv =
+          (emulatorMetadata->flags & remix::emulator::DrawFlagFixedUv) != 0;
+        const uint32_t uvElementSize = fixedUv ? 4u : 8u;
+
+        if (uvBase != nullptr && uvStride > 0) {
+          const VkDeviceSize uvSize = VkDeviceSize(drawVertexCount) * 8u;
+          Rc<DxvkBuffer> uvDst = AcquireHostVisibleHelperBuffer(
+            uvSize, "d3d11 rtx PCSX2 GS texcoords");
+          float* uvOut = uvDst != nullptr
+            ? reinterpret_cast<float*>(uvDst->mapPtr(0)) : nullptr;
+          if (uvOut != nullptr) {
+            for (uint32_t vertex = 0; vertex < drawVertexCount; ++vertex) {
+              const size_t uvOffset = size_t(vertex) * uvStride;
+              float u = 0.0f, v = 0.0f;
+              if (uvOffset + uvElementSize <= uvReadable) {
+                if (fixedUv) {
+                  const uint16_t* uv = reinterpret_cast<const uint16_t*>(uvBase + uvOffset);
+                  u = (float(uv[0]) - emulatorMetadata->textureOffset[0])
+                    * emulatorMetadata->textureScale[0];
+                  v = (float(uv[1]) - emulatorMetadata->textureOffset[1])
+                    * emulatorMetadata->textureScale[1];
+                } else {
+                  const float* st = reinterpret_cast<const float*>(uvBase + uvOffset);
+                  float perspectiveQ = 1.0f;
+                  const size_t qOffset = size_t(vertex) * qStride;
+                  if (qBase != nullptr && qStride > 0 && qOffset + 4u <= qReadable)
+                    perspectiveQ = *reinterpret_cast<const float*>(qBase + qOffset);
+                  if (!std::isfinite(perspectiveQ) || std::abs(perspectiveQ) < 1.0e-8f)
+                    perspectiveQ = 1.0f;
+                  u = (st[0] - emulatorMetadata->textureOffset[0]) / perspectiveQ;
+                  v = (st[1] - emulatorMetadata->textureOffset[1]) / perspectiveQ;
+                }
+              }
+              uvOut[vertex * 2u + 0u] = std::isfinite(u) ? u : 0.0f;
+              uvOut[vertex * 2u + 1u] = std::isfinite(v) ? v : 0.0f;
+            }
+            tcBuffer = RasterBuffer(DxvkBufferSlice(uvDst, 0, uvSize),
+                                    0, 8u, VK_FORMAT_R32G32_SFLOAT);
+            geo.texcoordBuffer = tcBuffer;
+          }
+        }
+      }
+    }
 
     // Persistent geometry-contract telemetry. GPU-only index buffers are
     // common, but when their exact maximum is unavailable this draw must cover
@@ -7400,6 +7728,23 @@ namespace dxvk {
     dcs.transformData    = ExtractTransforms();
     dcs.futureSkinningData = futureSkinningData;
 
+    if (pcsx2PostTransformDraw) {
+      // The reconstructed buffer above is canonical view space. Give it a
+      // fixed, invertible camera pair so Remix sees a valid main camera while
+      // objectToView stays identity and the reconstructed raster alignment is
+      // preserved. This camera never follows the host free camera and cannot
+      // produce the old enclosing slab/black rectangle.
+      constexpr float kCameraOffset = 0.001f;
+      dcs.transformData.viewToProjection = makeEmulatorProjection(
+        emulatorMetadata->viewportWidth, emulatorMetadata->viewportHeight);
+      dcs.transformData.worldToView = Matrix4(Vector3(0.0f, 0.0f, kCameraOffset));
+      dcs.transformData.objectToWorld = Matrix4(Vector3(0.0f, 0.0f, -kCameraOffset));
+      dcs.transformData.objectToView = Matrix4();
+      dcs.transformData.usedViewportFallbackProjection = false;
+      dcs.transformData.cameraRelativeView = false;
+      dcs.transformData.offscreenRenderTarget = false;
+    }
+
     // Apply per-instance world transform when submitting instanced draws.
     if (instanceTransform) {
       dcs.transformData.objectToWorld = *instanceTransform;
@@ -7812,7 +8157,8 @@ namespace dxvk {
     // device that happened to present first.
     // Do this only after rejecting obvious composite passes so skipped draws
     // do not pay the material/texture selection cost.
-    FillMaterialData(dcs.materialData);
+    FillMaterialData(dcs.materialData,
+      authenticatedEmulatorDraw ? emulatorMetadata->guestTextureHash : 0);
 
     // The DX11 bridge builds its LegacyMaterialData directly from the bound
     // SRVs, unlike the original D3D11 path.  Category evaluation therefore has
@@ -8565,10 +8911,11 @@ namespace dxvk {
     // scene geometry and created needless capture-buffer/BLAS pressure.
     const uint32_t captureBudgetRejectsBefore =
       m_submitRejectStats.positionCaptureBudgetRejected;
-    const bool capturedExactPositions = TryCapturePositionsViaStreamOut(
-      dcs, geo, indexed, count, start, base,
-      instanceTransform != nullptr, replayFirstInstance, replayInstanceCount,
-      usedWholeVertexBufferFallback);
+    const bool capturedExactPositions = !pcsx2PostTransformDraw
+      && TryCapturePositionsViaStreamOut(
+        dcs, geo, indexed, count, start, base,
+        instanceTransform != nullptr, replayFirstInstance, replayInstanceCount,
+        usedWholeVertexBufferFallback);
     const bool exactCaptureBudgetRejected =
       m_submitRejectStats.positionCaptureBudgetRejected != captureBudgetRejectsBefore;
     if (capturedExactPositions) {
@@ -8586,11 +8933,12 @@ namespace dxvk {
           " capturedVertices=", dcs.geometryData.vertexCount));
         return;
       }
-    } else if (requireExactPositionCapture
-            || usedWholeVertexBufferFallback
-            || (dcs.transformData.cameraRelativeView
-            && instanceTransform == nullptr
-            && dcs.usesVertexShader)) {
+    } else if (!pcsx2PostTransformDraw
+            && (requireExactPositionCapture
+             || usedWholeVertexBufferFallback
+             || (dcs.transformData.cameraRelativeView
+              && instanceTransform == nullptr
+              && dcs.usesVertexShader))) {
       // A camera-relative camera defines the RT world as current view space.
       // IA object-space positions combined with a guessed generic cbuffer
       // matrix do not belong to that world. Submitting them anyway is worse

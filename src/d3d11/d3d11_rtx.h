@@ -245,6 +245,9 @@ namespace dxvk {
     // must preserve the complete guest raster surface; otherwise force-
     // injection or a stale scene can replace it with an empty black RTX frame.
     bool                                 m_postTransformEmulatorHost = false;
+    // Set only by the versioned private-data ABI. Once authenticated, legacy
+    // PCSX2 layout heuristics can no longer force the whole process to raster.
+    bool                                 m_authenticatedEmulatorHost = false;
     bool                                 m_hasSeenRealSceneProjection = false;
     // Learned only from a real projection whose aspect agrees with the
     // established output. Once learned, square reflection/probe cameras can no
@@ -436,7 +439,8 @@ namespace dxvk {
                                                  uint32_t hashStartVertex,
                                                  uint32_t hashVertexCount) const;
     void ClearMaterialTextures(LegacyMaterialData& mat) const;
-    void FillMaterialData(LegacyMaterialData& mat) const;
+    void FillMaterialData(LegacyMaterialData& mat,
+                          XXH64_hash_t primaryTextureHashOverride = 0) const;
   };
 
 }
