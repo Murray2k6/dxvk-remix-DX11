@@ -142,6 +142,13 @@ namespace dxvk {
         && m_stateCache->isCompilingShaders();
   }
 
+
+  uint32_t DxvkPipelineManager::shaderCompilationCount() const {
+    return m_stateCache != nullptr
+      ? m_stateCache->shaderCompilationCount()
+      : 0u;
+  }
+
 // NV-DXVK start
   uint32_t DxvkPipelineManager::remixShaderCompilationCount() const {
     return m_stateCache != nullptr ? m_stateCache->remixShaderCompilationCount() : 0;

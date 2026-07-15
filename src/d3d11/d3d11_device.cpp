@@ -1,5 +1,7 @@
 #include <algorithm>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <mutex>
 
 #include "../dxgi/dxgi_monitor.h"
@@ -32,6 +34,18 @@ namespace dxvk {
   
   constexpr uint32_t D3D11DXGIDevice::DefaultFrameLatency;
 
+  namespace {
+    D3D11ShaderModuleSet& sharedD3D11ShaderModules() {
+      // All D3D11 devices in this build reuse one DxvkDevice so Remix is not
+      // initialized repeatedly by engines and emulators that probe adapters.
+      // Shader modules are Vulkan-device objects as well: retaining one shared
+      // set makes cached game shaders immediately available to every probe and
+      // real device without recompiling the complete title cache each time.
+      static D3D11ShaderModuleSet modules;
+      return modules;
+    }
+  }
+
 
 
   D3D11Device::D3D11Device(
@@ -48,12 +62,139 @@ namespace dxvk {
     m_dxbcOptions   (m_dxvkDevice, m_d3d11Options) {
     m_initializer = new D3D11Initializer(this);
     m_context     = new D3D11ImmediateContext(this, m_dxvkDevice);
+    PrewarmCachedGameShaders();
   }
   
   
   D3D11Device::~D3D11Device() {
     m_context = nullptr;
     delete m_initializer;
+  }
+
+
+  void D3D11Device::PrewarmCachedGameShaders() {
+    static dxvk::mutex prewarmMutex;
+    static bool prewarmComplete = false;
+    std::lock_guard<dxvk::mutex> prewarmLock(prewarmMutex);
+    if (prewarmComplete) {
+      Logger::info(
+        "[Remix-DX11][game-shader-cache] shared-device preload already complete; reusing cached modules for this D3D11 device.");
+      return;
+    }
+    prewarmComplete = true;
+
+    if (env::getEnvVar("DXVK_GAME_SHADER_CACHE") == "0") {
+      Logger::info("[Remix-DX11][game-shader-cache] disabled by DXVK_GAME_SHADER_CACHE=0.");
+      return;
+    }
+
+    constexpr uintmax_t kMaximumShaderSize = 8u << 20;
+    const std::filesystem::path cacheDirectory =
+      std::filesystem::path(env::getExePath()).parent_path()
+      / "rtx-remix" / "cache" / "d3d11-shaders";
+
+    std::error_code error;
+    if (!std::filesystem::exists(cacheDirectory, error) || error)
+      return;
+
+    std::vector<std::filesystem::path> cacheFiles;
+    std::filesystem::directory_iterator iterator(cacheDirectory, error);
+    const std::filesystem::directory_iterator end;
+    while (!error && iterator != end) {
+      const auto& entry = *iterator;
+      std::error_code entryError;
+      if (entry.is_regular_file(entryError)
+       && !entryError
+       && entry.path().extension() == ".dxbc") {
+        const uintmax_t size = entry.file_size(entryError);
+        if (!entryError && size > 0u && size <= kMaximumShaderSize)
+          cacheFiles.push_back(entry.path());
+      }
+      iterator.increment(error);
+    }
+
+    if (error) {
+      Logger::warn(str::format(
+        "[Remix-DX11][game-shader-cache] could not enumerate '",
+        cacheDirectory.string(), "': ", error.message()));
+    }
+    if (cacheFiles.empty())
+      return;
+
+    std::sort(cacheFiles.begin(), cacheFiles.end());
+    uint32_t loadedShaders = 0u;
+    uint32_t rejectedShaders = 0u;
+
+    m_dxvkDevice->getCommon()->getRtxInitializer().prewarmCachedGameShaders(
+      static_cast<uint32_t>(cacheFiles.size()),
+      [this, &cacheFiles, &loadedShaders, &rejectedShaders,
+       kMaximumShaderSize](
+          const std::function<void(uint32_t)>& updateProgress) {
+        for (size_t i = 0; i < cacheFiles.size(); ++i) {
+          const std::filesystem::path& path = cacheFiles[i];
+          VkShaderStageFlagBits stage = VK_SHADER_STAGE_FLAG_BITS_MAX_ENUM;
+          const std::string filename = path.filename().string();
+          if      (filename.rfind("VS_",  0) == 0) stage = VK_SHADER_STAGE_VERTEX_BIT;
+          else if (filename.rfind("TCS_", 0) == 0) stage = VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT;
+          else if (filename.rfind("TES_", 0) == 0) stage = VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT;
+          else if (filename.rfind("GS_",  0) == 0) stage = VK_SHADER_STAGE_GEOMETRY_BIT;
+          else if (filename.rfind("FS_",  0) == 0) stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+          else if (filename.rfind("CS_",  0) == 0) stage = VK_SHADER_STAGE_COMPUTE_BIT;
+
+          std::vector<char> bytecode;
+          if (stage != VK_SHADER_STAGE_FLAG_BITS_MAX_ENUM) {
+            std::error_code fileError;
+            const uintmax_t fileSize = std::filesystem::file_size(path, fileError);
+            if (!fileError && fileSize > 0u && fileSize <= kMaximumShaderSize) {
+              bytecode.resize(static_cast<size_t>(fileSize));
+              std::ifstream input(path, std::ios::in | std::ios::binary);
+              input.read(bytecode.data(), static_cast<std::streamsize>(bytecode.size()));
+              if (!input || static_cast<size_t>(input.gcount()) != bytecode.size())
+                bytecode.clear();
+            }
+          }
+
+          bool loaded = false;
+          if (!bytecode.empty()) {
+            const DxvkShaderKey shaderKey(
+              stage, Sha1Hash::compute(bytecode.data(), bytecode.size()));
+            if (path.stem().string() == shaderKey.toString()) {
+              DxbcTessInfo tessInfo;
+              tessInfo.maxTessFactor = float(m_d3d11Options.maxTessFactor);
+              DxbcModuleInfo moduleInfo;
+              moduleInfo.options = m_dxbcOptions;
+              moduleInfo.tess = stage == VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT
+                             && tessInfo.maxTessFactor >= 8.0f
+                ? &tessInfo : nullptr;
+              moduleInfo.xfb = nullptr;
+
+              D3D11CommonShader module;
+              loaded = SUCCEEDED(CreateShaderModule(
+                &module, shaderKey, bytecode.data(), bytecode.size(),
+                nullptr, &moduleInfo));
+            }
+          }
+
+          if (loaded) {
+            ++loadedShaders;
+          } else {
+            ++rejectedShaders;
+            Logger::warn(str::format(
+              "[Remix-DX11][game-shader-cache] rejected invalid cache entry '",
+              path.string(), "'."));
+            std::error_code removeError;
+            std::filesystem::remove(path, removeError);
+          }
+
+          updateProgress(static_cast<uint32_t>(cacheFiles.size() - i - 1u));
+        }
+      });
+
+    Logger::info(str::format(
+      "[Remix-DX11][game-shader-cache] executable='", env::getExeName(),
+      "' directory='", cacheDirectory.string(), "' discovered=",
+      cacheFiles.size(), " loaded=", loadedShaders,
+      " rejected=", rejectedShaders));
   }
   
   
@@ -2033,7 +2174,7 @@ namespace dxvk {
 
     D3D11CommonShader commonShader;
 
-    HRESULT hr = m_shaderModules.GetShaderModule(this,
+    HRESULT hr = sharedD3D11ShaderModules().GetShaderModule(this,
       &ShaderKey, pModuleInfo, pShaderBytecode, BytecodeLength,
       &commonShader);
 
@@ -3317,13 +3458,21 @@ namespace dxvk {
           IUnknown* const*      ppResources,
           DXGI_RESIDENCY*       pResidencyStatus,
           UINT                  NumResources) {
-    static bool s_errorShown = false;
-
-    if (!std::exchange(s_errorShown, true))
-      Logger::err("D3D11DXGIDevice::QueryResourceResidency: Stub");
+    // A zero-length query has no input or output elements, so accept it even
+    // when the caller supplies null arrays. Capability/residency probes in
+    // Unreal use this form while initializing the renderer.
+    if (NumResources == 0)
+      return S_OK;
     
     if (!ppResources || !pResidencyStatus)
       return E_INVALIDARG;
+
+    // DXVK owns residency through Vulkan memory allocation rather than the
+    // native DXGI offer/reclaim model. Resources visible through this device
+    // are therefore fully resident from the D3D11 caller's perspective.
+    static bool s_behaviorLogged = false;
+    if (!std::exchange(s_behaviorLogged, true))
+      Logger::info("D3D11DXGIDevice::QueryResourceResidency: reporting DXVK-managed resources as fully resident");
 
     for (uint32_t i = 0; i < NumResources; i++)
       pResidencyStatus[i] = DXGI_RESIDENCY_FULLY_RESIDENT;

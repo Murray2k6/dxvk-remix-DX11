@@ -2823,6 +2823,10 @@ namespace dxvk {
       RemixGui::DragFloat("Scene Unit Scale", &RtxOptions::sceneScaleObject(), 0.00001f, 0.00001f, FLT_MAX, "%.5f", sliderFlags);
       RemixGui::Checkbox("Scene Z-Up", &RtxOptions::zUpObject());
       RemixGui::Checkbox("Scene Left-Handed Coordinate System", &RtxOptions::leftHandedCoordinateSystemObject());
+      RemixGui::Checkbox("Override Projection Y Axis", &D3D11Rtx::projectionYFlipOverrideObject());
+      ImGui::BeginDisabled(!D3D11Rtx::projectionYFlipOverride());
+      RemixGui::Checkbox("Flip Projection Y Axis (Unity)", &D3D11Rtx::projectionYFlipObject());
+      ImGui::EndDisabled();
       fusedWorldViewModeCombo.getKey(&RtxOptions::fusedWorldViewModeObject());
       RemixGui::Separator();
 
@@ -2854,6 +2858,13 @@ namespace dxvk {
 
       if (RemixGui::CollapsingHeader("Shader Support (Experimental)", collapsingHeaderClosedFlags)) {
         ImGui::Indent();
+        RemixGui::Checkbox("Prewarm Remix Shaders On Boot", &RtxOptions::Shader::prewarmOnBootObject());
+        ImGui::BeginDisabled(!RtxOptions::Shader::prewarmOnBoot());
+        RemixGui::Checkbox("Wait For Shader Prewarm Before Game Init", &RtxOptions::Shader::waitForPrewarmOnBootObject());
+        RemixGui::Checkbox("Show Shader Compiler Please Wait Dialog", &RtxOptions::Shader::showPrewarmDialogObject());
+        RemixGui::Checkbox("Prewarm All Shader Variants", &RtxOptions::Shader::prewarmAllVariantsObject());
+        ImGui::EndDisabled();
+        RemixGui::Separator();
         RemixGui::Checkbox("Capture Vertices from Shader", &D3D11Rtx::useVertexCaptureObject());
         RemixGui::Checkbox("Capture Normals from Shader", &D3D11Rtx::useVertexCapturedNormalsObject());
         RemixGui::Separator();

@@ -191,23 +191,57 @@ static bool DirectoryExistsV219(const std::string& path) {
 }
 
 
-// DX11_V219_SHARED_DX11_GUID_SOURCE
-// Keep the exact same DX11-style Guid string across root DLL, launcher, and .trex\NvRemixBridge.exe.
-static void WriteSharedBridgeGuidV219(const std::string& gameRoot, const std::string& guid) {
-  if (gameRoot.empty() || guid.empty()) return;
+// DX11_V229_ATOMIC_GUID_VERSION_CONTRACT
+static bool IsValidBridgeGuidV229(const std::string& guid) {
+  if (guid.size() != 36) return false;
+  for (size_t i = 0; i < guid.size(); ++i) {
+    const char c = guid[i];
+    if (i == 8 || i == 13 || i == 18 || i == 23) {
+      if (c != '-') return false;
+    } else if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'))) {
+      return false;
+    }
+  }
+  return true;
+}
+
+static bool WriteBridgeTextFileAtomicallyV229(const std::string& path, const std::string& text) {
+  const std::string temp = path + ".tmp";
+  HANDLE h = CreateFileA(temp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (h == INVALID_HANDLE_VALUE) return false;
+  DWORD written = 0;
+  const BOOL wrote = WriteFile(h, text.data(), static_cast<DWORD>(text.size()), &written, nullptr);
+  const BOOL flushed = wrote && written == text.size() && FlushFileBuffers(h);
+  CloseHandle(h);
+  if (!flushed) {
+    DeleteFileA(temp.c_str());
+    return false;
+  }
+  if (!MoveFileExA(temp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+    DeleteFileA(temp.c_str());
+    return false;
+  }
+  return true;
+}
+
+static bool WriteSharedBridgeGuidV219(const std::string& gameRoot, const std::string& guid, const std::string& version) {
+  if (gameRoot.empty() || !IsValidBridgeGuidV229(guid) || version.empty()) {
+    LogLine("bridge", "DX11_V229 ERROR: refusing to launch bridge with an empty/invalid GUID or version.");
+    return false;
+  }
   SetEnvironmentVariableA("DX11_BRIDGE_GUID", guid.c_str());
   SetEnvironmentVariableA("DX11_BRIDGE_FIXED_GUID", guid.c_str());
+  SetEnvironmentVariableA("DX11_BRIDGE_VERSION", version.c_str());
 
   const std::string guidPath = gameRoot + ".trex\\dx11_bridge_guid.txt";
-  HANDLE h = CreateFileA(guidPath.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-  if (h != INVALID_HANDLE_VALUE) {
-    DWORD written = 0;
-    WriteFile(h, guid.c_str(), static_cast<DWORD>(guid.size()), &written, nullptr);
-    CloseHandle(h);
-    LogLine("bridge", "DX11_V219 wrote shared DX11-style bridge GUID to .trex\\dx11_bridge_guid.txt.");
-  } else {
-    LogLine("bridge", "DX11_V219 WARNING: failed to write .trex\\dx11_bridge_guid.txt.");
+  const std::string argsPath = gameRoot + ".trex\\dx11_bridge_args.txt";
+  if (!WriteBridgeTextFileAtomicallyV229(guidPath, guid) ||
+      !WriteBridgeTextFileAtomicallyV229(argsPath, guid + "\r\n" + version + "\r\n")) {
+    LogLine("bridge", "DX11_V229 ERROR: failed to atomically publish bridge GUID/version files.");
+    return false;
   }
+  LogLine("bridge", "DX11_V229 atomically published one validated GUID/version contract for client, launcher, and server.");
+  return true;
 }
 
 // DX11_V219_GAME_CMD_FILE_ANYWHERE
@@ -664,8 +698,9 @@ bool EnsureServer() {
 
   SetEnvironmentVariableA("DX11_BRIDGE_MODE", "d3d11");
   const std::string sharedGuidV219 = gUniqueIdentifier.toString();
-  WriteSharedBridgeGuidV219(gRemixFolder, sharedGuidV219);
-  SetEnvironmentVariableA("DX11_BRIDGE_VERSION", BRIDGE_VERSION);
+  if (!WriteSharedBridgeGuidV219(gRemixFolder, sharedGuidV219, BRIDGE_VERSION)) {
+    return false;
+  }
 
   const std::string gameCmdFileV219 = WriteSharedGameCommandLineV219(gRemixFolder);
   WriteRealGamePidForLauncherV219(gRemixFolder);

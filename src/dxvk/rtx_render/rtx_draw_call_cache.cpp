@@ -90,7 +90,19 @@ DrawCallCache::~DrawCallCache() {}
 
 DrawCallCache::CacheState DrawCallCache::get(const DrawCallState& drawCall, BlasEntry** out) {
   // First, find the right bucket:
-  const XXH64_hash_t hash = drawCall.getGeometryData().getHashForRule<rules::TopologicalHash>();
+  XXH64_hash_t hash = drawCall.getGeometryData().getHashForRule<rules::TopologicalHash>();
+  const XXH64_hash_t postVsCaptureIdentity =
+    drawCall.getGeometryData().postVsCaptureIdentity;
+  if (postVsCaptureIdentity != kEmptyHash) {
+    // DX11 post-VS captures from modern engines frequently share their index
+    // topology and material while containing completely different transformed
+    // meshes.  Keeping all of them in the topology-only bucket makes lookup
+    // quadratic and repeatedly compares unrelated Unreal meshes.  The capture
+    // identity is stable across frames and describes the exact replay contract,
+    // so use it to partition captured geometry without changing legacy draws.
+    hash = XXH3_64bits_withSeed(
+      &postVsCaptureIdentity, sizeof(postVsCaptureIdentity), hash);
+  }
   auto range = m_entries.equal_range(hash);
   if (range.first == m_entries.end()) {
     // New bucket

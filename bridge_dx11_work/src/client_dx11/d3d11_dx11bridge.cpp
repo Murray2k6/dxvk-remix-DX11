@@ -2,6 +2,7 @@
 #include <windows.h>
 #include <d3d11.h>
 #include <dxgi.h>
+#include <dxgi1_2.h>
 #include <cstdio>
 #include <cstdint>
 #include "dx11_bridge_client.h"
@@ -75,9 +76,12 @@ static bool V219HookVTable(void* object, size_t slot, void* detour, T* original,
 }
 
 // IDXGISwapChain slots.
+// DX11_V229_PRESENT1_AND_DEFERRED_SWAPCHAINS
 using PFN_SwapPresent = HRESULT (STDMETHODCALLTYPE *)(IDXGISwapChain*, UINT, UINT);
+using PFN_SwapPresent1 = HRESULT (STDMETHODCALLTYPE *)(IDXGISwapChain1*, UINT, UINT, const DXGI_PRESENT_PARAMETERS*);
 using PFN_SwapResizeBuffers = HRESULT (STDMETHODCALLTYPE *)(IDXGISwapChain*, UINT, UINT, UINT, DXGI_FORMAT, UINT);
 static PFN_SwapPresent oSwapPresent = nullptr;
+static PFN_SwapPresent1 oSwapPresent1 = nullptr;
 static PFN_SwapResizeBuffers oSwapResizeBuffers = nullptr;
 
 // ID3D11DeviceContext slots.
@@ -149,6 +153,21 @@ static HRESULT STDMETHODCALLTYPE HSwapPresent(IDXGISwapChain* self, UINT syncInt
   return oSwapPresent ? oSwapPresent(self, syncInterval, flags) : DXGI_ERROR_DEVICE_REMOVED;
 }
 
+static HRESULT STDMETHODCALLTYPE HSwapPresent1(IDXGISwapChain1* self, UINT syncInterval, UINT flags, const DXGI_PRESENT_PARAMETERS* parameters) {
+  if (!gV219InsideHook) {
+    gV219InsideHook = true;
+    LONG n = InterlockedIncrement(&gV219PresentCount);
+    if (n <= 8 || (n % 60) == 0) {
+      char msg[256] = {};
+      sprintf_s(msg, sizeof(msg), "DX11_V229: captured IDXGISwapChain1::Present1 count=%ld in game process.", n);
+      V219Log("capture", msg);
+    }
+    dx11_bridge_client::EnsureServer();
+    dx11_capture::OnPresent(self);
+    gV219InsideHook = false;
+  }
+  return oSwapPresent1 ? oSwapPresent1(self, syncInterval, flags, parameters) : DXGI_ERROR_DEVICE_REMOVED;
+}
 static HRESULT STDMETHODCALLTYPE HSwapResizeBuffers(IDXGISwapChain* self, UINT bufferCount, UINT width, UINT height, DXGI_FORMAT newFormat, UINT flags) {
   V219Log("capture", "DX11_V219_REAL_D3D11_CLIENT_CAPTURE_LAYER: captured IDXGISwapChain::ResizeBuffers in game process.");
   return oSwapResizeBuffers ? oSwapResizeBuffers(self, bufferCount, width, height, newFormat, flags) : DXGI_ERROR_DEVICE_REMOVED;
@@ -252,6 +271,12 @@ extern "C" __declspec(dllexport) void WINAPI DX11BridgeInstallSwapChainCapture(I
   if (!swapChain) return;
   V219HookVTable(swapChain, 8, reinterpret_cast<void*>(&HSwapPresent), &oSwapPresent, "IDXGISwapChain::Present");
   V219HookVTable(swapChain, 13, reinterpret_cast<void*>(&HSwapResizeBuffers), &oSwapResizeBuffers, "IDXGISwapChain::ResizeBuffers");
+
+  IDXGISwapChain1* swapChain1 = nullptr;
+  if (SUCCEEDED(swapChain->QueryInterface(__uuidof(IDXGISwapChain1), reinterpret_cast<void**>(&swapChain1))) && swapChain1) {
+    V219HookVTable(swapChain1, 22, reinterpret_cast<void*>(&HSwapPresent1), &oSwapPresent1, "IDXGISwapChain1::Present1");
+    swapChain1->Release();
+  }
 }
 
 static void V219InstallCapture(ID3D11Device* device, ID3D11DeviceContext* context, IDXGISwapChain* swapChain) {
@@ -293,6 +318,14 @@ static void V219InstallCapture(ID3D11Device* device, ID3D11DeviceContext* contex
   DX11BridgeInstallSwapChainCapture(swapChain);
 }
 
+using PFN_DX11BridgeInstallPendingSwapChainsV229 = void (WINAPI *)();
+static void TryDrainPendingSwapChainsV229() {
+  HMODULE dxgi = GetModuleHandleA("dxgi.dll");
+  auto drain = dxgi
+    ? reinterpret_cast<PFN_DX11BridgeInstallPendingSwapChainsV229>(GetProcAddress(dxgi, "DX11BridgeInstallPendingSwapChains"))
+    : nullptr;
+  if (drain) drain();
+}
 BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, LPVOID reserved) {
   if (reason == DLL_PROCESS_ATTACH) {
     DisableThreadLibraryCalls(hinst);
@@ -329,6 +362,7 @@ extern "C" HRESULT WINAPI D3D11CreateDevice(IDXGIAdapter* adapter, D3D_DRIVER_TY
   HRESULT hr = pD3D11CreateDevice(adapter, driverType, software, flags, featureLevels, featureLevelCount, sdkVersion, device, featureLevel, immediateContext);
   if (SUCCEEDED(hr)) {
     V219InstallCapture(device ? *device : nullptr, immediateContext ? *immediateContext : nullptr, nullptr);
+    TryDrainPendingSwapChainsV229();
   }
 
   char msg[256] = {};
@@ -357,6 +391,7 @@ extern "C" HRESULT WINAPI D3D11CreateDeviceAndSwapChain(IDXGIAdapter* adapter, D
   HRESULT hr = pD3D11CreateDeviceAndSwapChain(adapter, driverType, software, flags, featureLevels, featureLevelCount, sdkVersion, swapChainDesc, swapChain, device, featureLevel, immediateContext);
   if (SUCCEEDED(hr)) {
     V219InstallCapture(device ? *device : nullptr, immediateContext ? *immediateContext : nullptr, swapChain ? *swapChain : nullptr);
+    TryDrainPendingSwapChainsV229();
   }
 
   char msg[256] = {};

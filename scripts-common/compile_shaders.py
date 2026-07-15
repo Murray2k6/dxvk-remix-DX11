@@ -368,7 +368,40 @@ def main() -> int:
         )
 
         _install_hidden_module_hooks()
-        return _run_original_in_process(orig, new_args)
+        result = _run_original_in_process(orig, new_args)
+        if result != 0:
+            return result
+
+        # Meson declares src/dxvk/_built_shaders.txt as this custom target's
+        # output.  The upstream compiler writes the real .spv/.h files into
+        # the rtx_shaders directory but does not create that target output,
+        # which makes Ninja rebuild every RTX shader on every invocation.
+        # Record the shaders that were actually emitted only after the real
+        # compiler succeeds; this is build metadata, never shader fallback.
+        if output_dir is not None:
+            compiled = sorted(
+                (path for path in output_dir.glob("*.spv") if path.is_file()),
+                key=lambda path: path.name.casefold(),
+            )
+            if not compiled:
+                print(
+                    "DX11_V219_PY314_SAFE_SHADER_WRAPPER: compiler returned success "
+                    "without producing any SPIR-V shaders.",
+                    file=sys.stderr,
+                )
+                return 3
+
+            manifest = output_dir.parent / "_built_shaders.txt"
+            manifest.write_text(
+                "DX11 RTX shader build manifest\n"
+                f"Compiler={orig}\n"
+                f"ShaderCount={len(compiled)}\n"
+                + "\n".join(f"{path.name}\t{path.stat().st_size}" for path in compiled)
+                + "\n",
+                encoding="utf-8",
+            )
+
+        return 0
 
 if __name__ == "__main__":
     raise SystemExit(main())

@@ -1133,6 +1133,9 @@ namespace dxvk {
   void STDMETHODCALLTYPE D3D11DeviceContext::DrawAuto() {
     D3D11DeviceLock lock = LockContext();
 
+    if (!m_rtx.OnDrawAuto())
+      return;
+
     D3D11Buffer* buffer = m_state.ia.vertexBuffers[0].buffer.ptr();
 
     if (buffer == nullptr)
@@ -1157,7 +1160,8 @@ namespace dxvk {
           UINT            StartVertexLocation) {
     D3D11DeviceLock lock = LockContext();
 
-    m_rtx.OnDraw(VertexCount, StartVertexLocation);
+    if (!m_rtx.OnDraw(VertexCount, StartVertexLocation))
+      return;
 
     EmitCs([=] (DxvkContext* ctx) {
       ctx->draw(
@@ -1173,7 +1177,8 @@ namespace dxvk {
           INT             BaseVertexLocation) {
     D3D11DeviceLock lock = LockContext();
 
-    m_rtx.OnDrawIndexed(IndexCount, StartIndexLocation, BaseVertexLocation);
+    if (!m_rtx.OnDrawIndexed(IndexCount, StartIndexLocation, BaseVertexLocation))
+      return;
 
     EmitCs([=] (DxvkContext* ctx) {
       ctx->drawIndexed(
@@ -1191,7 +1196,8 @@ namespace dxvk {
           UINT            StartInstanceLocation) {
     D3D11DeviceLock lock = LockContext();
     
-    m_rtx.OnDrawInstanced(VertexCountPerInstance, InstanceCount, StartVertexLocation, StartInstanceLocation);
+    if (!m_rtx.OnDrawInstanced(VertexCountPerInstance, InstanceCount, StartVertexLocation, StartInstanceLocation))
+      return;
 
     EmitCs([=] (DxvkContext* ctx) {
       ctx->draw(
@@ -1211,7 +1217,8 @@ namespace dxvk {
           UINT            StartInstanceLocation) {
     D3D11DeviceLock lock = LockContext();
     
-    m_rtx.OnDrawIndexedInstanced(IndexCountPerInstance, InstanceCount, StartIndexLocation, BaseVertexLocation, StartInstanceLocation);
+    if (!m_rtx.OnDrawIndexedInstanced(IndexCountPerInstance, InstanceCount, StartIndexLocation, BaseVertexLocation, StartInstanceLocation))
+      return;
 
     EmitCs([=] (DxvkContext* ctx) {
       ctx->drawIndexed(
@@ -1228,7 +1235,8 @@ namespace dxvk {
           ID3D11Buffer*   pBufferForArgs,
           UINT            AlignedByteOffsetForArgs) {
     D3D11DeviceLock lock = LockContext();
-    m_rtx.OnDrawIndexedInstancedIndirect(pBufferForArgs, AlignedByteOffsetForArgs);
+    if (!m_rtx.OnDrawIndexedInstancedIndirect(pBufferForArgs, AlignedByteOffsetForArgs))
+      return;
     SetDrawBuffers(pBufferForArgs, nullptr);
 
     if (!ValidateDrawBufferSize(pBufferForArgs, AlignedByteOffsetForArgs, sizeof(VkDrawIndexedIndirectCommand)))
@@ -1263,7 +1271,8 @@ namespace dxvk {
           ID3D11Buffer*   pBufferForArgs,
           UINT            AlignedByteOffsetForArgs) {
     D3D11DeviceLock lock = LockContext();
-    m_rtx.OnDrawInstancedIndirect(pBufferForArgs, AlignedByteOffsetForArgs);
+    if (!m_rtx.OnDrawInstancedIndirect(pBufferForArgs, AlignedByteOffsetForArgs))
+      return;
     SetDrawBuffers(pBufferForArgs, nullptr);
 
     if (!ValidateDrawBufferSize(pBufferForArgs, AlignedByteOffsetForArgs, sizeof(VkDrawIndirectCommand)))

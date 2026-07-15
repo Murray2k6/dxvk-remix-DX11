@@ -35,6 +35,15 @@ if (!(Test-Path -LiteralPath variable:script:BridgeBranch)) {
   $script:BridgeBranch = 'main'
 }
 
+# Packaged GUID files are only a launcher fallback; the live x86 client writes
+# its own per-process GUID before starting the bridge.  Still, the fallback must
+# always be syntactically valid so a direct/helper recovery launch cannot produce
+# an empty IPC namespace.
+if (!(Test-Path -LiteralPath variable:script:Dx11BridgeFixedGuidV63) -or
+    [string]::IsNullOrWhiteSpace([string]$script:Dx11BridgeFixedGuidV63)) {
+  $script:Dx11BridgeFixedGuidV63 = [guid]::NewGuid().ToString('D')
+}
+
 # DX11_V219_DEFINE_BUILD_MODE_DEFAULTS
 # StrictMode-safe defaults for optional build-mode switches.  These switches are
 # read in top-level control flow and helper paths, so they must exist before use.
@@ -234,6 +243,12 @@ function CmdPath([string]$n) { return (Get-CommandFilePath $n) }
 
 function Write-TextNoBom {
   param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$Text)
+  if (Test-Path -LiteralPath $Path -PathType Leaf) {
+    $current = [System.IO.File]::ReadAllText($Path)
+    if ($current -ceq $Text) {
+      return
+    }
+  }
   $enc = New-Object System.Text.UTF8Encoding($false)
   [System.IO.File]::WriteAllText($Path, $Text, $enc)
 }
@@ -351,10 +366,6 @@ function Repair-RemixApiLine79Line130Corruption {
     throw "Missing $rel"
   }
 
-  $backup = Join-Path $BaseDir ('_dx11_v106_rtx_remix_api_corrupt_backup_' + (Get-Date -Format 'yyyyMMdd_HHmmss') + '.cpp')
-  Copy-Item -LiteralPath $file -Destination $backup -Force
-  $linesOut.Add(('Backed up current file to: {0}' -f $backup))
-
   # A clean working-tree copy is already the authoritative source.  The old
   # repair path unconditionally ran `git checkout`, which both discarded local
   # development changes and makes builds fail when the Git index is read-only
@@ -373,6 +384,12 @@ function Repair-RemixApiLine79Line130Corruption {
   if ($restored) {
     $linesOut.Add('OK: current rtx_remix_api.cpp passed corruption and structural checks; no restore required.')
     Log "V106 current rtx_remix_api.cpp is clean; preserving working-tree source."
+  }
+
+  if (-not $restored) {
+    $backup = Join-Path $BaseDir ('_dx11_v106_rtx_remix_api_corrupt_backup_' + (Get-Date -Format 'yyyyMMdd_HHmmss') + '.cpp')
+    Copy-Item -LiteralPath $file -Destination $backup -Force
+    $linesOut.Add(('Backed up corrupt file to: {0}' -f $backup))
   }
 
   $git = Get-Command git.exe -ErrorAction SilentlyContinue
@@ -394,7 +411,7 @@ function Repair-RemixApiLine79Line130Corruption {
     } finally {
       Pop-Location
     }
-  } else {
+  } elseif (-not $restored) {
     $linesOut.Add('WARN: git was not found.')
   }
 
@@ -506,16 +523,11 @@ static_assert(true, "Add/remove function registration");
     }
   }
 
-  foreach ($d in @(
-    (Join-Path $BaseDir '_Comp64Release'),
-    (Join-Path $BaseDir '_Comp64Debug')
-  )) {
-    if (Test-Path -LiteralPath $d -PathType Container) {
-      Remove-Item -LiteralPath $d -Recurse -Force -ErrorAction SilentlyContinue
-      $linesOut.Add(('OK: removed stale x64 build dir: {0}' -f $d))
-      Log "V106 removed stale x64 build dir: $d"
-    }
-  }
+  # Meson/Ninja tracks this source and will rebuild the affected objects after
+  # a repair.  Deleting the whole build directory here discarded every compiled
+  # RTX shader even when the file was already clean, turning each incremental
+  # build into a full rebuild.  Preserve both release and debug build trees.
+  $linesOut.Add('OK: preserved x64 Meson/Ninja build directories for incremental rebuilds.')
 
   [System.IO.File]::WriteAllLines($diag, $linesOut)
   Log "V106 wrote rtx_remix_api line 79/130 verification: $diag"
@@ -1659,13 +1671,10 @@ function Ensure-DX11ClientGlobalsIntegrated {
     Patch-DX11ClientMesonIntegrated -MesonPath (Join-Path $clientDir 'meson.build')
     Log "Ensured DX11 x86 client global linkage source in: $clientDir"
   }
-  foreach ($d in @('bridge_dx11_work\_Comp32Release','bridge_dx11_work\_Comp32Debug','bridge_dx11_work\_Comp32ReleaseOptimized')) {
-    $p = Join-Path $Root $d
-    if (Test-Path -LiteralPath $p -PathType Container) {
-      Log "Removing stale x86 Meson build dir so globals object is included: $p"
-      Remove-DirectoryRobust $p
-    }
-  }
+  # The client Meson file names the globals source explicitly. Ninja's Meson
+  # regeneration detects any real source-list/content change, so deleting the
+  # complete x86 tree here only destroys valid incremental state.
+  Log 'Preserving x86 bridge Meson trees; Ninja will rebuild changed client/global sources.'
 }
 
 function Restore-FinalDX11OutputsIntegrated {
@@ -2035,18 +2044,10 @@ function Remove-StaleX86ClientForUnifiedGuidV219 {
 
 
 function Remove-StaleX86ClientForUnifiedGuidV219 {
-  foreach ($d in @(
-    (Join-Path $Root 'bridge_dx11_work\_Comp32Release'),
-    (Join-Path $Root 'bridge_dx11_work\_Comp32Debug'),
-    (Join-Path $Root 'bridge_dx11_work\_Comp32ReleaseOptimized'),
-    (Join-Path $Root 'bridge_dx11_work\_dx11_client_x86_joined'),
-    (Join-Path $Root 'bridge_dx11_work\_dx11_launcher_x86')
-  )) {
-    if (Test-Path -LiteralPath $d -PathType Container) {
-      Remove-Item -LiteralPath $d -Recurse -Force -ErrorAction SilentlyContinue
-      Log "V219 removed stale x86 client build dir after GUID/IPC unification: $d"
-    }
-  }
+  # This migration is now part of the authoritative generated source. Meson
+  # and Ninja track those files, while the joined output is overwritten during
+  # staging. Preserve all incremental objects on normal rebuilds.
+  Log 'V219 GUID/IPC source is authoritative; preserving x86 bridge build trees.'
 }
 
 
@@ -3699,6 +3700,30 @@ dlss_dep = declare_dependency(
 )
 message('DX11_V219_REAL_NGX_IMPORT_LIBRARY: using real staged NVIDIA NGX import library from external/nv_ngx_real/lib/x64')
 '@
+
+  $marker = "message('DX11_V219_REAL_NGX_IMPORT_LIBRARY: using real staged NVIDIA NGX import library from external/nv_ngx_real/lib/x64')"
+  $escapedMarker = [regex]::Escape($marker)
+  $text = [regex]::Replace(
+    $text,
+    "(?m)^(?:$escapedMarker\s*(?:\r?\n|$))+",
+    "$marker`r`n")
+
+  # The worktree persists between builds. If the complete real-NGX block is
+  # already installed, preserve it after normalizing historical duplicate
+  # marker lines. Replacing an already-patched block used to prepend one marker
+  # per invocation, changed meson.build every time, and invalidated the entire
+  # runtime compile graph.
+  $hasRequiredRealNgxBlock =
+    $text -match "(?s)dlss_lib_name\s*=\s*'nvsdk_ngx'.*?dirs\s*:\s*join_paths\s*\(\s*meson\.project_source_root\(\)\s*,\s*'external'\s*,\s*'nv_ngx_real'\s*,\s*'lib'\s*,\s*'x64'\s*\).*?required\s*:\s*true.*?dlss_dep\s*=\s*declare_dependency\s*\(.*?$escapedMarker"
+  if ($hasRequiredRealNgxBlock) {
+    if ($text -cne $orig) {
+      Write-TextNoBom -Path $dxvkMeson -Text $text
+      Log "V219 normalized duplicate real-NGX Meson markers."
+    } else {
+      Log "V219 real-NGX Meson block is already installed."
+    }
+    return
+  }
 
   # Replace V219 optional block or stock upstream NGX block.
   $patterns = @(
@@ -7121,7 +7146,40 @@ def main() -> int:
         )
 
         _install_hidden_module_hooks()
-        return _run_original_in_process(orig, new_args)
+        result = _run_original_in_process(orig, new_args)
+        if result != 0:
+            return result
+
+        # Meson declares src/dxvk/_built_shaders.txt as this custom target's
+        # output.  The upstream compiler writes the real .spv/.h files into
+        # the rtx_shaders directory but does not create that target output,
+        # which makes Ninja rebuild every RTX shader on every invocation.
+        # Record the shaders that were actually emitted only after the real
+        # compiler succeeds; this is build metadata, never shader fallback.
+        if output_dir is not None:
+            compiled = sorted(
+                (path for path in output_dir.glob("*.spv") if path.is_file()),
+                key=lambda path: path.name.casefold(),
+            )
+            if not compiled:
+                print(
+                    "DX11_V219_PY314_SAFE_SHADER_WRAPPER: compiler returned success "
+                    "without producing any SPIR-V shaders.",
+                    file=sys.stderr,
+                )
+                return 3
+
+            manifest = output_dir.parent / "_built_shaders.txt"
+            manifest.write_text(
+                "DX11 RTX shader build manifest\n"
+                f"Compiler={orig}\n"
+                f"ShaderCount={len(compiled)}\n"
+                + "\n".join(f"{path.name}\t{path.stat().st_size}" for path in compiled)
+                + "\n",
+                encoding="utf-8",
+            )
+
+        return 0
 
 if __name__ == "__main__":
     raise SystemExit(main())
@@ -10868,6 +10926,56 @@ void CaptureDraw(ID3D11DeviceContext* context, uint32_t vertexCount,
   if (layout) layout->Release();
 }
 
+// DX11_V229_PRESENT_WINDOW_FALLBACK: composition/CoreWindow swapchains do not
+// expose a legacy DXGI_SWAP_CHAIN_DESC::OutputWindow. Resolve the game's real
+// top-level HWND so Remix Startup is not permanently skipped for those games.
+struct PresentWindowCandidateV229 {
+  DWORD pid;
+  HWND hwnd;
+  unsigned long long area;
+};
+
+static BOOL CALLBACK FindPresentWindowV229(HWND hwnd, LPARAM param) {
+  auto* best = reinterpret_cast<PresentWindowCandidateV229*>(param);
+  if (!best || !IsWindowVisible(hwnd) || GetWindow(hwnd, GW_OWNER) != nullptr) return TRUE;
+  DWORD pid = 0;
+  GetWindowThreadProcessId(hwnd, &pid);
+  if (pid != best->pid) return TRUE;
+  RECT rc = {};
+  if (!GetClientRect(hwnd, &rc)) return TRUE;
+  const LONG width = rc.right - rc.left;
+  const LONG height = rc.bottom - rc.top;
+  if (width <= 0 || height <= 0) return TRUE;
+  const unsigned long long area =
+    static_cast<unsigned long long>(width) * static_cast<unsigned long long>(height);
+  if (area > best->area) {
+    best->area = area;
+    best->hwnd = hwnd;
+  }
+  return TRUE;
+}
+
+static HWND ResolvePresentWindowV229(IDXGISwapChain* swapChain) {
+  if (swapChain) {
+    DXGI_SWAP_CHAIN_DESC desc = {};
+    if (SUCCEEDED(swapChain->GetDesc(&desc)) && desc.OutputWindow && IsWindow(desc.OutputWindow)) {
+      return desc.OutputWindow;
+    }
+  }
+
+  const DWORD selfPid = GetCurrentProcessId();
+  HWND foreground = GetForegroundWindow();
+  if (foreground) {
+    DWORD foregroundPid = 0;
+    GetWindowThreadProcessId(foreground, &foregroundPid);
+    if (foregroundPid == selfPid) return foreground;
+  }
+
+  PresentWindowCandidateV229 best = { selfPid, nullptr, 0 };
+  EnumWindows(&FindPresentWindowV229, reinterpret_cast<LPARAM>(&best));
+  return best.hwnd;
+}
+
 // DX11_V265_BRIDGE_PRESENT_CAMERA: the per-frame pump that makes the server
 // actually render. Startup attaches the Remix runtime to the GAME window
 // (HWNDs are system-global, so the x64 server presents into the x86 game's
@@ -10882,13 +10990,13 @@ void OnPresent(IDXGISwapChain* swapChain) {
   static uint64_t s_hwnd64 = 0;
   static bool s_startupSent = false;
   if (!s_startupSent && swapChain) {
-    DXGI_SWAP_CHAIN_DESC desc = {};
-    if (SUCCEEDED(swapChain->GetDesc(&desc)) && desc.OutputWindow) {
-      s_hwnd64 = (uint64_t)(uintptr_t) desc.OutputWindow;
+    const HWND presentWindow = ResolvePresentWindowV229(swapChain);
+    if (presentWindow) {
+      s_hwnd64 = (uint64_t)(uintptr_t) presentWindow;
       ClientMessage c(Commands::RemixApi_Startup);
       c.send_data((uint32_t) sizeof(s_hwnd64), &s_hwnd64);
       s_startupSent = true;
-      logf("capture", "RemixApi_Startup sent (game hwnd=0x%llx)", (unsigned long long) s_hwnd64);
+      logf("capture", "RemixApi_Startup sent (resolved game hwnd=0x%llx)", (unsigned long long) s_hwnd64);
     }
   }
   if (!s_startupSent) return;
@@ -11300,11 +11408,588 @@ extern "C" HRESULT WINAPI D3D11CreateDeviceAndSwapChain(IDXGIAdapter* adapter, D
   }
 }
 
+function Patch-BridgeServerDeterministicRemixBootstrapV229 {
+  param([Parameter(Mandatory)][string]$BridgeWork)
+
+  $main = Join-Path $BridgeWork 'src\server\main.cpp'
+  if (!(Test-Path -LiteralPath $main -PathType Leaf)) { Die "V229 deterministic server bootstrap missing main.cpp: $main" }
+  $text = [System.IO.File]::ReadAllText($main)
+
+  # Historical repair revisions accumulated a complete LoadLibrary pair and a
+  # wWinMain call for every version.  They all load the same .trex DLLs before
+  # filesystem/config/logger initialization.  Remove every legacy preload; the
+  # single authoritative Remix API initialization below happens after IPC setup
+  # and before Bridge_Ack.
+  # These helpers contain nested preprocessor guards, so a simple first-#endif
+  # match truncates them. Remove each complete historical block up to the next
+  # historical block or wWinMain.
+  $text = [regex]::Replace($text,
+    '(?s)\r?\n#ifndef\s+DX11_V\d+_(?:SERVER_REMIX_INITIALIZER|FORCE_TREX_DX11_RUNTIME)\b.*?(?=\r?\n#ifndef\s+DX11_V\d+_(?:SERVER_REMIX_INITIALIZER|FORCE_TREX_DX11_RUNTIME)\b|\r?\nint\s+WINAPI\s+wWinMain)',
+    "`r`n")
+  $text = [regex]::Replace($text,
+    '(?ms)^\s*if\s*\(!Dx11BridgeServerForceLoadTrexDx11RuntimeV\d+\(\)\)\s*\{.*?^\s*\}\s*',
+    '')
+  $text = [regex]::Replace($text,
+    '(?m)^\s*Dx11BridgeServerInitializeTrexRemixRuntimeV\d+\(\);\s*\r?\n?',
+    '')
+
+  if (!$text.Contains('DX11_V229_DETERMINISTIC_REMIX_BOOTSTRAP')) {
+    $bootHelper = @'
+
+// DX11_V229_DETERMINISTIC_REMIX_BOOTSTRAP
+// Kernel32-only stage logger.  This remains available even if bridge Logger or
+// the Remix runtime cannot initialize, and is written beside NvRemixBridge.exe.
+static void Dx11BridgeBootLogV229(const char* stage) {
+  wchar_t path[MAX_PATH] = {};
+  if (!GetModuleFileNameW(nullptr, path, _countof(path))) return;
+  wchar_t* slash = wcsrchr(path, L'\\');
+  if (!slash) return;
+  slash[1] = 0;
+  wcscat_s(path, _countof(path), L"dx11_bridge_server_boot.log");
+
+  HANDLE h = CreateFileW(path, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE,
+    nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (h == INVALID_HANDLE_VALUE) return;
+
+  SYSTEMTIME st = {};
+  GetLocalTime(&st);
+  char line[1024] = {};
+  sprintf_s(line, sizeof(line),
+    "[%04u-%02u-%02u %02u:%02u:%02u.%03u] pid=%lu %s\r\n",
+    st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond,
+    st.wMilliseconds, GetCurrentProcessId(), stage ? stage : "(null)");
+  DWORD written = 0;
+  WriteFile(h, line, static_cast<DWORD>(strlen(line)), &written, nullptr);
+  FlushFileBuffers(h);
+  CloseHandle(h);
+}
+'@
+    $entryMarker = 'int WINAPI wWinMain('
+    if (!$text.Contains($entryMarker)) { Die 'V229 could not find bridge server wWinMain.' }
+    $text = $text.Replace($entryMarker, $bootHelper + "`r`n" + $entryMarker)
+  }
+
+  $entryPattern = '(int\s+WINAPI\s+wWinMain\s*\([^\)]*\)\s*\{)'
+  if ($text -notmatch 'DX11 bridge server process entered wWinMain') {
+    $text2 = [regex]::Replace($text, $entryPattern,
+      '$1' + "`r`n  Dx11BridgeBootLogV229(`"DX11 bridge server process entered wWinMain.`");", 1)
+    if ($text2 -eq $text) { Die 'V229 could not insert bridge server entry stage.' }
+    $text = $text2
+  }
+
+  # Replace the entire legacy D3D initialization section.  DX11 mode loads the
+  # full-path .trex runtime exactly once through its public API and validates the
+  # function table.  A failed runtime never receives a false-success Bridge_Ack.
+  $initPattern = '(?s)(RegisterMessageChannel\(\);\s*)// \(2\).*?// \(3\) Send ACK to Client\. Connection has been established'
+  $initBlock = @'
+$1// (2) Initialize exactly one rendering runtime before acknowledging the client.
+  wchar_t dx11BridgeModeBuf[16] = {};
+  wchar_t serverHostsRuntimeBuf[16] = {};
+  const bool dx11BridgeMode =
+    GetEnvironmentVariableW(L"DX11_BRIDGE_MODE", dx11BridgeModeBuf, _countof(dx11BridgeModeBuf)) > 0 ||
+    GetEnvironmentVariableW(L"DXVK_REMIX_BRIDGE_SERVER_HOSTS_RUNTIME", serverHostsRuntimeBuf, _countof(serverHostsRuntimeBuf)) > 0;
+
+  if (dx11BridgeMode) {
+    Dx11BridgeBootLogV229("IPC connected; beginning full-path Remix API initialization.");
+    Logger::info("DX11_V229: initializing one .trex Remix API runtime before Bridge_Ack.");
+
+    wchar_t remixD3D11Path[MAX_PATH] = {};
+    if (!GetModuleFileNameW(nullptr, remixD3D11Path, _countof(remixD3D11Path))) {
+      Dx11BridgeBootLogV229("FATAL: could not resolve NvRemixBridge.exe path.");
+      Logger::err("DX11_V229: could not resolve NvRemixBridge.exe path.");
+      return 1;
+    }
+    wchar_t* lastSlash = wcsrchr(remixD3D11Path, L'\\');
+    if (!lastSlash) {
+      Dx11BridgeBootLogV229("FATAL: bridge executable has no parent directory.");
+      Logger::err("DX11_V229: bridge executable has no parent directory.");
+      return 1;
+    }
+    lastSlash[1] = 0;
+    SetDllDirectoryW(remixD3D11Path);
+    SetEnvironmentVariableW(L"DXVK_REMIX_TREX_DIR", remixD3D11Path);
+    wcscat_s(remixD3D11Path, _countof(remixD3D11Path), L"d3d11.dll");
+
+    const DWORD attrs = GetFileAttributesW(remixD3D11Path);
+    if (attrs == INVALID_FILE_ATTRIBUTES || (attrs & FILE_ATTRIBUTE_DIRECTORY)) {
+      Dx11BridgeBootLogV229("FATAL: .trex d3d11.dll is missing.");
+      Logger::err(format_string("DX11_V229: required Remix runtime is missing: %ls", remixD3D11Path));
+      return 1;
+    }
+
+    if (!remixapi::g_remix_initialized) {
+      Logger::info(format_string("DX11_V229: loading Remix API from full path: %ls", remixD3D11Path));
+      const remixapi_ErrorCode status = remixapi_lib_loadRemixDllAndInitialize(
+        remixD3D11Path, &remixapi::g_remix, &remixapi::g_remix_dll);
+      if (status != REMIXAPI_ERROR_CODE_SUCCESS) {
+        char stage[256] = {};
+        sprintf_s(stage, sizeof(stage), "FATAL: Remix API initialization failed status=%d win32=%lu.",
+          static_cast<int>(status), GetLastError());
+        Dx11BridgeBootLogV229(stage);
+        Logger::err(format_string("DX11_V229: Remix API initialization failed status=%d win32=%lu.",
+          static_cast<int>(status), GetLastError()));
+        return 1;
+      }
+      remixapi::g_remix_initialized = true;
+    }
+
+    if (!remixapi::g_remix.Startup || !remixapi::g_remix.Present ||
+        !remixapi::g_remix.SetupCamera || !remixapi::g_remix.CreateMaterial ||
+        !remixapi::g_remix.CreateMesh || !remixapi::g_remix.DrawInstance) {
+      Dx11BridgeBootLogV229("FATAL: Remix API function table is incomplete.");
+      Logger::err("DX11_V229: Remix API function table is incomplete; refusing false-success bridge handshake.");
+      return 1;
+    }
+
+    Dx11BridgeBootLogV229("Remix API initialized and function table validated.");
+    Logger::info("DX11_V229: Remix API initialized and validated; Bridge_Ack is now permitted.");
+  } else {
+    Logger::info("Initializing legacy bridge D3D path...");
+    if (!InitializeD3D()) return 1;
+  }
+
+  // (3) Send ACK to Client. Connection has been established
+'@
+  $hasDeterministicInit =
+    $text.Contains('DX11_V229: initializing one .trex Remix API runtime before Bridge_Ack.') -and
+    $text.Contains('remixapi_lib_loadRemixDllAndInitialize(') -and
+    $text.Contains('Remix API initialized and validated; Bridge_Ack is now permitted.') -and
+    $text.Contains('// (3) Send ACK to Client. Connection has been established')
+
+  if ($hasDeterministicInit) {
+    # bridge_dx11_work is intentionally persistent so incremental builds do not
+    # regenerate and recompile the entire x86 bridge on every invocation.  The
+    # old implementation required the source replacement to change the file,
+    # which made the second and every later build fail even though the complete
+    # deterministic initialization block was already installed.  Validate all
+    # of its required stages above and preserve the known-good source verbatim.
+    Log 'DX11_V229 deterministic bridge runtime initialization is already installed.'
+  } else {
+    $text2 = [regex]::Replace($text, $initPattern, $initBlock, 1)
+    if ($text2 -eq $text) {
+      Die 'V229 could not find either the legacy or deterministic bridge runtime initialization section.'
+    }
+    $text = $text2
+  }
+
+  if ($text -notmatch 'Bridge filesystem, config, and Logger initialized') {
+    $text = $text.Replace('  Logger::init();', "  Logger::init();`r`n  Dx11BridgeBootLogV229(`"Bridge filesystem, config, and Logger initialized.`");")
+  }
+  if ($text -notmatch 'bridge GUID accepted') {
+    $text = $text.Replace(
+      '    Logger::info("Launched server with GUID " + gUniqueIdentifier.toString());',
+      "    Logger::info(`"Launched server with GUID `" + gUniqueIdentifier.toString());`r`n    Dx11BridgeBootLogV229(`"Validated bridge GUID accepted.`");")
+  }
+  if ($text -notmatch 'bridge IPC namespaces initialized') {
+    $text = $text.Replace('  initDeviceBridge();', "  initDeviceBridge();`r`n  Dx11BridgeBootLogV229(`"Validated bridge IPC namespaces initialized.`");")
+  }
+  if ($text -notmatch 'Bridge_Ack sent only after') {
+    $ack = '  ServerMessage { Commands::Bridge_Ack, (uintptr_t) gpClientMessageChannel->getWorkerThreadId() };'
+    if (!$text.Contains($ack)) { Die 'V229 could not find bridge ACK send.' }
+    $text = $text.Replace($ack, $ack + "`r`n  Dx11BridgeBootLogV229(`"Bridge_Ack sent only after Remix API validation.`");")
+  }
+  if ($text -notmatch 'bridge handshake completed; command processing active') {
+    $text = $text.Replace(
+      '  Logger::info("Handshake completed! Now waiting for incoming commands...");',
+      "  Logger::info(`"Handshake completed! Now waiting for incoming commands...`" );`r`n  Dx11BridgeBootLogV229(`"Bridge handshake completed; command processing active.`");")
+  }
+
+  if ($text -match 'Dx11BridgeServer(?:ForceLoadTrexDx11Runtime|InitializeTrexRemixRuntime)V\d+') {
+    Die 'V229 deterministic bootstrap cleanup left a historical preloader call or helper behind.'
+  }
+
+  Write-TextNoBom -Path $main -Text $text
+  Log 'DX11_V229: removed historical runtime preload stack; added one validated Remix bootstrap before Bridge_Ack and a kernel32 stage log.'
+}
+
+function Patch-DX11ClientSwapchainCoverageV229 {
+  param([Parameter(Mandatory)][string]$DstClient)
+
+  $d3d11Path = Join-Path $DstClient 'd3d11_dx11bridge.cpp'
+  $dxgiPath = Join-Path $DstClient 'dxgi_dx11bridge.cpp'
+  $dxgiDefPath = Join-Path $DstClient 'dxgi_dx11bridge.def'
+  if (!(Test-Path -LiteralPath $d3d11Path -PathType Leaf)) { Die "V229 swapchain coverage patch missing d3d11 client source: $d3d11Path" }
+  if (!(Test-Path -LiteralPath $dxgiPath -PathType Leaf)) { Die "V229 swapchain coverage patch missing dxgi client source: $dxgiPath" }
+
+  # The DXGI proxy owns factory interception.  Query the actual interface before
+  # touching its vtable: the previous code wrote Factory2 slot 15 even when
+  # CreateDXGIFactory1 returned an IDXGIFactory1 (whose vtable ends at slot 13).
+  # Also retain swapchains created before the d3d11 proxy attaches, then hand
+  # them to d3d11 once its Present/Present1 hooks are available.
+  Write-TextNoBom -Path $dxgiPath -Text @'
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#include <dxgi.h>
+#include <dxgi1_2.h>
+#include <dxgi1_3.h>
+#include <cstdio>
+#include <cstdint>
+#include "dx11_bridge_client.h"
+
+#define DX11_V229_COMPLETE_SWAPCHAIN_COVERAGE 1
+
+using PFN_CreateDXGIFactory = HRESULT (WINAPI *)(REFIID, void**);
+using PFN_CreateDXGIFactory1 = HRESULT (WINAPI *)(REFIID, void**);
+using PFN_CreateDXGIFactory2 = HRESULT (WINAPI *)(UINT, REFIID, void**);
+
+static HMODULE gSystemDxgi = nullptr;
+static PFN_CreateDXGIFactory pCreateDXGIFactory = nullptr;
+static PFN_CreateDXGIFactory1 pCreateDXGIFactory1 = nullptr;
+static PFN_CreateDXGIFactory2 pCreateDXGIFactory2 = nullptr;
+
+using PFN_FactoryCreateSwapChain = HRESULT (STDMETHODCALLTYPE *)(IDXGIFactory*, IUnknown*, DXGI_SWAP_CHAIN_DESC*, IDXGISwapChain**);
+using PFN_Factory2CreateSwapChainForHwnd = HRESULT (STDMETHODCALLTYPE *)(IDXGIFactory2*, IUnknown*, HWND, const DXGI_SWAP_CHAIN_DESC1*, const DXGI_SWAP_CHAIN_FULLSCREEN_DESC*, IDXGIOutput*, IDXGISwapChain1**);
+using PFN_Factory2CreateSwapChainForCoreWindow = HRESULT (STDMETHODCALLTYPE *)(IDXGIFactory2*, IUnknown*, IUnknown*, const DXGI_SWAP_CHAIN_DESC1*, IDXGIOutput*, IDXGISwapChain1**);
+using PFN_Factory2CreateSwapChainForComposition = HRESULT (STDMETHODCALLTYPE *)(IDXGIFactory2*, IUnknown*, const DXGI_SWAP_CHAIN_DESC1*, IDXGIOutput*, IDXGISwapChain1**);
+using PFN_FactoryMediaCreateSwapChainForCompositionSurfaceHandle = HRESULT (STDMETHODCALLTYPE *)(IDXGIFactoryMedia*, IUnknown*, HANDLE, const DXGI_SWAP_CHAIN_DESC1*, IDXGIOutput*, IDXGISwapChain1**);
+
+static PFN_FactoryCreateSwapChain oFactoryCreateSwapChain = nullptr;
+static PFN_Factory2CreateSwapChainForHwnd oFactory2CreateSwapChainForHwnd = nullptr;
+static PFN_Factory2CreateSwapChainForCoreWindow oFactory2CreateSwapChainForCoreWindow = nullptr;
+static PFN_Factory2CreateSwapChainForComposition oFactory2CreateSwapChainForComposition = nullptr;
+static PFN_FactoryMediaCreateSwapChainForCompositionSurfaceHandle oFactoryMediaCreateSwapChainForCompositionSurfaceHandle = nullptr;
+
+static SRWLOCK gPendingSwapChainLockV229 = SRWLOCK_INIT;
+static IDXGISwapChain* gPendingSwapChainsV229[16] = {};
+static UINT gPendingSwapChainCountV229 = 0;
+
+static void DLog(const char* text) {
+  dx11_bridge_client::LogLine("dxgi", text);
+}
+
+static HMODULE LoadSystemDxgiV229() {
+  if (gSystemDxgi) return gSystemDxgi;
+  gSystemDxgi = dx11_bridge_client::LoadSystemDll("dxgi.dll");
+  if (!gSystemDxgi) return nullptr;
+  pCreateDXGIFactory = reinterpret_cast<PFN_CreateDXGIFactory>(GetProcAddress(gSystemDxgi, "CreateDXGIFactory"));
+  pCreateDXGIFactory1 = reinterpret_cast<PFN_CreateDXGIFactory1>(GetProcAddress(gSystemDxgi, "CreateDXGIFactory1"));
+  pCreateDXGIFactory2 = reinterpret_cast<PFN_CreateDXGIFactory2>(GetProcAddress(gSystemDxgi, "CreateDXGIFactory2"));
+  return gSystemDxgi;
+}
+
+template <typename T>
+static bool HookVTableV229(void* object, size_t slot, void* detour, T* original, const char* name) {
+  if (!object || !detour || !original) return false;
+  void*** obj = reinterpret_cast<void***>(object);
+  void** vt = *obj;
+  if (!vt) return false;
+  if (vt[slot] == detour) return true;
+
+  DWORD oldProtect = 0;
+  if (!VirtualProtect(&vt[slot], sizeof(void*), PAGE_EXECUTE_READWRITE, &oldProtect)) {
+    char msg[320] = {};
+    sprintf_s(msg, sizeof(msg), "DX11_V229: VirtualProtect failed for %s slot=%u err=%lu.", name, (unsigned) slot, GetLastError());
+    DLog(msg);
+    return false;
+  }
+
+  if (*original == nullptr) *original = reinterpret_cast<T>(vt[slot]);
+  vt[slot] = detour;
+
+  DWORD ignored = 0;
+  VirtualProtect(&vt[slot], sizeof(void*), oldProtect, &ignored);
+  FlushInstructionCache(GetCurrentProcess(), &vt[slot], sizeof(void*));
+
+  char msg[320] = {};
+  sprintf_s(msg, sizeof(msg), "DX11_V229: hooked %s slot=%u on its validated interface.", name, (unsigned) slot);
+  DLog(msg);
+  return true;
+}
+
+static HMODULE FindLocalD3D11ProxyV229() {
+  HMODULE self = nullptr;
+  GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+    reinterpret_cast<LPCSTR>(&FindLocalD3D11ProxyV229), &self);
+  if (self) {
+    char path[MAX_PATH] = {};
+    if (GetModuleFileNameA(self, path, MAX_PATH)) {
+      char* slash = strrchr(path, '\\');
+      if (slash) {
+        strcpy_s(slash + 1, MAX_PATH - static_cast<size_t>((slash + 1) - path), "d3d11.dll");
+        HMODULE local = nullptr;
+        if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, path, &local)) return local;
+      }
+    }
+  }
+  return GetModuleHandleA("d3d11.dll");
+}
+
+static void QueuePendingSwapChainV229(IDXGISwapChain* swapChain) {
+  if (!swapChain) return;
+  AcquireSRWLockExclusive(&gPendingSwapChainLockV229);
+  for (UINT i = 0; i < gPendingSwapChainCountV229; ++i) {
+    if (gPendingSwapChainsV229[i] == swapChain) {
+      ReleaseSRWLockExclusive(&gPendingSwapChainLockV229);
+      return;
+    }
+  }
+  if (gPendingSwapChainCountV229 < _countof(gPendingSwapChainsV229)) {
+    swapChain->AddRef();
+    gPendingSwapChainsV229[gPendingSwapChainCountV229++] = swapChain;
+    ReleaseSRWLockExclusive(&gPendingSwapChainLockV229);
+    DLog("DX11_V229: queued swapchain created before the local d3d11 Present hook was available.");
+    return;
+  }
+  ReleaseSRWLockExclusive(&gPendingSwapChainLockV229);
+  DLog("DX11_V229: pending swapchain queue is full; newest swapchain could not be retained.");
+}
+
+using PFN_D3D11SwapChainHook = void (WINAPI *)(IDXGISwapChain*);
+static bool TryInstallD3D11SwapChainHookV229(IDXGISwapChain* swapChain) {
+  if (!swapChain) return false;
+  HMODULE d3d11 = FindLocalD3D11ProxyV229();
+  auto hook = d3d11
+    ? reinterpret_cast<PFN_D3D11SwapChainHook>(GetProcAddress(d3d11, "DX11BridgeInstallSwapChainCapture"))
+    : nullptr;
+  if (!hook) {
+    QueuePendingSwapChainV229(swapChain);
+    return false;
+  }
+  hook(swapChain);
+  DLog("DX11_V229: installed d3d11 Present/Present1 capture on a discovered swapchain.");
+  return true;
+}
+
+extern "C" __declspec(dllexport) void WINAPI DX11BridgeInstallPendingSwapChains() {
+  IDXGISwapChain* pending[_countof(gPendingSwapChainsV229)] = {};
+  UINT count = 0;
+  AcquireSRWLockExclusive(&gPendingSwapChainLockV229);
+  count = gPendingSwapChainCountV229;
+  for (UINT i = 0; i < count; ++i) {
+    pending[i] = gPendingSwapChainsV229[i];
+    gPendingSwapChainsV229[i] = nullptr;
+  }
+  gPendingSwapChainCountV229 = 0;
+  ReleaseSRWLockExclusive(&gPendingSwapChainLockV229);
+
+  for (UINT i = 0; i < count; ++i) {
+    TryInstallD3D11SwapChainHookV229(pending[i]);
+    pending[i]->Release();
+  }
+  if (count) DLog("DX11_V229: drained deferred swapchains after d3d11 proxy initialization.");
+}
+
+static void OnSwapChainCreatedV229(const char* path, IDXGISwapChain* swapChain) {
+  if (!swapChain) return;
+  char msg[320] = {};
+  sprintf_s(msg, sizeof(msg), "DX11_V229: %s returned a swapchain; starting bridge and installing presentation capture.", path);
+  DLog(msg);
+  dx11_bridge_client::EnsureServer();
+  TryInstallD3D11SwapChainHookV229(swapChain);
+}
+
+static HRESULT STDMETHODCALLTYPE HFactoryCreateSwapChain(IDXGIFactory* self, IUnknown* device, DXGI_SWAP_CHAIN_DESC* desc, IDXGISwapChain** swapChain) {
+  HRESULT hr = oFactoryCreateSwapChain ? oFactoryCreateSwapChain(self, device, desc, swapChain) : DXGI_ERROR_UNSUPPORTED;
+  if (SUCCEEDED(hr) && swapChain && *swapChain) OnSwapChainCreatedV229("IDXGIFactory::CreateSwapChain", *swapChain);
+  return hr;
+}
+
+static HRESULT STDMETHODCALLTYPE HFactory2CreateSwapChainForHwnd(IDXGIFactory2* self, IUnknown* device, HWND hwnd, const DXGI_SWAP_CHAIN_DESC1* desc, const DXGI_SWAP_CHAIN_FULLSCREEN_DESC* fsDesc, IDXGIOutput* restrictToOutput, IDXGISwapChain1** swapChain) {
+  HRESULT hr = oFactory2CreateSwapChainForHwnd ? oFactory2CreateSwapChainForHwnd(self, device, hwnd, desc, fsDesc, restrictToOutput, swapChain) : DXGI_ERROR_UNSUPPORTED;
+  if (SUCCEEDED(hr) && swapChain && *swapChain) OnSwapChainCreatedV229("IDXGIFactory2::CreateSwapChainForHwnd", *swapChain);
+  return hr;
+}
+
+static HRESULT STDMETHODCALLTYPE HFactory2CreateSwapChainForCoreWindow(IDXGIFactory2* self, IUnknown* device, IUnknown* window, const DXGI_SWAP_CHAIN_DESC1* desc, IDXGIOutput* restrictToOutput, IDXGISwapChain1** swapChain) {
+  HRESULT hr = oFactory2CreateSwapChainForCoreWindow ? oFactory2CreateSwapChainForCoreWindow(self, device, window, desc, restrictToOutput, swapChain) : DXGI_ERROR_UNSUPPORTED;
+  if (SUCCEEDED(hr) && swapChain && *swapChain) OnSwapChainCreatedV229("IDXGIFactory2::CreateSwapChainForCoreWindow", *swapChain);
+  return hr;
+}
+
+static HRESULT STDMETHODCALLTYPE HFactory2CreateSwapChainForComposition(IDXGIFactory2* self, IUnknown* device, const DXGI_SWAP_CHAIN_DESC1* desc, IDXGIOutput* restrictToOutput, IDXGISwapChain1** swapChain) {
+  HRESULT hr = oFactory2CreateSwapChainForComposition ? oFactory2CreateSwapChainForComposition(self, device, desc, restrictToOutput, swapChain) : DXGI_ERROR_UNSUPPORTED;
+  if (SUCCEEDED(hr) && swapChain && *swapChain) OnSwapChainCreatedV229("IDXGIFactory2::CreateSwapChainForComposition", *swapChain);
+  return hr;
+}
+
+static HRESULT STDMETHODCALLTYPE HFactoryMediaCreateSwapChainForCompositionSurfaceHandle(IDXGIFactoryMedia* self, IUnknown* device, HANDLE surface, const DXGI_SWAP_CHAIN_DESC1* desc, IDXGIOutput* restrictToOutput, IDXGISwapChain1** swapChain) {
+  HRESULT hr = oFactoryMediaCreateSwapChainForCompositionSurfaceHandle
+    ? oFactoryMediaCreateSwapChainForCompositionSurfaceHandle(self, device, surface, desc, restrictToOutput, swapChain)
+    : DXGI_ERROR_UNSUPPORTED;
+  if (SUCCEEDED(hr) && swapChain && *swapChain) OnSwapChainCreatedV229("IDXGIFactoryMedia::CreateSwapChainForCompositionSurfaceHandle", *swapChain);
+  return hr;
+}
+
+static void InstallFactoryHooksV229(void* factory) {
+  if (!factory) return;
+  IUnknown* unknown = reinterpret_cast<IUnknown*>(factory);
+
+  IDXGIFactory* factory0 = nullptr;
+  if (SUCCEEDED(unknown->QueryInterface(__uuidof(IDXGIFactory), reinterpret_cast<void**>(&factory0))) && factory0) {
+    HookVTableV229(factory0, 10, reinterpret_cast<void*>(&HFactoryCreateSwapChain), &oFactoryCreateSwapChain, "IDXGIFactory::CreateSwapChain");
+    factory0->Release();
+  }
+
+  IDXGIFactory2* factory2 = nullptr;
+  if (SUCCEEDED(unknown->QueryInterface(__uuidof(IDXGIFactory2), reinterpret_cast<void**>(&factory2))) && factory2) {
+    HookVTableV229(factory2, 15, reinterpret_cast<void*>(&HFactory2CreateSwapChainForHwnd), &oFactory2CreateSwapChainForHwnd, "IDXGIFactory2::CreateSwapChainForHwnd");
+    HookVTableV229(factory2, 16, reinterpret_cast<void*>(&HFactory2CreateSwapChainForCoreWindow), &oFactory2CreateSwapChainForCoreWindow, "IDXGIFactory2::CreateSwapChainForCoreWindow");
+    HookVTableV229(factory2, 24, reinterpret_cast<void*>(&HFactory2CreateSwapChainForComposition), &oFactory2CreateSwapChainForComposition, "IDXGIFactory2::CreateSwapChainForComposition");
+    factory2->Release();
+  }
+
+  IDXGIFactoryMedia* factoryMedia = nullptr;
+  if (SUCCEEDED(unknown->QueryInterface(__uuidof(IDXGIFactoryMedia), reinterpret_cast<void**>(&factoryMedia))) && factoryMedia) {
+    HookVTableV229(factoryMedia, 3, reinterpret_cast<void*>(&HFactoryMediaCreateSwapChainForCompositionSurfaceHandle), &oFactoryMediaCreateSwapChainForCompositionSurfaceHandle, "IDXGIFactoryMedia::CreateSwapChainForCompositionSurfaceHandle");
+    factoryMedia->Release();
+  }
+}
+
+BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, LPVOID reserved) {
+  if (reason == DLL_PROCESS_ATTACH) {
+    DisableThreadLibraryCalls(hinst);
+    dx11_bridge_client::SetModule(hinst);
+    DLog("DX11_V229: game loaded root dxgi.dll with complete, interface-safe swapchain capture.");
+  }
+  if (reason == DLL_PROCESS_DETACH && reserved != nullptr) dx11_bridge_client::Detach();
+  return TRUE;
+}
+
+extern "C" HRESULT WINAPI CreateDXGIFactory(REFIID riid, void** ppFactory) {
+  DLog("DX11_V229: CreateDXGIFactory intercepted.");
+  if (!LoadSystemDxgiV229() || !pCreateDXGIFactory) return DXGI_ERROR_UNSUPPORTED;
+  HRESULT hr = pCreateDXGIFactory(riid, ppFactory);
+  if (SUCCEEDED(hr) && ppFactory && *ppFactory) InstallFactoryHooksV229(*ppFactory);
+  return hr;
+}
+
+extern "C" HRESULT WINAPI CreateDXGIFactory1(REFIID riid, void** ppFactory) {
+  DLog("DX11_V229: CreateDXGIFactory1 intercepted.");
+  if (!LoadSystemDxgiV229() || !pCreateDXGIFactory1) return DXGI_ERROR_UNSUPPORTED;
+  HRESULT hr = pCreateDXGIFactory1(riid, ppFactory);
+  if (SUCCEEDED(hr) && ppFactory && *ppFactory) InstallFactoryHooksV229(*ppFactory);
+  return hr;
+}
+
+extern "C" HRESULT WINAPI CreateDXGIFactory2(UINT flags, REFIID riid, void** ppFactory) {
+  DLog("DX11_V229: CreateDXGIFactory2 intercepted.");
+  if (!LoadSystemDxgiV229() || !pCreateDXGIFactory2) return DXGI_ERROR_UNSUPPORTED;
+  HRESULT hr = pCreateDXGIFactory2(flags, riid, ppFactory);
+  if (SUCCEEDED(hr) && ppFactory && *ppFactory) InstallFactoryHooksV229(*ppFactory);
+  return hr;
+}
+'@
+
+  $d3d11Text = [System.IO.File]::ReadAllText($d3d11Path).Replace("`r`n", "`n")
+  if (!$d3d11Text.Contains('DX11_V229_PRESENT1_AND_DEFERRED_SWAPCHAINS')) {
+    $d3d11Text = $d3d11Text.Replace('#include <dxgi.h>', "#include <dxgi.h>`r`n#include <dxgi1_2.h>")
+
+    $oldDecl = @'
+using PFN_SwapPresent = HRESULT (STDMETHODCALLTYPE *)(IDXGISwapChain*, UINT, UINT);
+using PFN_SwapResizeBuffers = HRESULT (STDMETHODCALLTYPE *)(IDXGISwapChain*, UINT, UINT, UINT, DXGI_FORMAT, UINT);
+static PFN_SwapPresent oSwapPresent = nullptr;
+static PFN_SwapResizeBuffers oSwapResizeBuffers = nullptr;
+'@
+    $newDecl = @'
+// DX11_V229_PRESENT1_AND_DEFERRED_SWAPCHAINS
+using PFN_SwapPresent = HRESULT (STDMETHODCALLTYPE *)(IDXGISwapChain*, UINT, UINT);
+using PFN_SwapPresent1 = HRESULT (STDMETHODCALLTYPE *)(IDXGISwapChain1*, UINT, UINT, const DXGI_PRESENT_PARAMETERS*);
+using PFN_SwapResizeBuffers = HRESULT (STDMETHODCALLTYPE *)(IDXGISwapChain*, UINT, UINT, UINT, DXGI_FORMAT, UINT);
+static PFN_SwapPresent oSwapPresent = nullptr;
+static PFN_SwapPresent1 oSwapPresent1 = nullptr;
+static PFN_SwapResizeBuffers oSwapResizeBuffers = nullptr;
+'@
+    $oldDecl = $oldDecl.Replace("`r`n", "`n")
+    $newDecl = $newDecl.Replace("`r`n", "`n")
+    if (!$d3d11Text.Contains($oldDecl)) { Die 'V229 could not find D3D11 swapchain declaration block.' }
+    $d3d11Text = $d3d11Text.Replace($oldDecl, $newDecl)
+
+    $resizeMarker = 'static HRESULT STDMETHODCALLTYPE HSwapResizeBuffers('
+    $present1 = @'
+static HRESULT STDMETHODCALLTYPE HSwapPresent1(IDXGISwapChain1* self, UINT syncInterval, UINT flags, const DXGI_PRESENT_PARAMETERS* parameters) {
+  if (!gV219InsideHook) {
+    gV219InsideHook = true;
+    LONG n = InterlockedIncrement(&gV219PresentCount);
+    if (n <= 8 || (n % 60) == 0) {
+      char msg[256] = {};
+      sprintf_s(msg, sizeof(msg), "DX11_V229: captured IDXGISwapChain1::Present1 count=%ld in game process.", n);
+      V219Log("capture", msg);
+    }
+    dx11_bridge_client::EnsureServer();
+    dx11_capture::OnPresent(self);
+    gV219InsideHook = false;
+  }
+  return oSwapPresent1 ? oSwapPresent1(self, syncInterval, flags, parameters) : DXGI_ERROR_DEVICE_REMOVED;
+}
+
+'@
+    $present1 = $present1.Replace("`r`n", "`n")
+    if (!$d3d11Text.Contains($resizeMarker)) { Die 'V229 could not find HSwapResizeBuffers insertion point.' }
+    $d3d11Text = $d3d11Text.Replace($resizeMarker, $present1 + $resizeMarker)
+
+    $oldInstall = @'
+extern "C" __declspec(dllexport) void WINAPI DX11BridgeInstallSwapChainCapture(IDXGISwapChain* swapChain) {
+  if (!swapChain) return;
+  V219HookVTable(swapChain, 8, reinterpret_cast<void*>(&HSwapPresent), &oSwapPresent, "IDXGISwapChain::Present");
+  V219HookVTable(swapChain, 13, reinterpret_cast<void*>(&HSwapResizeBuffers), &oSwapResizeBuffers, "IDXGISwapChain::ResizeBuffers");
+}
+'@
+    $newInstall = @'
+extern "C" __declspec(dllexport) void WINAPI DX11BridgeInstallSwapChainCapture(IDXGISwapChain* swapChain) {
+  if (!swapChain) return;
+  V219HookVTable(swapChain, 8, reinterpret_cast<void*>(&HSwapPresent), &oSwapPresent, "IDXGISwapChain::Present");
+  V219HookVTable(swapChain, 13, reinterpret_cast<void*>(&HSwapResizeBuffers), &oSwapResizeBuffers, "IDXGISwapChain::ResizeBuffers");
+
+  IDXGISwapChain1* swapChain1 = nullptr;
+  if (SUCCEEDED(swapChain->QueryInterface(__uuidof(IDXGISwapChain1), reinterpret_cast<void**>(&swapChain1))) && swapChain1) {
+    V219HookVTable(swapChain1, 22, reinterpret_cast<void*>(&HSwapPresent1), &oSwapPresent1, "IDXGISwapChain1::Present1");
+    swapChain1->Release();
+  }
+}
+'@
+    $oldInstall = $oldInstall.Replace("`r`n", "`n")
+    $newInstall = $newInstall.Replace("`r`n", "`n")
+    if (!$d3d11Text.Contains($oldInstall)) { Die 'V229 could not find DX11BridgeInstallSwapChainCapture body.' }
+    $d3d11Text = $d3d11Text.Replace($oldInstall, $newInstall)
+
+    $dllMainMarker = 'BOOL WINAPI DllMain('
+    $drainHelper = @'
+using PFN_DX11BridgeInstallPendingSwapChainsV229 = void (WINAPI *)();
+static void TryDrainPendingSwapChainsV229() {
+  HMODULE dxgi = GetModuleHandleA("dxgi.dll");
+  auto drain = dxgi
+    ? reinterpret_cast<PFN_DX11BridgeInstallPendingSwapChainsV229>(GetProcAddress(dxgi, "DX11BridgeInstallPendingSwapChains"))
+    : nullptr;
+  if (drain) drain();
+}
+
+'@
+    $drainHelper = $drainHelper.Replace("`r`n", "`n")
+    if (!$d3d11Text.Contains($dllMainMarker)) { Die 'V229 could not find d3d11 DllMain insertion point.' }
+    $d3d11Text = $d3d11Text.Replace($dllMainMarker, $drainHelper + $dllMainMarker)
+
+    $call1 = '    V219InstallCapture(device ? *device : nullptr, immediateContext ? *immediateContext : nullptr, nullptr);'
+    $call2 = '    V219InstallCapture(device ? *device : nullptr, immediateContext ? *immediateContext : nullptr, swapChain ? *swapChain : nullptr);'
+    if (!$d3d11Text.Contains($call1) -or !$d3d11Text.Contains($call2)) { Die 'V229 could not find both D3D11 capture installation calls.' }
+    $d3d11Text = $d3d11Text.Replace($call1, $call1 + "`r`n    TryDrainPendingSwapChainsV229();")
+    $d3d11Text = $d3d11Text.Replace($call2, $call2 + "`r`n    TryDrainPendingSwapChainsV229();")
+    Write-TextNoBom -Path $d3d11Path -Text $d3d11Text
+  }
+
+  if (Test-Path -LiteralPath $dxgiDefPath -PathType Leaf) {
+    $def = [System.IO.File]::ReadAllText($dxgiDefPath)
+    if (!$def.Contains('DX11BridgeInstallPendingSwapChains')) {
+      $def = $def.TrimEnd() + "`r`n  DX11BridgeInstallPendingSwapChains`r`n"
+      Write-TextNoBom -Path $dxgiDefPath -Text $def
+    }
+  }
+
+  Log 'DX11_V229: enabled interface-safe complete DXGI swapchain discovery, deferred handoff, Present, and Present1 capture.'
+}
+
 function Prepare-DX11BridgeSource([string]$PackDir) {
   $work = Join-Path $Root 'bridge_dx11_work'
   $sourceBridge = Join-Path $Root 'bridge'
   $sourceBridgeReady = Test-Path (Join-Path $sourceBridge 'meson.build')
-  $workBridgeReady = Test-Path (Join-Path $work 'src\client')
+  # The DX11 work tree deliberately removes the legacy src/client directory and
+  # replaces it with src/client_dx11. Testing the removed directory made every
+  # normal build clone the full upstream repository again, only to discard that
+  # clone after the RTXDI/RTXCR sync. Reuse the persistent, fully normalized
+  # bridge when its Meson file, server, and DX11 client are all present.
+  $workBridgeReady =
+    (Test-Path -LiteralPath (Join-Path $work 'meson.build') -PathType Leaf) -and
+    (Test-Path -LiteralPath (Join-Path $work 'src\server\main.cpp') -PathType Leaf) -and
+    (Test-Path -LiteralPath (Join-Path $work 'src\client_dx11') -PathType Container)
   # A completed bridge work tree is already the normalized, patched source
   # consumed below. Do not perform a redundant recursive NVIDIA clone merely
   # because the optional pristine ./bridge directory is absent.
@@ -11341,6 +12026,7 @@ function Prepare-DX11BridgeSource([string]$PackDir) {
   Write-DX11FullClientSourcesV63 -DstClient $dstClient
   Patch-DX11ClientRealCaptureLayerV219 -DstClient $dstClient
   Patch-DX11ClientCaptureToRemixV226 -DstClient $dstClient
+  Patch-DX11ClientSwapchainCoverageV229 -DstClient $dstClient
 
   $srcMeson = Join-Path $work 'src\meson.build'
   Normalize-BridgeSrcMesonClientDx11 -SrcMeson $srcMeson
@@ -11367,6 +12053,7 @@ function Prepare-DX11BridgeSource([string]$PackDir) {
   Patch-BridgeServerForceLoadRemixRuntimeV219 -BridgeWork $work
   Patch-BridgeServerDx11RealGameTargetAndNoExitKillV219 -BridgeWork $work
   Patch-BridgeServerForceTrexDx11RuntimeV219 -BridgeWork $work
+  Patch-BridgeServerDeterministicRemixBootstrapV229 -BridgeWork $work
   Assert-RealBridgeServerCanAckV219 -BridgeWork $work
   Patch-BridgeServerRemoveLegacyD3D9RegistrationV219 -BridgeWork $work
   Patch-BridgeServerRemoveStaleD3D11RegisterV219 -BridgeWork $work
@@ -12685,6 +13372,18 @@ Repair-RemixApiLine79Line130Corruption $Root
   Patch-UtilGdiConcreteDxgiFormatV219
 
 
+  # The authoritative RTX header sync above runs on every invocation. Reapply
+  # the bounded DX11 compatibility edits after it even when build.ninja already
+  # exists. Previously these only ran during first-time Meson setup, so the next
+  # incremental build received an upstream nrc_args.h with a one-level-too-deep
+  # relative path and could not find NrcStructures.h. These repairs are
+  # idempotent and refresh the NRC compiler include directory as well.
+  Patch-ActualDx11MaterialFogAndNrcV219
+  Patch-SurfaceSharedAndTerrainIncludeV219
+  Patch-Dx11LightStateApiV219
+  Patch-WxWarningErrorsV219
+  Patch-Dx11DeviceFeatureAndGdiFormatV219
+  Patch-GdiFormatAndDxvkBufferCookieV219
   Ensure-WindowsSdkD3D11IncludesV219
   Invoke-Logged -Label 'runtime-ninja-x64' -Exe $Ninja -CommandArgs (Get-DX11FastNinjaArgsV219 $buildDir) -WorkingDirectory $Root | Out-Null
   try { Invoke-Logged -Label 'runtime-install-x64' -Exe $Meson -CommandArgs @('install','-C',$buildDir,'--no-rebuild','--tags','output') -WorkingDirectory $Root | Out-Null } catch { Warn $_.Exception.Message }
@@ -13695,7 +14394,12 @@ static LPWSTR* Dx11BridgeBuildFallbackArgListV63(int* pArgCount) {
     $text = $text2
   }
 
-  $text = $text.Replace('LocalFree(argList); initModuleBridge();', 'if (!dx11FallbackArgListV63 && argList) { LocalFree(argList); } initModuleBridge();')
+  $freeArgPattern = 'LocalFree\(argList\);\s*(?=initModuleBridge\(\);)'
+  $text = [regex]::Replace(
+    $text,
+    $freeArgPattern,
+    'if (!dx11FallbackArgListV63 && argList) { LocalFree(argList); } ',
+    1)
   Write-TextNoBom -Path $main -Text $text
   Log 'Patched bridge server: GUID/version command-line fallback for DX11 launcher.'
 }
@@ -13914,23 +14618,57 @@ static bool DirectoryExistsV219(const std::string& path) {
 }
 
 
-// DX11_V219_SHARED_DX9_GUID_SOURCE
-// Keep the exact same DX9-style Guid string across root DLL, launcher, and .trex\NvRemixBridge.exe.
-static void WriteSharedBridgeGuidV219(const std::string& gameRoot, const std::string& guid) {
-  if (gameRoot.empty() || guid.empty()) return;
+// DX11_V229_ATOMIC_GUID_VERSION_CONTRACT
+static bool IsValidBridgeGuidV229(const std::string& guid) {
+  if (guid.size() != 36) return false;
+  for (size_t i = 0; i < guid.size(); ++i) {
+    const char c = guid[i];
+    if (i == 8 || i == 13 || i == 18 || i == 23) {
+      if (c != '-') return false;
+    } else if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'))) {
+      return false;
+    }
+  }
+  return true;
+}
+
+static bool WriteBridgeTextFileAtomicallyV229(const std::string& path, const std::string& text) {
+  const std::string temp = path + ".tmp";
+  HANDLE h = CreateFileA(temp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (h == INVALID_HANDLE_VALUE) return false;
+  DWORD written = 0;
+  const BOOL wrote = WriteFile(h, text.data(), static_cast<DWORD>(text.size()), &written, nullptr);
+  const BOOL flushed = wrote && written == text.size() && FlushFileBuffers(h);
+  CloseHandle(h);
+  if (!flushed) {
+    DeleteFileA(temp.c_str());
+    return false;
+  }
+  if (!MoveFileExA(temp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+    DeleteFileA(temp.c_str());
+    return false;
+  }
+  return true;
+}
+
+static bool WriteSharedBridgeGuidV219(const std::string& gameRoot, const std::string& guid, const std::string& version) {
+  if (gameRoot.empty() || !IsValidBridgeGuidV229(guid) || version.empty()) {
+    LogLine("bridge", "DX11_V229 ERROR: refusing to launch bridge with an empty/invalid GUID or version.");
+    return false;
+  }
   SetEnvironmentVariableA("DX11_BRIDGE_GUID", guid.c_str());
   SetEnvironmentVariableA("DX11_BRIDGE_FIXED_GUID", guid.c_str());
+  SetEnvironmentVariableA("DX11_BRIDGE_VERSION", version.c_str());
 
   const std::string guidPath = gameRoot + ".trex\\dx11_bridge_guid.txt";
-  HANDLE h = CreateFileA(guidPath.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-  if (h != INVALID_HANDLE_VALUE) {
-    DWORD written = 0;
-    WriteFile(h, guid.c_str(), static_cast<DWORD>(guid.size()), &written, nullptr);
-    CloseHandle(h);
-    LogLine("bridge", "DX11_V219 wrote shared DX9-style bridge GUID to .trex\\dx11_bridge_guid.txt.");
-  } else {
-    LogLine("bridge", "DX11_V219 WARNING: failed to write .trex\\dx11_bridge_guid.txt.");
+  const std::string argsPath = gameRoot + ".trex\\dx11_bridge_args.txt";
+  if (!WriteBridgeTextFileAtomicallyV229(guidPath, guid) ||
+      !WriteBridgeTextFileAtomicallyV229(argsPath, guid + "\r\n" + version + "\r\n")) {
+    LogLine("bridge", "DX11_V229 ERROR: failed to atomically publish bridge GUID/version files.");
+    return false;
   }
+  LogLine("bridge", "DX11_V229 atomically published one validated GUID/version contract for client, launcher, and server.");
+  return true;
 }
 
 // DX11_V219_GAME_CMD_FILE_ANYWHERE
@@ -14387,8 +15125,9 @@ bool EnsureServer() {
 
   SetEnvironmentVariableA("DX11_BRIDGE_MODE", "d3d11");
   const std::string sharedGuidV219 = gUniqueIdentifier.toString();
-  WriteSharedBridgeGuidV219(gRemixFolder, sharedGuidV219);
-  SetEnvironmentVariableA("DX11_BRIDGE_VERSION", BRIDGE_VERSION);
+  if (!WriteSharedBridgeGuidV219(gRemixFolder, sharedGuidV219, BRIDGE_VERSION)) {
+    return false;
+  }
 
   const std::string gameCmdFileV219 = WriteSharedGameCommandLineV219(gRemixFolder);
   WriteRealGamePidForLauncherV219(gRemixFolder);
@@ -14753,13 +15492,10 @@ Direct launcher source:
 function Build-DX11Bridge([string]$BridgeWork, [string]$VsInstall, [string]$Meson, [string]$Ninja) {
   
   Enable-DX11FastCompilerEnvV219
-Patch-BridgeServerRemoveLegacyD3D9RegistrationV219 -BridgeWork $BridgeWork
+  Patch-BridgeServerRemoveLegacyD3D9RegistrationV219 -BridgeWork $BridgeWork
   Assert-RealBridgeServerCanAckV219 -BridgeWork $BridgeWork
   $b64 = Join-Path $BridgeWork '_Comp64Release'
-  if (Test-Path $b64) {
-    Log "V219 removing bridge server build dir so real Bridge_Ack-capable NvRemixBridge.exe is rebuilt: $b64"
-    Remove-Item -LiteralPath $b64 -Recurse -Force
-  }
+  Log 'V219 preserving bridge server Meson/Ninja tree; changed Bridge_Ack sources rebuild incrementally.'
   if (!$SkipBridgeBuild) {
     Import-VSEnvironment $VsInstall 'x64'
     $env:NINJA = $Ninja

@@ -1063,6 +1063,56 @@ void CaptureDraw(ID3D11DeviceContext* context, uint32_t vertexCount,
   if (layout) layout->Release();
 }
 
+// DX11_V229_PRESENT_WINDOW_FALLBACK: composition/CoreWindow swapchains do not
+// expose a legacy DXGI_SWAP_CHAIN_DESC::OutputWindow. Resolve the game's real
+// top-level HWND so Remix Startup is not permanently skipped for those games.
+struct PresentWindowCandidateV229 {
+  DWORD pid;
+  HWND hwnd;
+  unsigned long long area;
+};
+
+static BOOL CALLBACK FindPresentWindowV229(HWND hwnd, LPARAM param) {
+  auto* best = reinterpret_cast<PresentWindowCandidateV229*>(param);
+  if (!best || !IsWindowVisible(hwnd) || GetWindow(hwnd, GW_OWNER) != nullptr) return TRUE;
+  DWORD pid = 0;
+  GetWindowThreadProcessId(hwnd, &pid);
+  if (pid != best->pid) return TRUE;
+  RECT rc = {};
+  if (!GetClientRect(hwnd, &rc)) return TRUE;
+  const LONG width = rc.right - rc.left;
+  const LONG height = rc.bottom - rc.top;
+  if (width <= 0 || height <= 0) return TRUE;
+  const unsigned long long area =
+    static_cast<unsigned long long>(width) * static_cast<unsigned long long>(height);
+  if (area > best->area) {
+    best->area = area;
+    best->hwnd = hwnd;
+  }
+  return TRUE;
+}
+
+static HWND ResolvePresentWindowV229(IDXGISwapChain* swapChain) {
+  if (swapChain) {
+    DXGI_SWAP_CHAIN_DESC desc = {};
+    if (SUCCEEDED(swapChain->GetDesc(&desc)) && desc.OutputWindow && IsWindow(desc.OutputWindow)) {
+      return desc.OutputWindow;
+    }
+  }
+
+  const DWORD selfPid = GetCurrentProcessId();
+  HWND foreground = GetForegroundWindow();
+  if (foreground) {
+    DWORD foregroundPid = 0;
+    GetWindowThreadProcessId(foreground, &foregroundPid);
+    if (foregroundPid == selfPid) return foreground;
+  }
+
+  PresentWindowCandidateV229 best = { selfPid, nullptr, 0 };
+  EnumWindows(&FindPresentWindowV229, reinterpret_cast<LPARAM>(&best));
+  return best.hwnd;
+}
+
 // DX11_V265_BRIDGE_PRESENT_CAMERA: the per-frame pump that makes the server
 // actually render. Startup attaches the Remix runtime to the GAME window
 // (HWNDs are system-global, so the x64 server presents into the x86 game's
@@ -1077,13 +1127,13 @@ void OnPresent(IDXGISwapChain* swapChain) {
   static uint64_t s_hwnd64 = 0;
   static bool s_startupSent = false;
   if (!s_startupSent && swapChain) {
-    DXGI_SWAP_CHAIN_DESC desc = {};
-    if (SUCCEEDED(swapChain->GetDesc(&desc)) && desc.OutputWindow) {
-      s_hwnd64 = (uint64_t)(uintptr_t) desc.OutputWindow;
+    const HWND presentWindow = ResolvePresentWindowV229(swapChain);
+    if (presentWindow) {
+      s_hwnd64 = (uint64_t)(uintptr_t) presentWindow;
       ClientMessage c(Commands::RemixApi_Startup);
       c.send_data((uint32_t) sizeof(s_hwnd64), &s_hwnd64);
       s_startupSent = true;
-      logf("capture", "RemixApi_Startup sent (game hwnd=0x%llx)", (unsigned long long) s_hwnd64);
+      logf("capture", "RemixApi_Startup sent (resolved game hwnd=0x%llx)", (unsigned long long) s_hwnd64);
     }
   }
   if (!s_startupSent) return;

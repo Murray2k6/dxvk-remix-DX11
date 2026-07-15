@@ -27,6 +27,8 @@
 #include "../util/util_matrix.h"
 #include "../util/util_threadpool.h"
 
+#include <unordered_set>
+
 namespace dxvk {
 
   class D3D11DeviceContext;
@@ -43,16 +45,19 @@ namespace dxvk {
     RTX_OPTION("rtx", bool, useWorldMatricesForShaders, true, "Use captured world/view matrices when reconstructing transforms for programmable-shader draws.");
     RTX_OPTION("rtx", bool, allowCubemaps, false, "Allow cubemap render targets/draws to be considered for ray tracing.");
     RTX_OPTION("rtx", bool, orthographicIsUI, true, "Treat draws with an orthographic projection as UI and skip them from the ray traced scene.");
+    RTX_OPTION("rtx", bool, projectionYFlipOverride, false, "Override automatic projection Y-axis detection. Enable this when a game engine's clip-space Y convention is detected incorrectly.");
+    RTX_OPTION("rtx", bool, projectionYFlip, true, "Flip the ray-traced projection Y axis when rtx.projectionYFlipOverride is enabled. This is commonly required by Unity games that use a negative Y projection scale.");
     RTX_OPTION("rtx", float, integerTexcoordScale, 1.0f / 2048.0f, "Scale applied when decoding fixed-point integer (SINT/UINT) texcoord vertex formats to floating point UVs. Engines that store UVs as 16-bit integers use an engine-specific divisor; 1/2048 fits common fixed-point conventions (Saints Row IV: TEXCOORD0 = R16G16_SINT). Adjust per game in rtx.conf if textures tile incorrectly.");
     RTX_OPTION("rtx", float, fallbackCameraFovDegrees, 60.0f, "Vertical field of view (degrees) of the synthesized fallback camera used when no projection matrix is found in any constant buffer. Tune per game in rtx.conf when the traced image looks zoomed relative to the raster view. Clamped to [20, 140].");
 
     void Initialize();
-    void OnDraw(UINT vertexCount, UINT startVertex);
-    void OnDrawIndexed(UINT indexCount, UINT startIndex, INT baseVertex);
-    void OnDrawInstanced(UINT vertexCountPerInstance, UINT instanceCount, UINT startVertex, UINT startInstance);
-    void OnDrawIndexedInstanced(UINT indexCountPerInstance, UINT instanceCount, UINT startIndex, INT baseVertex, UINT startInstance);
-    void OnDrawInstancedIndirect(ID3D11Buffer* argumentBuffer, UINT argumentOffset);
-    void OnDrawIndexedInstancedIndirect(ID3D11Buffer* argumentBuffer, UINT argumentOffset);
+    bool OnDrawAuto();
+    bool OnDraw(UINT vertexCount, UINT startVertex);
+    bool OnDrawIndexed(UINT indexCount, UINT startIndex, INT baseVertex);
+    bool OnDrawInstanced(UINT vertexCountPerInstance, UINT instanceCount, UINT startVertex, UINT startInstance);
+    bool OnDrawIndexedInstanced(UINT indexCountPerInstance, UINT instanceCount, UINT startIndex, INT baseVertex, UINT startInstance);
+    bool OnDrawInstancedIndirect(ID3D11Buffer* argumentBuffer, UINT argumentOffset);
+    bool OnDrawIndexedInstancedIndirect(ID3D11Buffer* argumentBuffer, UINT argumentOffset);
     void ResetCommandListState();
 
     // Must be called with the context lock held.
@@ -138,6 +143,8 @@ namespace dxvk {
     bool                                 m_zUpSettled    = false;
     bool                                 m_lhSettled     = false;
     bool                                 m_yFlipSettled  = false;
+    bool                                 m_projectionYFlipOverrideWasEnabled = false;
+    bool                                 m_projectionYFlipOverrideInitialized = false;
     static constexpr int kVoteThreshold  = 5; // votes needed to settle
     mutable Rc<DxvkSampler>              m_defaultSampler;
 
@@ -214,7 +221,24 @@ namespace dxvk {
     };
 
     SubmitRejectStats                    m_submitRejectStats;
+    // Screen-space UI is raster composition, not ray-traced world geometry.
+    // Keep the texture hashes discoverable for manual categorization, but
+    // preserve draw order by either injecting immediately before the first
+    // late UI draw or passing an early-UI frame through unchanged.
+    bool                                 m_rasterUiSeenThisFrame = false;
+    bool                                 m_midFrameRtxInjected = false;
+    bool                                 m_forceRasterPassThroughThisFrame = false;
+    // Native raster is required while the game constructs its frame and for
+    // proven late UI, but it must not execute for scene/helper draws after the
+    // RTX composite has already replaced the color target. This per-API-draw
+    // decision is consumed by D3D11DeviceContext before it queues the native
+    // draw command.
+    bool                                 m_allowNativeRasterForCurrentDraw = true;
     bool                                 m_hasSeenRealSceneProjection = false;
+    // Learned only from a real projection whose aspect agrees with the
+    // established output. Once learned, square reflection/probe cameras can no
+    // longer masquerade as the primary camera on a widescreen swap chain.
+    bool                                 m_hasSeenOutputAspectCompatibleProjection = false;
     uint32_t                             m_drawsSinceFlush = 0;
     uint32_t                             m_resizeTransitionFramesRemaining = 0;
 
@@ -298,11 +322,18 @@ namespace dxvk {
                                          bool indexed, UINT count, UINT start, INT base,
                                          bool hasExternalInstanceTransform,
                                          UINT replayFirstInstance,
+                                         UINT replayInstanceCount,
                                          bool requireIndexedFlatten);
     uint32_t     m_positionCapturesThisFrame = 0;
     uint32_t     m_positionNewCaptureBuffersThisFrame = 0;
     uint32_t     m_positionReplayCapturesThisFrame = 0;
     VkDeviceSize m_positionCaptureBytesThisFrame = 0;
+    uint64_t     m_positionCaptureVerticesSinceSubmission = 0;
+    // One detailed line per distinct position-capture contract. Unlike the
+    // old process-global 24-line counter, this remains useful after a long
+    // menu and identifies the exact gameplay shader/draw admitted before a
+    // driver reset without logging every hot-path occurrence.
+    std::unordered_set<uint64_t> m_positionCaptureContractsLogged;
 
     // DX11_V286_GAMEPLAY_MATRIX_DUMP: env-free camera diagnostic. Steam's DRM
     // relaunch strips DXVK_REMIX_MTXDUMP from the child process, so the env
@@ -383,7 +414,9 @@ namespace dxvk {
     void SubmitDraw(bool indexed, UINT count, UINT start, INT base,
                     const Matrix4* instanceTransform = nullptr,
                     UINT replayFirstInstance = 0,
+                    UINT replayInstanceCount = 1,
                     bool requireExactPositionCapture = false);
+    void BeginNativeRasterDrawRouting();
     void SubmitInstancedDraw(bool indexed, UINT count, UINT start, INT base,
                              UINT instanceCount, UINT startInstance);
     DrawCallTransforms ExtractTransforms();

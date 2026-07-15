@@ -319,25 +319,44 @@ namespace dxvk {
     RtxOptions::tonemappingModeObject().setDeferred(TonemappingMode::Global, defaults);
   }
 
-  void D3D11Rtx::OnDraw(UINT vertexCount, UINT startVertex) {
+  void D3D11Rtx::BeginNativeRasterDrawRouting() {
+    m_allowNativeRasterForCurrentDraw =
+      !m_midFrameRtxInjected || m_forceRasterPassThroughThisFrame;
+  }
+
+  bool D3D11Rtx::OnDrawAuto() {
+    BeginNativeRasterDrawRouting();
+    return m_allowNativeRasterForCurrentDraw;
+  }
+
+  bool D3D11Rtx::OnDraw(UINT vertexCount, UINT startVertex) {
+    BeginNativeRasterDrawRouting();
     SubmitDraw(false, vertexCount, startVertex, 0);
+    return m_allowNativeRasterForCurrentDraw;
   }
 
-  void D3D11Rtx::OnDrawIndexed(UINT indexCount, UINT startIndex, INT baseVertex) {
+  bool D3D11Rtx::OnDrawIndexed(UINT indexCount, UINT startIndex, INT baseVertex) {
+    BeginNativeRasterDrawRouting();
     SubmitDraw(true, indexCount, startIndex, baseVertex);
+    return m_allowNativeRasterForCurrentDraw;
   }
 
-  void D3D11Rtx::OnDrawInstanced(UINT vertexCountPerInstance, UINT instanceCount, UINT startVertex, UINT startInstance) {
+  bool D3D11Rtx::OnDrawInstanced(UINT vertexCountPerInstance, UINT instanceCount, UINT startVertex, UINT startInstance) {
+    BeginNativeRasterDrawRouting();
     SubmitInstancedDraw(false, vertexCountPerInstance, startVertex, 0, instanceCount, startInstance);
+    return m_allowNativeRasterForCurrentDraw;
   }
 
-  void D3D11Rtx::OnDrawIndexedInstanced(UINT indexCountPerInstance, UINT instanceCount, UINT startIndex, INT baseVertex, UINT startInstance) {
+  bool D3D11Rtx::OnDrawIndexedInstanced(UINT indexCountPerInstance, UINT instanceCount, UINT startIndex, INT baseVertex, UINT startInstance) {
+    BeginNativeRasterDrawRouting();
     SubmitInstancedDraw(true, indexCountPerInstance, startIndex, baseVertex, instanceCount, startInstance);
+    return m_allowNativeRasterForCurrentDraw;
   }
 
-  void D3D11Rtx::OnDrawInstancedIndirect(ID3D11Buffer* argumentBuffer, UINT argumentOffset) {
+  bool D3D11Rtx::OnDrawInstancedIndirect(ID3D11Buffer* argumentBuffer, UINT argumentOffset) {
+    BeginNativeRasterDrawRouting();
     if (argumentBuffer == nullptr)
-      return;
+      return m_allowNativeRasterForCurrentDraw;
 
     const auto* buffer = static_cast<D3D11Buffer*>(argumentBuffer);
     const auto mapped = buffer->GetMappedSlice();
@@ -351,20 +370,22 @@ namespace dxvk {
           "[D3D11Rtx] GPU-only DrawInstancedIndirect arguments are not CPU-visible at record time; "
           "leaving the raster draw untouched instead of submitting guessed RTX geometry");
       }
-      return;
+      return m_allowNativeRasterForCurrentDraw;
     }
 
     D3D11_DRAW_INSTANCED_INDIRECT_ARGS args = {};
     std::memcpy(&args, bytes + argumentOffset, sizeof(args));
     if (args.VertexCountPerInstance == 0u || args.InstanceCount == 0u)
-      return;
+      return m_allowNativeRasterForCurrentDraw;
     SubmitInstancedDraw(false, args.VertexCountPerInstance,
       args.StartVertexLocation, 0, args.InstanceCount, args.StartInstanceLocation);
+    return m_allowNativeRasterForCurrentDraw;
   }
 
-  void D3D11Rtx::OnDrawIndexedInstancedIndirect(ID3D11Buffer* argumentBuffer, UINT argumentOffset) {
+  bool D3D11Rtx::OnDrawIndexedInstancedIndirect(ID3D11Buffer* argumentBuffer, UINT argumentOffset) {
+    BeginNativeRasterDrawRouting();
     if (argumentBuffer == nullptr)
-      return;
+      return m_allowNativeRasterForCurrentDraw;
 
     const auto* buffer = static_cast<D3D11Buffer*>(argumentBuffer);
     const auto mapped = buffer->GetMappedSlice();
@@ -378,22 +399,27 @@ namespace dxvk {
           "[D3D11Rtx] GPU-only DrawIndexedInstancedIndirect arguments are not CPU-visible at record time; "
           "leaving the raster draw untouched instead of submitting guessed RTX geometry");
       }
-      return;
+      return m_allowNativeRasterForCurrentDraw;
     }
 
     D3D11_DRAW_INDEXED_INSTANCED_INDIRECT_ARGS args = {};
     std::memcpy(&args, bytes + argumentOffset, sizeof(args));
     if (args.IndexCountPerInstance == 0u || args.InstanceCount == 0u)
-      return;
+      return m_allowNativeRasterForCurrentDraw;
     SubmitInstancedDraw(true, args.IndexCountPerInstance,
       args.StartIndexLocation, args.BaseVertexLocation,
       args.InstanceCount, args.StartInstanceLocation);
+    return m_allowNativeRasterForCurrentDraw;
   }
 
   void D3D11Rtx::ResetCommandListState() {
     m_drawCallID = 0;
     m_drawsSinceFlush = 0;
     m_submitRejectStats = {};
+    m_rasterUiSeenThisFrame = false;
+    m_midFrameRtxInjected = false;
+    m_forceRasterPassThroughThisFrame = false;
+    m_allowNativeRasterForCurrentDraw = true;
   }
 
   // DX11_V280_TEXCOORD_CAPTURE: engine-agnostic recovery of texture
@@ -478,14 +504,14 @@ namespace dxvk {
     // per-draw capture are hard per-draw and per-frame ceilings so a
     // pathological frame degrades to the flat-albedo fallback instead of
     // stalling the GPU).
-    static constexpr uint32_t     kMaxCaptureVerticesPerDraw = 2u << 20;
+    static constexpr uint32_t     kMaxCaptureVerticesPerDraw = 512u << 10;
     // Transform-feedback replays share the graphics queue with BLAS builds and
     // path tracing. Bound them tightly so a scene containing many shader-only
     // UV streams degrades to the existing flat-albedo path instead of creating
     // a long driver submission (observed as nvlddmkm 153/device-lost on an
     // 8-GiB RTX 5060).
-    static constexpr uint32_t     kMaxCapturesPerFrame       = 32u;
-    static constexpr VkDeviceSize kMaxCaptureBytesPerFrame   = 16ull << 20;
+    static constexpr uint32_t     kMaxCapturesPerFrame       = 4u;
+    static constexpr VkDeviceSize kMaxCaptureBytesPerFrame   = 3ull << 20;
 
     const uint32_t vertexCount = geo.vertexCount;
     if (vertexCount == 0 || vertexCount > kMaxCaptureVerticesPerDraw)
@@ -686,6 +712,7 @@ namespace dxvk {
       bool indexed, UINT count, UINT start, INT base,
       bool hasExternalInstanceTransform,
       UINT replayFirstInstance,
+      UINT replayInstanceCount,
       bool requireIndexedFlatten) {
     static const bool s_disabled = env::getEnvVar("DXVK_REMIX_POSITION_CAPTURE") == "0";
     // Keep the existing developer-menu control authoritative. Previously the
@@ -695,11 +722,11 @@ namespace dxvk {
     if (s_disabled || !useVertexCapture())
       return false;
 
-    // SubmitInstancedDraw currently expands application instances on the CPU.
-    // Replaying a non-instanced point draw would always evaluate SV_InstanceID
-    // zero, so leave those draws on the explicit instance-transform path rather
-    // than capturing one instance and accidentally applying its transform twice.
-    if (hasExternalInstanceTransform)
+    // Explicit CPU instance transforms have already consumed the application's
+    // instance state. Replaying them here would evaluate SV_InstanceID again and
+    // apply placement twice. Shader-profile batches, on the other hand, pass the
+    // original FirstInstance/InstanceCount and must be evaluated as one draw.
+    if (hasExternalInstanceTransform || replayInstanceCount == 0)
       return false;
 
     if (!m_context->m_device->features().extTransformFeedback.transformFeedback)
@@ -736,19 +763,19 @@ namespace dxvk {
         return false;
     }
 
-    static constexpr uint32_t     kMaxCaptureVerticesPerDraw = 2u << 20;
-    // Cold allocations and updates have separate limits. A newly captured draw
-    // also creates its first BLAS/history allocation, so admitting hundreds in
-    // one Ultra-mode loading frame can consume gigabytes even when the stream-
-    // output buffers themselves are small. Existing captures need a wider
-    // update lane so camera/skinning motion does not make warmed geometry
-    // flicker. The total ceiling still bounds GPU work for pathological scenes.
-    static constexpr uint32_t     kMaxCapturesPerFrame       = 384u;
-    static constexpr uint32_t     kMaxNewCaptureBuffersPerFrame = 96u;
-    static constexpr uint32_t     kMaxReplayCapturesPerFrame = 384u;
-    static constexpr VkDeviceSize kMaxCaptureBytesPerFrame   = 24ull << 20;
-    static constexpr size_t       kMaxCacheEntries           = 2048u;
-    static constexpr VkDeviceSize kMaxCacheBytes             = 64ull << 20;
+    static constexpr uint32_t     kMaxCaptureVerticesPerDraw = 512u << 10;
+    // Cold capture and dynamic replay must be amortized.  Treating hundreds of
+    // Unreal ring-buffer draws as one frame of mandatory work can keep a single
+    // NVIDIA queue submission busy past TDR even when shader compilation is
+    // already complete.  Separate lanes guarantee forward progress: existing
+    // dynamic meshes consume only the replay lane, while later uncached meshes
+    // can still populate the cold lane on subsequent frames.
+    static constexpr uint32_t     kMaxCapturesPerFrame       = 3u;
+    static constexpr uint32_t     kMaxNewCaptureBuffersPerFrame = 2u;
+    static constexpr uint32_t     kMaxReplayCapturesPerFrame = 1u;
+    static constexpr VkDeviceSize kMaxCaptureBytesPerFrame   = 3ull << 20;
+    static constexpr size_t       kMaxCacheEntries           = 4096u;
+    static constexpr VkDeviceSize kMaxCacheBytes             = 384ull << 20;
 
     // Device-local index buffers cannot be scanned on the submit thread. The
     // old fallback replayed the entire shared vertex buffer for every indexed
@@ -759,15 +786,34 @@ namespace dxvk {
     // and use transform feedback's compact output as a non-indexed triangle
     // list. The ordering and duplicates exactly match the application's index
     // sequence; no CPU readback or guessed range is involved.
-    const bool flattenIndexed = requireIndexedFlatten
-      && indexed
-      && m_context->m_state.ia.primitiveTopology == D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+    const bool multiInstanceCapture = replayInstanceCount > 1u;
+    const bool triangleList =
+      m_context->m_state.ia.primitiveTopology == D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+    // An indexed replay emits vertices in index order.  That compact output is
+    // a different vertex domain from the application's original index buffer,
+    // even for a single instance: keeping the old index buffer can make a draw
+    // with 12 indices address a one-vertex capture and feed out-of-bounds
+    // addresses to vkCmdBuildAccelerationStructuresKHR (observed as an NVIDIA
+    // TDR in Unreal immediately after entering gameplay).  Independent
+    // triangle lists have an exact safe representation: flatten every indexed
+    // list into the XFB output and submit it as a non-indexed triangle list.
+    // Indexed strips cannot be flattened by merely preserving index order,
+    // since strip parity/restart state would be lost; reject that uncommon path
+    // rather than constructing an invalid RT geometry domain.
+    if (indexed && !triangleList)
+      return false;
+
+    const bool flattenIndexed = indexed && triangleList;
     if (requireIndexedFlatten && !flattenIndexed)
       return false;
 
-    const uint32_t vertexCount = flattenIndexed ? count : geo.vertexCount;
-    if (vertexCount == 0 || vertexCount > kMaxCaptureVerticesPerDraw)
+    const uint32_t verticesPerInstance = flattenIndexed ? count : geo.vertexCount;
+    const uint64_t totalVertexCount =
+      uint64_t(verticesPerInstance) * uint64_t(replayInstanceCount);
+    if (verticesPerInstance == 0 || totalVertexCount == 0
+     || totalVertexCount > kMaxCaptureVerticesPerDraw)
       return false;
+    const uint32_t vertexCount = uint32_t(totalVertexCount);
 
     if (m_context->m_state.vs.shader == nullptr)
       return false;
@@ -778,7 +824,38 @@ namespace dxvk {
     const bool capturesHomogeneousClip =
       commonVs->IsPositionCaptureHomogeneousClipSpace();
     const uint32_t positionBytes = capturesHomogeneousClip ? 16u : 12u;
-    const bool captureIncludesTexcoord = commonVs->PositionCaptureIncludesTexcoord();
+    std::string requestedTexcoordName;
+    uint32_t requestedTexcoordIndex = 0;
+    uint32_t requestedTexcoordComponent = 0;
+    const D3D11CommonShader* commonPs =
+      m_context->m_state.ps.shader != nullptr
+        ? m_context->m_state.ps.shader->GetCommonShader()
+        : nullptr;
+    const uint32_t colorTextureSlot =
+      dcs.materialData.getColorTextureSlot(0);
+    const bool hasPsSampledTexcoord = commonPs != nullptr
+      && colorTextureSlot < D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT
+      && commonPs->GetSampledTexcoordSemantic(
+           colorTextureSlot, requestedTexcoordName, requestedTexcoordIndex,
+           requestedTexcoordComponent);
+
+    std::string captureTexcoordName;
+    uint32_t captureTexcoordIndex = 0;
+    uint32_t captureTexcoordComponent = 0;
+    // Do not manufacture a position+UV GS variant for an untextured material.
+    // A PS can retain sampling dataflow while its color image is unbound (for
+    // example an Unreal helper/decal pass). Capturing that unused varying adds
+    // no RT material data and, on NVIDIA, one such TEXCOORD1 passthrough variant
+    // repeatedly reset the device even though the position-only variant of the
+    // same application VS was valid. Untextured geometry still captures exact
+    // positions and gets albedo from its real vertex color or TFactor policy.
+    const bool captureIncludesTexcoord = dcs.materialData.usesTexture()
+      && hasPsSampledTexcoord
+      && commonVs->ResolvePositionCaptureTexcoord(
+           requestedTexcoordName, requestedTexcoordIndex,
+           requestedTexcoordComponent,
+           captureTexcoordName, captureTexcoordIndex,
+           captureTexcoordComponent);
     const uint32_t captureStride = positionBytes
       + (captureIncludesTexcoord ? 8u : 0u);
     const VkDeviceSize captureBytes =
@@ -803,6 +880,33 @@ namespace dxvk {
       // this mode and deliberately ignores clip.z, so reversed-Z and unknown
       // game near/far planes cannot turn the reconstructed scene inside out.
       capturedClipUsesWDepth = dcs.transformData.usedViewportFallbackProjection;
+      if (capturedClipUsesWDepth) {
+        // The XYW reconstruction below defines one complete replacement
+        // camera space independent of the source engine: +X right, +Y up and
+        // +Z forward (clip.w is positive visible depth).  Keep Remix's scene
+        // convention synchronized with that generated geometry.  The older
+        // matrix-vote path cannot settle for optimized shaders that expose
+        // only a combined object-to-clip transform, leaving Remix at its RH
+        // default while the replacement geometry is LH; free-camera motion,
+        // culling and orientation then appear mirrored in Unity and any other
+        // engine using this exact-capture fallback.
+        const RtxOptionLayer* derived = RtxOptionLayer::getDerivedLayer();
+        RtxOptions::leftHandedCoordinateSystemObject().setDeferred(true, derived);
+        RtxOptions::zUpObject().setDeferred(false, derived);
+        const bool replacementYFlip = projectionYFlipOverride()
+          ? projectionYFlip()
+          : false;
+        RtCamera::correctProjectionYFlipObject().setDeferred(replacementYFlip, derived);
+
+        static uint32_t sReplacementAxisProfileLogCount = 0;
+        if (sReplacementAxisProfileLogCount < 4u) {
+          ++sReplacementAxisProfileLogCount;
+          Logger::info(
+            str::format(
+              "[D3D11Rtx] Exact clip-W replacement profile selected: LH, Y-up, projection Y ",
+              replacementYFlip ? "flipped (manual override)" : "unflipped"));
+        }
+      }
       for (uint32_t column = 0; column < 4; ++column) {
         for (uint32_t row = 0; row < 4; ++row) {
           if (!std::isfinite(capturedClipToPosition[column][row]))
@@ -811,9 +915,29 @@ namespace dxvk {
       }
     }
 
-    Rc<DxvkShader> captureGs = commonVs->GetPositionCaptureShader();
+    Rc<DxvkShader> captureGs = commonVs->GetPositionCaptureShader(
+      captureTexcoordName, captureTexcoordIndex, captureTexcoordComponent);
     if (captureGs == nullptr)
       return false;
+
+    if (captureIncludesTexcoord) {
+      static uint32_t sPsLinkedUvSelectionLogCount = 0;
+      if (sPsLinkedUvSelectionLogCount < 64u) {
+        ++sPsLinkedUvSelectionLogCount;
+        Logger::info(str::format(
+          "[D3D11Rtx][uv-link] selected ",
+          captureTexcoordName, captureTexcoordIndex,
+          " components=", captureTexcoordComponent, "-",
+          captureTexcoordComponent + 1u,
+          " for color resource t", colorTextureSlot,
+          " psProven=", hasPsSampledTexcoord ? 1 : 0,
+          " requested=", hasPsSampledTexcoord
+            ? str::format(requestedTexcoordName, requestedTexcoordIndex)
+            : "none",
+          " vs=", commonVs->GetName(),
+          " ps=", commonPs != nullptr ? commonPs->GetName() : "none"));
+      }
+    }
 
     const D3D11CapturedPositionSpace positionSpace = commonVs->GetPositionCaptureSpace();
     // SV_Position capture has no distinct non-system output to factor against
@@ -860,6 +984,8 @@ namespace dxvk {
       uint64_t stateHash = 0x5356504f53495449ull; // "SVPOSITI"
       stateHash = XXH3_64bits_withSeed(
         &replayFirstInstance, sizeof(replayFirstInstance), stateHash);
+      stateHash = XXH3_64bits_withSeed(
+        &replayInstanceCount, sizeof(replayInstanceCount), stateHash);
       bool readable = true;
       const bool hasNarrowTransformBinding = captureBinding != nullptr
         && captureBinding->matrixCount >= 1u
@@ -1050,7 +1176,6 @@ namespace dxvk {
         if (vb.buffer == nullptr || vb.stride == 0)
           continue;
         stateHash = XXH3_64bits_withSeed(&slot, sizeof(slot), stateHash);
-        stateHash = XXH3_64bits_withSeed(&vb.offset, sizeof(vb.offset), stateHash);
         stateHash = XXH3_64bits_withSeed(&vb.stride, sizeof(vb.stride), stateHash);
         if (vb.buffer->GetMapMode() == D3D11_COMMON_BUFFER_MAP_MODE_NONE)
           continue;
@@ -1063,8 +1188,8 @@ namespace dxvk {
           : size_t(firstVertex);
         const size_t begin = size_t(vb.offset) + elementIndex * vb.stride;
         const size_t byteLength = perInstance
-          ? size_t(vb.stride)
-          : size_t(vertexCount) * vb.stride;
+          ? size_t(vb.stride) * size_t(replayInstanceCount)
+          : size_t(verticesPerInstance) * vb.stride;
         if (ptr == nullptr || begin >= bufferSize || byteLength > bufferSize - begin) {
           readable = false;
           break;
@@ -1072,13 +1197,27 @@ namespace dxvk {
         stateHash = XXH3_64bits_withSeed(ptr + begin, byteLength, stateHash);
       }
 
-      // A vertex-stage SRV can contain animation/displacement data that is not
-      // represented by IA or cbuffers. Until its resource content hash is wired
-      // into this state key, keep that uncommon path strictly per-frame.
-      for (const auto& view : m_context->m_state.vs.shaderResources.views) {
-        if (view != nullptr) {
-          readable = false;
-          break;
+      // D3D11 retains stale SRVs until the application explicitly unbinds
+      // them. Treat only a slot proven sampled by this VS as position state;
+      // otherwise Unreal's always-bound global resources force every rigid
+      // mesh into the dynamic replay lane forever. A dynamically indexed
+      // resource profile remains conservative until content hashing exists.
+      if (commonVs->HasCompleteSampledResourceProfile()) {
+        for (uint32_t slot = 0;
+             slot < m_context->m_state.vs.shaderResources.views.size();
+             ++slot) {
+          if (commonVs->SamplesResourceSlot(slot)
+           && m_context->m_state.vs.shaderResources.views[slot] != nullptr) {
+            readable = false;
+            break;
+          }
+        }
+      } else {
+        for (const auto& view : m_context->m_state.vs.shaderResources.views) {
+          if (view != nullptr) {
+            readable = false;
+            break;
+          }
         }
       }
       if (readable) {
@@ -1101,15 +1240,29 @@ namespace dxvk {
       || captureMustReplayEveryFrame;
     const Matrix4 originalObjectToWorld = dcs.transformData.objectToWorld;
     const Matrix4 originalObjectToView = dcs.transformData.objectToView;
+    const Matrix4 originalWorldToView = dcs.transformData.worldToView;
+    const bool homogeneousHasStableGameView = capturesHomogeneousClip
+      && !dcs.transformData.cameraRelativeView
+      && !isIdentityExact(originalWorldToView);
+    bool useWorldAnchoredHomogeneousCapture = false;
     Matrix4 capturedToWorld;
     Matrix4 capturedToView;
     if (capturesHomogeneousClip) {
-      // The BLAS vertices are current view-space positions.  Both the RT camera
-      // and instance placement are therefore identity; projection is the only
-      // transform shared with rasterization.  This is the full replacement
-      // camera path and has no dependency on an engine's world-matrix layout.
-      capturedToWorld = Matrix4();
+      // inverse(P) reconstructs current VIEW-space positions from SV_Position.
+      // When the game supplied a real view matrix, pair those vertices with
+      // the inverse of that exact view so the BLAS occupies a stable world.
+      // Leaving objectToWorld and the RT camera both identity made the captured
+      // world follow the raster camera and prevented Remix free-camera motion.
+      capturedToWorld = homogeneousHasStableGameView
+        ? inverse(originalWorldToView)
+        : Matrix4();
       capturedToView = Matrix4();
+      for (uint32_t column = 0; column < 4; ++column) {
+        for (uint32_t row = 0; row < 4; ++row) {
+          if (!std::isfinite(capturedToWorld[column][row]))
+            return false;
+        }
+      }
     } else if (positionSpace == D3D11CapturedPositionSpace::World) {
       // The VS output already lives in the game's world coordinate system.
       // Applying inverse(view) here would transform it a second time and is the
@@ -1299,7 +1452,13 @@ namespace dxvk {
         + (outputIdentity << 6) + (outputIdentity >> 2);
     };
     mixOutputIdentity(firstVertex);
-    mixOutputIdentity(vertexCount);
+    // The capture allocation may grow and shrink with a live particle or
+    // foliage batch, but that does not create a new logical draw contract.
+    // Key the contract by the per-instance mesh domain; current FirstInstance
+    // and InstanceCount are already part of the transform-state hash below,
+    // so they still force an exact replay without manufacturing a new capture
+    // buffer and BLAS identity every frame.
+    mixOutputIdentity(verticesPerInstance);
     mixOutputIdentity(flattenIndexed ? 0x494e4458464c4154ull : 0x564552544558524eull);
     if (flattenIndexed) {
       mixOutputIdentity(start);
@@ -1311,8 +1470,13 @@ namespace dxvk {
     }
     mixOutputIdentity(positionSpace == D3D11CapturedPositionSpace::World ? 1u : 0u);
     mixOutputIdentity(capturesHomogeneousClip ? 0x434c495034ull : 0x5052455033ull);
+    if (captureIncludesTexcoord) {
+      mixOutputIdentity(XXH3_64bits(
+        captureTexcoordName.data(), captureTexcoordName.size()));
+      mixOutputIdentity(captureTexcoordIndex);
+      mixOutputIdentity(captureTexcoordComponent);
+    }
     mixOutputIdentity(usedShaderProvenCaptureTransform ? 0x50524f56454eull : 0x46414c4c4241434bull);
-    mixOutputIdentity(replayFirstInstance);
     mixOutputIdentity(capturedClipUsesWDepth ? 0x574445505448ull : 0x4d4154524958ull);
     for (uint32_t slot = 0; slot < D3D11_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT; ++slot) {
       if (!captureInputSlots[slot])
@@ -1321,7 +1485,12 @@ namespace dxvk {
       if (vb.buffer == nullptr)
         continue;
       mixOutputIdentity(slot);
-      mixOutputIdentity(vb.offset);
+      // Per-instance streams are normally suballocated from one engine ring
+      // buffer. Their physical offset changes every frame and is not a mesh
+      // identity; the stable draw contract plus same-frame occurrence below
+      // distinguishes logical instances without manufacturing new BLAS keys.
+      if (!capturePerInstanceSlots[slot])
+        mixOutputIdentity(vb.offset);
       mixOutputIdentity(vb.stride);
     }
     // Homogeneous capture is converted back to the mesh's pre-instance space,
@@ -1350,8 +1519,10 @@ namespace dxvk {
       if (vb.buffer == nullptr)
         continue;
       mixCacheKey(slot);
-      mixCacheKey(uint64_t(reinterpret_cast<uintptr_t>(vb.buffer.ptr())));
-      mixCacheKey(uint64_t(vb.offset));
+      if (!capturePerInstanceSlots[slot]) {
+        mixCacheKey(uint64_t(reinterpret_cast<uintptr_t>(vb.buffer.ptr())));
+        mixCacheKey(uint64_t(vb.offset));
+      }
       mixCacheKey(uint64_t(vb.stride));
     }
     if (flattenIndexed) {
@@ -1439,6 +1610,9 @@ namespace dxvk {
     }
 
     const bool haveUsableBuffer = entry.buffer != nullptr && entry.capacity >= captureBytes;
+    const bool haveReusableCapture = haveUsableBuffer
+      && entry.lastCapturedFrame != ~0u
+      && (!capturesHomogeneousClip || entry.hasCapturedClipToPosition);
     const bool transformStateMatches = capturesHomogeneousClip
       && hasHomogeneousTransformStateIdentity
       && entry.hasTransformStateIdentity
@@ -1457,8 +1631,9 @@ namespace dxvk {
       const bool classBudgetExhausted = needsNewCaptureBuffer
         ? m_positionNewCaptureBuffersThisFrame >= kMaxNewCaptureBuffersPerFrame
         : m_positionReplayCapturesThisFrame >= kMaxReplayCapturesPerFrame;
-      if (totalBudgetExhausted || classBudgetExhausted
-       || m_positionCaptureBytesThisFrame + captureBytes > kMaxCaptureBytesPerFrame) {
+      const bool reuseStaleCapture = totalBudgetExhausted || classBudgetExhausted
+        || m_positionCaptureBytesThisFrame + captureBytes > kMaxCaptureBytesPerFrame;
+      if (reuseStaleCapture) {
         ++m_submitRejectStats.positionCaptureBudgetRejected;
         static uint32_t sPositionCaptureBudgetLogCount = 0;
         if (sPositionCaptureBudgetLogCount < 24) {
@@ -1481,12 +1656,29 @@ namespace dxvk {
             " base=", base,
             " cameraRelative=", dcs.transformData.cameraRelativeView ? 1 : 0));
         }
-        if (entry.buffer == nullptr)
+        if (!haveReusableCapture) {
           m_positionCaptureCache.erase(cacheKey);
-        return false;
+          return false;
+        }
+
+        // A previous exact capture is safer than either dropping a mesh every
+        // other frame or recapturing an unbounded dynamic scene.  Its matching
+        // clip-to-position matrix remains stored in this entry, and the hash
+        // below is tied to lastCapturedFrame so the scene manager reuses the
+        // corresponding BLAS instead of interpreting stale bytes as new data.
+        static uint32_t sStalePositionCaptureLogCount = 0;
+        if (sStalePositionCaptureLogCount < 32u) {
+          ++sStalePositionCaptureLogCount;
+          Logger::info(str::format(
+            "[D3D11Rtx][position-capture] reusing last exact capture under bounded replay lane",
+            " frame=", curFrame,
+            " capturedFrame=", entry.lastCapturedFrame,
+            " vertices=", vertexCount,
+            " drawId=", dcs.drawCallID));
+        }
       }
 
-      if (!haveUsableBuffer) {
+      if (!reuseStaleCapture && !haveUsableBuffer) {
         DxvkBufferCreateInfo info;
         info.size   = desiredCapacity;
         info.usage  = VK_BUFFER_USAGE_TRANSFORM_FEEDBACK_BUFFER_BIT_EXT
@@ -1515,6 +1707,7 @@ namespace dxvk {
         entry.hasCapturedClipToPosition = false;
       }
 
+      if (!reuseStaleCapture) {
       // Transform feedback is the sole writer and the following BLAS build is
       // the consumer. Reuse the dedicated device-local allocation and let
       // DxvkContext insert the write/read barriers. Calling allocSlice() here
@@ -1522,28 +1715,147 @@ namespace dxvk {
       // allocations were not represented by m_positionCaptureCacheBytes and
       // grew process memory until Vulkan reported VK_ERROR_DEVICE_LOST.
 
+      // Transform-feedback replays used to accumulate in the application's
+      // current Vulkan submission until the whole frame was injected.  A busy
+      // Unreal scene can introduce hundreds of previously unseen meshes at a
+      // level transition; the resulting monolithic VS/GS workload exceeded the
+      // Windows GPU watchdog before BLAS batching was even reached.  Bound both
+      // draw count and vertex work, and create an actual queue submission (not
+      // merely a CPU command-stream chunk) after each bounded capture batch.
+      // A queue submission per capture was itself pathological: an Unreal
+      // frame with several dynamic draws generated capture submissions, then
+      // another submission per BLAS, then the path tracer.  On NVIDIA that
+      // submission storm preceded Event 153 even though every individual draw
+      // was small.  Eight draws is still a strict watchdog boundary, while the
+      // vertex ceiling splits a single heavy capture batch sooner.
+      static constexpr uint32_t kMaxCaptureDrawsPerSubmission = 8u;
+      static constexpr uint64_t kMaxCaptureVerticesPerSubmission = 64u << 10;
+      const uint64_t queuedCaptureVertices =
+        m_positionCaptureVerticesSinceSubmission + uint64_t(vertexCount);
+      const bool forceCaptureSubmissionBoundary =
+        ((m_positionCapturesThisFrame + 1u) % kMaxCaptureDrawsPerSubmission) == 0u
+        || queuedCaptureVertices >= kMaxCaptureVerticesPerSubmission;
+      m_positionCaptureVerticesSinceSubmission = forceCaptureSubmissionBoundary
+        ? 0u : queuedCaptureVertices;
+
+      static constexpr size_t kMaxLoggedPositionCaptureContracts = 4096u;
+      if (m_positionCaptureContractsLogged.size() < kMaxLoggedPositionCaptureContracts
+       && m_positionCaptureContractsLogged.insert(captureContractIdentity).second) {
+        bool hasVertexShaderResource = false;
+        for (const auto& view : m_context->m_state.vs.shaderResources.views)
+          hasVertexShaderResource |= view != nullptr;
+
+        std::string inputBuffers;
+        for (uint32_t slot = 0; slot < captureInputSlots.size(); ++slot) {
+          if (!captureInputSlots[slot])
+            continue;
+          const auto& vb = m_context->m_state.ia.vertexBuffers[slot];
+          if (vb.buffer == nullptr)
+            continue;
+          if (!inputBuffers.empty())
+            inputBuffers += ";";
+          inputBuffers += str::format(
+            "s", slot,
+            "(bytes=", vb.buffer->Desc()->ByteWidth,
+            ",offset=", vb.offset,
+            ",stride=", vb.stride,
+            ",instance=", capturePerInstanceSlots[slot] ? 1 : 0,
+            ")");
+        }
+
+        const auto& ib = m_context->m_state.ia.indexBuffer;
+        Logger::info(str::format(
+          "[D3D11Rtx][position-capture-contract] frame=", curFrame,
+          " contract=0x", std::hex, captureContractIdentity,
+          " vs=", commonVs->GetName(),
+          " ps=", commonPs != nullptr ? commonPs->GetName() : "none",
+          " texture=0x", dcs.materialData.getColorTexture().getImageHash(),
+          std::dec,
+          " drawId=", dcs.drawCallID,
+          " topology=", static_cast<uint32_t>(m_context->m_state.ia.primitiveTopology),
+          " indexed=", indexed ? 1 : 0,
+          " flatten=", flattenIndexed ? 1 : 0,
+          " count=", count,
+          " start=", start,
+          " base=", base,
+          " firstVertex=", firstVertex,
+          " vertices=", vertexCount,
+          " firstInstance=", replayFirstInstance,
+          " instances=", replayInstanceCount,
+          " captureBytes=", captureBytes,
+          " stride=", captureStride,
+          " texcoord=", captureIncludesTexcoord
+            ? str::format(captureTexcoordName, captureTexcoordIndex,
+                "[", captureTexcoordComponent, ":",
+                captureTexcoordComponent + 1u, "]")
+            : "none",
+          " psLinked=", hasPsSampledTexcoord ? 1 : 0,
+          " vsSrv=", hasVertexShaderResource ? 1 : 0,
+          " zEnable=", dcs.zEnable ? 1 : 0,
+          " zWrite=", dcs.zWriteEnable ? 1 : 0,
+          " minZ=", dcs.minZ,
+          " maxZ=", dcs.maxZ,
+          " fallbackCamera=", dcs.transformData.usedViewportFallbackProjection ? 1 : 0,
+          " identityWorld=", isIdentityExact(dcs.transformData.objectToWorld) ? 1 : 0,
+          " identityView=", isIdentityExact(dcs.transformData.worldToView) ? 1 : 0,
+          " cameraRelative=", dcs.transformData.cameraRelativeView ? 1 : 0,
+          " dynamic=", capturedDynamicPositions ? 1 : 0,
+          " replayEveryFrame=", captureMustReplayEveryFrame ? 1 : 0,
+          " stateIdentity=", hasHomogeneousTransformStateIdentity ? 1 : 0,
+          " newBuffer=", needsNewCaptureBuffer ? 1 : 0,
+          " ibBytes=", ib.buffer != nullptr ? ib.buffer->Desc()->ByteWidth : 0u,
+          " ibOffset=", ib.offset,
+          " ibFormat=", static_cast<uint32_t>(ib.format),
+          " inputs=[", inputBuffers, "]"));
+      }
+
       m_context->EmitCs([cGs = std::move(captureGs),
                          cBuf = DxvkBufferSlice(entry.buffer, 0, captureBytes),
-                         cCount = vertexCount,
+                         cCount = verticesPerInstance,
+                         cInstanceCount = replayInstanceCount,
                          cFirst = firstVertex,
                          cRestoreIa = restoreIa,
                          cFirstInstance = replayFirstInstance,
                          cFlattenIndexed = flattenIndexed,
                          cStartIndex = start,
-                         cBaseVertex = base](DxvkContext* ctx) {
+                         cBaseVertex = base,
+                         cForceSubmissionBoundary = forceCaptureSubmissionBoundary](DxvkContext* ctx) {
         const DxvkInputAssemblyState pointIa = { VK_PRIMITIVE_TOPOLOGY_POINT_LIST, VK_FALSE, 0 };
         ctx->bindShader(VK_SHADER_STAGE_GEOMETRY_BIT, cGs);
         ctx->bindXfbBuffer(0, cBuf, DxvkBufferSlice());
         ctx->setInputAssemblyState(pointIa);
         if (cFlattenIndexed) {
-          ctx->drawIndexed(cCount, 1, cStartIndex, cBaseVertex, cFirstInstance);
+          ctx->drawIndexed(cCount, cInstanceCount, cStartIndex, cBaseVertex, cFirstInstance);
         } else {
-          ctx->draw(cCount, 1, cFirst, cFirstInstance);
+          ctx->draw(cCount, cInstanceCount, cFirst, cFirstInstance);
         }
         ctx->bindShader(VK_SHADER_STAGE_GEOMETRY_BIT, nullptr);
         ctx->bindXfbBuffer(0, DxvkBufferSlice(), DxvkBufferSlice());
         ctx->setInputAssemblyState(cRestoreIa);
+        if (cForceSubmissionBoundary) {
+          // This replay runs before RTX injection, so use the base DXVK flush:
+          // it submits the captured buffers and starts a fully dirty command
+          // list without invoking RtxContext's end-of-frame sky handling.
+          ctx->DxvkContext::flushCommandList();
+          // The next RT command stream consumes this exact allocation. Wait
+          // only for its XFB write rather than idling the entire device; this
+          // prevents a level-load burst from queuing captures faster than the
+          // GPU can retire them while preserving path-tracer overlap.
+          ctx->getDevice()->waitForResource(cBuf.buffer(), DxvkAccess::Write);
+        }
       });
+
+      if (forceCaptureSubmissionBoundary) {
+        static uint32_t sCaptureSubmissionLogs = 0;
+        if (sCaptureSubmissionLogs < 32u) {
+          ++sCaptureSubmissionLogs;
+          Logger::info(str::format(
+            "[D3D11Rtx][position-capture] queued watchdog-safe submission boundary: frame=",
+            curFrame,
+            " captures=", m_positionCapturesThisFrame + 1u,
+            " lastVertices=", vertexCount));
+        }
+      }
 
       entry.lastCapturedFrame = curFrame;
       if (capturesHomogeneousClip) {
@@ -1557,12 +1869,23 @@ namespace dxvk {
       } else {
         entry.hasTransformStateIdentity = false;
       }
+      // Store the inverse-view transform in the same cache entry as the clip
+      // buffer and inverse projection. If a bounded replay lane reuses stale
+      // bytes, using the current frame's inverse view with an older view-space
+      // capture makes geometry translate/rotate with the camera.
+      if (capturesHomogeneousClip && homogeneousHasStableGameView) {
+        entry.canonicalCapturedToWorld = capturedToWorld;
+        entry.hasCanonicalCapturedToWorld = true;
+      } else if (capturesHomogeneousClip) {
+        entry.hasCanonicalCapturedToWorld = false;
+      }
       ++m_positionCapturesThisFrame;
       if (needsNewCaptureBuffer)
         ++m_positionNewCaptureBuffersThisFrame;
       else
         ++m_positionReplayCapturesThisFrame;
       m_positionCaptureBytesThisFrame += captureBytes;
+      }
     }
 
     if (capturesHomogeneousClip) {
@@ -1574,6 +1897,17 @@ namespace dxvk {
         return false;
       capturedClipToPosition = entry.capturedClipToPosition;
       capturedClipUsesWDepth = entry.capturedClipUsesWDepth;
+
+      if (entry.hasCanonicalCapturedToWorld) {
+        capturedToWorld = entry.canonicalCapturedToWorld;
+        // The current real camera views the stable world. During a brief
+        // camera-extraction gap, retain the exact view paired with the capture
+        // rather than dropping back to a camera-relative identity world.
+        if (!homogeneousHasStableGameView)
+          dcs.transformData.worldToView = inverse(capturedToWorld);
+        capturedToView = dcs.transformData.worldToView * capturedToWorld;
+        useWorldAnchoredHomogeneousCapture = true;
+      }
     }
 
     const RasterBuffer capturedPositions(
@@ -1593,13 +1927,11 @@ namespace dxvk {
       geo.texcoordBuffer = capturedTexcoords;
       dcs.geometryData.texcoordBuffer = capturedTexcoords;
     }
-    if (flattenIndexed) {
-      // XFB emitted one vertex per index in triangle-list order. The original
-      // index buffer must not be applied a second time. Original per-vertex
-      // attribute streams are indexed in the old domain and therefore cannot
-      // be paired with this compact stream. TEXCOORD is the exception: it was
-      // emitted beside position by the same indexed replay and is already in
-      // the exact flattened domain.
+    if (flattenIndexed || multiInstanceCapture) {
+      // XFB emitted one compact vertex stream containing every selected
+      // instance. The original one-instance index/attribute streams cannot be
+      // applied to that appended domain. TEXCOORD is the exception: it was
+      // emitted beside position by the same replay and already matches it.
       geo.indexBuffer = RasterBuffer();
       geo.indexCount = 0;
       geo.vertexCount = vertexCount;
@@ -1667,7 +1999,11 @@ namespace dxvk {
         &homogeneousTransformStateIdentity,
         sizeof(homogeneousTransformStateIdentity), outputHash);
     } else if (captureMustReplayEveryFrame) {
-      outputHash = XXH3_64bits_withSeed(&curFrame, sizeof(curFrame), outputHash);
+      // The buffer can intentionally be reused when its bounded replay lane is
+      // full. Seed the content identity with the frame that actually produced
+      // these bytes, not the current frame, so stale reuse stays a stable BLAS.
+      outputHash = XXH3_64bits_withSeed(
+        &entry.lastCapturedFrame, sizeof(entry.lastCapturedFrame), outputHash);
     }
     if (outputHash == 0)
       outputHash = 0x9e3779b97f4a7c15ull;
@@ -1679,10 +2015,13 @@ namespace dxvk {
     dcs.transformData.objectToWorld = capturedToWorld;
     dcs.transformData.objectToView = capturedToView;
     if (capturesHomogeneousClip) {
-      dcs.transformData.worldToView = Matrix4();
-      // Keep this marker set so RtxContext does not reinterpret the identity
-      // view as an unresolved/pre-combined game camera and decompose it again.
-      dcs.transformData.cameraRelativeView = true;
+      if (!useWorldAnchoredHomogeneousCapture)
+        dcs.transformData.worldToView = Matrix4();
+      // A real view anchors captured vertices in stable world space. Only the
+      // no-view fallback remains camera-relative; this keeps the fallback safe
+      // while allowing normal/free cameras to move independently of geometry.
+      dcs.transformData.cameraRelativeView =
+        !useWorldAnchoredHomogeneousCapture;
       dcs.transformData.exactReplacementCamera = true;
       // The geometry and camera now form one exact replacement coordinate
       // system. Treat it as a real camera even when the projection was derived
@@ -1706,6 +2045,7 @@ namespace dxvk {
         ", homogeneousClip=", capturesHomogeneousClip ? 1 : 0,
         ", clipWDepth=", capturedClipUsesWDepth ? 1 : 0,
         ", firstInstance=", replayFirstInstance,
+        ", instanceCount=", replayInstanceCount,
         ", dynamic=", capturedDynamicPositions ? 1 : 0,
         ", replayEveryFrame=", captureMustReplayEveryFrame ? 1 : 0,
         ", transformState=", hasHomogeneousTransformStateIdentity ? 1 : 0,
@@ -1731,7 +2071,7 @@ namespace dxvk {
 
   void D3D11Rtx::SweepPositionCaptureCache(uint32_t currentFrame) {
     static constexpr uint32_t     kEvictAfterFrames = 120u;
-    static constexpr VkDeviceSize kMaxCacheBytes    = 64ull << 20;
+    static constexpr VkDeviceSize kMaxCacheBytes    = 384ull << 20;
 
     const bool overBudget = m_positionCaptureCacheBytes > kMaxCacheBytes;
     if (!overBudget && (currentFrame & 63u) != 0u)
@@ -1773,10 +2113,10 @@ namespace dxvk {
     // the vertex shader (SV_InstanceID, per-instance IA rows, cbuffers or VS
     // SRVs). The old CPU matrix fit handled only one of those layouts and then
     // disabled post-VS capture, so the most important engine geometry was sent
-    // to RTX with guessed transforms or collapsed to one point. When the shader
-    // can be replayed, evaluate each selected instance with its real base
-    // instance and capture exact SV_Position instead. No engine or executable
-    // names are involved.
+    // to RTX with guessed transforms or collapsed to one point. Replay the
+    // original instance range in bounded GPU batches, preserving the game's
+    // real SV_InstanceID and per-instance input streams without creating one
+    // CPU capture buffer and one BLAS submission per instance.
     bool canCaptureExactInstances = useVertexCapture()
       && m_context->m_device->features().extTransformFeedback.transformFeedback
       && m_context->m_state.vs.shader != nullptr
@@ -1792,35 +2132,37 @@ namespace dxvk {
         && commonVs->HasPositionCaptureCandidate();
     }
 
+    canCaptureExactInstances &=
+      m_context->m_state.ia.primitiveTopology == D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+
     if (canCaptureExactInstances) {
-      // A single draw containing tens of thousands of grass instances must not
-      // expand into tens of thousands of CPU submissions (the previous Unity
-      // hang). Keep a uniformly distributed, deterministic working set. The
-      // global capture cache/budgets warm this set incrementally across frames.
-      static constexpr UINT kMaxExactInstancesPerDraw = 512u;
+      // Bound pathological vegetation draws while retaining every instance in
+      // ordinary Unity/Unreal batches. Each replay is also capped at two million
+      // emitted vertices, matching the capture allocator's hard safety limit.
+      static constexpr UINT kMaxExactInstancesPerDraw = 4096u;
+      static constexpr UINT kMaxCaptureVerticesPerBatch = 2u << 20;
       const UINT requestedLimit = std::max(1u, RtxOptions::maxInstanceSubmissions());
       const UINT selectedCount = std::min(
         instanceCount, std::min(requestedLimit, kMaxExactInstancesPerDraw));
-      auto selectedInstance = [&](UINT selectedIndex) {
-        if (selectedCount <= 1u || selectedCount == instanceCount)
-          return startInstance + selectedIndex;
-        const uint64_t relative = uint64_t(selectedIndex)
-          * uint64_t(instanceCount - 1u) / uint64_t(selectedCount - 1u);
-        return UINT(uint64_t(startInstance) + relative);
-      };
+      const UINT instancesPerBatch = std::max(1u, std::min(
+        selectedCount, kMaxCaptureVerticesPerBatch / std::max(1u, count)));
+      const UINT batchCount =
+        (selectedCount + instancesPerBatch - 1u) / instancesPerBatch;
 
       static uint32_t sExactInstanceLogCount = 0;
       if (sExactInstanceLogCount++ < 12u) {
         Logger::info(str::format(
           "[D3D11Rtx] Exact shader-profile instancing: sourceInstances=",
           instanceCount, " selected=", selectedCount,
+          " batches=", batchCount,
           " startInstance=", startInstance,
           " indexed=", indexed ? 1 : 0));
       }
 
-      for (UINT i = 0; i < selectedCount; ++i) {
+      for (UINT offset = 0; offset < selectedCount; offset += instancesPerBatch) {
+        const UINT batchInstances = std::min(instancesPerBatch, selectedCount - offset);
         SubmitDraw(indexed, count, start, base, nullptr,
-          selectedInstance(i), true);
+          startInstance + offset, batchInstances, true);
       }
       return;
     }
@@ -4202,20 +4544,47 @@ namespace dxvk {
     // plausible projection and either a non-identity view matrix or a camera-
     // relative identity view proven by the coherent frame-block checks above.
     // This avoids locking the session to helper, shadow, or other projections.
+    const bool yFlipOverrideEnabled = projectionYFlipOverride();
+    if (!m_projectionYFlipOverrideInitialized
+     || yFlipOverrideEnabled != m_projectionYFlipOverrideWasEnabled) {
+      m_projectionYFlipOverrideInitialized = true;
+      m_projectionYFlipOverrideWasEnabled = yFlipOverrideEnabled;
+
+      if (!yFlipOverrideEnabled) {
+        // Returning to Auto must gather fresh evidence rather than restoring a
+        // potentially stale decision made by a loading screen or prior scene.
+        m_yFlipVotes = 0;
+        m_yFlipSettled = false;
+      }
+
+      Logger::info(str::format(
+        "[D3D11Rtx][axis] projection Y mode changed: ",
+        yFlipOverrideEnabled
+          ? (projectionYFlip() ? "manual flip" : "manual normal")
+          : "automatic detection"));
+    }
+
+    if (yFlipOverrideEnabled) {
+      RtCamera::correctProjectionYFlipObject().setDeferred(
+        projectionYFlip(), RtxOptionLayer::getDerivedLayer());
+    }
+
     if (projSlot != UINT32_MAX
      && (!isIdentityExact(transforms.worldToView) || transforms.cameraRelativeView)) {
-      const bool canVote = !m_yFlipSettled || !m_lhSettled;
+      const bool canVote = (!yFlipOverrideEnabled && !m_yFlipSettled) || !m_lhSettled;
 
       if (canVote) {
         m_axisDetected = true;
 
         const Matrix4& projection = transforms.viewToProjection;
 
-        m_yFlipVotes += projectionWasFlippedY ? 1 : -1;
-        if (!m_yFlipSettled && std::abs(m_yFlipVotes) >= kVoteThreshold) {
-          m_yFlipSettled = true;
-          const bool yFlip = m_yFlipVotes > 0;
-          RtCamera::correctProjectionYFlipObject().setDeferred(yFlip, RtxOptionLayer::getDerivedLayer());
+        if (!yFlipOverrideEnabled) {
+          m_yFlipVotes += projectionWasFlippedY ? 1 : -1;
+          if (!m_yFlipSettled && std::abs(m_yFlipVotes) >= kVoteThreshold) {
+            m_yFlipSettled = true;
+            const bool yFlip = m_yFlipVotes > 0;
+            RtCamera::correctProjectionYFlipObject().setDeferred(yFlip, RtxOptionLayer::getDerivedLayer());
+          }
         }
 
         DecomposeProjectionParams dpp;
@@ -4786,6 +5155,41 @@ namespace dxvk {
       transforms.offscreenRenderTarget =
         !matchesSceneExtent(m_lastOutputExtent)
         && !matchesSceneExtent(m_lastRemixViewportExtent);
+
+      // A target can alias the swap-chain-sized resource while using an
+      // auxiliary square projection (Unreal scene captures, reflection probes,
+      // editor thumbnails). Extent-only routing therefore misses the exact
+      // wrong-viewport failure: a 1:1 projection (P11/P00 == 1) can replace a
+      // 16:9 main camera and the traced output immediately turns black. Learn
+      // that this title has produced an output-compatible projection before
+      // enforcing the gate, so engines that intentionally apply aspect outside
+      // their projection matrix are not rejected by assumption.
+      const float projectionScaleX = std::abs(transforms.viewToProjection[0][0]);
+      const float projectionScaleY = std::abs(transforms.viewToProjection[1][1]);
+      const VkExtent2D aspectReference =
+        m_lastRemixViewportExtent.width > 0u && m_lastRemixViewportExtent.height > 0u
+          ? m_lastRemixViewportExtent : m_lastOutputExtent;
+      if (projectionScaleX > 1.0e-5f && projectionScaleY > 1.0e-5f
+       && aspectReference.width > 0u && aspectReference.height > 0u) {
+        const float projectionAspect = projectionScaleY / projectionScaleX;
+        const float outputAspect = float(aspectReference.width)
+                                 / float(aspectReference.height);
+        const float relativeAspectError =
+          std::abs(projectionAspect - outputAspect) / outputAspect;
+        if (relativeAspectError <= 0.08f) {
+          m_hasSeenOutputAspectCompatibleProjection = true;
+        } else if (m_hasSeenOutputAspectCompatibleProjection
+                && relativeAspectError > 0.15f) {
+          transforms.offscreenRenderTarget = true;
+          static uint32_t sProjectionAspectGateLogs = 0;
+          if (sProjectionAspectGateLogs++ < 16u) {
+            Logger::info(str::format(
+              "[D3D11Rtx] Classified auxiliary camera by projection/output aspect: projection=",
+              projectionAspect, " output=", outputAspect,
+              " rt=", renderTargetWidth, "x", renderTargetHeight));
+          }
+        }
+      }
     }
 
     // Log camera discovery once.
@@ -4981,6 +5385,15 @@ namespace dxvk {
 
   void D3D11Rtx::FillMaterialData(LegacyMaterialData& mat) const {
     const auto& ps = m_context->m_state.ps;
+    const D3D11CommonShader* commonPs = ps.shader != nullptr
+      ? ps.shader->GetCommonShader()
+      : nullptr;
+    const auto& vs = m_context->m_state.vs;
+    const D3D11CommonShader* commonVs = vs.shader != nullptr
+      ? vs.shader->GetCommonShader()
+      : nullptr;
+    const bool hasCompleteSampledResourceProfile = commonPs != nullptr
+      && commonPs->HasCompleteSampledResourceProfile();
     uint32_t textureID = 0;
 
     static uint32_t s_logCount = 0;
@@ -5160,10 +5573,45 @@ namespace dxvk {
     for (uint32_t slot = 0; slot < D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT; ++slot) {
       D3D11ShaderResourceView* srv = ps.shaderResources.views[slot].ptr();
       if (!srv) continue;
+      // DX11 keeps stale SRVs bound across draws. Selecting from every bound
+      // slot associated UI atlases, scene color and unrelated prior materials
+      // with otherwise valid world geometry. A complete DXBC profile is
+      // authoritative: only slots consumed by an actual sample/gather
+      // instruction are material or texture-browser candidates.
+      if (hasCompleteSampledResourceProfile
+       && !commonPs->SamplesResourceSlot(slot))
+        continue;
       if (srv->GetResourceType() != D3D11_RESOURCE_DIMENSION_TEXTURE2D) continue;
 
       Rc<DxvkImageView> view = srv->GetImageView();
       if (view == nullptr) continue;
+
+      // Bind a sampled image to geometry only when the active PS proves which
+      // input components feed this exact resource slot and the active VS
+      // proves that it exports that same semantic. This is the stable identity
+      // joining texture hashes to geometry across engines; slot order and
+      // semantic-name guesses are not. Safe images without this proof remain
+      // available in the Remix texture browser below, but cannot corrupt a
+      // draw's albedo/hash association.
+      std::string sampledSemanticName;
+      uint32_t sampledSemanticIndex = 0;
+      uint32_t sampledSemanticComponent = 0;
+      std::string resolvedSemanticName;
+      uint32_t resolvedSemanticIndex = 0;
+      uint32_t resolvedSemanticComponent = 0;
+      const bool hasProvenGeometryUvContract =
+        commonPs != nullptr
+        && commonVs != nullptr
+        && commonPs->GetSampledTexcoordSemantic(
+             slot, sampledSemanticName, sampledSemanticIndex,
+             sampledSemanticComponent)
+        && commonVs->ResolvePositionCaptureTexcoord(
+             sampledSemanticName, sampledSemanticIndex,
+             sampledSemanticComponent,
+             resolvedSemanticName, resolvedSemanticIndex,
+             resolvedSemanticComponent);
+      const bool rejectUnprovenGeometryHash =
+        hasCompleteSampledResourceProfile && !hasProvenGeometryUvContract;
 
       const auto& imgInfo = view->image()->info();
       const auto& viewInfo = view->info();
@@ -5234,10 +5682,11 @@ namespace dxvk {
         || rtSizedIntermediate
         || (hasDepthBind && !hasMips)
         || ((hasRtBind || hasUavBind) && isSingleMipLargeTexture && !bc);
-      const bool rejectMaterialCandidate = !clearAlbedo && (rejectTextureBrowserCandidate
+      const bool rejectMaterialCandidate = rejectUnprovenGeometryHash
+        || (!clearAlbedo && (rejectTextureBrowserCandidate
         || likelyIntermediate
         || !albedoFormat
-        || dataOrSceneFormat);
+        || dataOrSceneFormat));
 
       int score = 0;
       if (colorBc)                  score += 14;  // Color BC = strong material signal.
@@ -5359,6 +5808,7 @@ namespace dxvk {
           likelyIntermediate ? " [LIKELY-INTERMEDIATE]" : "",
           isCurrentRT ? " [BOUND-RT]" : "",
           matchesRT ? " [RT-SIZED]" : "",
+          hasProvenGeometryUvContract ? " [PROVEN-UV]" : " [NO-PROVEN-UV]",
           rejectTextureBrowserCandidate ? " [REJECT-BROWSER]" : "",
           rejectMaterialCandidate ? " [REJECT-MATERIAL]" : ""));
       }
@@ -5578,6 +6028,7 @@ namespace dxvk {
                              INT  base,
                              const Matrix4* instanceTransform,
                              UINT replayFirstInstance,
+                             UINT replayInstanceCount,
                              bool requireExactPositionCapture) {
     if (m_pGeometryWorkers == nullptr) {
       const bool isDeferredContext = m_context->GetType() == D3D11_DEVICE_CONTEXT_DEFERRED;
@@ -5598,6 +6049,17 @@ namespace dxvk {
     }
 
     ++m_submitRejectStats.total;
+
+    // Once this frame has crossed onto its raster-overlay path, do not spend
+    // GPU/CPU work capturing more screen-space triangles into the RT scene.
+    // Still enumerate every bound texture so the Remix texture grid, manual
+    // hash categories and capture/export tooling continue to see UI atlases.
+    if (m_forceRasterPassThroughThisFrame) {
+      LegacyMaterialData rasterMaterial;
+      FillMaterialData(rasterMaterial);
+      ++m_submitRejectStats.screenSpaceUiSkip;
+      return;
+    }
 
     // forceInjection overflow guard: when injection is forced but the
     // previous frame produced zero scene instances, only the first
@@ -6867,6 +7329,20 @@ namespace dxvk {
         dcs.transformData.objectToView = dcs.transformData.worldToView * dcs.transformData.objectToWorld;
     }
 
+    // Reflection/probe/cubemap passes must remain native offscreen work. Their
+    // geometry is drawn again by the main pass; admitting the auxiliary copy
+    // adds a second, camera-incompatible instance to the primary RT scene and
+    // lets its projection move world geometry with the probe camera.
+    if (dcs.transformData.offscreenRenderTarget) {
+      static uint32_t sOffscreenGeometrySkipLogs = 0;
+      if (sOffscreenGeometrySkipLogs++ < 16u) {
+        Logger::info(str::format(
+          "[D3D11Rtx] Skipping auxiliary-camera geometry from the primary RT scene: drawId=",
+          dcs.drawCallID, " count=", count));
+      }
+      return;
+    }
+
     // DX11_V278_MIRRORED_TRANSFORM_WINDING (generalized from FO4-Remix's
     // "preserve mirror transforms in batched bases" inside-out-geometry fix):
     // a mirrored placement (negative-determinant world transform - games
@@ -7029,7 +7505,26 @@ namespace dxvk {
        || !isIdentityExact(dcs.transformData.worldToView))
         return false;
 
-      if (count > 12)
+      // Unity batches a complete Canvas into one indexed draw. Granny's menu,
+      // for example, is 5,040 indices; a fullscreen-quad-only limit silently
+      // admitted that Canvas as world geometry. Keep a generous corruption
+      // guard without assuming that UI is always one quad.
+      if (count < 3 || count > 262144)
+        return false;
+
+      // A screen Canvas is composited and does not write scene depth. Requiring
+      // the actual blend state keeps opaque fallback-camera world geometry out
+      // of this classifier even when matrix recovery is incomplete.
+      if (zWriteEnable)
+        return false;
+
+      D3D11BlendState* blendState = m_context->m_state.om.cbState;
+      if (blendState == nullptr)
+        return false;
+
+      D3D11_BLEND_DESC1 blendDesc = {};
+      blendState->GetDesc1(&blendDesc);
+      if (!blendDesc.RenderTarget[0].BlendEnable)
         return false;
 
       const auto& omState = m_context->m_state.om;
@@ -7051,15 +7546,6 @@ namespace dxvk {
           rtHeight = rtvView->image()->info().extent.height;
         }
       }
-
-      auto isBlockCompressed = [](DXGI_FORMAT fmt) {
-        return (fmt >= DXGI_FORMAT_BC1_TYPELESS && fmt <= DXGI_FORMAT_BC1_UNORM_SRGB)
-            || (fmt >= DXGI_FORMAT_BC2_TYPELESS && fmt <= DXGI_FORMAT_BC2_UNORM_SRGB)
-            || (fmt >= DXGI_FORMAT_BC3_TYPELESS && fmt <= DXGI_FORMAT_BC3_UNORM_SRGB)
-            || (fmt >= DXGI_FORMAT_BC4_TYPELESS && fmt <= DXGI_FORMAT_BC4_SNORM)
-            || (fmt >= DXGI_FORMAT_BC5_TYPELESS && fmt <= DXGI_FORMAT_BC5_SNORM)
-            || (fmt >= DXGI_FORMAT_BC6H_TYPELESS && fmt <= DXGI_FORMAT_BC7_UNORM_SRGB);
-      };
 
       uint32_t candidateCount = 0;
       uint32_t uiLikeCount = 0;
@@ -7086,8 +7572,6 @@ namespace dxvk {
           && imgInfo.extent.width == rtWidth
           && imgInfo.extent.height == rtHeight;
         const bool hasMips = imgInfo.mipLevels > 1;
-        const bool bc = isBlockCompressed(srvDesc.Format);
-
         bool isCurrentRT = false;
         for (DxvkImage* boundRT : boundRTImages) {
           if (boundRT == view->image().ptr()) {
@@ -7110,7 +7594,10 @@ namespace dxvk {
           clampSampler = !isWrapMode(sampDesc.AddressU) && !isWrapMode(sampDesc.AddressV);
         }
 
-        if (!hasMips && !bc && clampSampler)
+        // UI atlases may legitimately be BC-compressed (the observed Unity
+        // menu atlas is BC1). Compression says nothing about coordinate space;
+        // non-mipped clamp sampling is the reliable atlas signal here.
+        if (!hasMips && clampSampler)
           ++uiLikeCount;
       }
 
@@ -7169,13 +7656,17 @@ namespace dxvk {
       return;
     }
 
-    if (allowViewportFallbackScreenSpaceReject && isLikelyScreenSpaceUiPass()) {
-      ++m_submitRejectStats.screenSpaceUiSkip;
+    // Strong per-draw Canvas evidence is safe before a scene camera exists and
+    // is precisely what startup/menu frames need. Composite heuristics remain
+    // camera-gated above, but UI must not be admitted as the first fake scene.
+    const bool likelyScreenSpaceUiPass =
+      !renderDocAttached && isLikelyScreenSpaceUiPass();
+    if (likelyScreenSpaceUiPass) {
       static uint32_t sScreenSpaceUiSkipLogCount = 0;
       if (sScreenSpaceUiSkipLogCount < 8) {
         ++sScreenSpaceUiSkipLogCount;
         Logger::info(str::format(
-          "[D3D11Rtx] Skipping screen-space UI pass: viewport fallback camera + identity transforms + atlas-style textures (count=",
+          "[D3D11Rtx] Detected screen-space UI pass for WorldUI routing: viewport fallback camera + identity transforms + atlas-style textures (count=",
           count,
           ", zEnable=",
           zEnable ? 1 : 0,
@@ -7183,7 +7674,6 @@ namespace dxvk {
           zWriteEnable ? 1 : 0,
           ")"));
       }
-      return;
     }
 
     if (renderDocAttached && dcs.transformData.usedViewportFallbackProjection) {
@@ -7244,6 +7734,150 @@ namespace dxvk {
     // do not pay the material/texture selection cost.
     FillMaterialData(dcs.materialData);
 
+    // The DX11 bridge builds its LegacyMaterialData directly from the bound
+    // SRVs, unlike the original D3D11 path.  Category evaluation therefore has
+    // to happen after FillMaterialData has selected the final color texture.
+    // Without this call the Remix UI could persist a selected texture hash,
+    // but every submitted DrawCallState kept an empty category bitset: terrain,
+    // sky, ignore, player-model, decal, particle, and UI tagging were all
+    // observable no-ops.
+    dcs.setupCategoriesForTexture();
+
+    const XXH64_hash_t categorizedTextureHash =
+      dcs.materialData.getColorTexture().getImageHash();
+    const uint64_t categoryBits = dcs.getCategoryFlags().raw();
+    if (categoryBits != 0u) {
+      static uint32_t sTextureCategoryApplyLogCount = 0;
+      if (sTextureCategoryApplyLogCount < 64u) {
+        ++sTextureCategoryApplyLogCount;
+        Logger::info(str::format(
+          "[D3D11Rtx][texture-category] applied hash=0x",
+          std::hex, categorizedTextureHash,
+          " categories=0x", categoryBits,
+          std::dec,
+          " drawId=", dcs.drawCallID,
+          " count=", count,
+          " indexed=", indexed ? 1 : 0));
+      }
+    }
+
+    // Match the established Remix/D3D11 contract: an Ignore-tagged texture is
+    // intentionally absent from the RT scene.  Merely carrying the category
+    // into InstanceManager is insufficient because Ignore is an admission
+    // category, not a shading flag.
+    if (dcs.testCategoryFlags(InstanceCategories::Ignore)) {
+      static uint32_t sIgnoredTextureDrawLogCount = 0;
+      if (sIgnoredTextureDrawLogCount < 32u) {
+        ++sIgnoredTextureDrawLogCount;
+        Logger::info(str::format(
+          "[D3D11Rtx][texture-category] skipped Ignore-tagged draw hash=0x",
+          std::hex, categorizedTextureHash, std::dec,
+          " drawId=", dcs.drawCallID));
+      }
+      return;
+    }
+
+    const auto routeRasterUiLayer = [&](const char* classifier) {
+      m_rasterUiSeenThisFrame = true;
+      m_allowNativeRasterForCurrentDraw = true;
+      ++m_submitRejectStats.screenSpaceUiSkip;
+
+      // A previous proven UI draw already placed the RTX composite. Keep this
+      // independently proven UI draw on the native overlay, but never inject a
+      // second time in the same frame.
+      if (m_midFrameRtxInjected)
+        return;
+
+      Rc<DxvkImage> uiTarget;
+      auto* rtv0 = m_context->m_state.om.renderTargetViews[0].ptr();
+      if (rtv0 != nullptr) {
+        Rc<DxvkImageView> uiTargetView = rtv0->GetImageView();
+        if (uiTargetView != nullptr)
+          uiTarget = uiTargetView->image();
+      }
+
+      const uint32_t expectedWidth = m_lastOutputExtent.width > 0u
+        ? m_lastOutputExtent.width
+        : m_lastRemixViewportExtent.width;
+      const uint32_t expectedHeight = m_lastOutputExtent.height > 0u
+        ? m_lastOutputExtent.height
+        : m_lastRemixViewportExtent.height;
+      const VkExtent3D uiTargetExtent = uiTarget != nullptr
+        ? uiTarget->info().extent
+        : VkExtent3D { 0u, 0u, 0u };
+      const bool fullOutputTarget = uiTarget != nullptr
+        && (expectedWidth == 0u || uiTargetExtent.width == expectedWidth)
+        && (expectedHeight == 0u || uiTargetExtent.height == expectedHeight);
+      const bool realSceneBeforeUi = m_submitRejectStats.realSceneAccepted > 0u;
+      const bool stablePreviousScene = sceneManager.isPreviousFrameSceneAvailable();
+
+      // Current-frame scene submissions and this injection are emitted to the
+      // same command stream in order. Requiring isPreviousFrameSceneAvailable
+      // here is both unnecessary and racy: the CPU draw thread can reach the
+      // UI before the CS thread publishes that flag, which forced Unreal games
+      // into raster pass-through even after dozens of real scene draws. A real
+      // current-frame scene plus the full output target is the complete safety
+      // condition needed to insert RTX immediately before the raster overlay.
+      if (realSceneBeforeUi && fullOutputTarget) {
+        // SubmitDraw runs immediately before D3D11 queues the application's
+        // draw. Queue RTX now, after all scene draws and before this Canvas;
+        // the application's UI draw then lands on top of the final image.
+        m_context->EmitCs([uiTarget](DxvkContext* ctx) {
+          static_cast<RtxContext*>(ctx)->injectRTX(0, uiTarget);
+        });
+        m_midFrameRtxInjected = true;
+
+        static uint32_t sUiLayerMidFrameLogCount = 0;
+        if (sUiLayerMidFrameLogCount < 32u) {
+          ++sUiLayerMidFrameLogCount;
+          Logger::info(str::format(
+            "[D3D11Rtx][ui-layer] queued RTX before raster UI: classifier=",
+            classifier,
+            " count=", count,
+            " textureHash=0x", std::hex, categorizedTextureHash, std::dec,
+            " target=", uiTargetExtent.width, "x", uiTargetExtent.height,
+            " realScene=", m_submitRejectStats.realSceneAccepted,
+            " previousScene=", stablePreviousScene ? 1 : 0));
+        }
+      } else {
+        // UI appeared before a trustworthy 3D scene (menus, startup logos,
+        // loading screens), or on a helper target. Preserve the complete
+        // raster frame instead of overwriting it with stale/partial RTX.
+        m_forceRasterPassThroughThisFrame = true;
+
+        static uint32_t sUiLayerPassThroughLogCount = 0;
+        if (sUiLayerPassThroughLogCount < 32u) {
+          ++sUiLayerPassThroughLogCount;
+          Logger::info(str::format(
+            "[D3D11Rtx][ui-layer] raster pass-through: classifier=",
+            classifier,
+            " count=", count,
+            " textureHash=0x", std::hex, categorizedTextureHash, std::dec,
+            " target=", uiTargetExtent.width, "x", uiTargetExtent.height,
+            " expected=", expectedWidth, "x", expectedHeight,
+            " realScene=", m_submitRejectStats.realSceneAccepted,
+            " previousScene=", stablePreviousScene ? 1 : 0));
+        }
+      }
+    };
+
+    if (likelyScreenSpaceUiPass) {
+      const bool explicitlyWorldRouted =
+           dcs.testCategoryFlags(InstanceCategories::WorldUI)
+        || dcs.testCategoryFlags(InstanceCategories::WorldMatte)
+        || dcs.testCategoryFlags(InstanceCategories::Particle)
+        || dcs.testCategoryFlags(InstanceCategories::Beam);
+
+      // Manual texture-hash categories are authoritative. An explicitly tagged
+      // world UI/material continues through the RT/export path. Untagged
+      // screen UI keeps its real texture hash registered by FillMaterialData,
+      // but its triangles stay on the raster layer where they belong.
+      if (!explicitlyWorldRouted) {
+        routeRasterUiLayer("screen-space atlas");
+        return;
+      }
+    }
+
     const uint32_t tinyFallbackPrimitiveCount = dcs.geometryData.calculatePrimitiveCount();
     const bool tinyFallbackHasSceneDepthSignal =
       dcs.zEnable && (dcs.zWriteEnable || dcs.maxZ >= 0.99f);
@@ -7254,22 +7888,37 @@ namespace dxvk {
       tinyFallbackPrimitiveCount <= 2u &&
       !tinyFallbackHasSceneDepthSignal;
 
-    if (tinyFallbackMicroRaster) {
-      ++m_submitRejectStats.screenSpaceGarbageSkip;
+    if (tinyFallbackMicroRaster && !likelyScreenSpaceUiPass) {
       static uint32_t sTinyFallbackMicroRasterLogCount = 0;
-      if (sTinyFallbackMicroRasterLogCount < 16) {
+      if (sTinyFallbackMicroRasterLogCount < 16u) {
         ++sTinyFallbackMicroRasterLogCount;
         Logger::info(str::format(
-          "[D3D11Rtx] Skipping tiny fallback-camera micro-raster draw before RT submission: count=",
-          count,
-          ", indexed=",
-          indexed ? 1 : 0,
-          ", primitives=",
-          tinyFallbackPrimitiveCount,
-          ", zEnable=",
-          dcs.zEnable ? 1 : 0,
-          ", zWrite=",
-          dcs.zWriteEnable ? 1 : 0));
+          "[D3D11Rtx] Keeping tiny fallback-camera micro-raster out of RTX without starting the UI layer: count=",
+          count, ", indexed=", indexed ? 1 : 0,
+          ", primitives=", tinyFallbackPrimitiveCount,
+          ", zEnable=", dcs.zEnable ? 1 : 0,
+          ", zWrite=", dcs.zWriteEnable ? 1 : 0));
+      }
+      return;
+    }
+
+    // RTX has already replaced the native color target. A draw that reached
+    // this point did not satisfy either screen-space UI classifier, so letting
+    // its native raster command execute would stack scene/helper geometry on
+    // top of the path-traced image. Do not submit it to the now-finalized RT
+    // scene either; it will be considered in normal order on the next frame.
+    if (m_midFrameRtxInjected) {
+      static uint32_t sPostCompositeRasterSuppressLogCount = 0;
+      if (sPostCompositeRasterSuppressLogCount < 32u) {
+        ++sPostCompositeRasterSuppressLogCount;
+        Logger::info(str::format(
+          "[D3D11Rtx][raster-layer] suppressed post-composite non-UI draw",
+          " count=", count,
+          " indexed=", indexed ? 1 : 0,
+          " zEnable=", dcs.zEnable ? 1 : 0,
+          " zWrite=", dcs.zWriteEnable ? 1 : 0,
+          " fallbackCamera=", dcs.transformData.usedViewportFallbackProjection ? 1 : 0,
+          " textured=", dcs.materialData.usesTexture() ? 1 : 0));
       }
       return;
     }
@@ -7737,10 +8386,73 @@ namespace dxvk {
         && !cameraManager.hasSeenRealMainCamera()
         && hasSceneDepthSignal
         && primitiveCount >= 32u;
+      const bool isSceneCandidate = hasSceneDepthSignal
+        && primitiveCount >= 1u
+        && ((hasRealProjection && hasViewOrStrongProjection) || strongViewportFallbackScene);
 
-      if (hasSceneDepthSignal
-       && primitiveCount >= 1u
-       && ((hasRealProjection && hasViewOrStrongProjection) || strongViewportFallbackScene)) {
+      if (cameraManager.hasSeenRealMainCamera() && !isSceneCandidate) {
+        // Bounded admission telemetry for the remaining camera-enclosing slab
+        // failure.  This records structural signals only (no per-vertex dump),
+        // so a live game run can identify the non-scene draw family without
+        // turning the hot path logger into a performance problem.
+        static uint32_t sNonSceneAdmissionLogCount = 0;
+        if (sNonSceneAdmissionLogCount < 96u) {
+          ++sNonSceneAdmissionLogCount;
+          Logger::info(str::format(
+            "[D3D11Rtx][admission] accepted non-scene draw",
+            " drawId=", dcs.drawCallID,
+            " count=", count,
+            " indexed=", indexed ? 1 : 0,
+            " primitives=", primitiveCount,
+            " zEnable=", dcs.zEnable ? 1 : 0,
+            " zWrite=", dcs.zWriteEnable ? 1 : 0,
+            " minZ=", dcs.minZ,
+            " maxZ=", dcs.maxZ,
+            " fallbackCamera=", dcs.transformData.usedViewportFallbackProjection ? 1 : 0,
+            " identityWorld=", isIdentityExact(dcs.transformData.objectToWorld) ? 1 : 0,
+            " identityView=", isIdentityExact(dcs.transformData.worldToView) ? 1 : 0,
+            " cameraRelative=", dcs.transformData.cameraRelativeView ? 1 : 0,
+            " textured=", dcs.materialData.usesTexture() ? 1 : 0,
+            " textureHash=0x", std::hex,
+            dcs.materialData.getColorTexture().getImageHash(),
+            " materialHash=0x", dcs.materialData.getHash(),
+            " categories=0x", dcs.getCategoryFlags().raw(),
+              std::dec));
+        }
+
+        // A real scene camera is already established, so a draw that has no
+        // scene-depth/projection evidence belongs to a raster overlay/helper
+        // pass rather than the ray-traced world.  Replaying these draws through
+        // transform feedback is not merely wasteful: Unreal's solid-colour UI
+        // batches commonly reuse a scene VS with an unbound material texture.
+        // Feeding their tiny clip-space quads to BLAS construction caused an
+        // NVIDIA device reset at the first gameplay transition.  Preserve the
+        // native draw for the UI compositor and keep it out of RT admission.
+        // The test is structural and engine-independent; textured or depth-
+        // participating world geometry continues through the scene path.
+        const bool rasterOverlayOrHelper =
+             !dcs.zEnable
+          || dcs.transformData.usedViewportFallbackProjection
+          || (primitiveCount <= 4u && !dcs.materialData.usesTexture());
+        if (rasterOverlayOrHelper) {
+          static uint32_t sRasterOverlaySkipLogCount = 0;
+          if (sRasterOverlaySkipLogCount < 96u) {
+            ++sRasterOverlaySkipLogCount;
+            Logger::info(str::format(
+              "[D3D11Rtx][raster-layer] preserved non-scene overlay/helper draw",
+              " drawId=", dcs.drawCallID,
+              " count=", count,
+              " primitives=", primitiveCount,
+              " zEnable=", dcs.zEnable ? 1 : 0,
+              " zWrite=", dcs.zWriteEnable ? 1 : 0,
+              " fallbackCamera=", dcs.transformData.usedViewportFallbackProjection ? 1 : 0,
+              " textured=", dcs.materialData.usesTexture() ? 1 : 0));
+          }
+          return;
+        }
+      }
+
+      if (isSceneCandidate) {
 
         // UE-style significance culling: this draw is a scene candidate. Count
         // it, and if the budgeting loop has armed a distance threshold, drop
@@ -7775,15 +8487,27 @@ namespace dxvk {
       m_submitRejectStats.positionCaptureBudgetRejected;
     const bool capturedExactPositions = TryCapturePositionsViaStreamOut(
       dcs, geo, indexed, count, start, base,
-      instanceTransform != nullptr, replayFirstInstance,
+      instanceTransform != nullptr, replayFirstInstance, replayInstanceCount,
       usedWholeVertexBufferFallback);
     const bool exactCaptureBudgetRejected =
       m_submitRejectStats.positionCaptureBudgetRejected != captureBudgetRejectsBefore;
     if (capturedExactPositions) {
       ++m_submitRejectStats.positionCaptured;
+      // Exact indexed capture must own one compact vertex per source index and
+      // therefore must have consumed the application's index buffer.  Keep a
+      // final submission firewall here so a future topology/capture change
+      // cannot silently reintroduce an index domain that addresses beyond the
+      // XFB allocation and hangs the GPU.
+      if (indexed && dcs.geometryData.indexBuffer.defined()) {
+        Logger::err(str::format(
+          "[D3D11Rtx][position-capture] rejected mismatched captured index domain: drawId=",
+          dcs.drawCallID,
+          " count=", count,
+          " capturedVertices=", dcs.geometryData.vertexCount));
+        return;
+      }
     } else if (requireExactPositionCapture
             || usedWholeVertexBufferFallback
-            || exactCaptureBudgetRejected
             || (dcs.transformData.cameraRelativeView
             && instanceTransform == nullptr
             && dcs.usesVertexShader)) {
@@ -7798,7 +8522,7 @@ namespace dxvk {
         ++sUnsafeCameraRelativeSkipLogCount;
         Logger::warn(str::format(
           "[D3D11Rtx][position-capture] skipped unsafe uncaptured draw: reason=",
-          exactCaptureBudgetRejected ? "budget"
+          requireExactPositionCapture && exactCaptureBudgetRejected ? "budget"
             : (usedWholeVertexBufferFallback ? "gpu-index-flatten-required"
               : (requireExactPositionCapture ? "instanced-exact-required" : "camera-relative")),
           " count=",
@@ -7807,6 +8531,7 @@ namespace dxvk {
           " start=", start,
           " base=", base,
           " firstInstance=", replayFirstInstance,
+          " instanceCount=", replayInstanceCount,
           " drawId=", dcs.drawCallID));
       }
       return;
@@ -7826,7 +8551,8 @@ namespace dxvk {
     DrawParameters params;
     params.instanceCount = 1;
     const bool submitIndexed = indexed && dcs.geometryData.indexBuffer.defined();
-    params.vertexCount   = submitIndexed ? 0 : count;
+    params.vertexCount   = submitIndexed ? 0
+      : (capturedExactPositions ? dcs.geometryData.vertexCount : count);
     params.indexCount    = submitIndexed ? count : 0;
     // SubmitDraw already folds StartIndexLocation and BaseVertexLocation (or
     // StartVertexLocation) into RasterBuffer slice offsets above. Reapplying
@@ -8041,6 +8767,7 @@ namespace dxvk {
     m_positionNewCaptureBuffersThisFrame = 0;
     m_positionReplayCapturesThisFrame = 0;
     m_positionCaptureBytesThisFrame = 0;
+    m_positionCaptureVerticesSinceSubmission = 0;
     m_positionCaptureOccurrencesThisFrame.clear();
 
     // DX11_V285: age out capture buffers for meshes no longer drawn, and
@@ -8127,9 +8854,13 @@ namespace dxvk {
     }
     m_prevFrameSceneCandidates = m_submitRejectStats.sceneCandidates;
 
+
     const uint32_t sceneAcceptedDraws = m_submitRejectStats.sceneAccepted;
     const uint32_t realSceneAcceptedDraws = m_submitRejectStats.realSceneAccepted;
     const uint32_t sceneCandidateDraws = m_submitRejectStats.sceneCandidates;
+    const bool rasterUiSeen = m_rasterUiSeenThisFrame;
+    const bool midFrameRtxInjected = m_midFrameRtxInjected;
+    const bool forceRasterPassThrough = m_forceRasterPassThroughThisFrame;
     const uint32_t trustedSceneAcceptedDraws = realSceneAcceptedDraws > 0
       ? realSceneAcceptedDraws
       : (m_hasSeenRealSceneProjection ? 0u : sceneAcceptedDraws);
@@ -8202,7 +8933,10 @@ namespace dxvk {
         " uvCacheMiB=", m_texcoordCaptureCacheBytes >> 20,
         " uvCacheEntries=", m_texcoordCaptureCache.size(),
         " posCacheMiB=", m_positionCaptureCacheBytes >> 20,
-        " posCacheEntries=", m_positionCaptureCache.size()));
+        " posCacheEntries=", m_positionCaptureCache.size(),
+        " rasterUi=", rasterUiSeen ? 1 : 0,
+        " uiMidInject=", midFrameRtxInjected ? 1 : 0,
+        " uiPassThrough=", forceRasterPassThrough ? 1 : 0));
     }
 
     ResetCommandListState();
@@ -8217,7 +8951,7 @@ namespace dxvk {
     ++m_axisDetectFrame;
 
     const bool allowResizeCameraCarryover = m_resizeTransitionFramesRemaining > 0;
-    m_context->EmitCs([backbuffer, draws, acceptedDraws, sceneAcceptedDraws, realSceneAcceptedDraws, sceneCandidateDraws, trustedSceneAcceptedDraws, allowResizeCameraCarryover](DxvkContext* ctx) {
+    m_context->EmitCs([backbuffer, draws, acceptedDraws, sceneAcceptedDraws, realSceneAcceptedDraws, sceneCandidateDraws, trustedSceneAcceptedDraws, allowResizeCameraCarryover, rasterUiSeen, midFrameRtxInjected, forceRasterPassThrough](DxvkContext* ctx) {
       RtxContext* rtx = static_cast<RtxContext*>(ctx);
       const uint32_t fid = rtx->getDevice()->getCurrentFrameId();
       bool camValid = rtx->getSceneManager().getCamera().isValid(fid);
@@ -8319,7 +9053,9 @@ namespace dxvk {
           " draws=", draws, " (set DXVK_REMIX_MTXDUMP=1 to capture matrices for view-detection fix)"));
       }
 
-      const bool shouldInjectRtx = shouldInjectD3D11RtxFrame(
+      const bool shouldInjectRtx = !forceRasterPassThrough
+        && !midFrameRtxInjected
+        && shouldInjectD3D11RtxFrame(
             backbuffer != nullptr,
             hasGameSceneDraws,
             hasRealCamera,
@@ -8346,6 +9082,12 @@ namespace dxvk {
             camValid ? 1 : 0,
             " previousScene=",
             previousSceneAvailable ? 1 : 0,
+            " rasterUi=",
+            rasterUiSeen ? 1 : 0,
+            " uiMidInject=",
+            midFrameRtxInjected ? 1 : 0,
+            " uiPassThrough=",
+            forceRasterPassThrough ? 1 : 0,
             " backbuffer=",
             backbuffer != nullptr ? 1 : 0));
         }
