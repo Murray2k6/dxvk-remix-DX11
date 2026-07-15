@@ -243,6 +243,12 @@ function CmdPath([string]$n) { return (Get-CommandFilePath $n) }
 
 function Write-TextNoBom {
   param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$Text)
+  if (Test-Path -LiteralPath $Path -PathType Leaf) {
+    $current = [System.IO.File]::ReadAllText($Path)
+    if ($current -ceq $Text) {
+      return
+    }
+  }
   $enc = New-Object System.Text.UTF8Encoding($false)
   [System.IO.File]::WriteAllText($Path, $Text, $enc)
 }
@@ -360,10 +366,6 @@ function Repair-RemixApiLine79Line130Corruption {
     throw "Missing $rel"
   }
 
-  $backup = Join-Path $BaseDir ('_dx11_v106_rtx_remix_api_corrupt_backup_' + (Get-Date -Format 'yyyyMMdd_HHmmss') + '.cpp')
-  Copy-Item -LiteralPath $file -Destination $backup -Force
-  $linesOut.Add(('Backed up current file to: {0}' -f $backup))
-
   # A clean working-tree copy is already the authoritative source.  The old
   # repair path unconditionally ran `git checkout`, which both discarded local
   # development changes and makes builds fail when the Git index is read-only
@@ -382,6 +384,12 @@ function Repair-RemixApiLine79Line130Corruption {
   if ($restored) {
     $linesOut.Add('OK: current rtx_remix_api.cpp passed corruption and structural checks; no restore required.')
     Log "V106 current rtx_remix_api.cpp is clean; preserving working-tree source."
+  }
+
+  if (-not $restored) {
+    $backup = Join-Path $BaseDir ('_dx11_v106_rtx_remix_api_corrupt_backup_' + (Get-Date -Format 'yyyyMMdd_HHmmss') + '.cpp')
+    Copy-Item -LiteralPath $file -Destination $backup -Force
+    $linesOut.Add(('Backed up corrupt file to: {0}' -f $backup))
   }
 
   $git = Get-Command git.exe -ErrorAction SilentlyContinue
@@ -403,7 +411,7 @@ function Repair-RemixApiLine79Line130Corruption {
     } finally {
       Pop-Location
     }
-  } else {
+  } elseif (-not $restored) {
     $linesOut.Add('WARN: git was not found.')
   }
 
@@ -515,16 +523,11 @@ static_assert(true, "Add/remove function registration");
     }
   }
 
-  foreach ($d in @(
-    (Join-Path $BaseDir '_Comp64Release'),
-    (Join-Path $BaseDir '_Comp64Debug')
-  )) {
-    if (Test-Path -LiteralPath $d -PathType Container) {
-      Remove-Item -LiteralPath $d -Recurse -Force -ErrorAction SilentlyContinue
-      $linesOut.Add(('OK: removed stale x64 build dir: {0}' -f $d))
-      Log "V106 removed stale x64 build dir: $d"
-    }
-  }
+  # Meson/Ninja tracks this source and will rebuild the affected objects after
+  # a repair.  Deleting the whole build directory here discarded every compiled
+  # RTX shader even when the file was already clean, turning each incremental
+  # build into a full rebuild.  Preserve both release and debug build trees.
+  $linesOut.Add('OK: preserved x64 Meson/Ninja build directories for incremental rebuilds.')
 
   [System.IO.File]::WriteAllLines($diag, $linesOut)
   Log "V106 wrote rtx_remix_api line 79/130 verification: $diag"
@@ -1668,13 +1671,10 @@ function Ensure-DX11ClientGlobalsIntegrated {
     Patch-DX11ClientMesonIntegrated -MesonPath (Join-Path $clientDir 'meson.build')
     Log "Ensured DX11 x86 client global linkage source in: $clientDir"
   }
-  foreach ($d in @('bridge_dx11_work\_Comp32Release','bridge_dx11_work\_Comp32Debug','bridge_dx11_work\_Comp32ReleaseOptimized')) {
-    $p = Join-Path $Root $d
-    if (Test-Path -LiteralPath $p -PathType Container) {
-      Log "Removing stale x86 Meson build dir so globals object is included: $p"
-      Remove-DirectoryRobust $p
-    }
-  }
+  # The client Meson file names the globals source explicitly. Ninja's Meson
+  # regeneration detects any real source-list/content change, so deleting the
+  # complete x86 tree here only destroys valid incremental state.
+  Log 'Preserving x86 bridge Meson trees; Ninja will rebuild changed client/global sources.'
 }
 
 function Restore-FinalDX11OutputsIntegrated {
@@ -2044,18 +2044,10 @@ function Remove-StaleX86ClientForUnifiedGuidV219 {
 
 
 function Remove-StaleX86ClientForUnifiedGuidV219 {
-  foreach ($d in @(
-    (Join-Path $Root 'bridge_dx11_work\_Comp32Release'),
-    (Join-Path $Root 'bridge_dx11_work\_Comp32Debug'),
-    (Join-Path $Root 'bridge_dx11_work\_Comp32ReleaseOptimized'),
-    (Join-Path $Root 'bridge_dx11_work\_dx11_client_x86_joined'),
-    (Join-Path $Root 'bridge_dx11_work\_dx11_launcher_x86')
-  )) {
-    if (Test-Path -LiteralPath $d -PathType Container) {
-      Remove-Item -LiteralPath $d -Recurse -Force -ErrorAction SilentlyContinue
-      Log "V219 removed stale x86 client build dir after GUID/IPC unification: $d"
-    }
-  }
+  # This migration is now part of the authoritative generated source. Meson
+  # and Ninja track those files, while the joined output is overwritten during
+  # staging. Preserve all incremental objects on normal rebuilds.
+  Log 'V219 GUID/IPC source is authoritative; preserving x86 bridge build trees.'
 }
 
 
@@ -3708,6 +3700,30 @@ dlss_dep = declare_dependency(
 )
 message('DX11_V219_REAL_NGX_IMPORT_LIBRARY: using real staged NVIDIA NGX import library from external/nv_ngx_real/lib/x64')
 '@
+
+  $marker = "message('DX11_V219_REAL_NGX_IMPORT_LIBRARY: using real staged NVIDIA NGX import library from external/nv_ngx_real/lib/x64')"
+  $escapedMarker = [regex]::Escape($marker)
+  $text = [regex]::Replace(
+    $text,
+    "(?m)^(?:$escapedMarker\s*(?:\r?\n|$))+",
+    "$marker`r`n")
+
+  # The worktree persists between builds. If the complete real-NGX block is
+  # already installed, preserve it after normalizing historical duplicate
+  # marker lines. Replacing an already-patched block used to prepend one marker
+  # per invocation, changed meson.build every time, and invalidated the entire
+  # runtime compile graph.
+  $hasRequiredRealNgxBlock =
+    $text -match "(?s)dlss_lib_name\s*=\s*'nvsdk_ngx'.*?dirs\s*:\s*join_paths\s*\(\s*meson\.project_source_root\(\)\s*,\s*'external'\s*,\s*'nv_ngx_real'\s*,\s*'lib'\s*,\s*'x64'\s*\).*?required\s*:\s*true.*?dlss_dep\s*=\s*declare_dependency\s*\(.*?$escapedMarker"
+  if ($hasRequiredRealNgxBlock) {
+    if ($text -cne $orig) {
+      Write-TextNoBom -Path $dxvkMeson -Text $text
+      Log "V219 normalized duplicate real-NGX Meson markers."
+    } else {
+      Log "V219 real-NGX Meson block is already installed."
+    }
+    return
+  }
 
   # Replace V219 optional block or stock upstream NGX block.
   $patterns = @(
@@ -7130,7 +7146,40 @@ def main() -> int:
         )
 
         _install_hidden_module_hooks()
-        return _run_original_in_process(orig, new_args)
+        result = _run_original_in_process(orig, new_args)
+        if result != 0:
+            return result
+
+        # Meson declares src/dxvk/_built_shaders.txt as this custom target's
+        # output.  The upstream compiler writes the real .spv/.h files into
+        # the rtx_shaders directory but does not create that target output,
+        # which makes Ninja rebuild every RTX shader on every invocation.
+        # Record the shaders that were actually emitted only after the real
+        # compiler succeeds; this is build metadata, never shader fallback.
+        if output_dir is not None:
+            compiled = sorted(
+                (path for path in output_dir.glob("*.spv") if path.is_file()),
+                key=lambda path: path.name.casefold(),
+            )
+            if not compiled:
+                print(
+                    "DX11_V219_PY314_SAFE_SHADER_WRAPPER: compiler returned success "
+                    "without producing any SPIR-V shaders.",
+                    file=sys.stderr,
+                )
+                return 3
+
+            manifest = output_dir.parent / "_built_shaders.txt"
+            manifest.write_text(
+                "DX11 RTX shader build manifest\n"
+                f"Compiler={orig}\n"
+                f"ShaderCount={len(compiled)}\n"
+                + "\n".join(f"{path.name}\t{path.stat().st_size}" for path in compiled)
+                + "\n",
+                encoding="utf-8",
+            )
+
+        return 0
 
 if __name__ == "__main__":
     raise SystemExit(main())
@@ -11501,9 +11550,27 @@ $1// (2) Initialize exactly one rendering runtime before acknowledging the clien
 
   // (3) Send ACK to Client. Connection has been established
 '@
-  $text2 = [regex]::Replace($text, $initPattern, $initBlock, 1)
-  if ($text2 -eq $text) { Die 'V229 could not replace bridge server runtime initialization section.' }
-  $text = $text2
+  $hasDeterministicInit =
+    $text.Contains('DX11_V229: initializing one .trex Remix API runtime before Bridge_Ack.') -and
+    $text.Contains('remixapi_lib_loadRemixDllAndInitialize(') -and
+    $text.Contains('Remix API initialized and validated; Bridge_Ack is now permitted.') -and
+    $text.Contains('// (3) Send ACK to Client. Connection has been established')
+
+  if ($hasDeterministicInit) {
+    # bridge_dx11_work is intentionally persistent so incremental builds do not
+    # regenerate and recompile the entire x86 bridge on every invocation.  The
+    # old implementation required the source replacement to change the file,
+    # which made the second and every later build fail even though the complete
+    # deterministic initialization block was already installed.  Validate all
+    # of its required stages above and preserve the known-good source verbatim.
+    Log 'DX11_V229 deterministic bridge runtime initialization is already installed.'
+  } else {
+    $text2 = [regex]::Replace($text, $initPattern, $initBlock, 1)
+    if ($text2 -eq $text) {
+      Die 'V229 could not find either the legacy or deterministic bridge runtime initialization section.'
+    }
+    $text = $text2
+  }
 
   if ($text -notmatch 'Bridge filesystem, config, and Logger initialized') {
     $text = $text.Replace('  Logger::init();', "  Logger::init();`r`n  Dx11BridgeBootLogV229(`"Bridge filesystem, config, and Logger initialized.`");")
@@ -11914,7 +11981,15 @@ function Prepare-DX11BridgeSource([string]$PackDir) {
   $work = Join-Path $Root 'bridge_dx11_work'
   $sourceBridge = Join-Path $Root 'bridge'
   $sourceBridgeReady = Test-Path (Join-Path $sourceBridge 'meson.build')
-  $workBridgeReady = Test-Path (Join-Path $work 'src\client')
+  # The DX11 work tree deliberately removes the legacy src/client directory and
+  # replaces it with src/client_dx11. Testing the removed directory made every
+  # normal build clone the full upstream repository again, only to discard that
+  # clone after the RTXDI/RTXCR sync. Reuse the persistent, fully normalized
+  # bridge when its Meson file, server, and DX11 client are all present.
+  $workBridgeReady =
+    (Test-Path -LiteralPath (Join-Path $work 'meson.build') -PathType Leaf) -and
+    (Test-Path -LiteralPath (Join-Path $work 'src\server\main.cpp') -PathType Leaf) -and
+    (Test-Path -LiteralPath (Join-Path $work 'src\client_dx11') -PathType Container)
   # A completed bridge work tree is already the normalized, patched source
   # consumed below. Do not perform a redundant recursive NVIDIA clone merely
   # because the optional pristine ./bridge directory is absent.
@@ -13297,6 +13372,18 @@ Repair-RemixApiLine79Line130Corruption $Root
   Patch-UtilGdiConcreteDxgiFormatV219
 
 
+  # The authoritative RTX header sync above runs on every invocation. Reapply
+  # the bounded DX11 compatibility edits after it even when build.ninja already
+  # exists. Previously these only ran during first-time Meson setup, so the next
+  # incremental build received an upstream nrc_args.h with a one-level-too-deep
+  # relative path and could not find NrcStructures.h. These repairs are
+  # idempotent and refresh the NRC compiler include directory as well.
+  Patch-ActualDx11MaterialFogAndNrcV219
+  Patch-SurfaceSharedAndTerrainIncludeV219
+  Patch-Dx11LightStateApiV219
+  Patch-WxWarningErrorsV219
+  Patch-Dx11DeviceFeatureAndGdiFormatV219
+  Patch-GdiFormatAndDxvkBufferCookieV219
   Ensure-WindowsSdkD3D11IncludesV219
   Invoke-Logged -Label 'runtime-ninja-x64' -Exe $Ninja -CommandArgs (Get-DX11FastNinjaArgsV219 $buildDir) -WorkingDirectory $Root | Out-Null
   try { Invoke-Logged -Label 'runtime-install-x64' -Exe $Meson -CommandArgs @('install','-C',$buildDir,'--no-rebuild','--tags','output') -WorkingDirectory $Root | Out-Null } catch { Warn $_.Exception.Message }
@@ -15405,13 +15492,10 @@ Direct launcher source:
 function Build-DX11Bridge([string]$BridgeWork, [string]$VsInstall, [string]$Meson, [string]$Ninja) {
   
   Enable-DX11FastCompilerEnvV219
-Patch-BridgeServerRemoveLegacyD3D9RegistrationV219 -BridgeWork $BridgeWork
+  Patch-BridgeServerRemoveLegacyD3D9RegistrationV219 -BridgeWork $BridgeWork
   Assert-RealBridgeServerCanAckV219 -BridgeWork $BridgeWork
   $b64 = Join-Path $BridgeWork '_Comp64Release'
-  if (Test-Path $b64) {
-    Log "V219 removing bridge server build dir so real Bridge_Ack-capable NvRemixBridge.exe is rebuilt: $b64"
-    Remove-Item -LiteralPath $b64 -Recurse -Force
-  }
+  Log 'V219 preserving bridge server Meson/Ninja tree; changed Bridge_Ack sources rebuild incrementally.'
   if (!$SkipBridgeBuild) {
     Import-VSEnvironment $VsInstall 'x64'
     $env:NINJA = $Ninja
