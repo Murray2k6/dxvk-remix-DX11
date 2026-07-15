@@ -38,6 +38,7 @@
 #include <mutex>
 #include <optional>
 #include <cstdio>
+#include <unordered_map>
 
 // DX11_V263_CRASH_FILTER_SAFE: defined in d3d11_main.cpp. Re-installs the
 // log-only, chained unhandled-exception filter so a game crash handler
@@ -171,10 +172,27 @@ namespace dxvk {
         auto config = util::createDirectoriesAndOpenFile(configPath);
         if (!config)
           return false;
-        *config << "# Standard RTX Remix configuration for PCSX2 title "
-                << metadata.gameSerial << " (CRC " << crc << ").\n"
+        *config << "# Standard RTX Remix configuration for " << providerName
+                << " title " << metadata.gameSerial << " (CRC " << crc << ").\n"
                 << "# Texture categories edited in the Remix developer menu and\n"
                 << "# exporter-compatible rtx.* settings are saved in this file.\n";
+        if (metadata.coordinateSpace ==
+              remix::emulator::CoordinateSpace::Pcsx2GsPostTransform) {
+          // Post-transform guest positions change with the guest camera every
+          // frame; hashing them would give every mesh a new identity whenever
+          // the camera moves, breaking tagging, replacements and USD capture.
+          // Both hash rules have runtime onChange handlers, so these take
+          // effect the moment this per-title layer is activated. BLAS vertex
+          // updates are unaffected (rules::VertexDataHash is fixed).
+          *config << "\n"
+                  << "# Camera-independent mesh identity for post-transform guest geometry.\n"
+                  << "rtx.geometryGenerationHashRuleString = texcoords,indices,geometrydescriptor\n"
+                  << "rtx.geometryAssetHashRuleString = texcoords,indices,geometrydescriptor\n"
+                  << "\n"
+                  << "# Synthesized guest camera: set to this game's real vertical FOV so\n"
+                  << "# world proportions and the free camera feel correct.\n"
+                  << "rtx.emulator.cameraFovDegrees = 60.0\n";
+        }
       }
 
       const std::string layerName = str::format(providerName, " ", titleKey, " rtx.conf");
@@ -200,11 +218,17 @@ namespace dxvk {
     }
 
     Matrix4 makeEmulatorProjection(float viewportWidth, float viewportHeight) {
+      // DX11_V284_EMULATOR_CAMERA: the projection used to hardcode a 60-degree
+      // FOV. It is now per-title tunable (rtx.emulator.* live in the
+      // auto-created rtx.<SERIAL>_<CRC>.conf) so each game's real FOV can be
+      // dialed in for correct world proportions.
       const float aspect = viewportWidth > 0.0f && viewportHeight > 0.0f
         ? viewportWidth / viewportHeight : 4.0f / 3.0f;
-      const float fovY = 60.0f * (3.14159265f / 180.0f);
-      const float nearZ = 0.1f;
-      const float farZ = 10000.0f;
+      const float fovDegrees = std::clamp(
+        RtxOptions::Emulator::cameraFovDegrees(), 20.0f, 140.0f);
+      const float fovY = fovDegrees * (3.14159265f / 180.0f);
+      const float nearZ = std::max(RtxOptions::Emulator::cameraNearPlane(), 0.001f);
+      const float farZ = std::max(RtxOptions::Emulator::cameraFarPlane(), nearZ * 16.0f);
       const float yScale = 1.0f / std::tan(fovY * 0.5f);
       const float xScale = yScale / aspect;
       const float q = farZ / (farZ - nearZ);
@@ -213,6 +237,385 @@ namespace dxvk {
         Vector4(0.0f,   yScale, 0.0f,       0.0f),
         Vector4(0.0f,   0.0f,   q,          1.0f),
         Vector4(0.0f,   0.0f,  -nearZ * q, 0.0f));
+    }
+
+    Matrix4 matrixFromAbiRows(const float (&rows)[16]) {
+      return Matrix4(
+        Vector4(rows[0],  rows[1],  rows[2],  rows[3]),
+        Vector4(rows[4],  rows[5],  rows[6],  rows[7]),
+        Vector4(rows[8],  rows[9],  rows[10], rows[11]),
+        Vector4(rows[12], rows[13], rows[14], rows[15]));
+    }
+
+    std::optional<remix::emulator::CameraMetadataV1>
+    readEmulatorCameraMetadata(D3D11DeviceContext* context) {
+      remix::emulator::CameraMetadataV1 metadata = {};
+      UINT size = sizeof(metadata);
+      const HRESULT result = context->GetPrivateData(
+        remix::emulator::kCameraMetadataGuid, &size, &metadata);
+      if (FAILED(result) || size != sizeof(metadata))
+        return std::nullopt;
+      if (!remix::emulator::validateCamera(metadata)) {
+        static uint32_t s_invalidCameraLogCount = 0;
+        if (s_invalidCameraLogCount++ < 8u) {
+          Logger::warn(str::format(
+            "[D3D11Rtx][emulator-camera] Rejected invalid emulator camera metadata: magic=0x",
+            std::hex, metadata.magic, std::dec,
+            " abi=", metadata.abiMajor, ".", metadata.abiMinor,
+            " flags=", metadata.flags));
+        }
+        return std::nullopt;
+      }
+      for (uint32_t i = 0; i < 16; ++i) {
+        if (!std::isfinite(metadata.worldToView[i])
+         || !std::isfinite(metadata.viewToProjection[i]))
+          return std::nullopt;
+      }
+      return metadata;
+    }
+
+    // DX11_V284_EMULATOR_CAMERA: post-transform emulator draws (PCSX2 GS) only
+    // carry view-space geometry, so previous versions pinned the Remix camera
+    // to a fixed pose; any guest camera motion then read as the entire world
+    // teleporting - broken motion vectors, smeared temporal accumulation and
+    // denoising, no usable free camera, and per-frame BLAS identity churn.
+    // This tracker recovers the guest camera's rigid motion each frame WITHOUT
+    // guest matrices: meshes are re-identified across frames by a stable key
+    // (guest texture hash + topology + counts), giving exact 1:1 vertex
+    // correspondences between the previous and current view-space positions.
+    // A Horn quaternion (Kabsch) fit over those correspondences yields the
+    // inter-frame rigid transform of the static world, whose inverse is the
+    // camera motion; moving objects are rejected as residual outliers. The
+    // accumulated pose feeds worldToView/objectToWorld so static geometry
+    // stays anchored in a consistent world space, exactly like a native game.
+    // An emulator-published ABI camera block (Dolphin XF registers, a PS2 VU
+    // provider) overrides the estimate entirely.
+    class EmulatorCameraTracker {
+    public:
+      static constexpr uint32_t kPointsPerMesh = 8u;
+
+      void beginFrame() {
+        solveAndAccumulate();
+        m_previous = std::move(m_current);
+        m_current.clear();
+      }
+
+      void addMeshSample(uint64_t meshKey, const float* viewPositions,
+                         uint32_t vertexCount) {
+        if (viewPositions == nullptr || vertexCount < 3u
+         || m_current.size() >= kMaxTrackedMeshes
+         || m_current.find(meshKey) != m_current.end())
+          return;
+
+        MeshSample sample = {};
+        sample.vertexCount = vertexCount;
+        const uint32_t step = std::max(1u, vertexCount / kPointsPerMesh);
+        uint32_t stored = 0;
+        for (uint32_t vertex = 0; vertex < vertexCount
+             && stored < kPointsPerMesh; vertex += step, ++stored) {
+          sample.points[stored] = Vector3(
+            viewPositions[vertex * 3u + 0u],
+            viewPositions[vertex * 3u + 1u],
+            viewPositions[vertex * 3u + 2u]);
+        }
+        sample.pointCount = stored;
+        m_current.emplace(meshKey, sample);
+      }
+
+      void reset() {
+        m_previous.clear();
+        m_current.clear();
+        m_viewRotation[0] = Vector3(1.0f, 0.0f, 0.0f);
+        m_viewRotation[1] = Vector3(0.0f, 1.0f, 0.0f);
+        m_viewRotation[2] = Vector3(0.0f, 0.0f, 1.0f);
+        m_viewTranslation = Vector3(0.0f, 0.0f, kSeedOffset);
+      }
+
+      // Row-vector worldToView from the accumulated column-convention pose:
+      // rows are the transpose of the rotation, translation sits in row 3.
+      Matrix4 worldToView() const {
+        return Matrix4(
+          Vector4(m_viewRotation[0].x, m_viewRotation[1].x, m_viewRotation[2].x, 0.0f),
+          Vector4(m_viewRotation[0].y, m_viewRotation[1].y, m_viewRotation[2].y, 0.0f),
+          Vector4(m_viewRotation[0].z, m_viewRotation[1].z, m_viewRotation[2].z, 0.0f),
+          Vector4(m_viewTranslation.x, m_viewTranslation.y, m_viewTranslation.z, 1.0f));
+      }
+
+      Matrix4 viewToWorld() const {
+        // Rigid inverse of the column-convention pose: R' = R^T, t' = -R^T t.
+        // Emitted as a row-vector matrix, whose rotation block is (R^T)^T = R.
+        const Vector3& r0 = m_viewRotation[0];
+        const Vector3& r1 = m_viewRotation[1];
+        const Vector3& r2 = m_viewRotation[2];
+        const Vector3 invT(
+          -(r0.x * m_viewTranslation.x + r1.x * m_viewTranslation.y + r2.x * m_viewTranslation.z),
+          -(r0.y * m_viewTranslation.x + r1.y * m_viewTranslation.y + r2.y * m_viewTranslation.z),
+          -(r0.z * m_viewTranslation.x + r1.z * m_viewTranslation.y + r2.z * m_viewTranslation.z));
+        return Matrix4(
+          Vector4(r0.x, r0.y, r0.z, 0.0f),
+          Vector4(r1.x, r1.y, r1.z, 0.0f),
+          Vector4(r2.x, r2.y, r2.z, 0.0f),
+          Vector4(invT.x, invT.y, invT.z, 1.0f));
+      }
+
+    private:
+      static constexpr size_t kMaxTrackedMeshes = 512;
+      static constexpr float kSeedOffset = 0.001f; // non-identity view gate
+
+      struct MeshSample {
+        uint32_t vertexCount = 0;
+        uint32_t pointCount = 0;
+        Vector3 points[kPointsPerMesh];
+      };
+
+      struct RigidTransform {
+        Vector3 rotation[3]; // column-convention rows of R
+        Vector3 translation;
+      };
+
+      static Vector3 rotate(const Vector3 (&rotation)[3], const Vector3& p) {
+        return Vector3(
+          rotation[0].x * p.x + rotation[0].y * p.y + rotation[0].z * p.z,
+          rotation[1].x * p.x + rotation[1].y * p.y + rotation[1].z * p.z,
+          rotation[2].x * p.x + rotation[2].y * p.y + rotation[2].z * p.z);
+      }
+
+      // Horn's closed-form absolute orientation: dominant eigenvector of the
+      // 4x4 quaternion matrix built from the covariance, found by shifted
+      // power iteration (eigenvalues are bounded by the covariance norm, so
+      // the shift makes the maximum eigenvalue strictly dominant).
+      static bool solveRigid(const std::vector<Vector3>& from,
+                             const std::vector<Vector3>& to,
+                             RigidTransform& result) {
+        const size_t n = from.size();
+        if (n < 3 || to.size() != n)
+          return false;
+
+        Vector3 centroidFrom(0.0f, 0.0f, 0.0f), centroidTo(0.0f, 0.0f, 0.0f);
+        for (size_t i = 0; i < n; ++i) {
+          centroidFrom += from[i];
+          centroidTo += to[i];
+        }
+        const float invN = 1.0f / float(n);
+        centroidFrom *= invN;
+        centroidTo *= invN;
+
+        float h[3][3] = {};
+        for (size_t i = 0; i < n; ++i) {
+          const Vector3 a = from[i] - centroidFrom;
+          const Vector3 b = to[i] - centroidTo;
+          h[0][0] += a.x * b.x; h[0][1] += a.x * b.y; h[0][2] += a.x * b.z;
+          h[1][0] += a.y * b.x; h[1][1] += a.y * b.y; h[1][2] += a.y * b.z;
+          h[2][0] += a.z * b.x; h[2][1] += a.z * b.y; h[2][2] += a.z * b.z;
+        }
+
+        const float traceH = h[0][0] + h[1][1] + h[2][2];
+        float norm = 0.0f;
+        for (int r = 0; r < 3; ++r)
+          for (int c = 0; c < 3; ++c)
+            norm += h[r][c] * h[r][c];
+        norm = std::sqrt(norm);
+        if (!std::isfinite(norm))
+          return false;
+        if (norm < 1.0e-12f) {
+          // Pure translation (degenerate point cloud): identity rotation.
+          result.rotation[0] = Vector3(1.0f, 0.0f, 0.0f);
+          result.rotation[1] = Vector3(0.0f, 1.0f, 0.0f);
+          result.rotation[2] = Vector3(0.0f, 0.0f, 1.0f);
+          result.translation = centroidTo - centroidFrom;
+          return true;
+        }
+
+        float nMat[4][4] = {
+          { traceH,          h[1][2] - h[2][1], h[2][0] - h[0][2], h[0][1] - h[1][0] },
+          { h[1][2] - h[2][1], h[0][0] - h[1][1] - h[2][2], h[0][1] + h[1][0], h[2][0] + h[0][2] },
+          { h[2][0] - h[0][2], h[0][1] + h[1][0], h[1][1] - h[0][0] - h[2][2], h[1][2] + h[2][1] },
+          { h[0][1] - h[1][0], h[2][0] + h[0][2], h[1][2] + h[2][1], h[2][2] - h[0][0] - h[1][1] },
+        };
+        const float shift = 2.0f * norm;
+        for (int d = 0; d < 4; ++d)
+          nMat[d][d] += shift;
+
+        float quat[4] = { 1.0f, 0.0f, 0.0f, 0.0f };
+        for (int iteration = 0; iteration < 96; ++iteration) {
+          float next[4] = {};
+          for (int r = 0; r < 4; ++r)
+            for (int c = 0; c < 4; ++c)
+              next[r] += nMat[r][c] * quat[c];
+          const float length = std::sqrt(next[0] * next[0] + next[1] * next[1]
+                                       + next[2] * next[2] + next[3] * next[3]);
+          if (!(length > 1.0e-20f))
+            return false;
+          for (int d = 0; d < 4; ++d)
+            quat[d] = next[d] / length;
+        }
+
+        const float w = quat[0], x = quat[1], y = quat[2], z = quat[3];
+        result.rotation[0] = Vector3(
+          1.0f - 2.0f * (y * y + z * z), 2.0f * (x * y - w * z), 2.0f * (x * z + w * y));
+        result.rotation[1] = Vector3(
+          2.0f * (x * y + w * z), 1.0f - 2.0f * (x * x + z * z), 2.0f * (y * z - w * x));
+        result.rotation[2] = Vector3(
+          2.0f * (x * z - w * y), 2.0f * (y * z + w * x), 1.0f - 2.0f * (x * x + y * y));
+        result.translation = centroidTo - rotate(result.rotation, centroidFrom);
+
+        for (int r = 0; r < 3; ++r)
+          if (!std::isfinite(result.rotation[r].x) || !std::isfinite(result.rotation[r].y)
+           || !std::isfinite(result.rotation[r].z))
+            return false;
+        return std::isfinite(result.translation.x)
+            && std::isfinite(result.translation.y)
+            && std::isfinite(result.translation.z);
+      }
+
+      void solveAndAccumulate() {
+        if (m_previous.empty() || m_current.empty())
+          return;
+
+        struct MeshPairs {
+          size_t firstPoint;
+          size_t pointCount;
+          float residual;
+        };
+        std::vector<Vector3> fromPoints, toPoints;
+        std::vector<MeshPairs> meshes;
+        for (const auto& [key, current] : m_current) {
+          const auto previous = m_previous.find(key);
+          if (previous == m_previous.end()
+           || previous->second.vertexCount != current.vertexCount
+           || previous->second.pointCount != current.pointCount)
+            continue;
+          meshes.push_back({ fromPoints.size(), current.pointCount, 0.0f });
+          for (uint32_t i = 0; i < current.pointCount; ++i) {
+            fromPoints.push_back(previous->second.points[i]);
+            toPoints.push_back(current.points[i]);
+          }
+        }
+
+        const uint32_t minimumPoints = uint32_t(std::max(
+          RtxOptions::Emulator::cameraMotionMinSamplePoints(), 9));
+        if (meshes.size() < 3 || fromPoints.size() < minimumPoints)
+          return;
+
+        RigidTransform contentMotion;
+        if (!solveRigid(fromPoints, toPoints, contentMotion))
+          return;
+
+        // Reject moving objects: they disagree with the dominant (static
+        // world) motion. Drop meshes whose residual exceeds a multiple of the
+        // median residual and refit once from the survivors.
+        for (auto& mesh : meshes) {
+          float residual = 0.0f;
+          for (size_t i = 0; i < mesh.pointCount; ++i) {
+            const size_t point = mesh.firstPoint + i;
+            const Vector3 predicted =
+              rotate(contentMotion.rotation, fromPoints[point]) + contentMotion.translation;
+            residual += length(predicted - toPoints[point]);
+          }
+          mesh.residual = residual / float(mesh.pointCount);
+        }
+        std::vector<float> residuals;
+        residuals.reserve(meshes.size());
+        for (const auto& mesh : meshes)
+          residuals.push_back(mesh.residual);
+        std::nth_element(residuals.begin(),
+          residuals.begin() + residuals.size() / 2, residuals.end());
+        const float medianResidual = residuals[residuals.size() / 2];
+        const float residualLimit = std::max(4.0f * medianResidual, 1.0e-3f);
+
+        std::vector<Vector3> inlierFrom, inlierTo;
+        size_t inlierMeshes = 0;
+        for (const auto& mesh : meshes) {
+          if (mesh.residual > residualLimit)
+            continue;
+          ++inlierMeshes;
+          for (size_t i = 0; i < mesh.pointCount; ++i) {
+            inlierFrom.push_back(fromPoints[mesh.firstPoint + i]);
+            inlierTo.push_back(toPoints[mesh.firstPoint + i]);
+          }
+        }
+        if (inlierMeshes >= 3 && inlierFrom.size() >= minimumPoints
+         && inlierFrom.size() < fromPoints.size()) {
+          RigidTransform refit;
+          if (solveRigid(inlierFrom, inlierTo, refit))
+            contentMotion = refit;
+        }
+
+        // Scene-cut guard: an implausible jump means the content was replaced,
+        // not moved. Keep the current pose; world consistency is preserved
+        // because geometry and camera continue to use the same accumulated V.
+        const float translationMagnitude = length(contentMotion.translation);
+        const float maxTranslation = std::max(
+          RtxOptions::Emulator::cameraMotionMaxTranslation(), 1.0f);
+        const float rotationTrace = contentMotion.rotation[0].x
+                                  + contentMotion.rotation[1].y
+                                  + contentMotion.rotation[2].z;
+        // trace = 1 + 2cos(angle); trace < 0 is > ~104 degrees in one frame.
+        if (translationMagnitude > maxTranslation || rotationTrace < 0.0f)
+          return;
+
+        // Static world content moved by T in view space => the camera moved by
+        // T^-1: accumulate V_k = T * V_{k-1} (column convention).
+        Vector3 newRotation[3];
+        for (int r = 0; r < 3; ++r) {
+          newRotation[r] = Vector3(
+            contentMotion.rotation[r].x * m_viewRotation[0].x
+              + contentMotion.rotation[r].y * m_viewRotation[1].x
+              + contentMotion.rotation[r].z * m_viewRotation[2].x,
+            contentMotion.rotation[r].x * m_viewRotation[0].y
+              + contentMotion.rotation[r].y * m_viewRotation[1].y
+              + contentMotion.rotation[r].z * m_viewRotation[2].y,
+            contentMotion.rotation[r].x * m_viewRotation[0].z
+              + contentMotion.rotation[r].y * m_viewRotation[1].z
+              + contentMotion.rotation[r].z * m_viewRotation[2].z);
+        }
+        const Vector3 newTranslation =
+          rotate(contentMotion.rotation, m_viewTranslation) + contentMotion.translation;
+
+        // Renormalize the rotation so numerical error cannot accumulate into
+        // shear across thousands of frames (Gram-Schmidt).
+        newRotation[0] = normalize(newRotation[0]);
+        newRotation[1] = normalize(
+          newRotation[1] - newRotation[0] * dot(newRotation[0], newRotation[1]));
+        newRotation[2] = cross(newRotation[0], newRotation[1]);
+
+        m_viewRotation[0] = newRotation[0];
+        m_viewRotation[1] = newRotation[1];
+        m_viewRotation[2] = newRotation[2];
+        m_viewTranslation = newTranslation;
+      }
+
+      std::unordered_map<uint64_t, MeshSample> m_previous;
+      std::unordered_map<uint64_t, MeshSample> m_current;
+      Vector3 m_viewRotation[3] = {
+        Vector3(1.0f, 0.0f, 0.0f),
+        Vector3(0.0f, 1.0f, 0.0f),
+        Vector3(0.0f, 0.0f, 1.0f),
+      };
+      Vector3 m_viewTranslation = Vector3(0.0f, 0.0f, kSeedOffset);
+    };
+
+    // Post-transform emulator hosts drive one immediate context from the GS
+    // thread, so plain file-scope state is safe here; deferred contexts never
+    // reach the authenticated emulator path.
+    EmulatorCameraTracker s_emulatorCamera;
+    uint64_t s_emulatorCameraFrameId = ~0ull;
+    std::optional<remix::emulator::CameraMetadataV1> s_emulatorPublishedCamera;
+
+    // Publisher-provided projection when available and invertible by the
+    // reconstruction (standard D3D perspective shape), synthesized otherwise.
+    Matrix4 effectiveEmulatorProjection(const remix::emulator::DrawMetadataV1& metadata) {
+      if (s_emulatorPublishedCamera
+       && (s_emulatorPublishedCamera->flags
+           & remix::emulator::CameraFlagHasViewToProjection)) {
+        const Matrix4 published =
+          matrixFromAbiRows(s_emulatorPublishedCamera->viewToProjection);
+        if (published[0][0] > 0.0f && published[1][1] > 0.0f
+         && published[2][3] == 1.0f && published[2][2] > 0.0f
+         && published[3][2] < 0.0f)
+          return published;
+      }
+      return makeEmulatorProjection(metadata.viewportWidth, metadata.viewportHeight);
     }
 
     bool shouldInjectD3D11RtxFrame(bool hasBackbuffer,
@@ -6240,6 +6643,16 @@ namespace dxvk {
       m_postTransformEmulatorHost = false;
       m_forceRasterPassThroughThisFrame = false;
       activateEmulatorProfile(*emulatorMetadata);
+
+      // Guest-frame boundary: pick up a published ABI camera (if the emulator
+      // provides one) and advance the camera-motion tracker. Every draw of a
+      // guest frame shares the publisher's frameId.
+      if (emulatorMetadata->frameId != s_emulatorCameraFrameId) {
+        s_emulatorCameraFrameId = emulatorMetadata->frameId;
+        s_emulatorPublishedCamera = readEmulatorCameraMetadata(m_context);
+        if (RtxOptions::Emulator::estimateCameraMotion())
+          s_emulatorCamera.beginFrame();
+      }
     }
 
     // PCSX2 renders PS2 GS commands after the guest CPU/VU has already applied
@@ -6812,8 +7225,7 @@ namespace dxvk {
         return;
       }
 
-      const Matrix4 projection = makeEmulatorProjection(
-        emulatorMetadata->viewportWidth, emulatorMetadata->viewportHeight);
+      const Matrix4 projection = effectiveEmulatorProjection(*emulatorMetadata);
       const float xScale = projection[0][0];
       const float yScale = projection[1][1];
       const float q = projection[2][2];
@@ -6853,6 +7265,29 @@ namespace dxvk {
       posBuffer = RasterBuffer(DxvkBufferSlice(dst, 0, dstSize),
                                0, 12u, VK_FORMAT_R32G32B32_SFLOAT);
       geo.positionBuffer = posBuffer;
+
+      // Feed the camera-motion tracker: a stable mesh identity (guest texture
+      // hash + counts + topology) plus a subsample of the reconstructed
+      // view-space positions. Matching identities across frames give the
+      // solver exact vertex correspondences.
+      if (RtxOptions::Emulator::estimateCameraMotion()) {
+        struct MeshKeySource {
+          uint64_t textureHash;
+          uint32_t vertexCount;
+          uint32_t indexCount;
+          uint32_t topology;
+          uint32_t flags;
+        };
+        const MeshKeySource keySource = {
+          emulatorMetadata->guestTextureHash,
+          drawVertexCount,
+          emulatorMetadata->indexCount,
+          emulatorMetadata->topology,
+          emulatorMetadata->flags,
+        };
+        s_emulatorCamera.addMeshSample(
+          XXH3_64bits(&keySource, sizeof(keySource)), out, drawVertexCount);
+      }
 
       // Decode the same texture coordinates consumed by PCSX2's tfx shader.
       // Fixed UV uses (UV-TextureOffset)*TextureScale; ST uses (ST-
@@ -7729,17 +8164,58 @@ namespace dxvk {
     dcs.futureSkinningData = futureSkinningData;
 
     if (pcsx2PostTransformDraw) {
-      // The reconstructed buffer above is canonical view space. Give it a
-      // fixed, invertible camera pair so Remix sees a valid main camera while
-      // objectToView stays identity and the reconstructed raster alignment is
-      // preserved. This camera never follows the host free camera and cannot
-      // produce the old enclosing slab/black rectangle.
-      constexpr float kCameraOffset = 0.001f;
-      dcs.transformData.viewToProjection = makeEmulatorProjection(
-        emulatorMetadata->viewportWidth, emulatorMetadata->viewportHeight);
-      dcs.transformData.worldToView = Matrix4(Vector3(0.0f, 0.0f, kCameraOffset));
-      dcs.transformData.objectToWorld = Matrix4(Vector3(0.0f, 0.0f, -kCameraOffset));
+      // The reconstructed buffer above is canonical view space. worldToView
+      // carries the published or estimated guest camera pose and objectToWorld
+      // its rigid inverse, so objectToView stays exactly identity: on-screen
+      // raster alignment is untouched while static geometry stays anchored in
+      // a consistent world space (real motion vectors, stable temporal
+      // accumulation/denoising, and a usable free camera - the behavior of a
+      // native game). Without either camera source, fall back to the fixed
+      // non-identity pose.
+      dcs.transformData.viewToProjection =
+        effectiveEmulatorProjection(*emulatorMetadata);
+      if (s_emulatorPublishedCamera
+       && (s_emulatorPublishedCamera->flags
+           & remix::emulator::CameraFlagHasWorldToView)) {
+        const Matrix4 worldToView =
+          matrixFromAbiRows(s_emulatorPublishedCamera->worldToView);
+        dcs.transformData.worldToView = worldToView;
+        dcs.transformData.objectToWorld = inverse(worldToView);
+      } else if (RtxOptions::Emulator::estimateCameraMotion()) {
+        dcs.transformData.worldToView = s_emulatorCamera.worldToView();
+        dcs.transformData.objectToWorld = s_emulatorCamera.viewToWorld();
+      } else {
+        constexpr float kCameraOffset = 0.001f;
+        dcs.transformData.worldToView = Matrix4(Vector3(0.0f, 0.0f, kCameraOffset));
+        dcs.transformData.objectToWorld = Matrix4(Vector3(0.0f, 0.0f, -kCameraOffset));
+      }
       dcs.transformData.objectToView = Matrix4();
+      dcs.transformData.usedViewportFallbackProjection = false;
+      dcs.transformData.cameraRelativeView = false;
+      dcs.transformData.offscreenRenderTarget = false;
+    } else if (authenticatedEmulatorDraw
+            && (emulatorMetadata->coordinateSpace == remix::emulator::CoordinateSpace::View
+             || emulatorMetadata->coordinateSpace == remix::emulator::CoordinateSpace::World)
+            && s_emulatorPublishedCamera
+            && (s_emulatorPublishedCamera->flags & remix::emulator::CameraFlagHasWorldToView)
+            && (s_emulatorPublishedCamera->flags & remix::emulator::CameraFlagHasViewToProjection)) {
+      // Emulators that publish real guest matrices (e.g. GC/Wii XF state from
+      // a Dolphin D3D11 publisher, PSP GE matrices) alongside view- or
+      // world-space vertex data: adopt them directly, exactly like a native
+      // game's captured camera. Requires the emulator to run its D3D11
+      // backend - this ABI travels over ID3D11DeviceContext private data.
+      const Matrix4 worldToView =
+        matrixFromAbiRows(s_emulatorPublishedCamera->worldToView);
+      dcs.transformData.viewToProjection =
+        matrixFromAbiRows(s_emulatorPublishedCamera->viewToProjection);
+      dcs.transformData.worldToView = worldToView;
+      if (emulatorMetadata->coordinateSpace == remix::emulator::CoordinateSpace::View) {
+        dcs.transformData.objectToWorld = inverse(worldToView);
+        dcs.transformData.objectToView = Matrix4();
+      } else {
+        dcs.transformData.objectToWorld = Matrix4();
+        dcs.transformData.objectToView = worldToView;
+      }
       dcs.transformData.usedViewportFallbackProjection = false;
       dcs.transformData.cameraRelativeView = false;
       dcs.transformData.offscreenRenderTarget = false;
@@ -8157,8 +8633,13 @@ namespace dxvk {
     // device that happened to present first.
     // Do this only after rejecting obvious composite passes so skipped draws
     // do not pay the material/texture selection cost.
+    // Trust the guest texture identity only when the emulator marked the draw
+    // as textured; an untextured draw's hash field may carry stale state from
+    // the publisher's reused draw config and would tag the wrong surface.
+    const bool texturedEmulatorDraw = authenticatedEmulatorDraw
+      && (emulatorMetadata->flags & remix::emulator::DrawFlagTextured) != 0;
     FillMaterialData(dcs.materialData,
-      authenticatedEmulatorDraw ? emulatorMetadata->guestTextureHash : 0);
+      texturedEmulatorDraw ? emulatorMetadata->guestTextureHash : 0);
 
     // The DX11 bridge builds its LegacyMaterialData directly from the bound
     // SRVs, unlike the original D3D11 path.  Category evaluation therefore has

@@ -155,22 +155,98 @@ namespace remix::emulator {
     return hasCharacter && terminated;
   }
 
+  inline bool isKnownProvider(Provider provider) {
+    return provider == Provider::Pcsx2
+        || provider == Provider::Dolphin
+        || provider == Provider::Xenia
+        || provider == Provider::Ppsspp
+        || provider == Provider::Cemu
+        || provider == Provider::DuckStation;
+  }
+
   inline bool validate(const DrawMetadataV1& metadata) {
-    const bool knownProvider = metadata.provider == Provider::Pcsx2
-                            || metadata.provider == Provider::Dolphin
-                            || metadata.provider == Provider::Xenia
-                            || metadata.provider == Provider::Ppsspp
-                            || metadata.provider == Provider::Cemu
-                            || metadata.provider == Provider::DuckStation;
     return metadata.magic == kMagic
         && metadata.abiMajor == kAbiMajor
         && metadata.structSize == sizeof(DrawMetadataV1)
-        && knownProvider
+        && isKnownProvider(metadata.provider)
         && metadata.coordinateSpace != CoordinateSpace::Unknown
         && isSafeGameSerial(metadata.gameSerial)
         && metadata.gameCrc != 0
         && metadata.vertexCount > 0
         && metadata.payloadHash == calculatePayloadHash(metadata);
+  }
+
+  // Optional per-frame camera block published under its own GUID by emulators
+  // that can recover the guest camera - GC/Wii XF registers in Dolphin, a
+  // title-specific PS2 VU provider, PSP/GE matrices in PPSSPP, and so on.
+  // Post-transform providers that cannot supply it (generic PCSX2) receive a
+  // runtime-estimated camera instead. Publish once per guest frame before the
+  // frame's draws; clear with SetPrivateData(guid, 0, nullptr) when the
+  // transforms become unknown so a stale camera is never consumed.
+#if defined(_WIN32)
+  inline constexpr GUID kCameraMetadataGuid = {
+    0x7a1c9b04, 0x52d3, 0x4bd8,
+    { 0xae, 0x27, 0x66, 0x09, 0x4c, 0xd1, 0x8f, 0x35 }
+  };
+#endif
+
+  inline constexpr std::uint32_t kCameraMagic = 0x43455852u; // "RXEC"
+
+  enum CameraFlags : std::uint32_t {
+    CameraFlagNone = 0,
+    CameraFlagHasWorldToView = 1u << 0,
+    CameraFlagHasViewToProjection = 1u << 1,
+  };
+
+#pragma pack(push, 1)
+  struct CameraMetadataV1 {
+    std::uint32_t magic = kCameraMagic;
+    std::uint16_t abiMajor = kAbiMajor;
+    std::uint16_t abiMinor = kAbiMinor;
+    std::uint32_t structSize = 0;
+    std::uint32_t payloadHash = 0;
+    Provider provider = Provider::Unknown;
+    std::uint32_t flags = CameraFlagNone;
+    std::uint64_t frameId = 0;
+    // Row-vector convention matching D3D constant-buffer usage: p' = p * M,
+    // translation in row 3 (elements 12..14).
+    float worldToView[16] = {};
+    float viewToProjection[16] = {};
+    std::uint32_t reserved[8] = {};
+  };
+#pragma pack(pop)
+
+  static_assert(sizeof(CameraMetadataV1) == 192);
+  static_assert(offsetof(CameraMetadataV1, payloadHash) == 12);
+
+  inline std::uint32_t calculateCameraPayloadHash(const CameraMetadataV1& metadata) {
+    constexpr std::size_t hashOffset = offsetof(CameraMetadataV1, payloadHash);
+    constexpr std::size_t hashSize = sizeof(metadata.payloadHash);
+    std::uint32_t hash = fnv1a32(&metadata, hashOffset);
+    const std::uint32_t zero = 0;
+    hash = fnv1a32(&zero, sizeof(zero), hash);
+    return fnv1a32(reinterpret_cast<const std::uint8_t*>(&metadata)
+                    + hashOffset + hashSize,
+                  sizeof(metadata) - hashOffset - hashSize, hash);
+  }
+
+  inline void sealCamera(CameraMetadataV1& metadata) {
+    metadata.magic = kCameraMagic;
+    metadata.abiMajor = kAbiMajor;
+    metadata.abiMinor = kAbiMinor;
+    metadata.structSize = sizeof(CameraMetadataV1);
+    metadata.payloadHash = 0;
+    metadata.payloadHash = calculateCameraPayloadHash(metadata);
+  }
+
+  inline bool validateCamera(const CameraMetadataV1& metadata) {
+    return metadata.magic == kCameraMagic
+        && metadata.abiMajor == kAbiMajor
+        && metadata.structSize == sizeof(CameraMetadataV1)
+        && isKnownProvider(metadata.provider)
+        && (metadata.flags
+            & (CameraFlagHasWorldToView | CameraFlagHasViewToProjection)) != 0
+        && metadata.payloadHash == calculateCameraPayloadHash(metadata);
   }
 
 } // namespace remix::emulator

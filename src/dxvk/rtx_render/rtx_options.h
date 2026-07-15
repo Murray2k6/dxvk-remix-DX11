@@ -375,6 +375,27 @@ namespace dxvk {
                "If this causes an undesired GPU to be selected (e.g. if for some reason you want to force Remix to run on an integerated AMD GPU via the switchable graphics layer), then this option should be disabled.");
 
 
+    // Authenticated emulator integration (PCSX2 and other emulators publishing
+    // the remix::emulator draw ABI through their D3D11 backend).
+    struct Emulator {
+      RTX_OPTION("rtx.emulator", float, cameraFovDegrees, 60.0f,
+                 "Vertical field of view in degrees for the camera synthesized on authenticated post-transform emulator draws (e.g. PCSX2's GS output).\n"
+                 "Guest post-transform geometry no longer carries the game's projection, so the runtime rebuilds one; set this to the game's real FOV for correct world proportions.\n"
+                 "Stored per title in the auto-created rtx.<SERIAL>_<CRC>.conf, so each game can carry its own value.");
+      RTX_OPTION("rtx.emulator", float, cameraNearPlane, 0.1f,
+                 "Near plane distance of the synthesized emulator camera in world units.");
+      RTX_OPTION("rtx.emulator", float, cameraFarPlane, 10000.0f,
+                 "Far plane distance of the synthesized emulator camera in world units.");
+      RTX_OPTION("rtx.emulator", bool, estimateCameraMotion, true,
+                 "Estimates guest camera motion between frames from re-identified guest meshes and applies it to the Remix camera on post-transform emulator draws.\n"
+                 "This anchors static geometry in a consistent world space: temporal accumulation, denoising, motion vectors and the Remix free camera then behave like a native game instead of the whole scene teleporting with the guest camera.\n"
+                 "An emulator that publishes a real camera through the ABI camera block overrides this estimate. Disable to fall back to the fixed identity camera.");
+      RTX_OPTION("rtx.emulator", int, cameraMotionMinSamplePoints, 24,
+                 "Minimum number of corresponded guest vertices required before a frame's camera-motion estimate is applied. Below this the previous camera pose is kept.");
+      RTX_OPTION("rtx.emulator", float, cameraMotionMaxTranslation, 500.0f,
+                 "Maximum plausible camera translation per guest frame in world units. Larger estimated jumps are treated as scene cuts and ignored.");
+    };
+
     // Shader Compilation
     struct Shader {
       friend class ShaderManager;
