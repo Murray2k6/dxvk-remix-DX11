@@ -1784,23 +1784,87 @@ namespace dxvk {
       }
       assert(blasToBuild.size() == blasRangesToBuild.size());
 
-      // DX11_V290_PREEMPTIBLE_BLAS_BATCHES: a single Vulkan build call with
-      // hundreds of captured DX11 BLASes can become one long, effectively
-      // non-preemptible NVIDIA driver operation. Two live runs produced
-      // nvlddmkm Event 153 followed by VK_ERROR_DEVICE_LOST at that workload.
-      // Emit bounded calls with explicit AS barriers between them so Windows'
-      // GPU scheduler gets regular command boundaries. This builds the same
-      // complete ray-tracing scene; only the submission granularity changes.
-      static constexpr uint32_t kMaxBlasesPerBuildCall = 32u;
+      // A command-buffer barrier does not create a Windows GPU scheduling
+      // boundary.  Modern DX11 engines can update hundreds of post-VS BLASes in
+      // one frame, and keeping every vkCmdBuildAccelerationStructuresKHR call in
+      // the same queue submission has produced nvlddmkm Event 153 followed by
+      // VK_ERROR_DEVICE_LOST.  Bound both the Vulkan call and the queue
+      // submission, while preserving every BLAS in the scene.
+      static constexpr uint32_t kMaxBlasesPerSubmission = 16u;
       const uint32_t buildCount = static_cast<uint32_t>(blasToBuild.size());
-      for (uint32_t first = 0; first < buildCount; first += kMaxBlasesPerBuildCall) {
-        const uint32_t batchCount = std::min(kMaxBlasesPerBuildCall, buildCount - first);
+      for (uint32_t first = 0; first < buildCount; first += kMaxBlasesPerSubmission) {
+        const uint32_t batchCount = std::min(kMaxBlasesPerSubmission, buildCount - first);
         ctx->vkCmdBuildAccelerationStructuresKHR(
           batchCount,
           blasToBuild.data() + first,
           blasRangesToBuild.data() + first);
 
         if (first + batchCount < buildCount) {
+          // Make this batch's writes available to all later AS work, then end
+          // the command list.  The next submission is ordered on the same queue
+          // and therefore cannot race this batch.
+          ctx->emitMemoryBarrier(
+            0,
+            VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
+            VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR,
+            VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
+            VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR |
+              VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR);
+
+          ctx->getCommandList()->trackResource<DxvkAccess::Read>(m_scratchBuffer);
+          ctx->flushCommandList();
+
+          // beginRecording() starts a fresh lifetime/resource-tracking scope.
+          // Re-register every input that subsequent BLAS build descriptors can
+          // reference; CPU ownership alone is not sufficient for renamed DXVK
+          // allocations that are retired by command-list completion.
+          for (uint32_t uniqueBlasIdx = 0;
+               uniqueBlasIdx < m_uniqueDynamicBlasCount; ++uniqueBlasIdx) {
+            const UniqueBlasInstances& uniqueBlasEntry =
+              m_uniqueDynamicBlas[uniqueBlasIdx];
+            if (uniqueBlasEntry.blasEntry != nullptr
+             && !uniqueBlasEntry.instances.empty()) {
+              trackBlasBuildResources(
+                ctx, execBarriers, uniqueBlasEntry.blasEntry);
+            }
+          }
+          for (const auto& bucket : blasBuckets) {
+            for (const RtInstance* instance : bucket->originalInstances) {
+              if (instance != nullptr && instance->getBlas() != nullptr)
+                trackBlasBuildResources(ctx, execBarriers, instance->getBlas());
+            }
+          }
+
+          ctx->getCommandList()->trackResource<DxvkAccess::Write>(m_scratchBuffer);
+          ctx->getCommandList()->trackResource<DxvkAccess::Read>(m_scratchBuffer);
+          if (m_transformBuffer != nullptr) {
+            ctx->getCommandList()->trackResource<DxvkAccess::Read>(m_transformBuffer);
+          }
+
+          // Track the destination BLAS objects referenced by the remaining
+          // descriptors in this new command list.
+          for (uint32_t remaining = first + batchCount;
+               remaining < buildCount; ++remaining) {
+            const VkAccelerationStructureKHR destination =
+              blasToBuild[remaining].dstAccelerationStructure;
+            for (const auto& pooledBlas : m_blasPool) {
+              if (pooledBlas != nullptr
+               && pooledBlas->accelStructure->getAccelStructure() == destination) {
+                ctx->getCommandList()->trackResource<DxvkAccess::Write>(
+                  pooledBlas->accelStructure);
+                break;
+              }
+            }
+            for (const auto& dynamicBlas : m_activeDynamicBlases) {
+              if (dynamicBlas != nullptr
+               && dynamicBlas->accelStructure->getAccelStructure() == destination) {
+                ctx->getCommandList()->trackResource<DxvkAccess::Write>(
+                  dynamicBlas->accelStructure);
+                break;
+              }
+            }
+          }
+
           ctx->emitMemoryBarrier(
             0,
             VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
@@ -1812,12 +1876,14 @@ namespace dxvk {
       }
 
       static uint32_t sBatchedBuildLogs = 0;
-      if (buildCount > kMaxBlasesPerBuildCall && sBatchedBuildLogs < 16u) {
+      if (buildCount > kMaxBlasesPerSubmission && sBatchedBuildLogs < 16u) {
         ++sBatchedBuildLogs;
         Logger::info(str::format(
-          "[RTX][BLAS] split ", buildCount, " builds into ",
-          (buildCount + kMaxBlasesPerBuildCall - 1u) / kMaxBlasesPerBuildCall,
-          " watchdog-safe batches; scratchMiB=", totalScratchMemory >> 20));
+          "[RTX][BLAS] split ", buildCount, " builds across ",
+          (buildCount + kMaxBlasesPerSubmission - 1u) /
+            kMaxBlasesPerSubmission,
+          " watchdog-safe submissions; scratchMiB=",
+          totalScratchMemory >> 20));
       }
 
       execBarriers.accessBuffer(
