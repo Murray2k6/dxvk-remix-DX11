@@ -286,6 +286,12 @@ namespace dxvk {
     static const RtxOptionLayer* getUserLayer() { return s_userLayer; }
     static const RtxOptionLayer* getDefaultLayer();
     static RtxOptionLayer* getRtxConfLayer() { return s_rtxConfLayer; }
+    static RtxOptionLayer* getBaseRtxConfLayer() { return s_baseRtxConfLayer; }
+    // Redirect non-UserSetting edits from the Remix developer menu to a
+    // standard per-title rtx.conf. The caller must keep the layer acquired
+    // until clearRtxConfLayerOverride() has restored the native layer.
+    static bool setRtxConfLayerOverride(RtxOptionLayer* layer);
+    static void clearRtxConfLayerOverride();
     static const RtxOptionLayer* getEnvironmentLayer() { return s_environmentLayer; }
     static const RtxOptionLayer* getQualityLayer() { return s_qualityLayer; }
     static const RtxOptionLayer* getDerivedLayer() { return s_derivedLayer; }
@@ -307,6 +313,7 @@ namespace dxvk {
     // Cached pointers to system layers (initialized once during initializeSystemLayers)
     inline static const RtxOptionLayer* s_defaultLayer = nullptr;
     inline static RtxOptionLayer* s_rtxConfLayer = nullptr;
+    inline static RtxOptionLayer* s_baseRtxConfLayer = nullptr;
     inline static const RtxOptionLayer* s_environmentLayer = nullptr;
     inline static const RtxOptionLayer* s_qualityLayer = nullptr;
     inline static const RtxOptionLayer* s_derivedLayer = nullptr;

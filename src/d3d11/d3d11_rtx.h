@@ -218,6 +218,11 @@ namespace dxvk {
       // DX11_V281: wireframe-fill draws (debug/editor overlays) excluded -
       // their triangles are lines on screen, not solid RT surfaces.
       uint32_t wireframeSkipped = 0;
+      // Host emulator draws whose guest vertices have already been transformed
+      // to screen XY/depth. They are deliberately kept on the native raster
+      // surface because there is no world-space BLAS or camera to reconstruct
+      // at the D3D11 boundary.
+      uint32_t postTransformEmulator = 0;
     };
 
     SubmitRejectStats                    m_submitRejectStats;
@@ -234,6 +239,15 @@ namespace dxvk {
     // decision is consumed by D3D11DeviceContext before it queues the native
     // draw command.
     bool                                 m_allowNativeRasterForCurrentDraw = true;
+    // Process-lifetime capability latch. PCSX2's GS renderer exposes packed
+    // screen XY/Z (or an SV_VertexID StructuredBuffer) rather than the guest
+    // game's pre-transform world vertices. Once observed, every later frame
+    // must preserve the complete guest raster surface; otherwise force-
+    // injection or a stale scene can replace it with an empty black RTX frame.
+    bool                                 m_postTransformEmulatorHost = false;
+    // Set only by the versioned private-data ABI. Once authenticated, legacy
+    // PCSX2 layout heuristics can no longer force the whole process to raster.
+    bool                                 m_authenticatedEmulatorHost = false;
     bool                                 m_hasSeenRealSceneProjection = false;
     // Learned only from a real projection whose aspect agrees with the
     // established output. Once learned, square reflection/probe cameras can no
@@ -425,7 +439,8 @@ namespace dxvk {
                                                  uint32_t hashStartVertex,
                                                  uint32_t hashVertexCount) const;
     void ClearMaterialTextures(LegacyMaterialData& mat) const;
-    void FillMaterialData(LegacyMaterialData& mat) const;
+    void FillMaterialData(LegacyMaterialData& mat,
+                          XXH64_hash_t primaryTextureHashOverride = 0) const;
   };
 
 }

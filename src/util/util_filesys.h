@@ -29,6 +29,7 @@
 #include <array>
 #include <optional>
 #include <fstream>
+#include <mutex>
 
 namespace version {
   static constexpr uint64_t fileSysV = 1;
@@ -68,13 +69,30 @@ private:
   static bool s_bInit;
   using PathArray = std::array<fspath, kNumIds>;
   static PathArray s_paths;
+  static fspath s_rootPath;
+  static fspath s_emulatedGameProfileRoot;
+  static std::mutex s_profileMutex;
 
 public:
   static void init(const std::string rootPath);
   static inline const fspath path(const Id id) {
     assert(s_bInit && "[RtxFileSys] Not yet init.");
+    if (id == Captures) {
+      std::lock_guard<std::mutex> lock(s_profileMutex);
+      if (!s_emulatedGameProfileRoot.empty())
+        return s_emulatedGameProfileRoot / "captures";
+    }
     return s_paths[id];
   }
+  static inline const fspath rootPath() {
+    assert(s_bInit && "[RtxFileSys] Not yet init.");
+    return s_rootPath;
+  }
+  // Redirect only standard Remix captures for an authenticated emulated
+  // title. Mods, logs and every native-PC path remain unchanged.
+  static void setEmulatedGameProfileRoot(const fspath& profileRoot);
+  static void clearEmulatedGameProfileRoot();
+  static fspath emulatedGameProfileRoot();
   static void print();
 };
 

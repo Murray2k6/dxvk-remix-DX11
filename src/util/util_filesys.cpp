@@ -100,6 +100,9 @@ std::optional<std::ofstream> createDirectoriesAndOpenFile(const std::filesystem:
 
 bool RtxFileSys::s_bInit = false;
 RtxFileSys::PathArray RtxFileSys::s_paths;
+RtxFileSys::fspath RtxFileSys::s_rootPath;
+RtxFileSys::fspath RtxFileSys::s_emulatedGameProfileRoot;
+std::mutex RtxFileSys::s_profileMutex;
 
 void RtxFileSys::init(const std::string rootPath) {
   assert(!s_bInit && "[RtxFileSys] Already init.");
@@ -109,6 +112,7 @@ void RtxFileSys::init(const std::string rootPath) {
   if(!std::filesystem::exists(rootPath)) {
     Logger::err(format("[RtxFileSys] Cannot resolve RTX filesystem, base path does exist: ", rootPath));
   }
+  s_rootPath = std::filesystem::absolute(rootPath);
   for(const auto& pathSpec : s_pathSpecs) {
     const std::string pathStr = (pathSpec.env.empty()) ? "" : getEnvVar(pathSpec.env.c_str());
     fspath& path = s_paths[pathSpec.id];
@@ -124,6 +128,30 @@ void RtxFileSys::init(const std::string rootPath) {
     createDirectories(absolute(path));
   }
   s_bInit = true;
+}
+
+void RtxFileSys::setEmulatedGameProfileRoot(const fspath& profileRoot) {
+  assert(s_bInit && "[RtxFileSys] Not yet init.");
+  const fspath absoluteRoot = std::filesystem::absolute(profileRoot);
+  if (!createDirectories(absoluteRoot) || !createDirectories(absoluteRoot / "captures")) {
+    Logger::err(format("[RtxFileSys] Cannot create emulator profile root: ", absoluteRoot));
+    return;
+  }
+
+  std::lock_guard<std::mutex> lock(s_profileMutex);
+  s_emulatedGameProfileRoot = absoluteRoot;
+  Logger::info(format("[RtxFileSys] Standard Remix emulator capture root: ",
+                      s_emulatedGameProfileRoot / "captures"));
+}
+
+void RtxFileSys::clearEmulatedGameProfileRoot() {
+  std::lock_guard<std::mutex> lock(s_profileMutex);
+  s_emulatedGameProfileRoot.clear();
+}
+
+RtxFileSys::fspath RtxFileSys::emulatedGameProfileRoot() {
+  std::lock_guard<std::mutex> lock(s_profileMutex);
+  return s_emulatedGameProfileRoot;
 }
 
 void RtxFileSys::print() {
