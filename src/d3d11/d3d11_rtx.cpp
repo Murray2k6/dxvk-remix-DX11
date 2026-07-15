@@ -24,6 +24,7 @@
 #include "../dxvk/rtx_render/rtx_matrix_helpers.h"
 
 #include <cstring>
+#include <cctype>
 #include <cmath>
 #include <algorithm>
 #include <array>
@@ -42,6 +43,46 @@ namespace dxvk {
 
     bool isRenderDocAttached() {
       return ::GetModuleHandleW(L"renderdoc.dll") != nullptr;
+    }
+
+    bool isPcsx2HostProcess() {
+      static const bool result = [] {
+        std::string executable = env::getExeNameNoSuffix();
+        std::transform(executable.begin(), executable.end(), executable.begin(),
+          [](unsigned char c) { return char(std::tolower(c)); });
+        return executable == "pcsx2" || executable == "pcsx2-qt"
+            || executable.rfind("pcsx2-", 0) == 0;
+      }();
+      return result;
+    }
+
+    bool isPcsx2GsVertexLayout(const std::vector<D3D11RtxSemantic>& semantics) {
+      // PCSX2 resources/shaders/dx11/tfx.fx declares the guest GS position as
+      //   uint2 p : POSITION0; uint z : POSITION1;
+      // These are post-transform 12.4 fixed-point screen XY plus a 32-bit GS
+      // depth value, not object/world coordinates. Match the complete pair so
+      // native games with an unrelated integer attribute are unaffected.
+      bool packedScreenXy = false;
+      bool packedScreenZ = false;
+
+      for (const D3D11RtxSemantic& semantic : semantics) {
+        if (std::strncmp(semantic.name, "POSITION", 8) != 0
+         || semantic.systemValue != DxbcSystemValue::None
+         || semantic.perInstance)
+          continue;
+
+        const bool integerInput = semantic.componentType == DxbcScalarType::Uint32
+                               || semantic.componentType == DxbcScalarType::Sint32;
+        if (!integerInput)
+          continue;
+
+        if (semantic.index == 0 && semantic.componentCount >= 2)
+          packedScreenXy = true;
+        else if (semantic.index == 1 && semantic.componentCount >= 1)
+          packedScreenZ = true;
+      }
+
+      return packedScreenXy && packedScreenZ;
     }
 
     bool shouldInjectD3D11RtxFrame(bool hasBackbuffer,
@@ -6050,6 +6091,22 @@ namespace dxvk {
 
     ++m_submitRejectStats.total;
 
+    // PCSX2 renders PS2 GS commands after the guest CPU/VU has already applied
+    // its model/view/projection transform. The D3D11 input is packed screen
+    // XY/depth, and VS_EXPAND variants fetch the same record through
+    // SV_VertexID from a StructuredBuffer with no input layout. A synthetic
+    // world camera here would make geometry follow the host camera, destabilize
+    // hashes, and build an enclosing slab/black rectangle. Once this capability
+    // has been identified, keep the guest image as raster while still walking
+    // bound textures so Remix's texture browser and hash tagging remain usable.
+    if (m_postTransformEmulatorHost) {
+      m_forceRasterPassThroughThisFrame = true;
+      LegacyMaterialData rasterMaterial;
+      FillMaterialData(rasterMaterial);
+      ++m_submitRejectStats.postTransformEmulator;
+      return;
+    }
+
     // Once this frame has crossed onto its raster-overlay path, do not spend
     // GPU/CPU work capturing more screen-space triangles into the RT scene.
     // Still enumerate every bound texture so the Remix texture grid, manual
@@ -6162,11 +6219,34 @@ namespace dxvk {
 
     D3D11InputLayout* layout = m_context->m_state.ia.inputLayout.ptr();
     if (!layout) {
+      if (isPcsx2HostProcess()) {
+        m_postTransformEmulatorHost = true;
+        m_forceRasterPassThroughThisFrame = true;
+        ++m_submitRejectStats.postTransformEmulator;
+        Logger::info(
+          "[D3D11Rtx][emulator-profile] PCSX2 post-transform GS path detected "
+          "(SV_VertexID/no input layout). Preserving the guest raster surface "
+          "and texture-hash discovery; RTX scene injection is disabled because "
+          "no guest world vertices or camera reach host D3D11.");
+        return;
+      }
       ++m_submitRejectStats.noInputLayout;
       return;
     }
 
     const auto& semantics = layout->GetRtxSemantics();
+
+    if (isPcsx2HostProcess() && isPcsx2GsVertexLayout(semantics)) {
+      m_postTransformEmulatorHost = true;
+      m_forceRasterPassThroughThisFrame = true;
+      ++m_submitRejectStats.postTransformEmulator;
+      Logger::info(
+        "[D3D11Rtx][emulator-profile] PCSX2 packed POSITION0/POSITION1 GS "
+        "layout detected (post-transform screen XY/depth). Preserving the "
+        "guest raster surface and texture-hash discovery; RTX scene injection "
+        "is disabled because no guest world vertices or camera reach host D3D11.");
+      return;
+    }
 
     if (semantics.empty()) {
       ++m_submitRejectStats.noSemantics;
@@ -8927,6 +9007,7 @@ namespace dxvk {
         " posPoison=", m_submitRejectStats.poisonedPositions,
         " vtxRangeRej=", m_submitRejectStats.vertexRangeRejected,
         " idxRangeRej=", m_submitRejectStats.indexRangeRejected,
+        " emulatorRaster=", m_submitRejectStats.postTransformEmulator,
         " helperMiB=", m_helperPoolBytes >> 20,
         " helperRetired=", m_helperRetired.size(),
         " helperFree=", m_helperFree.size(),
