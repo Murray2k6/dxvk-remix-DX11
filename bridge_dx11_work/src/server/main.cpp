@@ -1336,6 +1336,12 @@ static void Dx11BridgeBootLogV229(const char* stage) {
 
 
 
+
+
+
+
+
+
 int WINAPI wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance, _In_ PWSTR pCmdLine, _In_ int nCmdShow) {
 Dx11BridgeBootLogV229("DX11 bridge server process entered wWinMain.");
 gTimeStart = std::chrono::high_resolution_clock::now();

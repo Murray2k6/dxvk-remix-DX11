@@ -1,4 +1,5 @@
 #include "d3d11_device.h"
+#include "d3d11_initializer.h"
 #include "d3d11_gdi.h"
 #include "d3d11_texture.h"
 
@@ -217,7 +218,11 @@ namespace dxvk {
   
   
   D3D11CommonTexture::~D3D11CommonTexture() {
-    
+    // DX11_V294_STABLE_HASH_SLOTS: return this texture's identity slot so a
+    // recreated same-descriptor texture reuses the same hash.
+    if (m_stableHashSlotHeld)
+      D3D11Initializer::ReleaseDynamicTextureSlot(
+        m_stableHashDescriptor, m_stableHashOrdinal);
   }
   
   

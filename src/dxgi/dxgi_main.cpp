@@ -26,6 +26,34 @@ static FARPROC WINAPI remixDxgiDelayLoadFailureHook(unsigned dliNotify, PDelayLo
 }
 extern "C" const PfnDliHook __pfnDliFailureHook2 = remixDxgiDelayLoadFailureHook;
 
+// DX11_V290_RUNTIME_DIR: same delay-load redirect as d3d11_main.cpp - prefer
+// the dedicated Remix runtime directory when it exists.
+static FARPROC WINAPI remixDxgiDelayLoadNotifyHook(unsigned dliNotify, PDelayLoadInfo pdli) {
+  if (dliNotify == dliNotePreLoadLibrary
+   && pdli != nullptr && pdli->szDll != nullptr) {
+    wchar_t fullPath[MAX_PATH];
+    const DWORD dirLen = dxvk::env::remixResolveRuntimeDirectoryW(fullPath, MAX_PATH);
+    if (dirLen != 0) {
+      size_t pos = dirLen;
+      if (pos < MAX_PATH - 1)
+        fullPath[pos++] = L'\\';
+      const char* name = pdli->szDll;
+      for (; *name != '\0' && pos < MAX_PATH - 1; ++name)
+        fullPath[pos++] = wchar_t(static_cast<unsigned char>(*name));
+      fullPath[pos] = L'\0';
+      if (*name == '\0'
+       && ::GetFileAttributesW(fullPath) != INVALID_FILE_ATTRIBUTES) {
+        const HMODULE loaded =
+          ::LoadLibraryExW(fullPath, nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+        if (loaded != nullptr)
+          return reinterpret_cast<FARPROC>(loaded);
+      }
+    }
+  }
+  return nullptr;
+}
+extern "C" const PfnDliHook __pfnDliNotifyHook2 = remixDxgiDelayLoadNotifyHook;
+
 // Same DLL search path fix as d3d11_main.cpp — ensures Remix runtime DLLs
 // are found in the game directory when loaded through launchers with
 // restricted search paths.
@@ -44,8 +72,19 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
           SetDllDirectoryW(path);
           AddDllDirectory(path);
         }
-            }
-        }
+      }
+      // DX11_V290_RUNTIME_DIR: dxgi.dll is loaded BEFORE d3d11.dll in the
+      // standard adapter-enumeration flow, so registering the runtime
+      // directory here is what allows d3d11.dll's hard USD/python/boost
+      // load-time imports to resolve from rtx-remix\runtime (or
+      // DXVK_REMIX_RUNTIME_DIR) instead of the game folder.
+      wchar_t runtimeDir[MAX_PATH];
+      if (dxvk::env::remixResolveRuntimeDirectoryW(runtimeDir, MAX_PATH) != 0) {
+        SetDllDirectoryW(runtimeDir);
+        AddDllDirectory(runtimeDir);
+        dxvk::env::remixAppendBootLine("dxgi.dll", "runtime directory registered (rtx-remix\\runtime or DXVK_REMIX_RUNTIME_DIR)");
+      }
+    }
     }
     return TRUE;
 }

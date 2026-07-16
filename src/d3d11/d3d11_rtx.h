@@ -295,6 +295,11 @@ namespace dxvk {
     uint32_t m_prevFrameSceneAccepted = 0;
     uint32_t m_prevFrameRealSceneAccepted = 0;
     static constexpr uint32_t kForceInjectionProbeDraws = 512;
+    // DX11_V295_ROTATING_PROBE: sweep state for the force-injection discovery
+    // window (heavy frames put their camera/scene draws past a fixed first-N
+    // window - Hello Neighbor 2 issues ~2000 draws per frame).
+    uint32_t m_prevFrameTotalDraws = 0;
+    uint32_t m_forceInjectionProbePhase = 0;
 
     // UE-style significance manager (rtx.significanceCulling, default OFF).
     // Unreal's Significance Manager spends a fixed budget by importance, not by

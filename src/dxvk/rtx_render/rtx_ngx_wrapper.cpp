@@ -142,9 +142,20 @@ namespace dxvk
 
     // Note: Enable DLSS logging for debugging in debug mode. Note this will disable all other DLSS logging sinks to ensure all logging
     // goes through the DXVK logging system.
-#ifndef NDEBUG
     NVSDK_NGX_FeatureCommonInfo featureCommonInfo{};
 
+    // DX11_V290_RUNTIME_DIR: tell NGX where the nvngx_* feature DLLs live so
+    // the payload can sit in the dedicated Remix runtime directory instead of
+    // flat in the game folder. The exe folder stays in the list so the
+    // classic layout keeps working.
+    wchar_t runtimeDir[MAX_PATH] = {};
+    const bool hasRuntimeDir =
+      env::remixResolveRuntimeDirectoryW(runtimeDir, MAX_PATH) != 0;
+    const wchar_t* featurePaths[2] = { logFolder.c_str(), runtimeDir };
+    featureCommonInfo.PathListInfo.Path = featurePaths;
+    featureCommonInfo.PathListInfo.Length = hasRuntimeDir ? 2 : 1;
+
+#ifndef NDEBUG
     featureCommonInfo.LoggingInfo.LoggingCallback = &NVSDK_NGX_AppLogCallback;
     featureCommonInfo.LoggingInfo.MinimumLoggingLevel = NVSDK_NGX_LOGGING_LEVEL_ON;
     featureCommonInfo.LoggingInfo.DisableOtherLoggingSinks = true;
@@ -154,12 +165,7 @@ namespace dxvk
       RtxOptions::applicationId(), logFolder.c_str(),
       vkInstance, vkPhysicalDevice, vkDevice,
       nullptr, nullptr,
-#ifndef NDEBUG
-      &featureCommonInfo
-#else
-      nullptr
-#endif
-    );
+      &featureCommonInfo);
 
     if (NVSDK_NGX_FAILED(result)) {
       if (result == NVSDK_NGX_Result_FAIL_FeatureNotSupported || result == NVSDK_NGX_Result_FAIL_PlatformError) {
@@ -216,9 +222,11 @@ namespace dxvk
     // Check DLSS-RR Support
     NVSDK_NGX_FeatureCommonInfo ci = {};
     memset(&ci, 0, sizeof(ci));
-    const wchar_t* pathes[] = { logFolder.c_str(), L"." };
+    // DX11_V290_RUNTIME_DIR: include the dedicated runtime directory in the
+    // discovery search paths as well (empty entry is skipped via Length).
+    const wchar_t* pathes[] = { logFolder.c_str(), L".", runtimeDir };
     ci.PathListInfo.Path = pathes;
-    ci.PathListInfo.Length = 2;
+    ci.PathListInfo.Length = hasRuntimeDir ? 3 : 2;
     ci.InternalData = nullptr;
     ci.LoggingInfo.LoggingCallback = nullptr;
     ci.LoggingInfo.MinimumLoggingLevel = NVSDK_NGX_LOGGING_LEVEL_OFF;

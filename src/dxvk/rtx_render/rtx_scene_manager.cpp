@@ -30,6 +30,7 @@
 #include "dxvk_device.h"
 #include "dxvk_context.h"
 #include "dxvk_buffer.h"
+#include "dxvk_memory_tracker.h"
 #include "rtx_context.h"
 #include "rtx_options.h"
 #include "rtx_terrain_baker.h"
@@ -538,6 +539,12 @@ namespace dxvk {
        && fid > s_lastGrowthCensusFrame + 100u) {
         censusDue = true;
         s_lastGrowthCensusFrame = fid;
+        // DX11_V295_LEAK_NAMER: growth-triggered census means something is
+        // climbing (the Skyrim leak shows as rtxBufMiB 110 -> 2000+). Name
+        // the biggest RTXBuffer allocations so the leaking pool identifies
+        // itself; requires rtx.profiler.memory.enable = True from launch.
+        GpuMemoryTracker::logTopAllocationsByCategory(
+          DxvkMemoryStats::Category::RTXBuffer, 10u);
       }
       if (censusDue) {
         s_lastCensusUsedBytes = usedBytes;

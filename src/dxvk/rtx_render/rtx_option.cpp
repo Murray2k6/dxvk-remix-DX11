@@ -21,6 +21,11 @@
 */
 #include "rtx_options.h"
 
+#include <chrono>
+#include <mutex>
+#include <utility>
+#include <vector>
+
 namespace dxvk {
   void fillHashVector(const std::vector<std::string>& rawInput, std::vector<XXH64_hash_t>& hashVectorOutput) {
     for (auto&& hashStr : rawInput) {
@@ -159,6 +164,43 @@ namespace dxvk {
     }
 
     return value;
+  }
+
+  // DX11_V289_TAGGING_CRASH: hot readers (draw-call category classification,
+  // geometry processing) fetch the resolved hash set by const reference and
+  // iterate it WITHOUT holding the option mutex. Assigning a re-resolved set
+  // into the existing object therefore invalidated their iterators the moment
+  // a texture was tagged in the dev menu - a use-after-free crash whose
+  // timing depends on the game's threading. The resolved set is now replaced
+  // by POINTER SWAP and the previous set is parked here, deleted only after a
+  // grace period; readers only hold the reference within a single draw call,
+  // so surviving sets many seconds old can never still be in use.
+  namespace {
+    dxvk::mutex s_retiredHashSetMutex;
+    std::vector<std::pair<uint64_t, HashSetLayer*>> s_retiredHashSets;
+
+    uint64_t monotonicNowMs() {
+      return static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::steady_clock::now().time_since_epoch()).count());
+    }
+
+    void deferHashSetRelease(HashSetLayer* retired) {
+      if (retired == nullptr)
+        return;
+      constexpr uint64_t kRetireDelayMs = 10000u;
+      const uint64_t nowMs = monotonicNowMs();
+      std::lock_guard<dxvk::mutex> lock(s_retiredHashSetMutex);
+      size_t kept = 0;
+      for (auto& entry : s_retiredHashSets) {
+        if (nowMs - entry.first >= kRetireDelayMs)
+          delete entry.second;
+        else
+          s_retiredHashSets[kept++] = entry;
+      }
+      s_retiredHashSets.resize(kept);
+      s_retiredHashSets.emplace_back(nowMs, retired);
+    }
   }
 
   void releaseGenericValue(GenericValue& value, OptionType type) {
@@ -953,9 +995,14 @@ namespace dxvk {
     case OptionType::Float:
       target.f = source.f;
       break;
-    case OptionType::HashSet:
-      *target.hashSet = *source.hashSet;
+    case OptionType::HashSet: {
+      // Publish by pointer swap; never mutate the set readers may be
+      // iterating (see deferHashSetRelease above for the full story).
+      HashSetLayer* previous = target.hashSet;
+      target.hashSet = new HashSetLayer(*source.hashSet);
+      deferHashSetRelease(previous);
       break;
+    }
     case OptionType::HashVector:
       *target.hashVector = *source.hashVector;
       break;

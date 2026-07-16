@@ -375,9 +375,42 @@ namespace dxvk {
                "If this causes an undesired GPU to be selected (e.g. if for some reason you want to force Remix to run on an integerated AMD GPU via the switchable graphics layer), then this option should be disabled.");
 
 
+    // PC-game D3D11 capture: camera recovery for titles whose geometry can
+    // only be captured camera-relative (view space, no proven world/view
+    // matrix). Fully separate from the emulator camera below - the two paths
+    // never share state.
+    RTX_OPTION("rtx.dx11", bool, estimateViewSpaceCameraMotion, true,
+               "Estimates real camera motion for PC games whose geometry is captured in camera-relative view space because no world/view matrix could be proven from the game's shaders (e.g. an unconfirmed view matrix).\n"
+               "Static geometry is re-identified across frames and the camera's rigid motion is solved from it, anchoring the scene in a consistent world space: motion vectors, temporal accumulation and the free camera then behave like a title with a real captured camera.\n"
+               "Titles with a proven world or confirmed view matrix never use this path. Disable to restore the fixed camera-relative fallback.");
+    RTX_OPTION("rtx.dx11", bool, stableDynamicTextureHashes, true,
+               "Gives sampled textures created without initial data (UI/font atlases, video surfaces, streaming pools) a stable identity derived from their descriptor and creation order, instead of hashing the content of whichever runtime upload happened to arrive first.\n"
+               "First-upload hashing made such texture hashes differ between sessions - the first upload depends on which glyphs or frames the menu touched first - so UI texture tags and replacements silently stopped applying on the next run.\n"
+               "Note: enabling or disabling this changes the hashes of these dynamic textures once, so existing tags on them need re-tagging; textures created with data (nearly all world materials) are unaffected.");
+    // DX11_V295_CAPTURE_BUDGET: per-frame post-VS capture budgets. Remix-native
+    // titles route their whole scene through capture (50-200 small draws per
+    // frame), so the caps default high; the byte cap bounds one frame's GPU
+    // copy work against TDR. Lower these per title if a device-lost occurs.
+    RTX_OPTION("rtx.dx11", int, captureMaxDrawsPerFrame, 64,
+               "Maximum post-VS position captures performed per frame. Draws past the cap keep their previous capture or stay on the raster layer until a later frame captures them.");
+    RTX_OPTION("rtx.dx11", int, captureMaxNewBuffersPerFrame, 32,
+               "Maximum NEW capture buffers allocated per frame (cold captures of meshes never seen before).");
+    RTX_OPTION("rtx.dx11", int, captureMaxReplaysPerFrame, 32,
+               "Maximum dynamic-mesh capture replays per frame (meshes whose vertex data changes every frame).");
+    RTX_OPTION("rtx.dx11", int, captureMaxMiBPerFrame, 24,
+               "Maximum bytes (MiB) of post-VS capture copied per frame. Bounds a single frame's GPU copy work so capture can never push one queue submission past the TDR limit.");
+    RTX_OPTION("rtx.dx11", bool, dynamicTextureHashUsesOrdinal, true,
+               "Includes a same-descriptor slot ordinal in the stable dynamic-texture identity. Slots are recycled when a texture is destroyed, so a recreated UI atlas keeps its hash across recreation.\n"
+               "Games that rotate several live buffers for one UI element get one stable hash per rotation slot - tag each slot once and the tags stick.\n"
+               "Set to false to collapse ALL dynamic textures sharing a descriptor (size/format/mips/usage) into a single identity: one tag then covers the whole rotation, at the cost of unrelated same-descriptor textures sharing that tag.");
+
     // Authenticated emulator integration (PCSX2 and other emulators publishing
     // the remix::emulator draw ABI through their D3D11 backend).
     struct Emulator {
+      RTX_OPTION("rtx.emulator", bool, enableIntegration, true,
+                 "Master switch for the authenticated emulator integration (draw-metadata ABI, per-title profiles, emulator camera synthesis/estimation).\n"
+                 "Emulator handling only ever engages for draws carrying valid sealed metadata from a known emulator, or post-transform heuristics inside a known emulator process - native PC games always take the unmodified PC path.\n"
+                 "Set to false to guarantee every draw is treated as a native PC game draw, e.g. when diagnosing whether emulator handling affects a title.");
       RTX_OPTION("rtx.emulator", float, cameraFovDegrees, 60.0f,
                  "Vertical field of view in degrees for the camera synthesized on authenticated post-transform emulator draws (e.g. PCSX2's GS output).\n"
                  "Guest post-transform geometry no longer carries the game's projection, so the runtime rebuilds one; set this to the game's real FOV for correct world proportions.\n"
@@ -420,8 +453,9 @@ namespace dxvk {
                      "Disable only to diagnose a driver compiler problem or reduce first-run compilation time; disabled variants compile asynchronously when first selected.");
       RTX_OPTION_ENV("rtx.shader", bool, prewarmOnBoot, true, "DXVK_REMIX_PREWARM",
                      "Registers the Remix path-tracing pipeline set with the asynchronous compiler during startup so required shaders are compiled before their first rendered use. Disable only when diagnosing a driver-specific compiler failure.");
-      RTX_OPTION("rtx.shader", bool, waitForPrewarmOnBoot, true,
-                 "Waits for boot shader prewarming to finish before Remix completes game initialization. The wait is bounded so a driver compiler failure cannot hang startup forever.");
+      RTX_OPTION("rtx.shader", bool, waitForPrewarmOnBoot, false,
+                 "Waits for boot shader prewarming to finish before Remix completes game initialization. The wait is bounded so a driver compiler failure cannot hang startup forever.\n"
+                 "DX11_V295: defaults OFF - on slower GPUs the full-variant prewarm can take several MINUTES (6 minutes observed on an RTX 3050), which froze the game at a black screen for that whole time. Pipelines compile in the background instead and first use is non-blocking; enable only for benchmarking or capture workflows that need every pipeline ready up front.");
       RTX_OPTION("rtx.shader", bool, showPrewarmDialog, true,
                  "Shows a responsive native Please Wait window with live shader count while boot shader prewarming is running before the game can render Remix's in-game UI.");
       RTX_OPTION_ENV("rtx.shader", bool, enableAsyncCompilation, true, "RTX_ENABLE_ASYNC_COMPILATION",

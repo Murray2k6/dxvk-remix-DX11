@@ -629,6 +629,49 @@ namespace dxvk {
       Logger::info("[Remix-DX11][init] shader prewarm disabled by configuration; pipelines will compile asynchronously on first use.");
       return false;
     }
+
+    // Prewarm belongs to the real game process. Launchers named *launcher*
+    // never reach here (DX11_V279 forwards them to system D3D11), but other
+    // helper-style processes from the game folder (updaters, crash handlers,
+    // overlay hosts) also create devices; each used to run its own prewarm
+    // pass with its own progress window and log - the "multiple prewarmers"
+    // report. Those processes never need the Remix pipeline set.
+    static const bool isHelperProcess = [] {
+      std::string executable = env::getExeName();
+      for (char& c : executable)
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+      static const char* const kHelperKeywords[] = {
+        "launcher", "updater", "bootstrap", "installer", "unins", "setup",
+        "crashhandler", "crash_handler", "crashreport", "crashpad",
+        "cef", "overlay", "redist", "eac", "battleye", "diagnostic",
+        "helper", "watchdog",
+      };
+      for (const char* keyword : kHelperKeywords) {
+        if (executable.find(keyword) != std::string::npos)
+          return true;
+      }
+      return false;
+    }();
+    if (isHelperProcess
+     && env::getEnvVar("DXVK_REMIX_FORCE_CURRENT_PROCESS") != "1") {
+      Logger::info("[Remix-DX11][init] helper/launcher-style process; skipping shader prewarm - the game process prewarms after launcher handoff (override: DXVK_REMIX_FORCE_CURRENT_PROCESS=1).");
+      return false;
+    }
+
+    // DX11_V285_PREWARM_ONCE_PER_PROCESS: emulators and engines re-create the
+    // device repeatedly (per-game boots, renderer restarts, adapter probes).
+    // Every new DxvkDevice used to re-register the complete Remix pipeline
+    // set: another full compile pass, another progress-log block every few
+    // seconds, and more pipeline memory for work already done in this
+    // process - the "multiple prewarm passes spamming the log and eating
+    // RAM" report. Register once per process; a re-created device compiles
+    // any pipeline it actually needs asynchronously on first use, served by
+    // the state and driver caches, without blocking or a progress window.
+    static std::atomic<bool> s_prewarmRegisteredThisProcess { false };
+    if (s_prewarmRegisteredThisProcess.exchange(true)) {
+      Logger::info("[Remix-DX11][init] shader prewarm already ran in this process; skipping re-registration for the re-created device.");
+      return false;
+    }
     Logger::info(str::format(
       "[Remix-DX11][init] shader prewarm ENABLED in game process after launcher handoff (allVariants=",
       RtxOptions::Shader::prewarmAllVariants() ? 1 : 0,

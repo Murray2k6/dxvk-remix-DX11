@@ -27,6 +27,7 @@
 #include "rtx/pass/nrd_args.h"
 #include "../../util/util_string.h"
 #include "../../util/util_global_time.h"
+#include "../../util/util_env.h"
 #include <Shlwapi.h>
 #include <filesystem>
 #include <vector>
@@ -78,6 +79,12 @@ namespace nrd {
       PathRemoveFileSpecW(exeDir);
 
     std::vector<std::filesystem::path> candidates;
+    // DX11_V290_RUNTIME_DIR: the dedicated Remix runtime directory is the
+    // preferred home for the satellite payload; try it before the flat
+    // game-folder locations so both layouts work.
+    wchar_t runtimeDir[MAX_PATH] = {};
+    if (dxvk::env::remixResolveRuntimeDirectoryW(runtimeDir, MAX_PATH) != 0)
+      candidates.push_back(std::filesystem::path(runtimeDir) / L"NRD.dll");
     auto addDir = [&candidates](const wchar_t* dir) {
       if (dir == nullptr || dir[0] == L'\0')
         return;

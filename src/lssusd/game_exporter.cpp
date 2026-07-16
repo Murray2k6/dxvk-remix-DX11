@@ -33,6 +33,7 @@
 #include <pxr/usd/ar/resolver.h>
 #include <pxr/usd/kind/registry.h>
 #include <pxr/usd/sdf/types.h>
+#include <pxr/usd/sdf/schema.h>
 #include <pxr/usd/usd/attribute.h>
 #include <pxr/usd/usd/modelAPI.h>
 #include <pxr/usd/usd/tokens.h>
@@ -91,6 +92,28 @@
 #endif
 
 namespace {
+// DX11_V290_RUNTIME_DIR: the USD stack (gf/sdf/usdGeom/...) is delay-loaded
+// so the payload can live in the dedicated rtx-remix\runtime directory
+// instead of flat beside the game exe. Delay-loading forbids importing DATA
+// symbols (LNK1194), which rules out the SdfValueTypeNames / UsdGeomTokens
+// tables and GfCamera's exported aperture constants. These helpers provide
+// the same values through ordinary function imports.
+pxr::SdfValueTypeName lssSdfTypeName(const char* sdfTypeName) {
+  return pxr::SdfSchema::GetInstance().FindType(pxr::TfToken(sdfTypeName));
+}
+
+// Sdf type-name strings for the SdfValueTypeNames members used in this file,
+// keyed so the AttrDescMapEntry/_SetDrawMetadata macros can paste them.
+constexpr const char* kSdfTypeName_Token = "token";
+constexpr const char* kSdfTypeName_Asset = "asset";
+constexpr const char* kSdfTypeName_Bool = "bool";
+constexpr const char* kSdfTypeName_UInt = "uint";
+
+// Literal mirrors of GfCamera::DEFAULT_HORIZONTAL/VERTICAL_APERTURE (the
+// 35mm-film standard values in USD 22.11).
+constexpr float kGfDefaultHorizontalAperture = 20.955f;
+constexpr float kGfDefaultVerticalAperture = 15.2908f;
+
 pxr::VtMatrix4dArray sanitizeBoneXforms(const pxr::VtMatrix4dArray& xforms,
                                         const pxr::VtMatrix4dArray& bindPose,
                                         const lss::Export::Meta& meta) {
@@ -285,7 +308,7 @@ void GameExporter::setCommonStageMetaData(pxr::UsdStageRefPtr stage, const Expor
     for (auto& pair : exportData.meta.renderingSettingsDict) {
       configs.push_back(pair.first + " = " + pair.second);
     }
-    settings.GetPrim().CreateAttribute(pxr::TfToken("remix_config"), pxr::SdfValueTypeNames->StringArray).Set(configs);
+    settings.GetPrim().CreateAttribute(pxr::TfToken("remix_config"), lssSdfTypeName("string[]")).Set(configs);
   }
 }
 
@@ -320,7 +343,7 @@ struct AttrDesc {
 { \
   attrEnum, \
   AttrDesc{pxr::TfToken(attrNames[attrEnum]), \
-           pxr::SdfValueTypeNames->##typeName, \
+           lssSdfTypeName(kSdfTypeName_##typeName), \
            custom, \
            pxr::SdfVariability##sdfVariability} \
 }
@@ -408,7 +431,7 @@ void GameExporter::exportMaterials(const Export& exportData, ExportContext& ctx)
     // Create and connect material outputs to shader outputs
     static const pxr::TfToken kTokOutputsMdlSurface("outputs:mdl:surface");
     const auto outputsMdlSurfaceAttr =
-      matPrim.CreateAttribute(kTokOutputsMdlSurface, pxr::SdfValueTypeNames->Token, false, pxr::SdfVariabilityVarying);
+      matPrim.CreateAttribute(kTokOutputsMdlSurface, lssSdfTypeName("token"), false, pxr::SdfVariabilityVarying);
     outputsMdlSurfaceAttr.AddConnection(shaderAttrs[ShaderAttr::OutputsOut].GetPath(), pxr::UsdListPositionFrontOfAppendList);
 
     // Set shader "Kind"
@@ -623,7 +646,7 @@ void GameExporter::exportMeshes(const Export& exportData, ExportContext& ctx) {
     // Set orientation attribute
     auto orientationAttr = meshSchema.CreateOrientationAttr();
     assert(orientationAttr);
-    orientationAttr.Set(pxr::VtValue(pxr::UsdGeomTokens->rightHanded));
+    orientationAttr.Set(pxr::VtValue(pxr::TfToken("rightHanded")));
 
     // Create corresponding attribute arrays using above populated VtArrays
     pxr::VtArray<int> faceVertexCounts;
@@ -633,7 +656,7 @@ void GameExporter::exportMeshes(const Export& exportData, ExportContext& ctx) {
     faceVertexCountsAttr.Set(faceVertexCounts);
 
     for (auto& pair : mesh.categoryFlags) {
-      const auto attribute = meshSchema.GetPrim().CreateAttribute(pxr::TfToken(pair.first), pxr::SdfValueTypeNames->Bool, true, pxr::SdfVariabilityUniform);
+      const auto attribute = meshSchema.GetPrim().CreateAttribute(pxr::TfToken(pair.first), lssSdfTypeName("bool"), true, pxr::SdfVariabilityUniform);
       attribute.Set(pxr::VtValue(pair.second));
     }
 
@@ -656,23 +679,23 @@ void GameExporter::exportMeshes(const Export& exportData, ExportContext& ctx) {
     // Set subdivision scheme to None (USD defaults to catmull clark)
     auto subdivAttr = meshSchema.CreateSubdivisionSchemeAttr();
     assert(subdivAttr);
-    subdivAttr.Set(pxr::UsdGeomTokens->none);
+    subdivAttr.Set(pxr::TfToken("none"));
     // Texture Coordinates
     static const pxr::TfToken kTokSt("st");
-    auto stAttr = primvarsAPI.CreatePrimvar(kTokSt, pxr::SdfValueTypeNames->TexCoord2fArray, pxr::UsdGeomTokens->vertex);
+    auto stAttr = primvarsAPI.CreatePrimvar(kTokSt, lssSdfTypeName("texCoord2f[]"), pxr::TfToken("vertex"));
     assert(stAttr);
     exportBufferSet(reduce ? reduceBufferSet(mesh.buffers.texcoordBufs, reducedIdxBufSet) : mesh.buffers.texcoordBufs, stAttr);
 
     // Vertex Colors
     if (mesh.buffers.colorBufs.size() > 0) {
-      auto displayColorPrimvar = meshSchema.CreateDisplayColorPrimvar(pxr::UsdGeomTokens->vertex);
-      auto displayOpacityPrimvar = meshSchema.CreateDisplayOpacityPrimvar(pxr::UsdGeomTokens->vertex);
+      auto displayColorPrimvar = meshSchema.CreateDisplayColorPrimvar(pxr::TfToken("vertex"));
+      auto displayOpacityPrimvar = meshSchema.CreateDisplayOpacityPrimvar(pxr::TfToken("vertex"));
       assert(displayColorPrimvar);
       assert(displayOpacityPrimvar);
       if (mesh.buffers.colorBufs.cbegin()->second.size() == 1) {
         // Constant Color
-        displayColorPrimvar.SetInterpolation(pxr::UsdGeomTokens->constant);
-        displayOpacityPrimvar.SetInterpolation(pxr::UsdGeomTokens->constant);
+        displayColorPrimvar.SetInterpolation(pxr::TfToken("constant"));
+        displayOpacityPrimvar.SetInterpolation(pxr::TfToken("constant"));
       }
       exportColorOpacityBufferSet(reduce ? reduceBufferSet(mesh.buffers.colorBufs, reducedIdxBufSet) : mesh.buffers.colorBufs, displayColorPrimvar, displayOpacityPrimvar);
     }
@@ -925,7 +948,7 @@ void GameExporter::exportInstances(const Export& exportData, ExportContext& ctx)
       pxr::UsdGeomMesh meshSchema = pxr::UsdGeomMesh::Define(ctx.instanceStage, meshSchemaSdfPath);
       pxr::UsdGeomPrimvarsAPI primvarsAPI(meshSchema.GetPrim());
 
-#define _SetDrawMetadata(name, type)  primvarsAPI.CreatePrimvar(pxr::TfToken("_remix_metadata:" #name), pxr::SdfValueTypeNames->##type).Set(pxr::VtValue(instanceData.metadata.##name))
+#define _SetDrawMetadata(name, type)  primvarsAPI.CreatePrimvar(pxr::TfToken("_remix_metadata:" #name), lssSdfTypeName(kSdfTypeName_##type)).Set(pxr::VtValue(instanceData.metadata.##name))
       _SetDrawMetadata(alphaTestEnabled, Bool);
       _SetDrawMetadata(alphaTestReferenceValue, UInt);
       _SetDrawMetadata(alphaTestCompareOp, UInt);
@@ -966,13 +989,17 @@ void GameExporter::exportCamera(const Export& exportData, ExportContext& ctx) {
   const pxr::SdfPath cameraSdfPath = gRootCamerasPath.AppendChild(kTokCamera);
   auto geomCamera = pxr::UsdGeomCamera::Define(ctx.instanceStage, cameraSdfPath);
 
-  // Create Gf Camera which will convert FOV + Aspect Ratio -> Usd Camera Attributes
-  pxr::GfCamera simpleCam;
+  // Create Gf Camera which will convert FOV + Aspect Ratio -> Usd Camera Attributes.
+  // The aperture arguments are passed explicitly (default arguments would
+  // import GfCamera's exported data constants and break gf.dll delay-loading).
+  pxr::GfCamera simpleCam(pxr::GfMatrix4d(1.0), pxr::GfCamera::Perspective,
+                          kGfDefaultHorizontalAperture, kGfDefaultVerticalAperture);
   simpleCam.SetPerspectiveFromAspectRatioAndFieldOfView(
     exportData.camera.aspectRatio,
     // Note: USD expects vertical FoV in this case in degrees, not radians like we store.
     exportData.camera.fov * (180.0f / M_PI),
-    pxr::GfCamera::FOVVertical
+    pxr::GfCamera::FOVVertical,
+    kGfDefaultHorizontalAperture
   );
 
   // Set horizontal aperture

@@ -40,7 +40,13 @@ namespace dxvk {
 
     void InitUavCounter(
             D3D11UnorderedAccessView*   pUav);
-    
+
+    // DX11_V294_STABLE_HASH_SLOTS: same-descriptor slot allocator for the
+    // dynamic-texture identity ordinal. Slots are recycled at texture
+    // destruction so recreated atlases keep their hash across recreation.
+    static uint32_t AcquireDynamicTextureSlot(uint64_t descriptorHash);
+    static void ReleaseDynamicTextureSlot(uint64_t descriptorHash, uint32_t ordinal);
+
   private:
 
     dxvk::mutex       m_mutex;
@@ -73,6 +79,11 @@ namespace dxvk {
     void InitTextureContentHash(
             D3D11CommonTexture*         pTexture,
       const D3D11_SUBRESOURCE_DATA*     pInitialData);
+    // NV-DXVK end
+
+    // NV-DXVK start: DX11_V288_STABLE_DYNAMIC_TEXTURE_HASH
+    void InitDynamicTextureStableHash(
+            D3D11CommonTexture*         pTexture);
     // NV-DXVK end
 
     void FlushImplicit();

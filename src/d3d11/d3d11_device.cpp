@@ -1,4 +1,6 @@
 #include <algorithm>
+#include <cctype>
+#include <chrono>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -29,6 +31,8 @@
 
 // DX11_V230: for RtxOptions::Create() (root singleton init before DxvkDevice construction)
 #include "../dxvk/rtx_render/rtx_options.h"
+// DX11_V292_PRECOMPILER_WIDGET: dev-menu driven on-demand shader precompile
+#include "../dxvk/rtx_render/rtx_shader_precompiler.h"
 
 namespace dxvk {
   
@@ -43,6 +47,369 @@ namespace dxvk {
       // real device without recompiling the complete title cache each time.
       static D3D11ShaderModuleSet modules;
       return modules;
+    }
+
+    // DX11_V286_GAME_SHADER_SCAN: game-wide shader harvesting at boot.
+    // The .dxbc cache only knows shaders the game already created in an
+    // earlier session, so a first playthrough still compiles at first use -
+    // the mid-game stall that forces players to exit. This scanner reads the
+    // game's own data files once, extracts every embedded DXBC container
+    // (validated header, chunk table, and SHDR/SHEX program type), and stores
+    // each one in the regular d3d11-shaders cache under its canonical shader
+    // key. The boot preload that runs immediately afterwards then compiles
+    // the complete set game-wide before the game's menu is even shown. The
+    // scan is time-budgeted and resumable across launches
+    // (game-shader-scan.marker), and DXVK_GAME_SHADER_SCAN=0 disables it.
+
+    // Launcher/helper processes load this d3d11.dll from the game folder too.
+    // "*launcher*" exes are already forwarded wholesale to the system D3D11
+    // (DX11_V279_LAUNCHER_BYPASS); this catches the remaining helper-style
+    // processes so the game-wide shader scan and cache preload only run in
+    // the REAL game process after the launcher hands off - a launcher must
+    // never burn the scan budget, pop the compile window, or write its own
+    // scan marker.
+    bool isHelperOrLauncherProcess() {
+      static const bool result = [] {
+        std::string executable = env::getExeNameNoSuffix();
+        for (char& c : executable)
+          c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        static const char* const kHelperKeywords[] = {
+          "launcher", "updater", "bootstrap", "installer", "unins", "setup",
+          "crashhandler", "crash_handler", "crashreport", "crashpad",
+          "cef", "overlay", "redist", "eac", "battleye", "diagnostic",
+          "helper", "watchdog",
+        };
+        for (const char* keyword : kHelperKeywords) {
+          if (executable.find(keyword) != std::string::npos)
+            return true;
+        }
+        return false;
+      }();
+      return result;
+    }
+
+    bool gameShaderScanSkippedExtension(const std::filesystem::path& path) {
+      static const char* const kSkipped[] = {
+        // Media containers never hold DXBC and dominate game-directory bytes.
+        ".png", ".jpg", ".jpeg", ".dds", ".tga", ".bmp", ".gif", ".webp",
+        ".wav", ".ogg", ".mp3", ".wem", ".bnk", ".opus", ".flac",
+        ".bik", ".bk2", ".webm", ".mp4", ".avi", ".wmv", ".mov",
+        // Executables (including this runtime's own satellites) and symbols.
+        ".exe", ".dll", ".pdb", ".ilk", ".sys",
+        // Text/config/scripts.
+        ".txt", ".log", ".ini", ".json", ".xml", ".cfg", ".conf", ".md",
+        ".lua", ".py", ".js", ".html", ".css", ".yaml", ".yml",
+        // Solid-compressed archives: embedded DXBC is not byte-visible.
+        ".zip", ".7z", ".rar", ".gz",
+        // Fonts and save-ish data.
+        ".ttf", ".otf", ".fnt", ".sav",
+      };
+      std::string extension = path.extension().string();
+      for (char& c : extension)
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+      for (const char* skipped : kSkipped) {
+        if (extension == skipped)
+          return true;
+      }
+      return false;
+    }
+
+    // Validates a candidate DXBC container's chunk table and derives its
+    // pipeline stage from the SHDR/SHEX program-type token. Non-compute
+    // shaders additionally require an input signature (ISGN/ISG1) - stripped
+    // blobs without one cannot be compiled.
+    VkShaderStageFlagBits classifyDxbcBlob(const uint8_t* blob, uint32_t blobSize) {
+      constexpr VkShaderStageFlagBits kInvalid = VK_SHADER_STAGE_FLAG_BITS_MAX_ENUM;
+      if (blobSize < 0x40u)
+        return kInvalid;
+      const auto readU32 = [blob](size_t offset) {
+        uint32_t value;
+        std::memcpy(&value, blob + offset, sizeof(value));
+        return value;
+      };
+      const uint32_t chunkCount = readU32(0x1Cu);
+      if (chunkCount == 0u || chunkCount > 64u)
+        return kInvalid;
+      const size_t chunkTableEnd = 0x20u + size_t(chunkCount) * 4u;
+      if (chunkTableEnd > blobSize)
+        return kInvalid;
+
+      bool hasInputSignature = false;
+      uint32_t programType = ~0u;
+      for (uint32_t chunk = 0; chunk < chunkCount; ++chunk) {
+        const uint32_t offset = readU32(0x20u + size_t(chunk) * 4u);
+        if (offset < chunkTableEnd || offset > blobSize - 8u)
+          return kInvalid;
+        const uint32_t fourCc = readU32(offset);
+        const uint32_t chunkSize = readU32(offset + 4u);
+        if (chunkSize > blobSize - offset - 8u)
+          return kInvalid;
+        if (fourCc == 0x4e475349u /* 'ISGN' */ || fourCc == 0x31475349u /* 'ISG1' */)
+          hasInputSignature = true;
+        if ((fourCc == 0x52444853u /* 'SHDR' */ || fourCc == 0x58454853u /* 'SHEX' */)
+         && chunkSize >= 4u)
+          programType = readU32(offset + 8u) >> 16;
+      }
+
+      switch (programType) {
+        case 0u: return hasInputSignature ? VK_SHADER_STAGE_FRAGMENT_BIT : kInvalid;
+        case 1u: return hasInputSignature ? VK_SHADER_STAGE_VERTEX_BIT : kInvalid;
+        case 2u: return hasInputSignature ? VK_SHADER_STAGE_GEOMETRY_BIT : kInvalid;
+        case 3u: return hasInputSignature ? VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT : kInvalid;
+        case 4u: return hasInputSignature ? VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT : kInvalid;
+        case 5u: return VK_SHADER_STAGE_COMPUTE_BIT;
+        default: return kInvalid;
+      }
+    }
+
+    bool extractDxbcBlobAt(
+        const std::filesystem::path& path,
+        uint64_t offset,
+        uintmax_t fileSize,
+        std::vector<char>& blob,
+        VkShaderStageFlagBits& stage) {
+      constexpr uint32_t kMaximumBlobSize = 8u << 20;
+      if (offset + 0x40u > fileSize)
+        return false;
+
+      std::ifstream input(path, std::ios::in | std::ios::binary);
+      if (!input)
+        return false;
+      char header[0x20] = {};
+      input.seekg(static_cast<std::streamoff>(offset));
+      input.read(header, sizeof(header));
+      if (!input || static_cast<size_t>(input.gcount()) != sizeof(header))
+        return false;
+
+      uint32_t containerVersion = 0;
+      uint32_t totalSize = 0;
+      std::memcpy(&containerVersion, header + 0x14, sizeof(containerVersion));
+      std::memcpy(&totalSize, header + 0x18, sizeof(totalSize));
+      if (containerVersion != 1u
+       || totalSize < 0x40u || totalSize > kMaximumBlobSize
+       || offset + totalSize > fileSize)
+        return false;
+
+      blob.resize(totalSize);
+      input.seekg(static_cast<std::streamoff>(offset));
+      input.read(blob.data(), static_cast<std::streamsize>(totalSize));
+      if (!input || static_cast<size_t>(input.gcount()) != totalSize)
+        return false;
+
+      stage = classifyDxbcBlob(
+        reinterpret_cast<const uint8_t*>(blob.data()), totalSize);
+      return stage != VK_SHADER_STAGE_FLAG_BITS_MAX_ENUM;
+    }
+
+    bool storeScannedShader(
+        const std::filesystem::path& cacheDirectory,
+        const DxvkShaderKey& shaderKey,
+        const std::vector<char>& blob) {
+      const std::filesystem::path target =
+        cacheDirectory / (shaderKey.toString() + ".dxbc");
+      std::error_code error;
+      if (std::filesystem::exists(target, error) && !error)
+        return false; // already harvested or created by a previous session
+
+      std::filesystem::path temporary = target;
+      temporary += str::format(".tmp.", GetCurrentProcessId());
+      {
+        std::ofstream output(
+          temporary, std::ios::out | std::ios::binary | std::ios::trunc);
+        output.write(blob.data(), static_cast<std::streamsize>(blob.size()));
+        output.flush();
+        if (!output) {
+          output.close();
+          std::filesystem::remove(temporary, error);
+          return false;
+        }
+      }
+      std::filesystem::rename(temporary, target, error);
+      if (error) {
+        std::error_code cleanupError;
+        std::filesystem::remove(temporary, cleanupError);
+        return false;
+      }
+      return true;
+    }
+
+    uint32_t scanGameDataForShaders(
+        const std::filesystem::path& gameRoot,
+        const std::filesystem::path& cacheDirectory,
+        uint64_t budgetOverrideMs = 0u,
+        bool ignoreResumeMarker = false) {
+      constexpr uintmax_t kMaximumFileSize = 2ull << 30;
+      uint64_t budgetMs = 45000u;
+      const std::string budgetOverride =
+        env::getEnvVar("DXVK_GAME_SHADER_SCAN_BUDGET_MS");
+      if (!budgetOverride.empty()) {
+        const long long parsed = std::atoll(budgetOverride.c_str());
+        if (parsed > 0)
+          budgetMs = static_cast<uint64_t>(parsed);
+      }
+      if (budgetOverrideMs != 0u)
+        budgetMs = budgetOverrideMs;
+
+      // Deterministic, sorted candidate list so the resume marker can
+      // continue an interrupted scan on the next launch.
+      std::vector<std::filesystem::path> files;
+      uintmax_t totalBytes = 0;
+      std::error_code walkError;
+      std::filesystem::recursive_directory_iterator iterator(
+        gameRoot, std::filesystem::directory_options::skip_permission_denied,
+        walkError);
+      const std::filesystem::recursive_directory_iterator end;
+      while (!walkError && iterator != end) {
+        const std::filesystem::directory_entry& entry = *iterator;
+        std::error_code entryError;
+        if (entry.is_directory(entryError) && !entryError) {
+          const std::string name = entry.path().filename().string();
+          if (name == "rtx-remix" || name == ".git")
+            iterator.disable_recursion_pending();
+        } else if (entry.is_regular_file(entryError) && !entryError
+                && !gameShaderScanSkippedExtension(entry.path())) {
+          const uintmax_t size = entry.file_size(entryError);
+          if (!entryError && size >= 0x40u && size <= kMaximumFileSize) {
+            files.push_back(entry.path());
+            totalBytes += size;
+          }
+        }
+        iterator.increment(walkError);
+      }
+      std::sort(files.begin(), files.end());
+
+      const std::filesystem::path markerPath =
+        cacheDirectory / "game-shader-scan.marker";
+      size_t resumeIndex = 0;
+      if (!ignoreResumeMarker) {
+        std::ifstream marker(markerPath);
+        std::string tag;
+        uint64_t markerFiles = 0, markerBytes = 0, markerNext = 0;
+        if (marker >> tag >> markerFiles >> markerBytes >> markerNext
+         && tag == "v1"
+         && markerFiles == files.size() && markerBytes == totalBytes) {
+          if (markerNext >= files.size())
+            return 0u; // this game version was already scanned to completion
+          resumeIndex = static_cast<size_t>(markerNext);
+        }
+      }
+
+      Logger::info(str::format(
+        "[Remix-DX11][game-shader-scan] scanning game data for embedded shader bytecode: files=",
+        files.size(), " totalMiB=", totalBytes >> 20,
+        " startIndex=", resumeIndex, " budgetMs=", budgetMs,
+        " (resumes next launch if the budget runs out)"));
+
+      const auto nowMs = [] {
+        return static_cast<uint64_t>(
+          std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count());
+      };
+      const uint64_t startMs = nowMs();
+      uint64_t lastLogMs = startMs;
+      uint32_t extracted = 0;
+      uint32_t candidateBlobs = 0;
+      bool budgetExhausted = false;
+
+      std::vector<char> block(8u << 20);
+      std::vector<char> blob;
+      size_t fileIndex = resumeIndex;
+      for (; fileIndex < files.size(); ++fileIndex) {
+        if (nowMs() - startMs >= budgetMs
+         || RtxShaderPrecompiler::cancelRequested()) {
+          budgetExhausted = true;
+          break;
+        }
+        RtxShaderPrecompiler::reportScanProgress(
+          uint32_t(fileIndex), uint32_t(files.size()), extracted);
+
+        const std::filesystem::path& path = files[fileIndex];
+        std::error_code sizeError;
+        const uintmax_t fileSize = std::filesystem::file_size(path, sizeError);
+        if (sizeError || fileSize < 0x40u)
+          continue;
+        std::ifstream input(path, std::ios::in | std::ios::binary);
+        if (!input)
+          continue;
+
+        uint64_t blockBase = 0;
+        size_t carry = 0;
+        while (input && !budgetExhausted) {
+          input.read(block.data() + carry,
+            static_cast<std::streamsize>(block.size() - carry));
+          const size_t available = carry + static_cast<size_t>(input.gcount());
+          if (available < 4u)
+            break;
+
+          size_t scanPos = 0;
+          while (scanPos + 4u <= available) {
+            const void* candidate = std::memchr(
+              block.data() + scanPos, 'D', available - scanPos - 3u);
+            if (candidate == nullptr) {
+              scanPos = available;
+              break;
+            }
+            const size_t hit =
+              static_cast<const char*>(candidate) - block.data();
+            if (std::memcmp(block.data() + hit, "DXBC", 4u) != 0) {
+              scanPos = hit + 1u;
+              continue;
+            }
+            ++candidateBlobs;
+            VkShaderStageFlagBits stage = VK_SHADER_STAGE_FLAG_BITS_MAX_ENUM;
+            if (extractDxbcBlobAt(path, blockBase + hit, fileSize, blob, stage)) {
+              const DxvkShaderKey shaderKey(
+                stage, Sha1Hash::compute(blob.data(), blob.size()));
+              if (storeScannedShader(cacheDirectory, shaderKey, blob))
+                ++extracted;
+            }
+            scanPos = hit + 4u;
+          }
+
+          const uint64_t elapsed = nowMs() - startMs;
+          if (elapsed >= budgetMs
+           || RtxShaderPrecompiler::cancelRequested()) {
+            budgetExhausted = true;
+            break;
+          }
+          if (nowMs() - lastLogMs >= 5000u) {
+            lastLogMs = nowMs();
+            Logger::info(str::format(
+              "[Remix-DX11][game-shader-scan] progress: file=", fileIndex + 1u,
+              "/", files.size(), " newShaders=", extracted,
+              " elapsedMs=", elapsed));
+          }
+
+          if (input.eof())
+            break;
+          const size_t keep = available >= 3u ? 3u : available;
+          std::memmove(block.data(), block.data() + available - keep, keep);
+          blockBase += available - keep;
+          carry = keep;
+        }
+
+        // A mid-file budget stop must resume from THIS file next launch, not
+        // skip its unscanned tail; already-extracted blobs dedupe on rescan.
+        if (budgetExhausted)
+          break;
+      }
+
+      {
+        std::ofstream marker(markerPath, std::ios::trunc);
+        marker << "v1 " << files.size() << ' ' << totalBytes << ' '
+               << fileIndex << '\n';
+      }
+
+      RtxShaderPrecompiler::reportScanProgress(
+        uint32_t(fileIndex), uint32_t(files.size()), extracted);
+      Logger::info(str::format(
+        "[Remix-DX11][game-shader-scan] ", budgetExhausted ? "paused (budget)" : "complete",
+        ": examinedFiles=", fileIndex - resumeIndex,
+        " candidateBlobs=", candidateBlobs,
+        " newShaders=", extracted,
+        " elapsedMs=", nowMs() - startMs,
+        budgetExhausted ? " - the scan resumes from this point on the next launch." : ""));
+      return extracted;
     }
   }
 
@@ -63,10 +430,23 @@ namespace dxvk {
     m_initializer = new D3D11Initializer(this);
     m_context     = new D3D11ImmediateContext(this, m_dxvkDevice);
     PrewarmCachedGameShaders();
+
+    // DX11_V292_PRECOMPILER_WIDGET: expose the on-demand precompile job to
+    // the Remix developer menu. Helper/launcher processes never register.
+    if (env::getEnvVar("DXVK_GAME_SHADER_CACHE") != "0"
+     && (!isHelperOrLauncherProcess()
+      || env::getEnvVar("DXVK_REMIX_FORCE_CURRENT_PROCESS") == "1")) {
+      RtxShaderPrecompiler::setRunner(this, [this](bool fullRescan) {
+        RunShaderPrecompileJob(fullRescan);
+      });
+    }
   }
-  
-  
+
+
   D3D11Device::~D3D11Device() {
+    // Blocks until any in-flight precompile job has finished so its worker
+    // can never touch a destroyed device.
+    RtxShaderPrecompiler::clearRunner(this);
     m_context = nullptr;
     delete m_initializer;
   }
@@ -88,10 +468,35 @@ namespace dxvk {
       return;
     }
 
+    // Prewarm belongs to the real game process, not to a launcher or helper
+    // that happens to create a D3D11 device from the same folder first.
+    if (isHelperOrLauncherProcess()
+     && env::getEnvVar("DXVK_REMIX_FORCE_CURRENT_PROCESS") != "1") {
+      Logger::info(str::format(
+        "[Remix-DX11][game-shader-cache] helper/launcher-style process '",
+        env::getExeName(),
+        "' detected; skipping shader scan and preload. The game process prewarms after launcher handoff (override: DXVK_REMIX_FORCE_CURRENT_PROCESS=1)."));
+      return;
+    }
+
     constexpr uintmax_t kMaximumShaderSize = 8u << 20;
     const std::filesystem::path cacheDirectory =
       std::filesystem::path(env::getExePath()).parent_path()
       / "rtx-remix" / "cache" / "d3d11-shaders";
+
+    // DX11_V286_GAME_SHADER_SCAN: harvest DXBC embedded in the game's own
+    // data files into the cache BEFORE enumerating it, so even the very
+    // first boot compiles the game's shaders game-wide during startup
+    // instead of stalling at each first use in gameplay.
+    if (env::getEnvVar("DXVK_GAME_SHADER_SCAN") != "0") {
+      std::error_code scanDirectoryError;
+      std::filesystem::create_directories(cacheDirectory, scanDirectoryError);
+      if (!scanDirectoryError) {
+        scanGameDataForShaders(
+          std::filesystem::path(env::getExePath()).parent_path(),
+          cacheDirectory);
+      }
+    }
 
     std::error_code error;
     if (!std::filesystem::exists(cacheDirectory, error) || error)
@@ -127,74 +532,160 @@ namespace dxvk {
 
     m_dxvkDevice->getCommon()->getRtxInitializer().prewarmCachedGameShaders(
       static_cast<uint32_t>(cacheFiles.size()),
-      [this, &cacheFiles, &loadedShaders, &rejectedShaders,
-       kMaximumShaderSize](
+      [this, &cacheFiles, &loadedShaders, &rejectedShaders](
           const std::function<void(uint32_t)>& updateProgress) {
-        for (size_t i = 0; i < cacheFiles.size(); ++i) {
-          const std::filesystem::path& path = cacheFiles[i];
-          VkShaderStageFlagBits stage = VK_SHADER_STAGE_FLAG_BITS_MAX_ENUM;
-          const std::string filename = path.filename().string();
-          if      (filename.rfind("VS_",  0) == 0) stage = VK_SHADER_STAGE_VERTEX_BIT;
-          else if (filename.rfind("TCS_", 0) == 0) stage = VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT;
-          else if (filename.rfind("TES_", 0) == 0) stage = VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT;
-          else if (filename.rfind("GS_",  0) == 0) stage = VK_SHADER_STAGE_GEOMETRY_BIT;
-          else if (filename.rfind("FS_",  0) == 0) stage = VK_SHADER_STAGE_FRAGMENT_BIT;
-          else if (filename.rfind("CS_",  0) == 0) stage = VK_SHADER_STAGE_COMPUTE_BIT;
-
-          std::vector<char> bytecode;
-          if (stage != VK_SHADER_STAGE_FLAG_BITS_MAX_ENUM) {
-            std::error_code fileError;
-            const uintmax_t fileSize = std::filesystem::file_size(path, fileError);
-            if (!fileError && fileSize > 0u && fileSize <= kMaximumShaderSize) {
-              bytecode.resize(static_cast<size_t>(fileSize));
-              std::ifstream input(path, std::ios::in | std::ios::binary);
-              input.read(bytecode.data(), static_cast<std::streamsize>(bytecode.size()));
-              if (!input || static_cast<size_t>(input.gcount()) != bytecode.size())
-                bytecode.clear();
-            }
-          }
-
-          bool loaded = false;
-          if (!bytecode.empty()) {
-            const DxvkShaderKey shaderKey(
-              stage, Sha1Hash::compute(bytecode.data(), bytecode.size()));
-            if (path.stem().string() == shaderKey.toString()) {
-              DxbcTessInfo tessInfo;
-              tessInfo.maxTessFactor = float(m_d3d11Options.maxTessFactor);
-              DxbcModuleInfo moduleInfo;
-              moduleInfo.options = m_dxbcOptions;
-              moduleInfo.tess = stage == VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT
-                             && tessInfo.maxTessFactor >= 8.0f
-                ? &tessInfo : nullptr;
-              moduleInfo.xfb = nullptr;
-
-              D3D11CommonShader module;
-              loaded = SUCCEEDED(CreateShaderModule(
-                &module, shaderKey, bytecode.data(), bytecode.size(),
-                nullptr, &moduleInfo));
-            }
-          }
-
-          if (loaded) {
-            ++loadedShaders;
-          } else {
-            ++rejectedShaders;
-            Logger::warn(str::format(
-              "[Remix-DX11][game-shader-cache] rejected invalid cache entry '",
-              path.string(), "'."));
-            std::error_code removeError;
-            std::filesystem::remove(path, removeError);
-          }
-
-          updateProgress(static_cast<uint32_t>(cacheFiles.size() - i - 1u));
-        }
+        LoadGameShaderCacheFiles(
+          cacheFiles, updateProgress, loadedShaders, rejectedShaders);
       });
 
+    RtxShaderPrecompiler::reportCacheCounts(
+      static_cast<uint32_t>(cacheFiles.size()), loadedShaders, rejectedShaders);
     Logger::info(str::format(
       "[Remix-DX11][game-shader-cache] executable='", env::getExeName(),
       "' directory='", cacheDirectory.string(), "' discovered=",
       cacheFiles.size(), " loaded=", loadedShaders,
       " rejected=", rejectedShaders));
+  }
+
+
+  void D3D11Device::LoadGameShaderCacheFiles(
+      const std::vector<std::filesystem::path>& cacheFiles,
+      const std::function<void(uint32_t)>&      updateProgress,
+      uint32_t&                                 loadedShaders,
+      uint32_t&                                 rejectedShaders) {
+    constexpr uintmax_t kMaximumShaderSize = 8u << 20;
+    for (size_t i = 0; i < cacheFiles.size(); ++i) {
+      if (RtxShaderPrecompiler::cancelRequested())
+        break;
+
+      const std::filesystem::path& path = cacheFiles[i];
+      VkShaderStageFlagBits stage = VK_SHADER_STAGE_FLAG_BITS_MAX_ENUM;
+      const std::string filename = path.filename().string();
+      if      (filename.rfind("VS_",  0) == 0) stage = VK_SHADER_STAGE_VERTEX_BIT;
+      else if (filename.rfind("TCS_", 0) == 0) stage = VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT;
+      else if (filename.rfind("TES_", 0) == 0) stage = VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT;
+      else if (filename.rfind("GS_",  0) == 0) stage = VK_SHADER_STAGE_GEOMETRY_BIT;
+      else if (filename.rfind("FS_",  0) == 0) stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+      else if (filename.rfind("CS_",  0) == 0) stage = VK_SHADER_STAGE_COMPUTE_BIT;
+
+      std::vector<char> bytecode;
+      if (stage != VK_SHADER_STAGE_FLAG_BITS_MAX_ENUM) {
+        std::error_code fileError;
+        const uintmax_t fileSize = std::filesystem::file_size(path, fileError);
+        if (!fileError && fileSize > 0u && fileSize <= kMaximumShaderSize) {
+          bytecode.resize(static_cast<size_t>(fileSize));
+          std::ifstream input(path, std::ios::in | std::ios::binary);
+          input.read(bytecode.data(), static_cast<std::streamsize>(bytecode.size()));
+          if (!input || static_cast<size_t>(input.gcount()) != bytecode.size())
+            bytecode.clear();
+        }
+      }
+
+      bool loaded = false;
+      if (!bytecode.empty()) {
+        const DxvkShaderKey shaderKey(
+          stage, Sha1Hash::compute(bytecode.data(), bytecode.size()));
+        if (path.stem().string() == shaderKey.toString()) {
+          DxbcTessInfo tessInfo;
+          tessInfo.maxTessFactor = float(m_d3d11Options.maxTessFactor);
+          DxbcModuleInfo moduleInfo;
+          moduleInfo.options = m_dxbcOptions;
+          moduleInfo.tess = stage == VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT
+                         && tessInfo.maxTessFactor >= 8.0f
+            ? &tessInfo : nullptr;
+          moduleInfo.xfb = nullptr;
+
+          D3D11CommonShader module;
+          loaded = SUCCEEDED(CreateShaderModule(
+            &module, shaderKey, bytecode.data(), bytecode.size(),
+            nullptr, &moduleInfo));
+        }
+      }
+
+      if (loaded) {
+        ++loadedShaders;
+      } else {
+        ++rejectedShaders;
+        Logger::warn(str::format(
+          "[Remix-DX11][game-shader-cache] rejected invalid cache entry '",
+          path.string(), "'."));
+        std::error_code removeError;
+        std::filesystem::remove(path, removeError);
+      }
+
+      updateProgress(static_cast<uint32_t>(cacheFiles.size() - i - 1u));
+    }
+  }
+
+
+  // DX11_V292_PRECOMPILER_WIDGET: dev-menu driven precompile. Mirrors the
+  // Fossilize / Steam shader pre-caching model on top of this runtime's own
+  // pieces: (optionally) harvest every DXBC container from the game's data
+  // files, then compile the complete cache; already-compiled shaders dedupe
+  // through the shared module set, and pipeline warmth accumulates in the
+  // DXVK state cache for every later launch.
+  void D3D11Device::RunShaderPrecompileJob(bool fullRescan) {
+    const std::filesystem::path cacheDirectory =
+      std::filesystem::path(env::getExePath()).parent_path()
+      / "rtx-remix" / "cache" / "d3d11-shaders";
+
+    if (fullRescan && !RtxShaderPrecompiler::cancelRequested()) {
+      RtxShaderPrecompiler::setPhase(RtxShaderPrecompiler::Phase::Scanning);
+      std::error_code directoryError;
+      std::filesystem::create_directories(cacheDirectory, directoryError);
+      if (!directoryError) {
+        // Generous budget: this is an explicit user action with visible
+        // progress, not a boot-time tax.
+        scanGameDataForShaders(
+          std::filesystem::path(env::getExePath()).parent_path(),
+          cacheDirectory,
+          15u * 60u * 1000u,
+          /* ignoreResumeMarker */ true);
+      }
+    }
+
+    if (RtxShaderPrecompiler::cancelRequested())
+      return;
+    RtxShaderPrecompiler::setPhase(RtxShaderPrecompiler::Phase::Compiling);
+
+    constexpr uintmax_t kMaximumShaderSize = 8u << 20;
+    std::vector<std::filesystem::path> cacheFiles;
+    std::error_code error;
+    std::filesystem::directory_iterator iterator(cacheDirectory, error);
+    const std::filesystem::directory_iterator end;
+    while (!error && iterator != end) {
+      const auto& entry = *iterator;
+      std::error_code entryError;
+      if (entry.is_regular_file(entryError) && !entryError
+       && entry.path().extension() == ".dxbc") {
+        const uintmax_t size = entry.file_size(entryError);
+        if (!entryError && size > 0u && size <= kMaximumShaderSize)
+          cacheFiles.push_back(entry.path());
+      }
+      iterator.increment(error);
+    }
+    std::sort(cacheFiles.begin(), cacheFiles.end());
+
+    uint32_t loadedShaders = 0u;
+    uint32_t rejectedShaders = 0u;
+    const uint32_t total = static_cast<uint32_t>(cacheFiles.size());
+    RtxShaderPrecompiler::reportCacheCounts(total, 0u, 0u);
+
+    LoadGameShaderCacheFiles(
+      cacheFiles,
+      [total, &loadedShaders, &rejectedShaders](uint32_t) {
+        RtxShaderPrecompiler::reportCacheCounts(
+          total, loadedShaders, rejectedShaders);
+      },
+      loadedShaders, rejectedShaders);
+
+    RtxShaderPrecompiler::reportCacheCounts(total, loadedShaders, rejectedShaders);
+    Logger::info(str::format(
+      "[Remix-DX11][precompiler] job finished: fullRescan=", fullRescan ? 1 : 0,
+      " cachedShaders=", total,
+      " loaded=", loadedShaders,
+      " rejected=", rejectedShaders,
+      RtxShaderPrecompiler::cancelRequested() ? " (cancelled)" : ""));
   }
   
   

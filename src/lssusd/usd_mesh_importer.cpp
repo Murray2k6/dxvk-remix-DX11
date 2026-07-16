@@ -364,18 +364,18 @@ namespace lss {
         sampler = new TriangleVertexSampler(data, usdIndices, elementSize);
       } else {
         TfToken interpolation = pv.GetInterpolation();
-        if (interpolation == UsdGeomTokens->constant) {
+        if (interpolation == pxr::TfToken("constant")) {
           sampler = new ConstantSampler(data, elementSize);
-        } else if (interpolation == UsdGeomTokens->uniform) {
+        } else if (interpolation == pxr::TfToken("uniform")) {
           sampler = new UniformSampler(data, trianglePrimitiveParams, elementSize);
-        } else if (interpolation == UsdGeomTokens->vertex || interpolation == UsdGeomTokens->varying) {
+        } else if (interpolation == pxr::TfToken("vertex") || interpolation == pxr::TfToken("varying")) {
           const uint32_t expectedArraySize = numPoints * pv.GetElementSize(); 
           if (data.GetArraySize() == expectedArraySize) {
             sampler = new TriangleVertexSampler(data, usdIndices, elementSize);
           } else {
             Logger::warn(str::format("Unexpected number of elements found for vertex attribute, ", desc.vertexAttribute, ", for primvar, id=", pv.GetName()));
           }
-        } else if (interpolation == UsdGeomTokens->faceVarying) {
+        } else if (interpolation == pxr::TfToken("faceVarying")) {
           sampler = new TriangleFaceVaryingSampler(data, meshUtil, elementSize);
         } else {
           throw DxvkError(str::format("Unexpected interpolation mode for primvar, id=", pv.GetName()));
