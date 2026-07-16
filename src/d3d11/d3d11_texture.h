@@ -260,6 +260,17 @@ namespace dxvk {
     void MarkImageHashEstablished() {
       m_imageHashClaimed.store(~0ull, std::memory_order_release);
     }
+
+    // DX11_V294_STABLE_HASH_SLOTS: dynamic (no-initial-data) textures derive
+    // their identity from descriptor + a same-descriptor slot ordinal. The
+    // slot is released at destruction so a recreated atlas re-acquires the
+    // SAME slot - and therefore the same hash - instead of drifting to a new
+    // identity every recreation ("UI tags flicker and disappear").
+    void SetStableHashSlot(uint64_t descriptorHash, uint32_t ordinal) {
+      m_stableHashDescriptor = descriptorHash;
+      m_stableHashOrdinal = ordinal;
+      m_stableHashSlotHeld = true;
+    }
     // NV-DXVK end
 
     /**
@@ -418,6 +429,10 @@ namespace dxvk {
 
     // NV-DXVK start: DX11_V258_TEXTURE_HASH_STABILITY
     std::atomic<uint64_t>         m_imageHashClaimed = { 0ull };
+    // DX11_V294_STABLE_HASH_SLOTS
+    uint64_t                      m_stableHashDescriptor = 0ull;
+    uint32_t                      m_stableHashOrdinal = 0u;
+    bool                          m_stableHashSlotHeld = false;
     // NV-DXVK end
 
     MappedBuffer CreateMappedBuffer(

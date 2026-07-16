@@ -1,8 +1,12 @@
 #include <algorithm>
 #include <cstring>
+#include <unordered_map>
 
 #include "d3d11_device.h"
 #include "d3d11_initializer.h"
+
+// DX11_V288_STABLE_DYNAMIC_TEXTURE_HASH: for RtxOptions::stableDynamicTextureHashes()
+#include "../dxvk/rtx_render/rtx_options.h"
 
 #define XXH_INLINE_ALL
 #include "../util/xxHash/xxhash.h"
@@ -89,6 +93,8 @@ namespace dxvk {
     // the CPU texels are guaranteed available.
     if (pInitialData != nullptr && pInitialData->pSysMem != nullptr)
       InitTextureContentHash(pTexture, pInitialData);
+    else
+      InitDynamicTextureStableHash(pTexture);
     // NV-DXVK end
   }
 
@@ -175,6 +181,103 @@ namespace dxvk {
     // runtime uploads (UpdateSubresource/Unmap/Copy chokepoints) must not
     // re-mix it or streamed sub-rect updates would churn the hash.
     pTexture->MarkImageHashEstablished();
+  }
+  // NV-DXVK end
+
+
+  // NV-DXVK start: DX11_V288_STABLE_DYNAMIC_TEXTURE_HASH
+  void D3D11Initializer::InitDynamicTextureStableHash(
+          D3D11CommonTexture*         pTexture) {
+    // Sampled textures created WITHOUT initial data (UI/font atlases, video
+    // surfaces, streaming pools) used to take their identity from the CONTENT
+    // of whichever runtime upload claimed the hash first. That first upload
+    // depends on which glyphs/frames the session touched first, so the same
+    // UI atlas hashed differently on every run and its texture tags silently
+    // stopped applying - "the UI doesn't load right with hashes". Derive the
+    // identity from the descriptor plus a same-descriptor creation ordinal
+    // instead: games create their UI resources in a deterministic order at
+    // startup, so this is the same value every session.
+    if (!RtxOptions::stableDynamicTextureHashes())
+      return;
+
+    const auto& desc = *pTexture->Desc();
+    if (!(desc.BindFlags & D3D11_BIND_SHADER_RESOURCE))
+      return;
+    // Render/depth targets keep hash 0 here: their identity is handled by
+    // descriptor hashes on the render-target path.
+    if (desc.BindFlags & (D3D11_BIND_RENDER_TARGET | D3D11_BIND_DEPTH_STENCIL))
+      return;
+
+    Rc<DxvkImage> image = pTexture->GetImage();
+    if (image == nullptr || image->getHash() != 0ull)
+      return;
+
+    const VkFormat packedFormat = m_parent->LookupPackedFormat(
+      desc.Format, pTexture->GetFormatMode()).Format;
+    const auto* formatInfo = imageFormatInfo(packedFormat);
+    if (!(formatInfo->aspectMask & VK_IMAGE_ASPECT_COLOR_BIT))
+      return;
+
+    const VkExtent3D mip0 = pTexture->MipLevelExtent(0);
+    XXH64_hash_t descriptorHash = XXH3_64bits(&packedFormat, sizeof(packedFormat));
+    descriptorHash = XXH3_64bits_withSeed(&mip0, sizeof(mip0), descriptorHash);
+    descriptorHash = XXH3_64bits_withSeed(&desc.MipLevels, sizeof(desc.MipLevels), descriptorHash);
+    descriptorHash = XXH3_64bits_withSeed(&desc.ArraySize, sizeof(desc.ArraySize), descriptorHash);
+    descriptorHash = XXH3_64bits_withSeed(&desc.BindFlags, sizeof(desc.BindFlags), descriptorHash);
+    descriptorHash = XXH3_64bits_withSeed(&desc.Usage, sizeof(desc.Usage), descriptorHash);
+    descriptorHash = XXH3_64bits_withSeed(&desc.CPUAccessFlags, sizeof(desc.CPUAccessFlags), descriptorHash);
+
+    // DX11_V294_STABLE_HASH_SLOTS: a monotonically increasing ordinal made
+    // every recreated atlas drift to a NEW hash mid-session (UI tags
+    // "flicker and disappear" as the game destroys/recreates its dynamic
+    // textures). Slots are recycled at destruction instead, so a recreated
+    // same-descriptor texture re-acquires the same slot and hash. Games that
+    // rotate several live buffers get one stable hash per rotation slot -
+    // tag each once and the tags stick. rtx.dx11.dynamicTextureHashUsesOrdinal
+    // = False collapses all same-descriptor dynamics into ONE identity for
+    // titles where per-slot tagging is still too flickery.
+    uint32_t ordinal = 0u;
+    if (RtxOptions::dynamicTextureHashUsesOrdinal()) {
+      ordinal = AcquireDynamicTextureSlot(descriptorHash);
+      pTexture->SetStableHashSlot(descriptorHash, ordinal);
+    }
+
+    const XXH64_hash_t stableHash =
+      XXH3_64bits_withSeed(&ordinal, sizeof(ordinal), descriptorHash);
+    image->setHash(stableHash != 0ull ? stableHash : 1ull);
+    pTexture->MarkImageHashEstablished();
+  }
+
+
+  namespace {
+    dxvk::mutex& dynamicSlotMutex() {
+      static dxvk::mutex* s_mutex = new dxvk::mutex();
+      return *s_mutex;
+    }
+    std::unordered_map<uint64_t, std::vector<bool>>& dynamicSlotPools() {
+      static auto* s_pools = new std::unordered_map<uint64_t, std::vector<bool>>();
+      return *s_pools;
+    }
+  }
+
+  uint32_t D3D11Initializer::AcquireDynamicTextureSlot(uint64_t descriptorHash) {
+    std::lock_guard<dxvk::mutex> lock(dynamicSlotMutex());
+    std::vector<bool>& pool = dynamicSlotPools()[descriptorHash];
+    for (size_t slot = 0; slot < pool.size(); ++slot) {
+      if (!pool[slot]) {
+        pool[slot] = true;
+        return uint32_t(slot);
+      }
+    }
+    pool.push_back(true);
+    return uint32_t(pool.size() - 1u);
+  }
+
+  void D3D11Initializer::ReleaseDynamicTextureSlot(uint64_t descriptorHash, uint32_t ordinal) {
+    std::lock_guard<dxvk::mutex> lock(dynamicSlotMutex());
+    auto pools = dynamicSlotPools().find(descriptorHash);
+    if (pools != dynamicSlotPools().end() && ordinal < pools->second.size())
+      pools->second[ordinal] = false;
   }
   // NV-DXVK end
 

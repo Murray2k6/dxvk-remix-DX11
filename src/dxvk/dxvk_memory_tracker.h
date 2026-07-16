@@ -24,6 +24,13 @@ namespace dxvk {
     static void onFrameEnd();
     static void renderGui();
 
+    // DX11_V295_LEAK_NAMER: aggregates the live allocations of one memory
+    // category by resource name and logs the biggest totals. Fired by the
+    // VRAM growth census so a leaking pool identifies itself by name in the
+    // log instead of requiring a debugger session.
+    static void logTopAllocationsByCategory(
+      dxvk::DxvkMemoryStats::Category category, uint32_t topCount);
+
     // Sometimes we dont know these things until the memory is allocated, so allow users to finalize this tracker.
     void finalize(size_t size, bool isDeviceResident, bool wasDemoted);
 

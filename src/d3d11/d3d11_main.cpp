@@ -281,7 +281,7 @@ static FARPROC WINAPI remixDelayLoadFailureHook(unsigned dliNotify, PDelayLoadIn
    && pdli != nullptr && pdli->szDll != nullptr) {
     char msg[320];
     size_t pos = 0;
-    const char* head = "MISSING SATELLITE DLL (copy the FULL x64 payload next to the game exe): ";
+    const char* head = "MISSING SATELLITE DLL (place the x64 payload next to the game exe or in rtx-remix\\runtime): ";
     for (const char* s = head; *s != '\0' && pos < sizeof(msg) - 1; ++s)
       msg[pos++] = *s;
     for (const char* s = pdli->szDll; *s != '\0' && pos < sizeof(msg) - 1; ++s)
@@ -293,6 +293,40 @@ static FARPROC WINAPI remixDelayLoadFailureHook(unsigned dliNotify, PDelayLoadIn
   return nullptr;
 }
 extern "C" const PfnDliHook __pfnDliFailureHook2 = remixDelayLoadFailureHook;
+
+// DX11_V290_RUNTIME_DIR: resolve delay-loaded satellites from the dedicated
+// Remix runtime directory first, so the payload does not have to live flat in
+// the game folder. Loading with an absolute path + ALTERED_SEARCH_PATH makes
+// each satellite's own static dependencies (cudart/nvrtc for NRC, libxess_*
+// for XeSS, ...) resolve from that same directory. Returning the module from
+// dliNotePreLoadLibrary is the documented delay-load override contract; the
+// default search still runs when this returns null, so the classic flat
+// layout keeps working unchanged.
+static FARPROC WINAPI remixDelayLoadNotifyHook(unsigned dliNotify, PDelayLoadInfo pdli) {
+  if (dliNotify == dliNotePreLoadLibrary
+   && pdli != nullptr && pdli->szDll != nullptr) {
+    wchar_t fullPath[MAX_PATH];
+    const DWORD dirLen = dxvk::env::remixResolveRuntimeDirectoryW(fullPath, MAX_PATH);
+    if (dirLen != 0) {
+      size_t pos = dirLen;
+      if (pos < MAX_PATH - 1)
+        fullPath[pos++] = L'\\';
+      const char* name = pdli->szDll;
+      for (; *name != '\0' && pos < MAX_PATH - 1; ++name)
+        fullPath[pos++] = wchar_t(static_cast<unsigned char>(*name));
+      fullPath[pos] = L'\0';
+      if (*name == '\0'
+       && ::GetFileAttributesW(fullPath) != INVALID_FILE_ATTRIBUTES) {
+        const HMODULE loaded =
+          ::LoadLibraryExW(fullPath, nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+        if (loaded != nullptr)
+          return reinterpret_cast<FARPROC>(loaded);
+      }
+    }
+  }
+  return nullptr;
+}
+extern "C" const PfnDliHook __pfnDliNotifyHook2 = remixDelayLoadNotifyHook;
 
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
   if (reason == DLL_PROCESS_ATTACH) {
@@ -329,6 +363,19 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
           SetDllDirectoryW(path);
           AddDllDirectory(path);
         }
+      }
+      // DX11_V290_RUNTIME_DIR: when a dedicated Remix runtime directory
+      // exists (rtx-remix\runtime beside the exe, or DXVK_REMIX_RUNTIME_DIR),
+      // register it in the process DLL search path. SetDllDirectory occupies
+      // search position 2 (right after the exe dir), which is what lets the
+      // USD/python/boost stack - hard load-time imports of this DLL that
+      // cannot be delay-loaded - resolve from the runtime directory instead
+      // of having to live flat in the game folder.
+      wchar_t runtimeDir[MAX_PATH];
+      if (dxvk::env::remixResolveRuntimeDirectoryW(runtimeDir, MAX_PATH) != 0) {
+        SetDllDirectoryW(runtimeDir);
+        AddDllDirectory(runtimeDir);
+        dxvk::env::remixAppendBootLine("d3d11.dll", "runtime directory registered (rtx-remix\\runtime or DXVK_REMIX_RUNTIME_DIR)");
       }
     }
   } else if (reason == DLL_PROCESS_DETACH) {

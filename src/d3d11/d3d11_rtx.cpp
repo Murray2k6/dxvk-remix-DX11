@@ -64,6 +64,24 @@ namespace dxvk {
       return result;
     }
 
+    // Known emulator front-ends with a D3D11 backend. Their guest scene is
+    // rendered into an internal framebuffer and only blitted to the window,
+    // so scene classification must treat that internal target differently
+    // from a PC game's auxiliary passes. Exe-name gated: PC games can never
+    // take these paths.
+    bool isKnownEmulatorHostProcess() {
+      static const bool result = [] {
+        std::string executable = env::getExeNameNoSuffix();
+        std::transform(executable.begin(), executable.end(), executable.begin(),
+          [](unsigned char c) { return char(std::tolower(c)); });
+        return executable == "pcsx2" || executable.rfind("pcsx2-", 0) == 0
+            || executable.rfind("dolphin", 0) == 0
+            || executable.rfind("duckstation", 0) == 0
+            || executable.rfind("ppsspp", 0) == 0;
+      }();
+      return result;
+    }
+
     bool isPcsx2GsVertexLayout(const std::vector<D3D11RtxSemantic>& semantics) {
       // PCSX2 resources/shaders/dx11/tfx.fx declares the guest GS position as
       //   uint2 p : POSITION0; uint z : POSITION1;
@@ -274,30 +292,42 @@ namespace dxvk {
       return metadata;
     }
 
-    // DX11_V284_EMULATOR_CAMERA: post-transform emulator draws (PCSX2 GS) only
-    // carry view-space geometry, so previous versions pinned the Remix camera
-    // to a fixed pose; any guest camera motion then read as the entire world
-    // teleporting - broken motion vectors, smeared temporal accumulation and
-    // denoising, no usable free camera, and per-frame BLAS identity churn.
-    // This tracker recovers the guest camera's rigid motion each frame WITHOUT
-    // guest matrices: meshes are re-identified across frames by a stable key
-    // (guest texture hash + topology + counts), giving exact 1:1 vertex
-    // correspondences between the previous and current view-space positions.
-    // A Horn quaternion (Kabsch) fit over those correspondences yields the
-    // inter-frame rigid transform of the static world, whose inverse is the
-    // camera motion; moving objects are rejected as residual outliers. The
-    // accumulated pose feeds worldToView/objectToWorld so static geometry
-    // stays anchored in a consistent world space, exactly like a native game.
-    // An emulator-published ABI camera block (Dolphin XF registers, a PS2 VU
-    // provider) overrides the estimate entirely.
-    class EmulatorCameraTracker {
+    // DX11_V284_VIEWSPACE_CAMERA: draws that only exist in view space pin the
+    // Remix camera to a fixed pose, so any real camera motion reads as the
+    // entire world teleporting - broken motion vectors, smeared temporal
+    // accumulation and denoising, and no usable free camera. Two independent
+    // producers hit this: post-transform emulator draws (PCSX2 GS), and PC
+    // games whose geometry can only be captured camera-relative because no
+    // world/view matrix was proven (e.g. Skyrim SE's unconfirmed view). This
+    // tracker recovers the camera's rigid motion each frame WITHOUT game
+    // matrices: meshes are re-identified across frames by a stable
+    // camera-independent key, giving exact 1:1 vertex correspondences between
+    // the previous and current view-space positions. A Horn quaternion
+    // (Kabsch) fit over those correspondences yields the inter-frame rigid
+    // transform of the static world, whose inverse is the camera motion;
+    // moving objects are rejected as residual outliers. The accumulated pose
+    // feeds worldToView/objectToWorld so static geometry stays anchored in a
+    // consistent world space, exactly like a native game with a real camera.
+    // Each producer owns its own instance - emulator and PC-game camera state
+    // are never mixed - and an emulator-published ABI camera block (Dolphin
+    // XF registers, a PS2 VU provider) overrides the estimate entirely.
+    class ViewSpaceCameraTracker {
     public:
       static constexpr uint32_t kPointsPerMesh = 8u;
 
-      void beginFrame() {
+      void beginFrame(uint32_t minimumSamplePoints, float maxTranslationPerFrame) {
+        m_minimumSamplePoints = std::max(minimumSamplePoints, 9u);
+        m_maxTranslationPerFrame = std::max(maxTranslationPerFrame, 1.0f);
         solveAndAccumulate();
         m_previous = std::move(m_current);
         m_current.clear();
+      }
+
+      // True once real camera motion has been solved at least once. Until
+      // then the pose is just the seed and callers should keep their proven
+      // fallback behavior (menus and intro screens have no trackable meshes).
+      bool hasConfidentPose() const {
+        return m_hasEverSolved;
       }
 
       void addMeshSample(uint64_t meshKey, const float* viewPositions,
@@ -329,6 +359,7 @@ namespace dxvk {
         m_viewRotation[1] = Vector3(0.0f, 1.0f, 0.0f);
         m_viewRotation[2] = Vector3(0.0f, 0.0f, 1.0f);
         m_viewTranslation = Vector3(0.0f, 0.0f, kSeedOffset);
+        m_hasEverSolved = false;
       }
 
       // Row-vector worldToView from the accumulated column-convention pose:
@@ -492,9 +523,7 @@ namespace dxvk {
           }
         }
 
-        const uint32_t minimumPoints = uint32_t(std::max(
-          RtxOptions::Emulator::cameraMotionMinSamplePoints(), 9));
-        if (meshes.size() < 3 || fromPoints.size() < minimumPoints)
+        if (meshes.size() < 3 || fromPoints.size() < m_minimumSamplePoints)
           return;
 
         RigidTransform contentMotion;
@@ -534,7 +563,7 @@ namespace dxvk {
             inlierTo.push_back(toPoints[mesh.firstPoint + i]);
           }
         }
-        if (inlierMeshes >= 3 && inlierFrom.size() >= minimumPoints
+        if (inlierMeshes >= 3 && inlierFrom.size() >= m_minimumSamplePoints
          && inlierFrom.size() < fromPoints.size()) {
           RigidTransform refit;
           if (solveRigid(inlierFrom, inlierTo, refit))
@@ -545,8 +574,7 @@ namespace dxvk {
         // not moved. Keep the current pose; world consistency is preserved
         // because geometry and camera continue to use the same accumulated V.
         const float translationMagnitude = length(contentMotion.translation);
-        const float maxTranslation = std::max(
-          RtxOptions::Emulator::cameraMotionMaxTranslation(), 1.0f);
+        const float maxTranslation = m_maxTranslationPerFrame;
         const float rotationTrace = contentMotion.rotation[0].x
                                   + contentMotion.rotation[1].y
                                   + contentMotion.rotation[2].z;
@@ -583,10 +611,14 @@ namespace dxvk {
         m_viewRotation[1] = newRotation[1];
         m_viewRotation[2] = newRotation[2];
         m_viewTranslation = newTranslation;
+        m_hasEverSolved = true;
       }
 
       std::unordered_map<uint64_t, MeshSample> m_previous;
       std::unordered_map<uint64_t, MeshSample> m_current;
+      uint32_t m_minimumSamplePoints = 24u;
+      float m_maxTranslationPerFrame = 500.0f;
+      bool m_hasEverSolved = false;
       Vector3 m_viewRotation[3] = {
         Vector3(1.0f, 0.0f, 0.0f),
         Vector3(0.0f, 1.0f, 0.0f),
@@ -595,12 +627,28 @@ namespace dxvk {
       Vector3 m_viewTranslation = Vector3(0.0f, 0.0f, kSeedOffset);
     };
 
-    // Post-transform emulator hosts drive one immediate context from the GS
-    // thread, so plain file-scope state is safe here; deferred contexts never
-    // reach the authenticated emulator path.
-    EmulatorCameraTracker s_emulatorCamera;
+    // Both producers drive one immediate context from a single app/GS thread,
+    // so plain file-scope state is safe here; deferred contexts never reach
+    // these paths. The two trackers are deliberately SEPARATE instances:
+    // emulator camera state and PC-game camera state must never mix.
+    ViewSpaceCameraTracker s_emulatorCamera;
     uint64_t s_emulatorCameraFrameId = ~0ull;
     std::optional<remix::emulator::CameraMetadataV1> s_emulatorPublishedCamera;
+
+    ViewSpaceCameraTracker s_pcViewSpaceCamera;
+    // PC world units vary per engine; Skyrim units are ~1.4 cm so sprinting
+    // is ~100 units/frame. 2000 comfortably covers vehicles without letting
+    // teleports/scene cuts through.
+    constexpr uint32_t kPcCameraMinSamplePoints = 24u;
+    constexpr float kPcCameraMaxTranslationPerFrame = 2000.0f;
+
+    // DX11_V291_CROSS_CONTEXT_DIAG: Dolphin-style hosts render the guest on a
+    // different D3D11 device/context than the one that presents. Per-context
+    // counters made those draws invisible ("draws=0, total=1" while the guest
+    // is clearly rendering). This process-wide counter appears in the
+    // EndFrame log so a single log line proves whether ANY context in the
+    // process is submitting draws, and roughly how many.
+    std::atomic<uint64_t> s_processWideSubmittedDraws { 0u };
 
     // Publisher-provided projection when available and invertible by the
     // reconstruction (standard D3D perspective shape), synthesized otherwise.
@@ -989,6 +1037,11 @@ namespace dxvk {
   void D3D11Rtx::ResetCommandListState() {
     m_drawCallID = 0;
     m_drawsSinceFlush = 0;
+    // DX11_V295_ROTATING_PROBE: remember the frame's draw volume and advance
+    // the probe phase so the force-injection discovery window sweeps the
+    // whole frame over successive frames (see SubmitDraw).
+    m_prevFrameTotalDraws = m_submitRejectStats.total;
+    ++m_forceInjectionProbePhase;
     m_submitRejectStats = {};
     m_rasterUiSeenThisFrame = false;
     m_midFrameRtxInjected = false;
@@ -1080,12 +1133,15 @@ namespace dxvk {
     // stalling the GPU).
     static constexpr uint32_t     kMaxCaptureVerticesPerDraw = 512u << 10;
     // Transform-feedback replays share the graphics queue with BLAS builds and
-    // path tracing. Bound them tightly so a scene containing many shader-only
-    // UV streams degrades to the existing flat-albedo path instead of creating
-    // a long driver submission (observed as nvlddmkm 153/device-lost on an
-    // 8-GiB RTX 5060).
-    static constexpr uint32_t     kMaxCapturesPerFrame       = 4u;
-    static constexpr VkDeviceSize kMaxCaptureBytesPerFrame   = 3ull << 20;
+    // path tracing. Bound them so a scene containing many shader-only UV
+    // streams degrades to the existing flat-albedo path instead of creating a
+    // long driver submission (observed as nvlddmkm 153/device-lost on an
+    // 8-GiB RTX 5060). DX11_V295_CAPTURE_BUDGET: shares the per-title capture
+    // budget options so Remix-native titles can capture their full scene.
+    const uint32_t kMaxCapturesPerFrame =
+      std::max(RtxOptions::captureMaxDrawsPerFrame(), 1);
+    const VkDeviceSize kMaxCaptureBytesPerFrame =
+      VkDeviceSize(std::max(RtxOptions::captureMaxMiBPerFrame(), 1)) << 20;
 
     const uint32_t vertexCount = geo.vertexCount;
     if (vertexCount == 0 || vertexCount > kMaxCaptureVerticesPerDraw)
@@ -1344,10 +1400,22 @@ namespace dxvk {
     // already complete.  Separate lanes guarantee forward progress: existing
     // dynamic meshes consume only the replay lane, while later uncached meshes
     // can still populate the cold lane on subsequent frames.
-    static constexpr uint32_t     kMaxCapturesPerFrame       = 3u;
-    static constexpr uint32_t     kMaxNewCaptureBuffersPerFrame = 2u;
-    static constexpr uint32_t     kMaxReplayCapturesPerFrame = 1u;
-    static constexpr VkDeviceSize kMaxCaptureBytesPerFrame   = 3ull << 20;
+    // DX11_V295_CAPTURE_BUDGET: the old caps (3 draws / 2 new / 1 replay /
+    // 3 MiB) were sized for Unreal ring buffers, but a title whose ENTIRE
+    // scene flows through post-VS capture (sm64coopdx and other Remix-native
+    // ports draw 50-200 captured meshes per frame, each only a few KiB) could
+    // never assemble a scene: two draws captured, everything else fell to the
+    // raster layer, and the frame passed through un-path-traced forever. The
+    // caps are per-title tunable now with defaults sized for full-scene
+    // capture; the byte cap still bounds a single frame's GPU copy work.
+    const uint32_t kMaxCapturesPerFrame =
+      std::max(RtxOptions::captureMaxDrawsPerFrame(), 1);
+    const uint32_t kMaxNewCaptureBuffersPerFrame =
+      std::max(RtxOptions::captureMaxNewBuffersPerFrame(), 1);
+    const uint32_t kMaxReplayCapturesPerFrame =
+      std::max(RtxOptions::captureMaxReplaysPerFrame(), 1);
+    const VkDeviceSize kMaxCaptureBytesPerFrame =
+      VkDeviceSize(std::max(RtxOptions::captureMaxMiBPerFrame(), 1)) << 20;
     static constexpr size_t       kMaxCacheEntries           = 4096u;
     static constexpr VkDeviceSize kMaxCacheBytes             = 384ull << 20;
 
@@ -2589,13 +2657,81 @@ namespace dxvk {
     dcs.transformData.objectToWorld = capturedToWorld;
     dcs.transformData.objectToView = capturedToView;
     if (capturesHomogeneousClip) {
-      if (!useWorldAnchoredHomogeneousCapture)
+      if (!useWorldAnchoredHomogeneousCapture) {
         dcs.transformData.worldToView = Matrix4();
+
+        // DX11_V287_PC_VIEWSPACE_CAMERA: this is the camera-relative fallback
+        // (no proven world matrix, unconfirmed view - the "camera position is
+        // wrong / pinned at origin" case for PC games). Estimate the real
+        // camera motion from the captured geometry itself, exactly like the
+        // emulator path but with a SEPARATE tracker instance so PC and
+        // emulator camera state never mix. objectToView stays untouched, so
+        // raster alignment is identical; only the world anchoring changes.
+        if (RtxOptions::estimateViewSpaceCameraMotion()
+         && !isKnownEmulatorHostProcess()) {
+          const float projectionScaleX = dcs.transformData.viewToProjection[0][0];
+          const float projectionScaleY = dcs.transformData.viewToProjection[1][1];
+          const bool perspectiveWDepth =
+            dcs.transformData.viewToProjection[2][3] == 1.0f
+            && std::isfinite(projectionScaleX) && projectionScaleX > 1.0e-5f
+            && std::isfinite(projectionScaleY) && projectionScaleY > 1.0e-5f;
+          const uint8_t* clipBase = reinterpret_cast<const uint8_t*>(
+            capturedPositions.mapPtr(capturedPositions.offsetFromSlice()));
+          const uint32_t clipStride = capturedPositions.stride();
+          if (perspectiveWDepth && clipBase != nullptr && clipStride >= 16u
+           && vertexCount >= 3u) {
+            // Unproject a small sample back to view space: for a standard
+            // perspective projection clip = (view.x*P00, view.y*P11, ...,
+            // view.z), so view is recovered exactly from x/P00, y/P11, w.
+            constexpr uint32_t kSampleCount = ViewSpaceCameraTracker::kPointsPerMesh;
+            float viewSamples[kSampleCount * 3u] = {};
+            const uint32_t step = std::max(1u, vertexCount / kSampleCount);
+            uint32_t sampled = 0;
+            bool samplesValid = true;
+            for (uint32_t vertex = 0; vertex < vertexCount
+                 && sampled < kSampleCount; vertex += step) {
+              const float* clip = reinterpret_cast<const float*>(
+                clipBase + size_t(vertex) * clipStride);
+              const float w = clip[3];
+              if (!std::isfinite(w) || std::abs(w) < 1.0e-6f
+               || !std::isfinite(clip[0]) || !std::isfinite(clip[1])) {
+                samplesValid = false;
+                break;
+              }
+              viewSamples[sampled * 3u + 0u] = clip[0] / projectionScaleX;
+              viewSamples[sampled * 3u + 1u] = clip[1] / projectionScaleY;
+              viewSamples[sampled * 3u + 2u] = w;
+              ++sampled;
+            }
+            if (samplesValid && sampled >= 3u) {
+              // postVsCaptureIdentity is the camera-independent mesh identity
+              // built above - the exact stable key the tracker needs.
+              s_pcViewSpaceCamera.addMeshSample(
+                geo.postVsCaptureIdentity, viewSamples, sampled);
+            }
+          }
+
+          // DX11_V293_CONFIDENCE_GATE: before the first successful solve the
+          // estimated pose is only the seed; applying it changed menu/intro
+          // frames (no trackable meshes - e.g. Call of Duty front-ends) away
+          // from the proven camera-relative fallback. Keep the original
+          // fallback bit-for-bit until real camera motion has been solved.
+          if (s_pcViewSpaceCamera.hasConfidentPose()) {
+            dcs.transformData.worldToView = s_pcViewSpaceCamera.worldToView();
+            dcs.transformData.objectToWorld = s_pcViewSpaceCamera.viewToWorld();
+            dcs.transformData.cameraRelativeView = false;
+          }
+        }
+      }
       // A real view anchors captured vertices in stable world space. Only the
       // no-view fallback remains camera-relative; this keeps the fallback safe
       // while allowing normal/free cameras to move independently of geometry.
-      dcs.transformData.cameraRelativeView =
-        !useWorldAnchoredHomogeneousCapture;
+      if (useWorldAnchoredHomogeneousCapture)
+        dcs.transformData.cameraRelativeView = false;
+      else if (!RtxOptions::estimateViewSpaceCameraMotion()
+            || isKnownEmulatorHostProcess()
+            || !s_pcViewSpaceCamera.hasConfidentPose())
+        dcs.transformData.cameraRelativeView = true;
       dcs.transformData.exactReplacementCamera = true;
       // The geometry and camera now form one exact replacement coordinate
       // system. Treat it as a real camera even when the projection was derived
@@ -5730,6 +5866,35 @@ namespace dxvk {
         !matchesSceneExtent(m_lastOutputExtent)
         && !matchesSceneExtent(m_lastRemixViewportExtent);
 
+      // DX11_V286_EMULATOR_INTERNAL_RENDER: emulators draw the guest scene
+      // into an internal-resolution framebuffer (EFB/GS/GE target) whose
+      // extent and aspect need not match the host window - the window only
+      // receives a final blit. The extent gate above classified that ENTIRE
+      // guest render as auxiliary, so Remix "saw nothing" in-game on
+      // unauthenticated emulators. Inside known emulator processes, a
+      // substantial internal target IS the scene: accept it, keeping only
+      // genuinely small helper targets (shadow maps, EFB copies, LUTs) on
+      // the auxiliary path. Exe-name gated; PC games are unaffected.
+      bool emulatorInternalSceneTarget = false;
+      if (transforms.offscreenRenderTarget
+       && RtxOptions::Emulator::enableIntegration()
+       && isKnownEmulatorHostProcess()) {
+        const bool substantialTarget =
+          renderTargetWidth >= 0.5f * float(m_lastOutputExtent.width)
+          || renderTargetHeight >= 0.5f * float(m_lastOutputExtent.height);
+        if (substantialTarget) {
+          transforms.offscreenRenderTarget = false;
+          emulatorInternalSceneTarget = true;
+          static uint32_t sEmulatorInternalTargetLogs = 0;
+          if (sEmulatorInternalTargetLogs++ < 8u) {
+            Logger::info(str::format(
+              "[D3D11Rtx] Emulator internal render target accepted as the scene: rt=",
+              renderTargetWidth, "x", renderTargetHeight,
+              " output=", m_lastOutputExtent.width, "x", m_lastOutputExtent.height));
+          }
+        }
+      }
+
       // A target can alias the swap-chain-sized resource while using an
       // auxiliary square projection (Unreal scene captures, reflection probes,
       // editor thumbnails). Extent-only routing therefore misses the exact
@@ -6628,11 +6793,16 @@ namespace dxvk {
     }
 
     ++m_submitRejectStats.total;
+    s_processWideSubmittedDraws.fetch_add(1u, std::memory_order_relaxed);
 
     // Emulator integration is authenticated per draw through a versioned
     // ID3D11DeviceContext private-data ABI. No metadata means the normal PC
-    // game path below is byte-for-byte unchanged.
-    const auto emulatorMetadata = readEmulatorDrawMetadata(m_context);
+    // game path below is byte-for-byte unchanged. rtx.emulator.enableIntegration
+    // is the hard separation switch: disabled, no emulator code (camera,
+    // profile, transforms) can run at all and every draw takes the PC path.
+    std::optional<remix::emulator::DrawMetadataV1> emulatorMetadata;
+    if (RtxOptions::Emulator::enableIntegration())
+      emulatorMetadata = readEmulatorDrawMetadata(m_context);
     const bool authenticatedEmulatorDraw = emulatorMetadata.has_value();
     const bool pcsx2PostTransformDraw = authenticatedEmulatorDraw
       && emulatorMetadata->provider == remix::emulator::Provider::Pcsx2
@@ -6650,8 +6820,11 @@ namespace dxvk {
       if (emulatorMetadata->frameId != s_emulatorCameraFrameId) {
         s_emulatorCameraFrameId = emulatorMetadata->frameId;
         s_emulatorPublishedCamera = readEmulatorCameraMetadata(m_context);
-        if (RtxOptions::Emulator::estimateCameraMotion())
-          s_emulatorCamera.beginFrame();
+        if (RtxOptions::Emulator::estimateCameraMotion()) {
+          s_emulatorCamera.beginFrame(
+            uint32_t(std::max(RtxOptions::Emulator::cameraMotionMinSamplePoints(), 9)),
+            RtxOptions::Emulator::cameraMotionMaxTranslation());
+        }
       }
     }
 
@@ -6693,8 +6866,27 @@ namespace dxvk {
      && m_prevFrameSceneAccepted == 0
      && m_prevFrameRealSceneAccepted == 0
      && m_submitRejectStats.total > kForceInjectionProbeDraws) {
-      ++m_submitRejectStats.forceInjectionIdle;
-      return;
+      // DX11_V295_ROTATING_PROBE: a fixed first-N window never discovered
+      // cameras that only appear late in heavy frames (Hello Neighbor 2
+      // issues ~2000 draws per frame; its scene/camera draws sit past the
+      // window, so forceInjIdle rejected them every frame and the title
+      // stayed rasterized forever). In addition to the first N draws, probe
+      // a window that rotates through the frame's draw range: every draw
+      // position is examined within a few frames while per-frame work stays
+      // bounded.
+      const uint32_t totalDraws =
+        std::max(m_prevFrameTotalDraws, kForceInjectionProbeDraws + 1u);
+      const uint32_t windowCount =
+        (totalDraws + kForceInjectionProbeDraws - 1u) / kForceInjectionProbeDraws;
+      const uint32_t windowBase =
+        (m_forceInjectionProbePhase % windowCount) * kForceInjectionProbeDraws;
+      const uint32_t drawIndex = m_submitRejectStats.total - 1u;
+      const bool inRotatingWindow = drawIndex >= windowBase
+        && drawIndex < windowBase + kForceInjectionProbeDraws;
+      if (!inRotatingWindow) {
+        ++m_submitRejectStats.forceInjectionIdle;
+        return;
+      }
     }
 
     // Throttle: don't exceed the worker ring buffer capacity.
@@ -6797,7 +6989,8 @@ namespace dxvk {
             "[D3D11Rtx][emulator-profile] Authenticated PCSX2 draw used VS-expanded/no-layout input; preserving raster draw. DisableVertexShaderExpand is required for Remix scene capture.");
         }
         return;
-      } else if (isPcsx2HostProcess() && !m_authenticatedEmulatorHost) {
+      } else if (RtxOptions::Emulator::enableIntegration()
+              && isPcsx2HostProcess() && !m_authenticatedEmulatorHost) {
         m_postTransformEmulatorHost = true;
         m_forceRasterPassThroughThisFrame = true;
         ++m_submitRejectStats.postTransformEmulator;
@@ -6815,6 +7008,7 @@ namespace dxvk {
     const auto& semantics = layout->GetRtxSemantics();
 
     if (!m_authenticatedEmulatorHost
+     && RtxOptions::Emulator::enableIntegration()
      && isPcsx2HostProcess() && isPcsx2GsVertexLayout(semantics)) {
       m_postTransformEmulatorHost = true;
       m_forceRasterPassThroughThisFrame = true;
@@ -9653,6 +9847,15 @@ namespace dxvk {
         ::RemixReassertCrashSignatureFilter();
     }
 
+    // DX11_V287_PC_VIEWSPACE_CAMERA: advance the PC view-space camera tracker
+    // on the app-thread frame boundary (the same thread that samples in the
+    // capture path, so no synchronization is needed). The emulator tracker
+    // rotates separately on the publisher's guest frameId - the two never mix.
+    if (RtxOptions::estimateViewSpaceCameraMotion() && !isKnownEmulatorHostProcess()) {
+      s_pcViewSpaceCamera.beginFrame(
+        kPcCameraMinSamplePoints, kPcCameraMaxTranslationPerFrame);
+    }
+
     // An in-process GPU capture is the only reliable way to diagnose a
     // fullscreen game launched through Steam (desktop capture APIs run in a
     // different session). Drop dx11-remix-screenshot.flag beside the game
@@ -9778,6 +9981,7 @@ namespace dxvk {
     if (s_endFrameLogCount < 8) {
       ++s_endFrameLogCount;
       Logger::info(str::format("[D3D11Rtx] EndFrame: draws=", draws,
+        " processWideDraws=", s_processWideSubmittedDraws.load(std::memory_order_relaxed),
         " backbuffer=", backbuffer != nullptr ? 1 : 0,
         " remixViewport=", singleRemixViewportExtent.width, "x", singleRemixViewportExtent.height,
         " gameRasterViewports=", gameViewportCount,

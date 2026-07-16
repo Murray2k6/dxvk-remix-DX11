@@ -72,6 +72,54 @@ namespace dxvk {
     }
   }
 
+  // DX11_V295_LEAK_NAMER: name the biggest live allocations of one category
+  // so a leaking pool identifies itself in the log during the VRAM growth
+  // census. Requires rtx.profiler.memory.enable = True from launch (the
+  // tracker registers nothing otherwise); the dump says so when disabled.
+  void GpuMemoryTracker::logTopAllocationsByCategory(
+      DxvkMemoryStats::Category category, uint32_t topCount) {
+    if (!MemoryTrackerSettings::enable()) {
+      Logger::info(
+        "[Remix-DX11][vram] allocation naming unavailable - set rtx.profiler.memory.enable = True (from launch) to identify the growing pool by name.");
+      return;
+    }
+
+    struct NameTotal {
+      std::string name;
+      size_t bytes = 0;
+      uint32_t count = 0;
+    };
+    std::unordered_map<std::string, NameTotal> totals;
+    {
+      std::lock_guard<mutex> lock(s_mutex);
+      for (const GpuMemoryTracker* tracker : s_tracker) {
+        const Stats& stats = tracker->m_stats;
+        if (stats.category != category)
+          continue;
+        NameTotal& total = totals[std::string(stats.getName())];
+        total.name = stats.getName();
+        total.bytes += stats.size;
+        total.count += 1u;
+      }
+    }
+
+    std::vector<NameTotal> sorted;
+    sorted.reserve(totals.size());
+    for (auto& entry : totals)
+      sorted.push_back(std::move(entry.second));
+    std::sort(sorted.begin(), sorted.end(),
+      [](const NameTotal& a, const NameTotal& b) { return a.bytes > b.bytes; });
+
+    Logger::info(str::format(
+      "[Remix-DX11][vram] top allocations for category ", uint32_t(category), ":"));
+    for (uint32_t i = 0; i < topCount && i < sorted.size(); ++i) {
+      Logger::info(str::format(
+        "[Remix-DX11][vram]   #", i, " '", sorted[i].name,
+        "' totalMiB=", sorted[i].bytes >> 20,
+        " allocations=", sorted[i].count));
+    }
+  }
+
   void GpuMemoryTracker::onFrameEnd() {
     std::lock_guard<mutex> lock(s_mutex);
     if (MemoryTrackerSettings::includeWholeFrame()) {

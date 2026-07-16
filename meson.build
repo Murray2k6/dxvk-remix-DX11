@@ -533,6 +533,12 @@ remix_satellite_delay_load_args = [
   '/DELAYLOAD:libxess.dll',
   '/DELAYLOAD:GFSDK_Aftermath_Lib.x64.dll',
   '/DELAYLOAD:NvLowLatencyVk.dll',
+  # DX11_V290_RUNTIME_DIR: full USD delay-loading was attempted and is
+  # impossible: SdfPath inlines accesses to Sdf_Pool's exported DATA members
+  # in its public headers (LNK1194 on sdf.dll), and SdfPath is pervasive.
+  # The USD stack therefore remains a hard load-time dependency beside the
+  # game exe, while the heavy vendor satellites above relocate into the
+  # dedicated rtx-remix\runtime directory through the delay-load notify hook.
 ]
 
 nvapi_include_paths = include_directories('submodules/nvapi')

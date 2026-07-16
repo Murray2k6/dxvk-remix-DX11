@@ -293,6 +293,66 @@ namespace dxvk::env {
   }
 #endif
 
+#ifdef _WIN32
+  // DX11_V290_RUNTIME_DIR: the Remix satellite payload (USD stack, NRD, DLSS,
+  // XeSS, NRC, rtxio, ...) no longer has to be dumped flat next to the game
+  // exe. Resolution order:
+  //   1. DXVK_REMIX_RUNTIME_DIR environment variable (existing directory)
+  //   2. "rtx-remix\runtime" beside this DLL (i.e. beside the game exe)
+  //   3. none - the classic flat layout beside the exe keeps working.
+  // Kernel32-only so it is safe from DllMain under the loader lock. Returns
+  // the character count written to 'out' (0 = no runtime directory).
+  inline DWORD remixResolveRuntimeDirectoryW(wchar_t* out, DWORD outCapacity) {
+    if (out == nullptr || outCapacity == 0)
+      return 0;
+    out[0] = L'\0';
+
+    const auto isDirectory = [](const wchar_t* path) {
+      const DWORD attributes = ::GetFileAttributesW(path);
+      return attributes != INVALID_FILE_ATTRIBUTES
+          && (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+    };
+
+    const DWORD envLen = ::GetEnvironmentVariableW(
+      L"DXVK_REMIX_RUNTIME_DIR", out, outCapacity);
+    if (envLen > 0 && envLen < outCapacity && isDirectory(out))
+      return envLen;
+    out[0] = L'\0';
+
+    // This inline function is compiled into the calling DLL, so the module
+    // resolved from its address is that DLL (d3d11.dll / dxgi.dll).
+    HMODULE selfModule = nullptr;
+    ::GetModuleHandleExW(
+      GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS
+        | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+      reinterpret_cast<LPCWSTR>(&remixResolveRuntimeDirectoryW), &selfModule);
+    const DWORD moduleLen = ::GetModuleFileNameW(selfModule, out, outCapacity);
+    if (moduleLen == 0 || moduleLen >= outCapacity) {
+      out[0] = L'\0';
+      return 0;
+    }
+    wchar_t* separator = ::wcsrchr(out, L'\\');
+    if (separator == nullptr) {
+      out[0] = L'\0';
+      return 0;
+    }
+    *separator = L'\0';
+
+    static constexpr wchar_t kSuffix[] = L"\\rtx-remix\\runtime";
+    const size_t baseLen = size_t(separator - out);
+    if (baseLen + (sizeof(kSuffix) / sizeof(wchar_t)) >= outCapacity) {
+      out[0] = L'\0';
+      return 0;
+    }
+    std::memcpy(out + baseLen, kSuffix, sizeof(kSuffix));
+    if (isDirectory(out))
+      return DWORD(baseLen + (sizeof(kSuffix) / sizeof(wchar_t)) - 1);
+
+    out[0] = L'\0';
+    return 0;
+  }
+#endif
+
   inline bool shouldBypassRemixForCurrentProcess() {
 #ifdef _WIN32
     auto readFlag = [](const char* name, bool fallback) -> bool {

@@ -1,5 +1,7 @@
 #pragma once
 
+#include <filesystem>
+#include <functional>
 #include <mutex>
 #include <vector>
 
@@ -449,7 +451,18 @@ namespace dxvk {
     D3D11StateObjectSet<D3D11RasterizerState>   m_rsStateObjects;
     D3D11StateObjectSet<D3D11SamplerState>      m_samplerObjects;
     void PrewarmCachedGameShaders();
-    
+
+    // DX11_V292_PRECOMPILER_WIDGET: on-demand precompile job driven by the
+    // Remix developer menu (optionally re-scans the game's own data files,
+    // then compiles every cached shader). Runs on a background thread.
+    void RunShaderPrecompileJob(bool fullRescan);
+
+    void LoadGameShaderCacheFiles(
+      const std::vector<std::filesystem::path>& cacheFiles,
+      const std::function<void(uint32_t)>&      updateProgress,
+      uint32_t&                                 loadedShaders,
+      uint32_t&                                 rejectedShaders);
+
     HRESULT CreateShaderModule(
             D3D11CommonShader*      pShaderModule,
             DxvkShaderKey           ShaderKey,

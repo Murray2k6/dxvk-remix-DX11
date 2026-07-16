@@ -730,6 +730,30 @@ namespace dxvk {
     const uint32_t thisSceneDraws = immediateContext->m_rtx.getAcceptedSceneDrawCount();
     m_lastPresentDrawCount = thisDraws;
 
+    // DX11_V293_FIRST_PRESENT_TRACE: some games (CoD AW; Dolphin-style hosts)
+    // leave logs that end right after swapchain creation with no frame ever
+    // presented. Bracket the first presents so one log distinguishes "the
+    // game never calls Present" (engine-side wait) from "Present itself
+    // hangs" - a begin line without its end line means the hang is inside.
+    static std::atomic<uint32_t> s_presentTraceCounter { 0u };
+    const uint32_t presentTraceIndex =
+      s_presentTraceCounter.load(std::memory_order_relaxed) < 8u
+        ? s_presentTraceCounter.fetch_add(1u, std::memory_order_relaxed)
+        : 8u;
+    struct PresentTraceGuard {
+      uint32_t index;
+      bool active;
+      ~PresentTraceGuard() {
+        if (active)
+          Logger::info(str::format("[D3D11SwapChain] PresentImage end #", index));
+      }
+    } presentTraceGuard { presentTraceIndex, presentTraceIndex < 8u };
+    if (presentTraceIndex < 8u) {
+      Logger::info(str::format("[D3D11SwapChain] PresentImage begin #", presentTraceIndex,
+        " draws=", thisDraws, " sync=", SyncInterval,
+        " HWND=", (uintptr_t) m_window));
+    }
+
     // Fallback for games/window systems that do not deliver keyboard messages
     // to the hooked WndProc. Rising-edge polling requests Remix capture; the
     // WndProc path above remains responsible for blocking vanilla handling.
