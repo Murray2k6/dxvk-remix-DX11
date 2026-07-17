@@ -143,6 +143,10 @@ namespace dxvk {
 
 // NV-DXVK start
     uint32_t remixShaderCompilationCount() const;
+
+    // DX11_V296_BACKGROUND_COMPILE_CAP: caps concurrent Remix pipeline compiles
+    // on the state-cache workers (0 = unlimited). See DxvkStateCache.
+    void setRemixCompileConcurrency(uint32_t maxConcurrent);
 // NV-DXVK end
 
     /**

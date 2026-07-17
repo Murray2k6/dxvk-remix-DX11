@@ -333,7 +333,10 @@ namespace dxvk {
           ++m_workerCompilingRemixShaders;
         }
 
-        m_workerQueue.push(item);
+        if (item.isRemixShader)
+          m_workerQueueRemix.push(item);
+        else
+          m_workerQueue.push(item);
         m_workerItemsInFlight.insert(item.hash());
       }
       // NV-DXVK end
@@ -393,7 +396,7 @@ namespace dxvk {
       ++m_workerCompilationCount;
       ++m_workerCompilingRemixShaders;
 
-      m_workerQueue.push(item);
+      m_workerQueueRemix.push(item);
       m_workerItemsInFlight.insert(item.hash());
 
       m_workerCond.notify_all();
@@ -1047,27 +1050,47 @@ namespace dxvk {
   void DxvkStateCache::workerFunc() {
     env::setThreadName("dxvk-shader");
 
+    // DX11_V296_BACKGROUND_COMPILE_CAP: a worker may take a Remix item only
+    // while fewer than m_remixCompileConcurrencyLimit Remix compiles are in
+    // flight (0 = unlimited). Regular game pipelines have their own queue and
+    // are always eligible, so they never stall behind a capped Remix backlog.
+    const auto remixSlotAvailable = [this] () {
+      const uint32_t limit = m_remixCompileConcurrencyLimit.load();
+      return limit == 0u || m_remixCompilesActive.load() < limit;
+    };
+    const auto hasEligibleWork = [this, remixSlotAvailable] () {
+      return !m_workerQueue.empty()
+          || (!m_workerQueueRemix.empty() && remixSlotAvailable());
+    };
+
     while (!m_stopThreads.load()) {
       WorkerItem item;
+      bool tookRemixSlot = false;
 
       { std::unique_lock<dxvk::mutex> lock(m_workerLock);
 
-        if (m_workerQueue.empty()) {
+        if (!hasEligibleWork()) {
           m_workerBusy -= 1;
-          m_workerCond.wait(lock, [this] () {
-            return m_workerQueue.size()
+          m_workerCond.wait(lock, [this, hasEligibleWork] () {
+            return hasEligibleWork()
                 || m_stopThreads.load();
           });
 
-          if (!m_workerQueue.empty())
+          if (hasEligibleWork())
             m_workerBusy += 1;
         }
 
-        if (m_workerQueue.empty())
+        if (!m_workerQueue.empty()) {
+          item = m_workerQueue.front();
+          m_workerQueue.pop();
+        } else if (!m_workerQueueRemix.empty() && remixSlotAvailable()) {
+          item = m_workerQueueRemix.front();
+          m_workerQueueRemix.pop();
+          m_remixCompilesActive += 1;
+          tookRemixSlot = true;
+        } else {
           break;
-        
-        item = m_workerQueue.front();
-        m_workerQueue.pop();
+        }
       }
 
       compilePipelines(item);
@@ -1086,6 +1109,11 @@ namespace dxvk {
         m_workerItemsInFlight.erase(item.hash());
       }
       // NV-DXVK end
+
+      if (tookRemixSlot) {
+        m_remixCompilesActive -= 1;
+        m_workerCond.notify_all();
+      }
     }
   }
 

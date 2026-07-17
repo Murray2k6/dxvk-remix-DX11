@@ -26,6 +26,7 @@
 #include "../../util/log/log.h"
 #include "../../util/util_env.h"
 #include "../../util/util_string.h"
+#include <algorithm>
 #include <cctype>
 #include "../../util/thread.h"
 #include "dxvk_context.h"
@@ -562,6 +563,37 @@ namespace dxvk {
       Logger::info("[Remix-DX11][init] waiting for shader prewarm...");
       waitForShaderPrewarm(false);
     }
+
+    // DX11_V296_BACKGROUND_COMPILE_CAP: from here on the game is running, so
+    // Remix pipeline compiles (background boot prewarm and any later first-use
+    // compile) are capped to a few concurrent builds. Uncapped, every compiler
+    // worker chewed on a multi-second ray-tracing pipeline at once and the
+    // driver's internal compiler pool saturated the CPU - the reported
+    // "lagging games after the prewarmer". Blocking boot prewarm above and the
+    // exit drain in waitForShaderPrewarm() run before/after this cap applies.
+    {
+      uint32_t concurrency = RtxOptions::Shader::backgroundCompilerConcurrency();
+      if (concurrency == 0u) {
+        const uint32_t cpuThreads = std::max(1u, dxvk::thread::hardware_concurrency());
+        concurrency = std::clamp(cpuThreads / 4u, 1u, 4u);
+      }
+      pCommon->pipelineManager().setRemixCompileConcurrency(concurrency);
+      Logger::info(str::format(
+        "[Remix-DX11][init] background Remix compile concurrency capped at ",
+        concurrency, " (rtx.shader.backgroundCompilerConcurrency=",
+        RtxOptions::Shader::backgroundCompilerConcurrency(), ", 0=auto)."));
+    }
+
+    // DX11_V296_NONBLOCKING_PREWARM_WINDOW: when boot prewarm runs in the
+    // background, the old blocking wait was the only code path that showed the
+    // progress window - so V295's non-blocking default silently compiled ~300
+    // pipelines with no window at all ("games are grabbing shaders without the
+    // window"). Drive the same shared window from a monitor thread instead:
+    // progress stays visible, the game keeps running.
+    if (prewarmStarted && !m_warmupComplete) {
+      startBackgroundPrewarmMonitor();
+    }
+
     Logger::info("[Remix-DX11][init] RtxInitializer::initialize() complete.");
   }
 
@@ -697,9 +729,22 @@ namespace dxvk {
   }
 
   void RtxInitializer::waitForShaderPrewarm(bool showProgressDialog) {
+    // DX11_V296_NONBLOCKING_PREWARM_WINDOW: the background monitor references
+    // this device, so it must be stopped before any blocking drain or device
+    // teardown proceeds. It reacts to the stop flag within a poll interval.
+    m_stopPrewarmMonitor.store(true);
+    if (m_prewarmMonitorThread.joinable()) {
+      m_prewarmMonitorThread.join();
+    }
+
     if (m_warmupComplete) {
       return;
     }
+
+    // DX11_V296_BACKGROUND_COMPILE_CAP: this wait blocks the game (boot wait or
+    // exit drain), so restore full compile parallelism for its duration - the
+    // gameplay cap would otherwise stretch the drain out severalfold.
+    m_device->getCommon()->pipelineManager().setRemixCompileConcurrency(0u);
 
     // Full-variant prewarming can legitimately take several minutes on an empty
     // driver cache. A fixed total timeout released the game halfway through that
@@ -770,6 +815,81 @@ namespace dxvk {
     DxvkRaytracingPipeline::releaseFinalizer();
 
     m_warmupComplete = true;
+  }
+
+  void RtxInitializer::startBackgroundPrewarmMonitor() {
+    m_stopPrewarmMonitor.store(false);
+    m_prewarmMonitorThread = dxvk::thread([this] {
+      env::setThreadName("rtx-prewarm-monitor");
+
+      constexpr uint64_t kNoProgressTimeoutMs = 180000;
+      constexpr uint64_t kProgressLogIntervalMs = 5000;
+      constexpr uint32_t kPollIntervalMs = 250;
+
+      auto& pipelineManager = m_device->getCommon()->pipelineManager();
+      uint32_t pendingPipelines = pipelineManager.remixShaderCompilationCount();
+      if (pendingPipelines == 0u) {
+        return;
+      }
+
+      const uint64_t startMs = ::GetTickCount64();
+      uint64_t lastProgressMs = startMs;
+      uint64_t lastProgressLogMs = startMs;
+      bool stalled = false;
+
+      // Same shared window as the blocking boot wait; the game keeps rendering
+      // while this thread keeps the count and progress bar live.
+      ShaderPrewarmDialogPhase progressDialog(
+        RtxOptions::Shader::showPrewarmDialog(),
+        L"Compiling Remix pipelines in the background - the game stays playable...",
+        pendingPipelines);
+
+      while (!m_stopPrewarmMonitor.load()) {
+        const uint64_t nowMs = ::GetTickCount64();
+        const uint32_t currentPending =
+          pipelineManager.remixShaderCompilationCount();
+        if (currentPending != pendingPipelines) {
+          pendingPipelines = currentPending;
+          lastProgressMs = nowMs;
+        }
+
+        progressDialog.update(pendingPipelines);
+
+        if (pendingPipelines == 0u) {
+          break;
+        }
+
+        if (nowMs - lastProgressLogMs >= kProgressLogIntervalMs) {
+          Logger::info(str::format(
+            "[Remix-DX11][init] background shader prewarm progress: pendingPipelines=",
+            pendingPipelines, " elapsedMs=", nowMs - startMs));
+          lastProgressLogMs = nowMs;
+        }
+
+        if (nowMs - lastProgressMs >= kNoProgressTimeoutMs) {
+          stalled = true;
+          break;
+        }
+
+        ::Sleep(kPollIntervalMs);
+      }
+
+      const uint64_t totalElapsedMs = ::GetTickCount64() - startMs;
+      if (pendingPipelines == 0u) {
+        Logger::info(str::format(
+          "[Remix-DX11][init] background shader prewarm complete: pendingPipelines=0 elapsedMs=",
+          totalElapsedMs));
+        DxvkRaytracingPipeline::releaseFinalizer();
+        m_warmupComplete = true;
+      } else if (stalled) {
+        Logger::err(str::format(
+          "[Remix-DX11][init] background shader prewarm monitor stopped: no progress for 180s, remainingPipelines=",
+          pendingPipelines, " elapsedMs=", totalElapsedMs,
+          "; compilation continues in the background without the window."));
+      }
+      // A stop request (device teardown / blocking drain) just ends the
+      // monitor; waitForShaderPrewarm owns completion from there.
+    });
   }
 
   void RtxInitializer::prewarmCachedGameShaders(

@@ -132,6 +132,16 @@ namespace dxvk {
     uint32_t remixShaderCompilationCount() const {
       return m_workerCompilingRemixShaders.load();
     }
+
+    // DX11_V296_BACKGROUND_COMPILE_CAP: limits how many Remix pipeline compiles
+    // run concurrently (0 = unlimited). Remix ray-tracing pipelines are the
+    // multi-second giants; letting all workers chew on them while the game is
+    // presenting frames saturates the driver's own compiler pool and lags
+    // gameplay. Regular game pipelines are never throttled by this.
+    void setRemixCompileConcurrency(uint32_t maxConcurrent) {
+      m_remixCompileConcurrencyLimit.store(maxConcurrent);
+      m_workerCond.notify_all();
+    }
 // NV-DXVK end
 
   private:
@@ -184,6 +194,13 @@ namespace dxvk {
     dxvk::mutex                       m_workerLock;
     dxvk::condition_variable          m_workerCond;
     std::queue<WorkerItem>            m_workerQueue;
+    // NV-DXVK start: Remix compiles queue separately so the concurrency cap can
+    // hold them back without ever delaying a regular game pipeline behind a
+    // multi-second ray-tracing pipeline compile.
+    std::queue<WorkerItem>            m_workerQueueRemix;
+    std::atomic<uint32_t>             m_remixCompilesActive = { 0 };
+    std::atomic<uint32_t>             m_remixCompileConcurrencyLimit = { 0 };
+    // NV-DXVK end
     // NV-DXVK start: do not compile same shader multiple times
     std::unordered_set<size_t>        m_workerItemsInFlight;  // stores hashes for work items in the queue
     // NV-DXVK end

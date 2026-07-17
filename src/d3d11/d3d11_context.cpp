@@ -3496,46 +3496,55 @@ namespace dxvk {
      && dstExtent.height == dstMipExtent.height
      && dstExtent.depth  == dstMipExtent.depth) {
       Rc<DxvkImage> dstImage = pDstTexture->GetImage();
-      if (dstImage != nullptr && dstImage->getHash() == 0ull) {
-        const Rc<DxvkImage> srcImage = srcIsImage ? pSrcTexture->GetImage() : nullptr;
-        const XXH64_hash_t srcImageHash = srcImage != nullptr ? srcImage->getHash() : 0ull;
-        constexpr size_t kMaxTexelHashBytes = 32768;
-        const VkFormat dstFormat = pDstTexture->GetPackedFormat();
+      if (dstImage != nullptr) {
+        if (srcIsImage) {
+          // DX11_V297_HASH_IDENTITY_INHERIT: image-to-image copies transfer
+          // the source's identity VERBATIM. Games stream textures by creating
+          // a new object, copying the shared mips over and destroying the old
+          // one - the new object is the SAME asset, so it must keep the same
+          // hash or every streaming upgrade mints a duplicate entry in the
+          // texture list, breaks tags/replacements keyed on the old hash and
+          // resets the surface's temporal history (ghosting/flicker). The old
+          // recipe re-mixed dst format/extent/subresource over the inherited
+          // hash, which minted exactly those duplicates. The strong claim may
+          // replace a weak content-chokepoint claim, so identity converges on
+          // the original asset hash regardless of copy-vs-upload order. A
+          // source with hash 0 (render target, unhashed intermediate) offers
+          // no identity - leave dst as-is.
+          const Rc<DxvkImage> srcImage = pSrcTexture->GetImage();
+          const XXH64_hash_t srcImageHash = srcImage != nullptr ? srcImage->getHash() : 0ull;
+          if (srcImageHash != 0ull
+           && dstImage->getHash() != srcImageHash
+           && pDstTexture->TryClaimImageHashStrong())
+            dstImage->setHash(srcImageHash);
+        } else if (dstImage->getHash() == 0ull) {
+          // Staging-to-image: hash the CPU-visible packed texels the copy
+          // will read. The packed layout is computed by DXVK from
+          // format/extent, so the bytes are identical across runs/vendors.
+          constexpr size_t kMaxTexelHashBytes = 32768;
+          const VkFormat dstFormat = pDstTexture->GetPackedFormat();
 
-        const uint32_t hashLayerCount = std::max(1u, pDstLayers->layerCount);
-        for (uint32_t layer = 0; layer < hashLayerCount; layer++) {
-          const UINT dstSubresource = D3D11CalcSubresource(pDstLayers->mipLevel,
-            pDstLayers->baseArrayLayer + layer, pDstTexture->Desc()->MipLevels);
+          const uint32_t hashLayerCount = std::max(1u, pDstLayers->layerCount);
+          for (uint32_t layer = 0; layer < hashLayerCount; layer++) {
+            const UINT dstSubresource = D3D11CalcSubresource(pDstLayers->mipLevel,
+              pDstLayers->baseArrayLayer + layer, pDstTexture->Desc()->MipLevels);
 
-          XXH64_hash_t contentHash;
-          if (srcIsImage) {
-            // Image-to-image: inherit the source's content identity. A source
-            // with hash 0 (render target, unhashed intermediate) offers no
-            // stable identity - leave the subresource unmarked so a later
-            // copy from a hashed source can still establish it.
-            if (srcImageHash == 0ull)
-              continue;
-            contentHash = srcImageHash;
-          } else {
-            // Staging-to-image: hash the CPU-visible packed texels the copy
-            // will read. The packed layout is computed by DXVK from
-            // format/extent, so the bytes are identical across runs/vendors.
             const UINT srcSubresource = D3D11CalcSubresource(pSrcLayers->mipLevel,
               pSrcLayers->baseArrayLayer + layer, pSrcTexture->Desc()->MipLevels);
             const DxvkBufferSliceHandle srcSlice = pSrcTexture->GetMappedSlice(srcSubresource);
             if (srcSlice.mapPtr == nullptr)
               continue;
-            contentHash = XXH3_64bits(srcSlice.mapPtr,
+            XXH64_hash_t contentHash = XXH3_64bits(srcSlice.mapPtr,
               std::min<size_t>(size_t(srcSlice.length), kMaxTexelHashBytes));
+
+            contentHash = XXH3_64bits_withSeed(&dstFormat, sizeof(dstFormat), contentHash);
+            contentHash = XXH3_64bits_withSeed(&dstMipExtent, sizeof(dstMipExtent), contentHash);
+            contentHash = XXH3_64bits_withSeed(&dstSubresource, sizeof(dstSubresource), contentHash);
+
+            if (pDstTexture->TryClaimImageHashWeak())
+              dstImage->setHash(contentHash != 0ull ? contentHash : 1ull);
+            break;
           }
-
-          contentHash = XXH3_64bits_withSeed(&dstFormat, sizeof(dstFormat), contentHash);
-          contentHash = XXH3_64bits_withSeed(&dstMipExtent, sizeof(dstMipExtent), contentHash);
-          contentHash = XXH3_64bits_withSeed(&dstSubresource, sizeof(dstSubresource), contentHash);
-
-          if (pDstTexture->TryClaimImageHash())
-            dstImage->setHash(contentHash != 0ull ? contentHash : 1ull);
-          break;
         }
       }
     }
@@ -3861,7 +3870,7 @@ namespace dxvk {
       Rc<DxvkImage> dstImage = pDstTexture->GetImage();
       if (dstImage != nullptr
        && dstImage->getHash() == 0ull
-       && pDstTexture->TryClaimImageHash()) {
+       && pDstTexture->TryClaimImageHashWeak()) {
         // Cap the bytes hashed per upload for performance (mirrors the capped
         // geometry-index hash in rtx_hashing.cpp). 64 KiB is enough entropy for
         // stable identity while bounding CPU cost on large BC textures.

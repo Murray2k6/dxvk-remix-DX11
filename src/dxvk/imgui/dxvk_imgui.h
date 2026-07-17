@@ -101,6 +101,12 @@ namespace dxvk {
     
     static void AddTexture(const XXH64_hash_t hash, const Rc<DxvkImageView>& imageView, uint32_t textureFeatureFlags);
     static void ReleaseTexture(const XXH64_hash_t hash);
+    // DX11_V297_TEXTURE_RELEASE_QUEUE: D3D11 textures are destroyed from
+    // arbitrary app threads, but the ImGui texture map is single-threaded.
+    // Destructors queue the hash here; the UI thread drains the queue once
+    // per frame (in update()) through ReleaseTexture, which honors
+    // rtx.keepTexturesForTagging ("Preserve discarded textures").
+    static void QueueReleaseTexture(const XXH64_hash_t hash);
     static bool checkHotkeyState(const VirtualKeys& virtKeys, const bool allowContinuousPress = false);
     static void SetFogStates(const fast_unordered_cache<FogState>& fogStates, XXH64_hash_t usedFogHash);
 

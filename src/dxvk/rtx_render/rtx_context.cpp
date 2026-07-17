@@ -2407,10 +2407,25 @@ namespace dxvk {
 
     UnifiedCB prevCB;
 
-    if (drawCallState.usesVertexShader) {
-      prevCB.programmablePipeline = *static_cast<D3D11RtxVertexCaptureData*>(m_rtState.vertexCaptureCB->mapPtr(0));
+    // DX11_V296_NULL_STATE_CB_GUARD: these Remix-owned constant buffers are
+    // never created in the DX11 fork (setConstantBuffers has no caller), and
+    // DXBC game shaders would not read them anyway. Dereferencing them here
+    // crashed the game whenever a sky draw took the raster path (skybox quads
+    // or reprojection disabled). Skip the save/modify/restore and still render
+    // the matte - only the clip-space jitter injection is lost, which was a
+    // no-op for DXBC shaders regardless.
+    const bool hasVertexStateCB = drawCallState.usesVertexShader
+      ? m_rtState.vertexCaptureCB != nullptr
+      : m_rtState.vsFixedFunctionCB != nullptr;
+
+    if (hasVertexStateCB) {
+      if (drawCallState.usesVertexShader) {
+        prevCB.programmablePipeline = *static_cast<D3D11RtxVertexCaptureData*>(m_rtState.vertexCaptureCB->mapPtr(0));
+      } else {
+        prevCB.fixedFunction = *static_cast<D3D11FixedFunctionVS*>(m_rtState.vsFixedFunctionCB->mapPtr(0));
+      }
     } else {
-      prevCB.fixedFunction = *static_cast<D3D11FixedFunctionVS*>(m_rtState.vsFixedFunctionCB->mapPtr(0));
+      ONCE(Logger::info("[RTX Sky] Rasterizing sky matte without state constant buffers (DX11 runtime); clip-space jitter injection skipped."));
     }
 
     auto skyMatteView = getResourceManager().getSkyMatte(this, m_skyColorFormat).view;
@@ -2443,33 +2458,35 @@ namespace dxvk {
       setViewports(1, &viewport, &scissor);
     }
 
-    if (drawCallState.usesVertexShader) {
-      D3D11RtxVertexCaptureData modified = prevCB.programmablePipeline;
-      {
-        // Jittered clip space for DLSS
-        // Note: we can't jitter the projection matrix, as a game might calculate
-        // its gl_Position by different methods (e.g. without projection matrix at all);
-        // so apply jitter directly on gl_Position
-        float ratioX = Sign(drawCallState.getTransformData().viewToProjection[2][3]);
-        float ratioY = -Sign(drawCallState.getTransformData().viewToProjection[2][3]);
-        Vector2 clipSpaceJitter = camera.calcClipSpaceJitter(camera.calcPixelJitter(m_device->getCurrentFrameId()), ratioX, ratioY);
-        modified.jitterX = clipSpaceJitter.x;
-        modified.jitterY = clipSpaceJitter.y;
-      }
+    if (hasVertexStateCB) {
+      if (drawCallState.usesVertexShader) {
+        D3D11RtxVertexCaptureData modified = prevCB.programmablePipeline;
+        {
+          // Jittered clip space for DLSS
+          // Note: we can't jitter the projection matrix, as a game might calculate
+          // its gl_Position by different methods (e.g. without projection matrix at all);
+          // so apply jitter directly on gl_Position
+          float ratioX = Sign(drawCallState.getTransformData().viewToProjection[2][3]);
+          float ratioY = -Sign(drawCallState.getTransformData().viewToProjection[2][3]);
+          Vector2 clipSpaceJitter = camera.calcClipSpaceJitter(camera.calcPixelJitter(m_device->getCurrentFrameId()), ratioX, ratioY);
+          modified.jitterX = clipSpaceJitter.x;
+          modified.jitterY = clipSpaceJitter.y;
+        }
 
-      // Ensure that memcpy can be used for fewer memory interactions
-      static_assert(std::is_trivially_copyable_v<D3D11RtxVertexCaptureData>);
-      allocAndMapVertexCaptureConstantBuffer() = modified;
-    } else {
-      D3D11FixedFunctionVS modified = prevCB.fixedFunction;
-      {
-        // Jittered projection for DLSS
-        camera.applyJitterTo(modified.Projection,
-                             m_device->getCurrentFrameId());
+        // Ensure that memcpy can be used for fewer memory interactions
+        static_assert(std::is_trivially_copyable_v<D3D11RtxVertexCaptureData>);
+        allocAndMapVertexCaptureConstantBuffer() = modified;
+      } else {
+        D3D11FixedFunctionVS modified = prevCB.fixedFunction;
+        {
+          // Jittered projection for DLSS
+          camera.applyJitterTo(modified.Projection,
+                               m_device->getCurrentFrameId());
+        }
+        // Ensure that memcpy can be used for fewer memory interactions
+        static_assert(std::is_trivially_copyable_v<D3D11FixedFunctionVS>);
+        allocAndMapFixedFunctionVSConstantBuffer() = modified;
       }
-      // Ensure that memcpy can be used for fewer memory interactions
-      static_assert(std::is_trivially_copyable_v<D3D11FixedFunctionVS>);
-      allocAndMapFixedFunctionVSConstantBuffer() = modified;
     }
 
     DxvkRenderTargets skyRt;
@@ -2492,10 +2509,12 @@ namespace dxvk {
       assert(prevClipSpaceJitterEnabled == 0 || prevClipSpaceJitterEnabled == 1);
       setSpecConstant(VK_PIPELINE_BIND_POINT_GRAPHICS, D3D11SpecConstantId::ClipSpaceJitterEnabled, prevClipSpaceJitterEnabled);
     }
-    if (drawCallState.usesVertexShader) {
-      allocAndMapVertexCaptureConstantBuffer() = prevCB.programmablePipeline;
-    } else {
-      allocAndMapFixedFunctionVSConstantBuffer() = prevCB.fixedFunction;
+    if (hasVertexStateCB) {
+      if (drawCallState.usesVertexShader) {
+        allocAndMapVertexCaptureConstantBuffer() = prevCB.programmablePipeline;
+      } else {
+        allocAndMapFixedFunctionVSConstantBuffer() = prevCB.fixedFunction;
+      }
     }
   }
 
@@ -2540,14 +2559,29 @@ namespace dxvk {
 
     UnifiedCB prevCB;
 
-    if (drawCallState.usesVertexShader) {
-      prevCB.programmablePipeline = *static_cast<D3D11RtxVertexCaptureData*>(m_rtState.vertexCaptureCB->mapPtr(0));
+    // DX11_V296_NULL_STATE_CB_GUARD: same as rasterizeToSkyMatte - these
+    // buffers do not exist in the DX11 fork and dereferencing them crashed any
+    // sky draw that reached the probe path. Without them the per-cube-face
+    // reprojection (customWorldToProjection) cannot be injected, so the six
+    // faces render with the game's own transform: a degenerate but stable
+    // probe instead of a crash.
+    const bool hasVertexStateCB = drawCallState.usesVertexShader
+      ? m_rtState.vertexCaptureCB != nullptr
+      : m_rtState.vsFixedFunctionCB != nullptr;
+
+    if (hasVertexStateCB) {
+      if (drawCallState.usesVertexShader) {
+        prevCB.programmablePipeline = *static_cast<D3D11RtxVertexCaptureData*>(m_rtState.vertexCaptureCB->mapPtr(0));
+      } else {
+        prevCB.fixedFunction = *static_cast<D3D11FixedFunctionVS*>(m_rtState.vsFixedFunctionCB->mapPtr(0));
+      }
     } else {
-      prevCB.fixedFunction = *static_cast<D3D11FixedFunctionVS*>(m_rtState.vsFixedFunctionCB->mapPtr(0));
+      ONCE(Logger::info("[RTX Sky] Rasterizing sky probe without state constant buffers (DX11 runtime); per-face reprojection unavailable."));
     }
 
-    const Matrix4& worldToView = drawCallState.usesVertexShader ? drawCallState.getTransformData().worldToView : prevCB.fixedFunction.View;
-    const Matrix4& viewToProj  = drawCallState.usesVertexShader ? drawCallState.getTransformData().viewToProjection : prevCB.fixedFunction.Projection;
+    const bool useDrawCallTransforms = drawCallState.usesVertexShader || !hasVertexStateCB;
+    const Matrix4& worldToView = useDrawCallTransforms ? drawCallState.getTransformData().worldToView : prevCB.fixedFunction.View;
+    const Matrix4& viewToProj  = useDrawCallTransforms ? drawCallState.getTransformData().viewToProjection : prevCB.fixedFunction.Projection;
 
     // Figure out camera position
     const Vector3 camPos = inverse(worldToView).data[3].xyz();
@@ -2609,32 +2643,34 @@ namespace dxvk {
     for (uint32_t plane = 0; plane < 6; plane++) {
       Rc<DxvkImageView>* skyRenderTarget = &m_skyProbeCubePlanes[plane];
 
-      if (drawCallState.usesVertexShader) {
-        D3D11RtxVertexCaptureData& newState = allocAndMapVertexCaptureConstantBuffer();
-        newState = prevCB.programmablePipeline;
+      if (hasVertexStateCB) {
+        if (drawCallState.usesVertexShader) {
+          D3D11RtxVertexCaptureData& newState = allocAndMapVertexCaptureConstantBuffer();
+          newState = prevCB.programmablePipeline;
 
-        // Create cube plane projection
-        Matrix4 proj = viewToProj;
-        proj[0][0] = 1.f;
-        proj[1][1] = 1.f;
-        proj[2][2] = 1.f;
-        proj[2][3] = 1.f;
+          // Create cube plane projection
+          Matrix4 proj = viewToProj;
+          proj[0][0] = 1.f;
+          proj[1][1] = 1.f;
+          proj[2][2] = 1.f;
+          proj[2][3] = 1.f;
 
-        newState.customWorldToProjection = proj * makeViewMatrixForCubePlane(plane, camPos);
-      } else {
-        // Push new state to the fixed function constants
-        D3D11FixedFunctionVS& newState = allocAndMapFixedFunctionVSConstantBuffer();
-        newState = prevCB.fixedFunction;
-        const Matrix4 view = makeViewMatrixForCubePlane(plane, camPos);
+          newState.customWorldToProjection = proj * makeViewMatrixForCubePlane(plane, camPos);
+        } else {
+          // Push new state to the fixed function constants
+          D3D11FixedFunctionVS& newState = allocAndMapFixedFunctionVSConstantBuffer();
+          newState = prevCB.fixedFunction;
+          const Matrix4 view = makeViewMatrixForCubePlane(plane, camPos);
 
-        // Set to identity, as we use custom matrices that transform from world to cube side projection
-        newState.View      = view;
-        newState.WorldView = view * prevCB.fixedFunction.World;
-        // And cube plane projection
-        newState.Projection[0][0] = 1.f;
-        newState.Projection[1][1] = 1.f;
-        newState.Projection[2][2] = 1.f;
-        newState.Projection[2][3] = 1.f;
+          // Set to identity, as we use custom matrices that transform from world to cube side projection
+          newState.View      = view;
+          newState.WorldView = view * prevCB.fixedFunction.World;
+          // And cube plane projection
+          newState.Projection[0][0] = 1.f;
+          newState.Projection[1][1] = 1.f;
+          newState.Projection[2][2] = 1.f;
+          newState.Projection[2][3] = 1.f;
+        }
       }
 
       DxvkRenderTargets skyRt;
@@ -2660,10 +2696,12 @@ namespace dxvk {
       assert(prevCustomVertexTransformEnabled == 0 || prevCustomVertexTransformEnabled == 1);
       setSpecConstant(VK_PIPELINE_BIND_POINT_GRAPHICS, D3D11SpecConstantId::CustomVertexTransformEnabled, prevCustomVertexTransformEnabled);
     }
-    if (drawCallState.usesVertexShader) {
-      allocAndMapVertexCaptureConstantBuffer() = prevCB.programmablePipeline;
-    } else {
-      allocAndMapFixedFunctionVSConstantBuffer() = prevCB.fixedFunction;
+    if (hasVertexStateCB) {
+      if (drawCallState.usesVertexShader) {
+        allocAndMapVertexCaptureConstantBuffer() = prevCB.programmablePipeline;
+      } else {
+        allocAndMapFixedFunctionVSConstantBuffer() = prevCB.fixedFunction;
+      }
     }
   }
 

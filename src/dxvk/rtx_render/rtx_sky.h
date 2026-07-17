@@ -189,6 +189,26 @@ dxvk::RtxContext::TryHandleSkyResult dxvk::RtxContext::tryHandleSky(const DrawPa
     // But for 3D skybox (i.e. the objects that are rendered in sky camera space),
     // we would need to know the main camera to be able to reproject from sky to main camera space,
     // so delay ray traced logic until then
+    //
+    // Entries are only meaningful within the frame that recorded them: the
+    // reprojection below uses that frame's main camera, and each DrawCallState
+    // pins its dynamic vertex/index snapshot buffers. If a previous frame never
+    // reached the flush (no eligible main camera), discard its entries instead
+    // of accumulating them - unbounded growth here pinned gigabytes of
+    // 'd3d11 rtx dynamic vb snapshot' allocations in Skyrim SE until the
+    // driver lost the device.
+    {
+      const uint32_t currentFrameId = m_device->getCurrentFrameId();
+      if (m_delayedRayTracedSkyFrameId != currentFrameId) {
+        if (!m_delayedRayTracedSky.empty()) {
+          ONCE(Logger::info(str::format("[RTX Sky] Discarding ", m_delayedRayTracedSky.size(),
+                                        " delayed ray-traced sky draw(s) from frame ", m_delayedRayTracedSkyFrameId,
+                                        " that never flushed (main camera not updated); further drops are silent.")));
+          m_delayedRayTracedSky.clear();
+        }
+        m_delayedRayTracedSkyFrameId = currentFrameId;
+      }
+    }
     m_delayedRayTracedSky.push_back(std::move(*originalDrawCallState));
     return TryHandleSkyResult::SkipSubmit;
   }
@@ -203,9 +223,22 @@ dxvk::RtxContext::TryHandleSkyResult dxvk::RtxContext::tryHandleSky(const DrawPa
   // 2. Submit ray traced sky geometry as a part of the main scene by reprojecting its transform
   const RtCamera& mainCam = getSceneManager().getCameraManager().getCamera(CameraType::Main);
 
-  if (mainCam.getLastUpdateFrame() != m_device->getCurrentFrameId()) {
-    // Skip, if the main camera hasn't been updated yet
-    return TryHandleSkyResult::Default;
+  // The DX11 exact replacement camera is stamped at present time, so during
+  // draw submission the main camera's last update is the *previous* frame.
+  // Accept one frame of staleness (the same tolerance the
+  // resolvePreCombinedMatrices path uses); requiring a same-frame update meant
+  // this flush never ran in the DX11 path, so the delayed sky never rendered
+  // and m_delayedRayTracedSky grew without bound.
+  {
+    const uint32_t currentFrameId = m_device->getCurrentFrameId();
+    const uint32_t camFrame = mainCam.getLastUpdateFrame();
+    const bool cameraFresh = camFrame == currentFrameId
+                          || (currentFrameId > 0 && camFrame == currentFrameId - 1);
+    if (!cameraFresh) {
+      // Skip, if the main camera hasn't been updated yet. Stale entries are
+      // aged out on the next sky push, so this cannot accumulate.
+      return TryHandleSkyResult::Default;
+    }
   }
 
   // Note: getNearPlane() / getFarPlane() do not return actual values in case if overrideNearPlane is enabled
