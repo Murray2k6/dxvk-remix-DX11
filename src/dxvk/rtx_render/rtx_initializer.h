@@ -20,6 +20,7 @@
 * DEALINGS IN THE SOFTWARE.
 */
 #pragma once
+#include <atomic>
 #include <functional>
 
 #include "../../util/rc/util_rc_ptr.h"
@@ -67,7 +68,14 @@ namespace dxvk {
     void loadAssets();
     bool startPrewarmShaders();
 
+    // DX11_V296_NONBLOCKING_PREWARM_WINDOW: when boot prewarm runs in the
+    // background (rtx.shader.waitForPrewarmOnBoot off), this thread drives the
+    // shared progress window and the progress log without blocking the game.
+    void startBackgroundPrewarmMonitor();
+
     dxvk::thread m_asyncAssetLoadThread;
+    dxvk::thread m_prewarmMonitorThread;
+    std::atomic<bool> m_stopPrewarmMonitor { false };
 
     RTX_OPTION_ENV("rtx.initializer", bool, asyncShaderPrewarming, true, "RTX_ASYNC_SHADER_PREWARMING",
                    "When set to true, shader prewarming will be enabled, allowing for Remix to start compiling shaders before their first use.\n"

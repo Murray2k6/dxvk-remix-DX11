@@ -153,6 +153,11 @@ namespace dxvk {
   uint32_t DxvkPipelineManager::remixShaderCompilationCount() const {
     return m_stateCache != nullptr ? m_stateCache->remixShaderCompilationCount() : 0;
   }
+
+  void DxvkPipelineManager::setRemixCompileConcurrency(uint32_t maxConcurrent) {
+    if (m_stateCache != nullptr)
+      m_stateCache->setRemixCompileConcurrency(maxConcurrent);
+  }
 // NV-DXVK end
 
 

@@ -470,9 +470,13 @@ namespace dxvk {
       RTX_OPTION("rtx.shader", bool, enableAsyncCompilationUI, true,
                  "Enables a UI message when async shader compilation is in progress to indicate the current compilation progress. Only takes effect when rtx.shader.enableAsyncCompilation is true.\n"
                  "This should usually be enabled as providing information to the user about the current progress of compilation is useful. May be disabled however for automated testing purposes if the nondeterministic behavior of the UI's rendered text interferes with testing.");
-      RTX_OPTION("rtx.shader", std::uint32_t, asyncCompilationThrottleMilliseconds, 33,
+      RTX_OPTION("rtx.shader", std::uint32_t, asyncCompilationThrottleMilliseconds, 8,
                  "Specifies a time in milliseconds to throttle each application frame when async shader compilation is in progress. Set to 0 to disable, and only takes effect when rtx.shader.enableAsyncCompilation is true.\n"
-                 "This generally should be set to a value low enough to not impact the application framerate significantly (especially if non-ray traced visuals are capable of being displayed by the application while loading, e.g. an intro video), but also high enough to get the desired shader compilation performance (especially relevant if the application is fairly heavy on the CPU during async shader compilation, or on CPUs with few hardware threads).");
+                 "This generally should be set to a value low enough to not impact the application framerate significantly (especially if non-ray traced visuals are capable of being displayed by the application while loading, e.g. an intro video), but also high enough to get the desired shader compilation performance (especially relevant if the application is fairly heavy on the CPU during async shader compilation, or on CPUs with few hardware threads).\n"
+                 "DX11_V296: default lowered from 33 to 8. With rtx.shader.waitForPrewarmOnBoot off, the full pipeline set compiles in the background while the game is already playable; a 33ms tax on every frame capped games near 30 FPS for that whole multi-minute window - the reported post-prewarm lag. 8ms keeps the compiler fed without visibly dragging the frame rate.");
+      RTX_OPTION("rtx.shader", std::uint32_t, backgroundCompilerConcurrency, 0,
+                 "Maximum number of Remix pipeline compiles allowed to run concurrently on the shader compiler workers once the game is running (0 = automatic: one quarter of the hardware threads, clamped to [1, 4]).\n"
+                 "Remix ray-tracing pipelines take seconds to minutes each to build and the GPU driver parallelizes each compile internally; letting every worker thread build one at once saturates the CPU and the driver's own compiler pool, which lags gameplay while the background prewarm runs. This cap only applies to Remix pipelines and only after initialization - boot-time blocking prewarm and the exit drain always run at full parallelism - and regular game pipelines are never held back by it.");
     } shader;
 
     struct RaytracedRenderTarget {

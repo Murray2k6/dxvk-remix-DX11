@@ -276,6 +276,10 @@ namespace dxvk {
     } m_objectPickingReadback {};
 
     std::vector<DrawCallState> m_delayedRayTracedSky;
+    // Frame that produced the entries in m_delayedRayTracedSky. Entries hold
+    // live vertex/index snapshot references and are only valid for the frame
+    // that recorded them; anything older is dropped, never submitted.
+    uint32_t m_delayedRayTracedSkyFrameId = kInvalidFrameIndex;
 
 #ifdef REMIX_DEVELOPMENT
     void queryAvailableResourceAliasing();

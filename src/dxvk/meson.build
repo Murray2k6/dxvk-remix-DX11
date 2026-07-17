@@ -469,7 +469,12 @@ else
   message('DX11_V219_OPTIONAL_NGX_NO_LIB_BLOCK: NGX import library not found; building runtime without static NGX linkage. DLSS/RR/FG NGX features will be disabled until nvsdk_ngx*.lib is added.')
   dlss_dep = declare_dependency(include_directories : [ dlss_include_dir, dlfg_include_dir ])
 else
+  if not dlss_lib.found()
+  message('DX11_V219_OPTIONAL_NGX_NO_LIB_BLOCK: NGX import library not found; building runtime without static NGX linkage. DLSS/RR/FG NGX features will be disabled until nvsdk_ngx*.lib is added.')
+  dlss_dep = declare_dependency(include_directories : [ dlss_include_dir, dlfg_include_dir ])
+else
   dlss_dep = declare_dependency(dependencies : [ dlss_lib ], include_directories : [ dlss_include_dir, dlfg_include_dir ])
+endif
 endif
 endif
 endif

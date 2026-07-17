@@ -292,6 +292,22 @@ namespace dxvk {
       return false;
     }
 
+    // DX11_V296_NULL_STATE_CB_GUARD: the D3D9-era state constant buffers
+    // (vertexCaptureCB / vsFixedFunctionCB / psSharedStateCB) are never created
+    // in the DX11 fork - RtxContext::setConstantBuffers has no caller and the
+    // DXBC shader path has no CustomVertexTransform hook that would consume
+    // them. This function dereferenced them unconditionally, so tagging ANY
+    // texture as Terrain crashed the game on the very next frame - the
+    // reported terrain-tagging crash. Until a DXBC-side vertex-transform hook
+    // exists, terrain-tagged draws fall back to regular path-traced geometry
+    // (no cascade baking) instead of crashing.
+    if (rtState.psSharedStateCB == nullptr
+     || (drawCallState.usesVertexShader && rtState.vertexCaptureCB == nullptr)
+     || (!drawCallState.usesVertexShader && rtState.vsFixedFunctionCB == nullptr)) {
+      ONCE(Logger::warn("[RTX Terrain Baker] Terrain cascade baking is not available in the DX11 runtime (no vertex-transform constant buffers). Rendering terrain-tagged draws as regular path-traced geometry."));
+      return false;
+    }
+
     if (!Material::bakeReplacementMaterials()) {
       replacementMaterial = nullptr;
     }

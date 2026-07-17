@@ -240,25 +240,52 @@ namespace dxvk {
     }
 
     // NV-DXVK start: DX11_V258_TEXTURE_HASH_STABILITY
+    // DX11_V297_HASH_IDENTITY_INHERIT: claims now carry a strength.
+    // A WEAK claim comes from a CPU-content chokepoint (UpdateSubresource,
+    // Unmap, staging copy) - it identifies the texture by whichever
+    // subresource happened to upload first, which is stable for standalone
+    // textures but arbitrary for stream-assembled ones. A STRONG claim comes
+    // from creation data or from inheriting another hashed image's identity
+    // (GPU-to-GPU copy). Strong may replace weak exactly once, so a texture
+    // assembled by "upload new mips + copy shared mips from the previous
+    // generation" converges on the ORIGINAL asset identity no matter which
+    // upload lands first. Strong never replaces strong.
+    static constexpr uint64_t kImageHashWeakClaim   = 1ull;
+    static constexpr uint64_t kImageHashStrongClaim = ~0ull;
+
     /**
-     * \brief Atomically claims establishment of the image identity
-     *
-     * A Remix texture/category hash is an immutable asset identifier, not a
-     * running checksum of streamed mips. The first complete color upload wins;
-     * every later mip/layer/frame keeps that identity so viewport selections,
-     * tags and replacements cannot drift while the game streams the texture.
+     * \brief Claims image identity from a CPU-content upload chokepoint
      */
-    bool TryClaimImageHash() {
+    bool TryClaimImageHashWeak() {
       uint64_t expected = 0ull;
       return m_imageHashClaimed.compare_exchange_strong(
-        expected, ~0ull, std::memory_order_acq_rel, std::memory_order_relaxed);
+        expected, kImageHashWeakClaim, std::memory_order_acq_rel, std::memory_order_relaxed);
+    }
+
+    /**
+     * \brief Claims (or upgrades to) an inherited/creation image identity
+     *
+     * Returns true when the caller owns the identity and must set the hash:
+     * either the identity was unclaimed, or it was only weakly claimed and
+     * this call upgraded it.
+     */
+    bool TryClaimImageHashStrong() {
+      uint64_t expected = 0ull;
+      if (m_imageHashClaimed.compare_exchange_strong(
+            expected, kImageHashStrongClaim, std::memory_order_acq_rel, std::memory_order_relaxed))
+        return true;
+      if (expected == kImageHashWeakClaim) {
+        return m_imageHashClaimed.compare_exchange_strong(
+          expected, kImageHashStrongClaim, std::memory_order_acq_rel, std::memory_order_relaxed);
+      }
+      return false;
     }
 
     /**
      * \brief Records that creation data established the image identity
      */
     void MarkImageHashEstablished() {
-      m_imageHashClaimed.store(~0ull, std::memory_order_release);
+      m_imageHashClaimed.store(kImageHashStrongClaim, std::memory_order_release);
     }
 
     // DX11_V294_STABLE_HASH_SLOTS: dynamic (no-initial-data) textures derive

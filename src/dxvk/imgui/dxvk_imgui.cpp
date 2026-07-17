@@ -651,9 +651,39 @@ namespace dxvk {
     if (RtxOptions::keepTexturesForTagging()) {
       return;
     }
-    
+
     // Note: Erase will do nothing if the hash does not exist in the map, and erase it if it is.
     g_imguiTextureMap.erase(hash);
+  }
+
+  // DX11_V297_TEXTURE_RELEASE_QUEUE: see dxvk_imgui.h. The queue is the only
+  // cross-thread surface; the map itself stays single-threaded.
+  static dxvk::mutex g_imguiPendingReleaseMutex;
+  static std::vector<XXH64_hash_t> g_imguiPendingTextureReleases;
+
+  void ImGUI::QueueReleaseTexture(const XXH64_hash_t hash) {
+    if (hash == 0) {
+      return;
+    }
+    std::lock_guard<dxvk::mutex> lock(g_imguiPendingReleaseMutex);
+    g_imguiPendingTextureReleases.push_back(hash);
+  }
+
+  static void drainPendingTextureReleases() {
+    std::vector<XXH64_hash_t> pending;
+    {
+      std::lock_guard<dxvk::mutex> lock(g_imguiPendingReleaseMutex);
+      if (g_imguiPendingTextureReleases.empty()) {
+        return;
+      }
+      pending.swap(g_imguiPendingTextureReleases);
+    }
+    // A hash that is still in use (identity inherited by a streaming upgrade
+    // of the same asset) is re-added by the next draw's texture promotion, so
+    // releasing here is safe even for shared identities.
+    for (const XXH64_hash_t hash : pending) {
+      ImGUI::ReleaseTexture(hash);
+    }
   }
 
   void ImGUI::SetFogStates(const fast_unordered_cache<FogState>& fogStates, XXH64_hash_t usedFogHash) {
@@ -903,6 +933,11 @@ namespace dxvk {
   }
 
   void ImGUI::update(const Rc<DxvkContext>& ctx) {
+    // DX11_V297_TEXTURE_RELEASE_QUEUE: retire textures destroyed by the game
+    // since the last frame (single-threaded map, hence drained here). With
+    // rtx.keepTexturesForTagging enabled, ReleaseTexture keeps the entries.
+    drainPendingTextureReleases();
+
     ImGui_ImplDxvk::NewFrame();
     ImGui_ImplWin32_NewFrame();
 

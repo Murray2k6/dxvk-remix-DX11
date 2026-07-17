@@ -3,6 +3,8 @@
 #include "d3d11_gdi.h"
 #include "d3d11_texture.h"
 
+#include "../dxvk/imgui/dxvk_imgui.h"
+
 namespace dxvk {
   
   D3D11CommonTexture::D3D11CommonTexture(
@@ -223,6 +225,13 @@ namespace dxvk {
     if (m_stableHashSlotHeld)
       D3D11Initializer::ReleaseDynamicTextureSlot(
         m_stableHashDescriptor, m_stableHashOrdinal);
+
+    // DX11_V297_TEXTURE_RELEASE_QUEUE: this fork never released destroyed
+    // textures from the tagging UI ("Preserve discarded textures" was a
+    // no-op and dead entries pinned their image views forever). Queue the
+    // release; the UI thread drains it and honors keepTexturesForTagging.
+    if (m_image != nullptr && m_image->getHash() != 0ull)
+      ImGUI::QueueReleaseTexture(m_image->getHash());
   }
   
   

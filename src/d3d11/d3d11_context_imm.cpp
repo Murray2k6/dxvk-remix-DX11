@@ -647,7 +647,7 @@ namespace dxvk {
         const DxvkBufferSliceHandle mappedSlice = pResource->GetMappedSlice(Subresource);
         if (mappedSlice.mapPtr != nullptr
          && image->getHash() == 0ull
-         && pResource->TryClaimImageHash()) {
+         && pResource->TryClaimImageHashWeak()) {
           constexpr size_t kMaxTexelHashBytes = 65536;
           const size_t hashLen = std::min<size_t>(size_t(mappedSlice.length), kMaxTexelHashBytes);
           const VkFormat packedFormat = pResource->GetPackedFormat();

@@ -410,9 +410,13 @@ namespace dxvk {
       t0 = dxvk::high_resolution_clock::now();
     
     VkPipeline pipeline = VK_NULL_HANDLE;
-    if (m_vkd->vkCreateGraphicsPipelines(m_vkd->device(),
-          m_pipeMgr->m_cache->handle(), 1, &info, nullptr, &pipeline) != VK_SUCCESS) {
-      Logger::err("DxvkGraphicsPipeline: Failed to compile pipeline");
+    const VkResult vr = m_vkd->vkCreateGraphicsPipelines(m_vkd->device(),
+          m_pipeMgr->m_cache->handle(), 1, &info, nullptr, &pipeline);
+    if (vr != VK_SUCCESS) {
+      // The VkResult distinguishes a driver rejection from resource exhaustion
+      // (OUT_OF_HOST/DEVICE_MEMORY, DEVICE_LOST) - without it a failure under
+      // memory pressure is indistinguishable from a bad pipeline state.
+      Logger::err(str::format("DxvkGraphicsPipeline: Failed to compile pipeline: ", vr));
       this->logPipelineState(LogLevel::Error, state);
       return VK_NULL_HANDLE;
     }
