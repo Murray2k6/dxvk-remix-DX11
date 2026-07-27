@@ -108,6 +108,7 @@ constexpr const char* kSdfTypeName_Token = "token";
 constexpr const char* kSdfTypeName_Asset = "asset";
 constexpr const char* kSdfTypeName_Bool = "bool";
 constexpr const char* kSdfTypeName_UInt = "uint";
+constexpr const char* kSdfTypeName_Color3f = "color3f";
 
 // Literal mirrors of GfCamera::DEFAULT_HORIZONTAL/VERTICAL_APERTURE (the
 // 35mm-film standard values in USD 22.11).
@@ -352,6 +353,7 @@ namespace ShaderAttr {
 enum Enum {
   OutputsOut,
   DiffuseTex,
+  DiffuseConstant,
   ImplSrc,
   MdlSrcAsset,
   MdlSrcAssetSubId,
@@ -363,6 +365,7 @@ enum Enum {
 static std::unordered_map<Enum,std::string> attrNames {
   {OutputsOut,       "outputs:out"},
   {DiffuseTex,       "inputs:diffuse_texture"},
+  {DiffuseConstant,  "inputs:diffuse_color_constant"},
   {ImplSrc,          "info:implementationSource"},
   {MdlSrcAsset,      "info:mdl:sourceAsset"},
   {MdlSrcAssetSubId, "info:mdl:sourceAsset:subIdentifier"},
@@ -374,6 +377,7 @@ static std::unordered_map<Enum,std::string> attrNames {
 static std::unordered_map<Enum,AttrDesc> attrDescs{
   AttrDescMapEntry(OutputsOut,       Token, false, Varying),
   AttrDescMapEntry(DiffuseTex,       Asset, false, Varying),
+  AttrDescMapEntry(DiffuseConstant,  Color3f, false, Varying),
   AttrDescMapEntry(ImplSrc,          Token, false, Uniform),
   AttrDescMapEntry(MdlSrcAsset,      Asset, false, Uniform),
   AttrDescMapEntry(MdlSrcAssetSubId, Token, false, Uniform),
@@ -422,6 +426,13 @@ void GameExporter::exportMaterials(const Export& exportData, ExportContext& ctx)
 
     std::unordered_map<ShaderAttr::Enum, pxr::UsdAttribute> shaderAttrs;
     for(const auto& [attrEnum, desc] : ShaderAttr::attrDescs) {
+      // Only author the diffuse inputs the material actually provides.
+      if (attrEnum == ShaderAttr::DiffuseTex && matData.albedoTexPath.empty()) {
+        continue;
+      }
+      if (attrEnum == ShaderAttr::DiffuseConstant && !matData.hasAlbedoConstant) {
+        continue;
+      }
       shaderAttrs[attrEnum] =
         shaderPrim.CreateAttribute(desc.attrName, desc.typeName, desc.custom, desc.sdfVariability);
       // Cannot assert. Attr "outputs:out" asserts false, but authoring + Setting works just fine.
@@ -439,10 +450,16 @@ void GameExporter::exportMaterials(const Export& exportData, ExportContext& ctx)
     pxr::UsdModelAPI(shader).SetKind(kTokMaterial);
 
     // Create and set textures asset paths on material
-    const auto relToMaterialsTexPath =
-      std::filesystem::relative(computeLocalPath(matData.albedoTexPath), fullMaterialBasePath).string();
-    ASSERT_OR_EXECUTE(shaderAttrs[ShaderAttr::DiffuseTex].Set(pxr::SdfAssetPath(relToMaterialsTexPath)));
-    shaderAttrs[ShaderAttr::DiffuseTex].SetColorSpace(pxr::TfToken("auto"));
+    if (!matData.albedoTexPath.empty()) {
+      const auto relToMaterialsTexPath =
+        std::filesystem::relative(computeLocalPath(matData.albedoTexPath), fullMaterialBasePath).string();
+      ASSERT_OR_EXECUTE(shaderAttrs[ShaderAttr::DiffuseTex].Set(pxr::SdfAssetPath(relToMaterialsTexPath)));
+      shaderAttrs[ShaderAttr::DiffuseTex].SetColorSpace(pxr::TfToken("auto"));
+    }
+
+    if (matData.hasAlbedoConstant) {
+      ASSERT_OR_EXECUTE(shaderAttrs[ShaderAttr::DiffuseConstant].Set(matData.albedoConstant));
+    }
 
     // Create and set OmniPBR MDL boilerplate attributes on shader
     ASSERT_OR_EXECUTE(shaderAttrs[ShaderAttr::ImplSrc].Set(pxr::TfToken("sourceAsset")));
@@ -960,13 +977,10 @@ void GameExporter::exportInstances(const Export& exportData, ExportContext& ctx)
       _SetDrawMetadata(dstAlphaBlendFactor, UInt);
       _SetDrawMetadata(alphaBlendOp, UInt);
       _SetDrawMetadata(writeMask, UInt);
-      _SetDrawMetadata(textureColorArg1Source, UInt);
-      _SetDrawMetadata(textureColorArg2Source, UInt);
-      _SetDrawMetadata(textureColorOperation, UInt);
-      _SetDrawMetadata(textureAlphaArg1Source, UInt);
-      _SetDrawMetadata(textureAlphaArg2Source, UInt);
-      _SetDrawMetadata(textureAlphaOperation, UInt);
-      _SetDrawMetadata(tFactor, UInt);
+      _SetDrawMetadata(colorSource, UInt);
+      _SetDrawMetadata(alphaSource, UInt);
+      _SetDrawMetadata(modulateVertexColor, Bool);
+      _SetDrawMetadata(modulateVertexAlpha, Bool);
       _SetDrawMetadata(isTextureFactorBlend, Bool);
       _SetDrawMetadata(isVertexColorBakedLighting, Bool);
 #undef _SetDrawMetadata

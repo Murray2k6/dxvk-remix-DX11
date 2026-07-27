@@ -255,14 +255,6 @@ void logRemixDx11BuildBanner() {
   dxvk::Logger::info("[Remix-DX11] fixes: nrcVendorFallback texcoordSINT SR4viewport budgetHeadroom inputSeparation noSyntheticTexture revertedDLSSGuard initStepLogging allVendorPrewarmSkip anyGameAlbedoFix significanceCullingOptIn gpuSceneUI remixapiExport taauDefaultAllVendors rtxOptionsNullGuard rtxOptionsRootCreate intelFseSwapchainFix steamOverlayVkDisable wsiSelfDeadlockPump vramLeakDiag restoreIconicWindow intelFifoPresent intelForceFSEallowed gdiInteropPresent frameLatencyHandleGuard noUvFlatAlbedo baseVertexGeometry gpuSceneBBox perVendorPresent gdiWsiFallback nrcOptIn nvidiaPrewarm rawInputHandoff noInfiniteWaits nonblockingRtPipelines tlasFirewall interleaverFormatNorm dynamicVbSnapshot color0Norm interleaverSkipGuard intUvDecode menuPassthrough migrationPersists fullresTargetGuard viewInProjCbuffer fallbackRadianceTame textureHashStability bridgeTextureContentHash skinningNameGate preciseCamera vpConfirmOncePerFrame crashFilterSafe nrdDenoiserPayload strongerDenoising bridgePresentCamera bootMarkerLogCleanup vertexColorFormats texcoordFormats pickResolveLog nrdRobustLoad menuToggleDebounce uiDisplayMatchesSurface noBlackFromVertexColor nrdDenoiserSafeDefault useRealAlbedo requireRealViewToInject noPrewarmByDefault noStackedInstanceCopies noDepthOnlyGeometry skyAutoDetect realShaderModel colorNameGate mirroredWinding launcherBypass nrdOn globalTonemap texcoordCaptureSO v271SubmitFix dx11FixedFunction bootBreadcrumb sysDllExports satelliteDelayLoad eacAdvisory sharedVkInstance vkCreateInstanceMarkers crossDllInstanceLock crossDllDriverReentryBypass borrowDxgiInstance adapterEnumMarkers texcoordCaptureReuse offscreenCameraGate instRowStrideClamp censusOnGrowth helperBufferPool gpMatrixDump lightCensus submitSummaryPeriodic half4PositionInterleave cameraRelativeView exactCameraPriority firstTouchCameraMetadata indexBoundsFirewall allRayQueryDx11 ommSafeDefault captureBudgetComplete raySafeTwoSided boundedRtScene preemptibleBlasBatches shaderProvenObjectToView");
   dxvk::Logger::info("[Remix-DX11] camera/runtime: replacementViewCamera tempMoveTransformProof shaderScopedWorldScan cameraRelativeSkinning dxbcTransformProfile pairedClipProjection pacedColdCaptures exactDirectInstancing hostVisibleIndirectCapture gpuIndexedPositionFlatten clipWReplacementProjection selectableTexturelessRtAuthoring unrealPrivateProbeSilence noRasterSceneFallback remixScreenshotKey startupBrandingPassthrough FSR_REMOVED");
   dxvk::Logger::info("[Remix-DX11] if this line is absent or older than your last build, the game loaded a STALE d3d11.dll.");
-  // DX11_V282: anti-cheat advisory (detection + guidance only; Remix cannot
-  // and must not run under an active anti-cheat).
-  if (const char* antiCheat = dxvk::env::remixDetectAntiCheat()) {
-    dxvk::Logger::warn(dxvk::str::format(
-      "[Remix-DX11] ", antiCheat, " detected near the game. If the game fails to launch or exits at startup ",
-      "with Remix installed, launch the game's official anti-cheat-disabled / mod mode ",
-      "(e.g. Halo MCC's 'Anti-Cheat Disabled' Steam launch option)."));
-  }
   dxvk::Logger::info("=====================================================");
 }
 
@@ -331,25 +323,6 @@ extern "C" const PfnDliHook __pfnDliNotifyHook2 = remixDelayLoadNotifyHook;
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
   if (reason == DLL_PROCESS_ATTACH) {
     g_d3d11Module = hModule;
-    // DX11_V282_BOOT_BREADCRUMB: pure kernel32, loader-lock safe. If a user
-    // reports "no logs at all", the absence of even this file (with the DLL
-    // in place) proves the DLL never attached - anti-cheat block, wrong
-    // architecture, or a missing hard dependency - a different failure class
-    // than a crash after attach.
-    dxvk::env::remixAppendBootLine("d3d11.dll",
-      dxvk::env::shouldBypassRemixForCurrentProcess() ? "attached (bypass)" : "attached");
-    if (const char* antiCheat = dxvk::env::remixDetectAntiCheat()) {
-      char msg[256];
-      size_t pos = 0;
-      for (const char* s = antiCheat; *s != '\0' && pos < sizeof(msg) - 1; ++s)
-        msg[pos++] = *s;
-      const char* tail = " detected: if the game refuses to launch with Remix installed,"
-                         " use the game's official anti-cheat-disabled / mod launch mode";
-      for (const char* s = tail; *s != '\0' && pos < sizeof(msg) - 1; ++s)
-        msg[pos++] = *s;
-      msg[pos] = '\0';
-      dxvk::env::remixAppendBootLine("d3d11.dll", msg);
-    }
     // DX11_V263_CRASH_FILTER_SAFE: unhandled-only, chained - never fires
     // during normal operation, so it cannot interfere with game/DRM startup
     // the way the V261 vectored handler could.
@@ -375,7 +348,6 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
       if (dxvk::env::remixResolveRuntimeDirectoryW(runtimeDir, MAX_PATH) != 0) {
         SetDllDirectoryW(runtimeDir);
         AddDllDirectory(runtimeDir);
-        dxvk::env::remixAppendBootLine("d3d11.dll", "runtime directory registered (rtx-remix\\runtime or DXVK_REMIX_RUNTIME_DIR)");
       }
     }
   } else if (reason == DLL_PROCESS_DETACH) {
@@ -744,12 +716,16 @@ extern "C" {
         return E_FAIL;
     }
     
-    // Feature levels to probe if the
-    // application does not specify any.
-    std::array<D3D_FEATURE_LEVEL, 6> defaultFeatureLevels = {
-      D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_1,
-      D3D_FEATURE_LEVEL_10_0, D3D_FEATURE_LEVEL_9_3,
-      D3D_FEATURE_LEVEL_9_2,  D3D_FEATURE_LEVEL_9_1,
+    // Feature levels to probe if the application does not specify any.
+    // Highest first: with d3d11.maxFeatureLevel = 12_1 (the shipped default
+    // config) modern engines that require FL 12_x on their D3D11 device get
+    // it; older hardware/config caps fall through to the next level down.
+    std::array<D3D_FEATURE_LEVEL, 9> defaultFeatureLevels = {
+      D3D_FEATURE_LEVEL_12_1, D3D_FEATURE_LEVEL_12_0,
+      D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0,
+      D3D_FEATURE_LEVEL_10_1, D3D_FEATURE_LEVEL_10_0,
+      D3D_FEATURE_LEVEL_9_3,  D3D_FEATURE_LEVEL_9_2,
+      D3D_FEATURE_LEVEL_9_1,
     };
     
     if (pFeatureLevels == nullptr || FeatureLevels == 0) {

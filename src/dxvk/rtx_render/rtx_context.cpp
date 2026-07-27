@@ -24,11 +24,13 @@
 #include <cassert>
 
 #include "dxvk_device.h"
+#include "dxvk_gpu_query.h"
 #include "dxvk_scoped_annotation.h"
 #include "rtx_shader_manager.h"
 #include "dxvk_adapter.h"
 #include "rtx_context.h"
 // DX11_V225: complete type for the fixed-function-equivalent VS constant block.
+#include "perf_debug.h"
 #include "../../d3d11/d3d11_fixed_function.h"
 #include "rtx_asset_exporter.h"
 #include "rtx_options.h"
@@ -229,6 +231,9 @@ namespace dxvk {
 
     GlobalTime::get().init(RtxOptions::timeDeltaBetweenFrames() * 0.001f);
     GlobalTime::get().setAdvanceTime(RtxOptions::advanceTime());
+
+    // Initialize atmosphere system.
+    m_atmosphere = std::make_unique<RtxAtmosphere>(m_device.ptr());
   }
 
   RtxContext::~RtxContext() {
@@ -935,11 +940,21 @@ namespace dxvk {
     m_resetHistory = false;
   }
 
-  void RtxContext::endFrame(std::uint64_t cachedReflexFrameId, Rc<DxvkImage> targetImage, bool callInjectRtx) {
+void RtxContext::endFrame(std::uint64_t cachedReflexFrameId, Rc<DxvkImage> targetImage, bool callInjectRtx) {
+
+    // Start the performance debug frame timer
+    PerfDebug_BeginFrame();
 
     if (callInjectRtx) {
-      // Fallback inject (is a no-op if already injected this frame, or no valid RT scene)
-      injectRTX(cachedReflexFrameId, targetImage);
+      // Wrap the main RTX injection pass (Path Tracing, Denoising, Post-Processing)
+      if (!PerfDebug_IsFeatureDisabled(FEATURE_RAYTRACING)) {
+        PerfDebug_BeginFeature(FEATURE_RAYTRACING);
+        
+        // Fallback inject (is a no-op if already injected this frame, or no valid RT scene)
+        injectRTX(cachedReflexFrameId, targetImage);
+        
+        PerfDebug_EndFeature(FEATURE_RAYTRACING);
+      }
     } else if (m_frameLastInjected != m_device->getCurrentFrameId()) {
       // A raster pass-through frame still submitted candidate geometry to the
       // Remix scene before its UI/loading classification was known. It must
@@ -961,6 +976,9 @@ namespace dxvk {
       onInjectRtxFrameEnd(false);
     }
 
+    // End the performance debug frame timer and write to log
+    PerfDebug_EndFrame();
+
 #ifdef REMIX_DEVELOPMENT
     queryAvailableResourceAliasing();
     analyzeResourceAliasing();
@@ -969,7 +987,7 @@ namespace dxvk {
 
     // Update time on the frame end so all other systems can benefit from a global time
     GlobalTime::get().update();
-  }
+}
 
   // Called right before D3D11 present
   void RtxContext::onPresent(Rc<DxvkImage> targetImage) {
@@ -1050,10 +1068,15 @@ namespace dxvk {
     RasterGeometry& geoData = drawCallState.geometryData;
     DrawCallTransforms& transformData = drawCallState.transformData;
 
-    assert(geoData.futureGeometryHashes.valid());
+    // Static geometry hash memoization can pre-populate hashes without a future.
+    assert(geoData.futureGeometryHashes.valid() || geoData.hashes[HashComponents::VertexPosition] != kEmptyHash);
     assert(geoData.positionBuffer.defined());
 
-    const auto fusedMode = RtxOptions::fusedWorldViewMode();
+    // DX11_V284: Force fusedWorldViewMode to None.
+    // Fusing the world and view matrices bakes the camera into the geometry (objectToWorld),
+    // which causes the "geometry follows player" bug and breaks ray tracing camera motion.
+    // We must keep World and View matrices separate.
+      const auto fusedMode = RtxOptions::fusedWorldViewMode();
     if (unlikely(fusedMode != FusedWorldViewMode::None)) {
       if (fusedMode == FusedWorldViewMode::View) {
         // Set World from WorldView transform
@@ -1476,6 +1499,82 @@ namespace dxvk {
     constants.resolveStochasticAlphaBlendThreshold = m_common->metaComposite().stochasticAlphaBlendOpacityThreshold();
 
     constants.skyBrightness = RtxOptions::skyBrightness();
+
+    // DX11_V307_NO_DEGENERATE_SKY_PROBE: SkyboxRasterization makes every
+    // g-buffer/indirect miss sample the SkyProbe cubemap by ray direction. That
+    // cubemap cannot be rasterized correctly on the DX11 runtime - aiming each
+    // of the six faces requires injecting customWorldToProjection into the
+    // game's own DXBC vertex shader, which Remix does not author. All six faces
+    // therefore receive the same view-projected sky, five of them fall outside
+    // their face's clip volume and stay at the clear value, and the player ends
+    // up sitting inside a black box.
+    //
+    // Fall back to the physical atmosphere, which is the only sky path here that
+    // returns correct radiance for an arbitrary direction. This deliberately
+    // overrides rtx.skyMode because the requested value is unimplementable on
+    // this runtime; it is reported once so the override is not silent.
+    SkyMode currentSkyMode = RtxOptions::skyMode();
+
+    // Detect the condition structurally rather than waiting for the first sky
+    // draw to trip the flag: both state constant buffers are null exactly when
+    // hasVertexStateCB would be false in rasterizeToSkyProbe (for either shader
+    // type), and setConstantBuffers has no caller in this fork, so this is
+    // already true on frame 0. Waiting for the flag would leave one frame
+    // rendering the broken mode.
+    const bool skyProbeUnusable = m_skyProbeReprojectionUnavailable
+      || (m_rtState.vertexCaptureCB == nullptr && m_rtState.vsFixedFunctionCB == nullptr);
+
+    if (skyProbeUnusable && currentSkyMode == SkyMode::SkyboxRasterization) {
+      currentSkyMode = SkyMode::PhysicalAtmosphere;
+      ONCE(Logger::warn(
+        "[RTX Sky] rtx.skyMode=SkyboxRasterization cannot be honoured on the DX11 runtime "
+        "(the sky cubemap has no usable per-face reprojection). Using PhysicalAtmosphere "
+        "instead - rasterized skybox mode would render a black box around the camera."));
+    }
+
+    constants.skyMode = static_cast<uint32_t>(currentSkyMode);
+
+    // Detect sky mode changes and clear rasterized sky targets when switching to physical atmosphere.
+    if (currentSkyMode != m_lastSkyMode) {
+      if (currentSkyMode == SkyMode::PhysicalAtmosphere) {
+        auto skyProbe = getResourceManager().getSkyProbe(this, m_skyColorFormat);
+        auto skyMatte = getResourceManager().getSkyMatte(this, m_skyRtColorFormat);
+
+        VkClearValue clearValue = {};
+        clearValue.color.float32[0] = 0.0f;
+        clearValue.color.float32[1] = 0.0f;
+        clearValue.color.float32[2] = 0.0f;
+        clearValue.color.float32[3] = 0.0f;
+
+        if (skyProbe.view != nullptr) {
+          DxvkContext::clearRenderTarget(skyProbe.view, VK_IMAGE_ASPECT_COLOR_BIT, clearValue);
+        }
+
+        if (skyMatte.view != nullptr) {
+          DxvkContext::clearRenderTarget(skyMatte.view, VK_IMAGE_ASPECT_COLOR_BIT, clearValue);
+        }
+      }
+
+      m_lastSkyMode = currentSkyMode;
+    }
+
+    // Update atmosphere parameters and LUTs in physical atmosphere mode.
+    // Note: keyed off currentSkyMode, not RtxOptions::skyMode(), so the DX11
+    // fallback above actually brings the atmosphere up. Reading the option here
+    // would publish skyMode=PhysicalAtmosphere to the shader while leaving
+    // m_atmosphere null and atmosphereArgs unwritten - the miss path would take
+    // the atmosphere branch with no LUTs behind it and the sky would go black a
+    // different way.
+    if (currentSkyMode == SkyMode::PhysicalAtmosphere) {
+      if (!m_atmosphere) {
+        m_atmosphere = std::make_unique<RtxAtmosphere>(m_device.ptr());
+      }
+
+      m_atmosphere->initialize(this);
+      m_atmosphere->computeLuts(this);
+      constants.atmosphereArgs = m_atmosphere->getAtmosphereArgs();
+    }
+
     constants.isLastCompositeOutputValid = restirGI.isActive() && restirGI.getLastCompositeOutput().matchesWriteFrameIdx(frameIdx - 1);
     constants.isZUp = RtxOptions::zUp();
     constants.enableCullingSecondaryRays = RtxOptions::enableCullingInSecondaryRays();
@@ -1559,6 +1658,29 @@ namespace dxvk {
     bindResourceView(BINDING_VALUE_NOISE_SAMPLER, valueNoiseLut, nullptr);
     bindResourceSampler(BINDING_VALUE_NOISE_SAMPLER, linearSampler);
     bindResourceBuffer(BINDING_SAMPLER_READBACK_BUFFER, DxvkBufferSlice(samplerFeedbackBuffer, 0, samplerFeedbackBuffer.ptr() ? samplerFeedbackBuffer->info().size : 0));
+
+    // Atmosphere LUTs are declared in common bindings and must always be bound.
+    if (!m_atmosphere) {
+      m_atmosphere = std::make_unique<RtxAtmosphere>(m_device.ptr());
+    }
+
+    m_atmosphere->initialize(this);
+
+    auto transmittanceLut = m_atmosphere->getTransmittanceLut();
+    auto multiscatteringLut = m_atmosphere->getMultiscatteringLut();
+    auto skyViewLut = m_atmosphere->getSkyViewLut();
+
+    if (transmittanceLut.isValid()) {
+      bindResourceView(BINDING_ATMOSPHERE_TRANSMITTANCE_LUT, transmittanceLut.view, nullptr);
+    }
+
+    if (multiscatteringLut.isValid()) {
+      bindResourceView(BINDING_ATMOSPHERE_MULTISCATTERING_LUT, multiscatteringLut.view, nullptr);
+    }
+
+    if (skyViewLut.isValid()) {
+      bindResourceView(BINDING_ATMOSPHERE_SKY_VIEW_LUT, skyViewLut.view, nullptr);
+    }
   }
 
   void RtxContext::bindResourceView(const uint32_t slot, const Rc<DxvkImageView>& imageView, const Rc<DxvkBufferView>& bufferView)
@@ -1609,6 +1731,40 @@ namespace dxvk {
   }
 
   void RtxContext::checkNeuralRadianceCacheSupport() {
+    // DX11_V319_NRC_OPT_IN_IS_AUTHORITATIVE: enforce the opt-in wherever the mode
+    // came from, not just when a graphics preset picked it.
+    //
+    // DX11_V244 established that NRC crashes on first use on the DX11 path
+    // (REMIX-4105) and made the PRESET refuse to enable it without
+    // DXVK_REMIX_ENABLE_NRC=1. But that guard only covers the preset: the mode is
+    // a plain RtxOption, so the in-game UI, an rtx.conf entry, or any option layer
+    // could still select it, and nothing downstream re-checked. The support test
+    // below does not catch it either - the hardware genuinely does support NRC.
+    //
+    // Field evidence (Skyrim SE, this build): no DXVK_REMIX_ENABLE_NRC anywhere in
+    // the environment and no NRC entry in rtx.conf, yet "Integrate Indirect Mode:
+    // Neural Radiance Cache - activated", followed by "[RTX Neural Radiance Cache]
+    // EndFrame call failed", a GPU fault whose faulting address resolved to
+    // write-invalid gpuVA=0x0 (a write through a null device address), and 46
+    // consecutive VK_ERROR_DEVICE_LOST submissions. That is the REMIX-4105
+    // signature, and it is what "the game hangs and does not act right" looks like
+    // from the outside.
+    //
+    // Falling back here makes the opt-in mean what DX11_V244 intended: NRC is
+    // reachable only when it is explicitly asked for, no matter which layer set it.
+    if (RtxOptions::integrateIndirectMode() == IntegrateIndirectMode::NeuralRadianceCache
+     && env::getEnvVar("DXVK_REMIX_ENABLE_NRC") != "1") {
+      Logger::warn(
+        "[RTX] Neural Radiance Cache was selected without the explicit opt-in and is unstable on the "
+        "DX11 path (REMIX-4105: null-address GPU write and device loss on the first NRC frame). "
+        "Switching indirect illumination mode to ReSTIR GI. Set DXVK_REMIX_ENABLE_NRC=1 to force it.");
+      // Same reasoning as the unsupported case below: this must take effect before
+      // a frame is dispatched, so setImmediately on the Quality layer to override
+      // whichever layer selected NRC.
+      RtxOptions::integrateIndirectMode.setImmediately(IntegrateIndirectMode::ReSTIRGI, RtxOptionLayer::getQualityLayer());
+      return;
+    }
+
     // Update RtxOption selection if Neural Radiance Cache was selected but it's not supported
     if (RtxOptions::integrateIndirectMode() == IntegrateIndirectMode::NeuralRadianceCache &&
         !NeuralRadianceCache::checkIsSupported(m_device.ptr())) {
@@ -2576,7 +2732,35 @@ namespace dxvk {
         prevCB.fixedFunction = *static_cast<D3D11FixedFunctionVS*>(m_rtState.vsFixedFunctionCB->mapPtr(0));
       }
     } else {
-      ONCE(Logger::info("[RTX Sky] Rasterizing sky probe without state constant buffers (DX11 runtime); per-face reprojection unavailable."));
+      // DX11_V307_NO_DEGENERATE_SKY_PROBE: do not rasterize the cube at all.
+      //
+      // The loop below binds each of the 6 cube faces in turn and re-draws the
+      // sky geometry, relying on customWorldToProjection to aim the draw at that
+      // face. That injection needs m_rtState.vertexCaptureCB, which does not
+      // exist in this fork (RtxContext::setConstantBuffers has no caller), and
+      // it cannot be made to exist for DXBC titles: the reprojection has to
+      // happen inside the game's own compiled vertex shader, which Remix does
+      // not author. D3D11SpecConstantId::CustomVertexTransformEnabled is set
+      // below but appears nowhere in src/d3d11 or the shaders, so it is inert.
+      //
+      // Running the loop anyway wrote the SAME view-projected sky into all six
+      // faces. Five of the six directions fall outside their face's clip volume
+      // and keep the clear value, so the resulting cubemap is a mostly-black box
+      // centred on the camera - and because SkyProbe is sampled by direction on
+      // every g-buffer/indirect miss, the player sits inside that black box.
+      // It also cost six extra full sky-dome draws per sky draw per frame for a
+      // result that was never usable.
+      //
+      // Skip it and let the sky come from the physical atmosphere instead (see
+      // updateAtmosphereConstants, which forces PhysicalAtmosphere once this
+      // flag is set). Leave the probe cleared rather than filled with garbage.
+      m_skyProbeReprojectionUnavailable = true;
+      ONCE(Logger::warn(
+        "[RTX Sky] Sky probe per-face reprojection is unavailable on the DX11 runtime "
+        "(no vertex-capture constant buffer, and DXBC vertex shaders cannot be reprojected). "
+        "Skipping skybox-cubemap rasterization and switching the sky to the physical "
+        "atmosphere model; rasterized skybox mode would render a black box around the camera."));
+      return;
     }
 
     const bool useDrawCallTransforms = drawCallState.usesVertexShader || !hasVertexStateCB;
@@ -2780,6 +2964,11 @@ namespace dxvk {
   }
 
   void RtxContext::rasterizeSky(const DrawParameters& params, const DrawCallState& drawCallState) {
+    // Skip rasterized sky rendering when physical atmosphere mode is active.
+    if (RtxOptions::skyMode() == SkyMode::PhysicalAtmosphere) {
+      return;
+    }
+
     // Grab and apply replacement texture if any
     // NOTE: only the original color texture will be replaced with albedo-opacity texture
     MaterialData* replacementMaterial = getSceneManager().getAssetReplacer()->getReplacementMaterial(drawCallState.getMaterialData().getHash());

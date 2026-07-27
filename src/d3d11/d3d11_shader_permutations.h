@@ -9,7 +9,7 @@ namespace dxvk {
 
   class DxvkShader;
 
-  // DX11_V225: specialization permutations the DXSO compiler can emit for a single
+  // DX11_V225: specialization permutations the shader compiler can emit for a single
   // shader. DX11 only needs the base shader plus a flat-shaded pixel-shader variant
   // (for D3DSHADE_FLAT-style provoking-vertex emulation).
   namespace D3D11ShaderPermutations {
@@ -20,6 +20,6 @@ namespace dxvk {
     };
   }
 
-  using DxsoPermutations = std::array<Rc<DxvkShader>, D3D11ShaderPermutations::Count>;
+  using D3D11Permutations = std::array<Rc<DxvkShader>, D3D11ShaderPermutations::Count>;
 
 }

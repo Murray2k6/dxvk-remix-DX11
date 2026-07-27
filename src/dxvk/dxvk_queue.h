@@ -253,6 +253,11 @@ namespace dxvk {
 
     DxvkDevice*             m_device;
 
+    // NV-DXVK start: DX11_V298_DEVICE_FAULT - on device loss, query
+    // VK_EXT_device_fault and log the GPU fault report (once).
+    void logDeviceFaultInfo();
+    // NV-DXVK end
+
     std::atomic<VkResult>   m_lastError = { VK_SUCCESS };
     
     std::atomic<bool>       m_stopped = { false };

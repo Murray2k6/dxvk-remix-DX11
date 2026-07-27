@@ -48,7 +48,12 @@ namespace dxvk {
     void initialize();
     void release();
 
-    void waitForShaderPrewarm(bool showProgressDialog = false);
+    // allowBackgroundHandoff: this is the BOOT wait, so it may give up after
+    // rtx.shader.maxBootPrewarmWaitSeconds and let the background monitor
+    // finish the remaining pipelines while the game runs. The exit drain must
+    // never do that - it has to actually finish before teardown.
+    void waitForShaderPrewarm(bool showProgressDialog = false,
+                              bool allowBackgroundHandoff = false);
 
     using GameShaderRegistrar = std::function<void(
       const std::function<void(uint32_t)>&)>;
@@ -56,6 +61,11 @@ namespace dxvk {
     void prewarmCachedGameShaders(
       uint32_t cachedShaderCount,
       const GameShaderRegistrar& registerShaders);
+
+    // DX11_V298_BOOT_SHADER_SCAN_PHASE: runs the boot-time game-data shader
+    // scan inside the shared prewarm window so building the cache from the
+    // game's data before play is visible instead of a silent stall.
+    void runBootShaderScanPhase(const std::function<void()>& scan);
 
     bool getWarmupComplete() const {
       return m_warmupComplete;

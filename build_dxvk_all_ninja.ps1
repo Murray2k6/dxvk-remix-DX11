@@ -5995,23 +5995,23 @@ function Mark-DX11ShaderModeNoD3D9V219 {
 
 
 
-function Write-Dx11DxsoCapsHeaderV219 {
+function Write-Dx11ShaderCapsHeaderV219 {
   # DX11_V219_FULL_DX11_ONLY_NO_DX9
   $dx11Dir = Join-Path $Root 'src\d3d11'
   if (!(Test-Path -LiteralPath $dx11Dir -PathType Container)) {
     New-Item -ItemType Directory -Path $dx11Dir -Force | Out-Null
   }
 
-  $capsHeader = Join-Path $dx11Dir 'd3d11_dxso_caps.h'
+  $capsHeader = Join-Path $dx11Dir 'd3d11_shader_caps.h'
   $capsText = @'
 #pragma once
 
 // DX11_V219_FULL_DX11_ONLY_NO_DX9
 //
-// DXSO/DXBC shared compiler utilities need a caps namespace for array bounds
+// The DXBC shared compiler utilities need a caps namespace for array bounds
 // and register limits.  This DX11 fork must not depend on src/d3d9.
 // This header provides those shared compiler limits from the DX11 side using
-// D3D11 SDK limits where possible and DXSO shader-model compatibility limits
+// D3D11 SDK limits where possible and shader-model compatibility limits
 // where the value belongs to the legacy bytecode model being decoded.
 
 #include <cstdint>
@@ -6058,7 +6058,7 @@ namespace dxvk::caps {
   constexpr uint32_t MaxTexturesPS                = D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT;
   constexpr uint32_t MaxTextures                  = MaxTexturesVS + MaxTexturesPS;
 
-  // DXSO shader-model compatibility limits used by the shared decoder.
+  // Shader-model compatibility limits used by the shared decoder.
   // These are not a dependency on a DX9 runtime path.
   constexpr uint32_t MaxFloatConstantsVS          = 256;
   constexpr uint32_t MaxSM1FloatConstantsPS       = 8;
@@ -6075,7 +6075,7 @@ namespace dxvk::caps {
 }
 '@
   Write-TextNoBom -Path $capsHeader -Text $capsText
-  Log "V219 wrote DX11-side DXSO caps header: $capsHeader"
+  Log "V219 wrote DX11-side shader caps header: $capsHeader"
 }
 
 function Convert-TextTokenCaseV219 {
@@ -6111,28 +6111,28 @@ function Invoke-BoundedDx11OnlyNoDx9ScrubV219 {
   $lines.Add('DX11_V219_FULL_DX11_ONLY_NO_DX9')
   $lines.Add(('Time: {0}' -f (Get-Date)))
   $lines.Add('Mode: replace DX9/D3D9 source/build references with DX11/D3D11, then remove DX9/D3D9 source files.')
-  $lines.Add('No stubs: shared compiler constants are provided by src\d3d11\d3d11_dxso_caps.h.')
+  $lines.Add('No stubs: shared compiler constants are provided by src\d3d11\d3d11_shader_caps.h.')
   $lines.Add('')
 
-  Write-Dx11DxsoCapsHeaderV219
+  Write-Dx11ShaderCapsHeaderV219
 
   $dxsoUtil = Join-Path $Root 'src\dxso\dxso_util.h'
   if (Test-Path -LiteralPath $dxsoUtil -PathType Leaf) {
     $u = [System.IO.File]::ReadAllText($dxsoUtil)
     $origU = $u
-    $u = $u.Replace('#include "../d3d9/d3d9_caps.h"', '#include "../d3d11/d3d11_dxso_caps.h"')
-    $u = $u.Replace('#include "..\d3d9\d3d9_caps.h"', '#include "../d3d11/d3d11_dxso_caps.h"')
-    $u = [regex]::Replace($u, '#\s*include\s*[<"]\.\./d3d9/d3d9_caps\.h[>"]', '#include "../d3d11/d3d11_dxso_caps.h"')
-    $u = [regex]::Replace($u, '#\s*include\s*[<"]\.\.\\d3d9\\d3d9_caps\.h[>"]', '#include "../d3d11/d3d11_dxso_caps.h"')
+    $u = $u.Replace('#include "../d3d9/d3d9_caps.h"', '#include "../d3d11/d3d11_shader_caps.h"')
+    $u = $u.Replace('#include "..\d3d9\d3d9_caps.h"', '#include "../d3d11/d3d11_shader_caps.h"')
+    $u = [regex]::Replace($u, '#\s*include\s*[<"]\.\./d3d9/d3d9_caps\.h[>"]', '#include "../d3d11/d3d11_shader_caps.h"')
+    $u = [regex]::Replace($u, '#\s*include\s*[<"]\.\.\\d3d9\\d3d9_caps\.h[>"]', '#include "../d3d11/d3d11_shader_caps.h"')
     if ($u -ne $origU) {
       if (!(Test-Path -LiteralPath "$dxsoUtil.v219.before")) { Copy-Item -LiteralPath $dxsoUtil -Destination "$dxsoUtil.v219.before" -Force }
       Write-TextNoBom -Path $dxsoUtil -Text $u
-      $lines.Add(('OK: patched shared DXSO caps include: {0}' -f $dxsoUtil))
+      $lines.Add(('OK: patched shared caps include: {0}' -f $dxsoUtil))
     } else {
       $lines.Add('OK: dxso_util.h already uses DX11 caps or has no old caps include.')
     }
   } else {
-    $lines.Add('SKIP: src\dxso\dxso_util.h not found yet.')
+    $lines.Add('OK: src\dxso removed - the DX11 runtime no longer has a legacy shader module to patch.')
   }
 
   $skipDirPatterns = @(
@@ -6305,16 +6305,16 @@ function Invoke-BoundedDx11OnlyNoDx9ScrubV219 {
   $lines.Add('Mode: bounded active-source scrub; no full repo crawl.')
   $lines.Add('')
 
-  Write-Dx11DxsoCapsHeaderV219
+  Write-Dx11ShaderCapsHeaderV219
 
   $dxsoUtil = Join-Path $Root 'src\dxso\dxso_util.h'
   if (Test-Path -LiteralPath $dxsoUtil -PathType Leaf) {
     $u = [System.IO.File]::ReadAllText($dxsoUtil)
     $origU = $u
-    $u = $u.Replace('#include "../d3d9/d3d9_caps.h"', '#include "../d3d11/d3d11_dxso_caps.h"')
-    $u = $u.Replace('#include "..\d3d9\d3d9_caps.h"', '#include "../d3d11/d3d11_dxso_caps.h"')
-    $u = [regex]::Replace($u, '#\s*include\s*[<"]\.\./d3d9/d3d9_caps\.h[>"]', '#include "../d3d11/d3d11_dxso_caps.h"')
-    $u = [regex]::Replace($u, '#\s*include\s*[<"]\.\.\\d3d9\\d3d9_caps\.h[>"]', '#include "../d3d11/d3d11_dxso_caps.h"')
+    $u = $u.Replace('#include "../d3d9/d3d9_caps.h"', '#include "../d3d11/d3d11_shader_caps.h"')
+    $u = $u.Replace('#include "..\d3d9\d3d9_caps.h"', '#include "../d3d11/d3d11_shader_caps.h"')
+    $u = [regex]::Replace($u, '#\s*include\s*[<"]\.\./d3d9/d3d9_caps\.h[>"]', '#include "../d3d11/d3d11_shader_caps.h"')
+    $u = [regex]::Replace($u, '#\s*include\s*[<"]\.\.\\d3d9\\d3d9_caps\.h[>"]', '#include "../d3d11/d3d11_shader_caps.h"')
     if ($u -ne $origU) {
       if (!(Test-Path -LiteralPath "$dxsoUtil.v219.before")) {
         # DX11: backup-file creation disabled -- Copy-Item -LiteralPath $dxsoUtil -Destination "$dxsoUtil.v219.before" -Force
@@ -15152,6 +15152,26 @@ bool EnsureServer() {
     gpServer = new Process(command.c_str(), OnServerExited);
   } catch (...) {
     LogLine("bridge", "Process() failed to create NvRemixLauncher32.exe launcher/client helper.");
+    gpServer = nullptr;
+    return false;
+  }
+
+  // DX11_V319_LAUNCH_FAILURE_IS_VISIBLE: Process does NOT throw when
+  // CreateProcess fails - it just stores INVALID_HANDLE_VALUE - so the catch
+  // above can never fire, and a launcher that never started was indistinguishable
+  // from one that did. The client went on to wait out the full handle-duplication
+  // timeout and then reported "launcher did not provide a real game handle
+  // duplicated into NvRemixBridge.exe", blaming the handshake for a process that
+  // was never created. Field signature (Saints Row the Third): no
+  // NvRemixLauncher32.log, no .trex\dx11_bridge_server_pid.txt, ~9s stall, then
+  // that error. Ask the object whether the launch actually happened.
+  if (gpServer == nullptr || !gpServer->isValid()) {
+    LogLine("bridge",
+      "DX11_V319 ERROR: NvRemixLauncher32.exe did not start - CreateProcess failed, so the .trex "
+      "bridge server was never launched and Remix cannot load. The preceding 'CreateProcess FAILED' "
+      "line carries the error code and the exact command line; check that NvRemixLauncher32.exe sits "
+      "beside the game executable and is not blocked by security software.");
+    delete gpServer;
     gpServer = nullptr;
     return false;
   }

@@ -22,6 +22,8 @@
 #pragma once
 
 #include <atomic>
+#include <map>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -33,6 +35,70 @@
 #include "dxvk_memory_tracker.h"
 
 namespace dxvk {
+
+  /**
+   * \brief GPU virtual address registry
+   *
+   * DX11_V319_FAULT_ADDRESS_NAMING: VK_EXT_device_fault reports the GPU virtual
+   * addresses involved in a fault, but a bare address names nothing. A real
+   * report from Little Nightmares II read:
+   *
+   *   [device-fault] GPU fault report: ''
+   *   [device-fault]   address[0]: type=instruction-pointer-fault gpuVA=0xf00b50800
+   *   [device-fault]   address[1]: type=read-invalid gpuVA=0x111ee00000 precision=4096
+   *
+   * which is unactionable: nothing in the process could say what lived at
+   * 0x111ee00000. This registry keeps the address range of every buffer whose
+   * device address has been taken, so the fault handler can resolve a faulting
+   * address to the allocation that owns it - and, just as usefully, report
+   * "no live allocation" when the address belongs to something already freed,
+   * which is the signature of a lifetime bug.
+   *
+   * Only buffers someone actually asked the device address of are tracked.
+   * That is deliberate: those are exactly the buffers reachable by the GPU
+   * through a raw pointer - acceleration-structure build inputs above all -
+   * which is the population a page fault can come from. Descriptor-bound
+   * resources cannot fault this way.
+   */
+  class DxvkGpuAddressRegistry {
+
+  public:
+
+    static DxvkGpuAddressRegistry& get();
+
+    /// Tracking is off until a device with VK_EXT_device_fault enables it;
+    /// without that extension the map could never be read and is pure cost.
+    void setEnabled(bool enabled) {
+      m_enabled.store(enabled, std::memory_order_relaxed);
+    }
+
+    bool isEnabled() const {
+      return m_enabled.load(std::memory_order_relaxed);
+    }
+
+    void add(VkDeviceAddress address, VkDeviceSize size, const char* name);
+    void remove(VkDeviceAddress address);
+
+    /**
+     * \brief Describes the allocation containing an address
+     *
+     * \returns "<name> (base+offset, size)" for a live allocation, or a
+     *          statement that no live allocation covers it.
+     */
+    std::string describe(VkDeviceAddress address) const;
+
+  private:
+
+    struct Entry {
+      VkDeviceSize size = 0;
+      std::string  name;
+    };
+
+    mutable dxvk::mutex               m_mutex;
+    std::map<VkDeviceAddress, Entry>  m_entries;
+    std::atomic<bool>                 m_enabled = { false };
+
+  };
 
   /**
    * \brief Buffer create info
@@ -247,6 +313,12 @@ namespace dxvk {
      * \returns Previous buffer slice
      */
     DxvkBufferSliceHandle rename(const DxvkBufferSliceHandle& slice) {
+      // DX11_V319_FAULT_ADDRESS_NAMING: the old range stops belonging to this
+      // buffer here, so drop it before the address is forgotten. Leaving it
+      // registered would let a later fault be blamed on a buffer that no longer
+      // owns that memory - worse than no name at all.
+      DxvkGpuAddressRegistry::get().remove(m_deviceAddress);
+
       // Our cached device address may no longer be valid
       m_deviceAddress = 0;
 
@@ -387,6 +459,13 @@ namespace dxvk {
 
     DxvkMemoryStats::Category m_category;
     GpuMemoryTracker m_tracker;
+    // DX11_V319_FAULT_ADDRESS_NAMING: GpuMemoryTracker only keeps the name when
+    // rtx.profiler.memory.enable is set, which is exactly the gap that left a
+    // faulting address unattributable. Keep an independent copy so a GPU fault
+    // can be named without asking the user to relaunch with the profiler on.
+    // Populated only while the address registry is active, so a build that can
+    // never read it pays nothing.
+    std::string m_gpuAddressName;
 
     void pushSlice(const DxvkBufferHandle& handle, uint32_t index) {
       DxvkBufferSliceHandle slice;

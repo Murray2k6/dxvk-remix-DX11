@@ -740,7 +740,9 @@ namespace dxvk {
     // upgrade: if the game asked for something higher than the
     // desktop rate we leave it alone and let FindClosestMatchingMode
     // clamp to whatever the monitor advertises.
-    {
+    // DX11_V319: this changes a mode the game explicitly asked for, so it is a
+    // setting - see DxgiOptions::overrideRefreshRate.
+    if (static_cast<DxgiFactory*>(m_factory.ptr())->GetOptions()->overrideRefreshRate) {
       DEVMODEW curMode = { };
       curMode.dmSize = sizeof(curMode);
       if (GetMonitorDisplayMode(outputDesc.Monitor, ENUM_CURRENT_SETTINGS, &curMode)

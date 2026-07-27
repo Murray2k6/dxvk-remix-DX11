@@ -47,6 +47,7 @@
 #include "rtx_option_manager.h"
 #include "rtx_hashing.h"
 #include "rtx_mod_manager.h"
+#include "rtx_fork_weather.h"
 
 enum _NV_GPU_ARCHITECTURE_ID;
 typedef enum _NV_GPU_ARCHITECTURE_ID NV_GPU_ARCHITECTURE_ID;
@@ -159,6 +160,11 @@ namespace dxvk {
     CameraPositionAndDepthFlags
   };
 
+  enum class SkyMode : int {
+    SkyboxRasterization = 0,
+    PhysicalAtmosphere = 1
+  };
+
   enum class EnableVsync : int {
     Off = 0,
     On = 1,
@@ -185,6 +191,15 @@ namespace dxvk {
     RTX_OPTION("rtx", fast_unordered_set, lightmapTextures, {},
                   "Textures used for lightmapping (baked static lighting on surfaces) in older games.\n"
                   "These textures will be ignored when attempting to determine the desired textures from a draw to use for ray tracing.");
+    RTX_OPTION("rtx", fast_unordered_set, neverAlbedoTextures, {},
+                  "Textures that must never be selected as the primary albedo in D3D11 shader path draws.\n"
+                  "Use this for shared overlay content (dirt/grunge masks, detail patterns, tint ramps) that the albedo "
+                  "inference might otherwise pick over the intended diffuse; tagging the overlay once corrects every "
+                  "material that samples it.");
+    RTX_OPTION("rtx", fast_unordered_set, preferredAlbedoTextures, {},
+                  "Textures that should be strongly preferred as the primary albedo when bound to a draw.\n"
+                  "Use this to override the albedo sampler inference for D3D11 shader path draws where the heuristics pick "
+                  "the wrong texture (e.g. a specular or normal map is selected instead of the intended diffuse).");
     RTX_OPTION("rtx", fast_unordered_set, skyBoxTextures, {},
                   "Textures on draw calls used for the sky or are otherwise intended to be very far away from the camera at all times (no parallax).\n"
                   "Any draw calls using a texture in this list will be treated as sky and rendered as such in a manner different from typical geometry.");    
@@ -201,6 +216,13 @@ namespace dxvk {
                   "Textures on draw calls that should be treated as screenspace UI elements.\n"
                   "All exclusively UI-related textures should be classified this way and doing so allows the UI to be rasterized on top of the ray traced scene like usual.\n"
                   "Note that currently the first UI texture encountered triggers RTX injection (though this may change in the future as this does cause issues with games that draw UI mid-frame).");
+    RTX_OPTION("rtx", fast_unordered_set, deferredUiTextures, {},
+                  "Textures on overlay draw calls (fullscreen fades, scope/damage screen effects) that the game renders mid-scene, before 3D rendering has finished for the frame.\n"
+                  "Like rtx.uiTextures these draws are rasterized on top of the ray-traced image, but they never trigger RTX injection; instead each tagged draw is captured and replayed right after RTX injection fires later in the frame (at the first real UI draw, or at the end-of-frame fallback).\n"
+                  "Use this for post-process style overlays (e.g. full-screen material fade effects) that would otherwise end the ray-traced scene early and force later geometry (such as first-person meshes) back to rasterization.\n"
+                  "For render-target textures the stable descriptor hash matches in addition to the (recreation-dependent) image hash, and rtx.d3d11.deferredUiPixelShaders can tag the overlay's pixel shader instead.\n"
+                  "Tagging is not absolute: depth-writing draws, world geometry (anything beyond trivial depth-test-off overlay quads), and engine post-process shaders are refused deferral and classified normally, so shared textures cannot pull scene geometry out of the ray-traced world.\n"
+                  "See rtx.d3d11.deferredUiReplay and rtx.d3d11.deferredUiRefreshSceneColor for the replay behavior.");
     RTX_OPTION("rtx", fast_unordered_set, worldSpaceUiTextures, {},
                   "Textures on draw calls that should be treated as worldspace UI elements.\n"
                   "Unlike typical UI textures this option is useful for improved rendering of UI elements which appear as part of the scene (moving around in 3D space rather than as a screenspace element).");
@@ -312,10 +334,10 @@ namespace dxvk {
     RTX_OPTION("rtx", bool, significanceCulling, false, "Performance (opt-in): drops scene instances whose projected on-screen size is below significanceCullingMinScreenFraction, reducing the instance count the path tracer must build/trace each frame. Defaults OFF so ALL geometry is always present; when enabled it is fail-safe (only culls when the world bounding box is valid and the projected size is sub-pixel, i.e. already-invisible geometry).");
     RTX_OPTION("rtx", float, significanceCullingMinScreenFraction, 0.0003f, "Performance: minimum projected on-screen size (object world-size / camera distance, an angular fraction) below which significanceCulling drops an instance. 0.0003 is sub-pixel even at 4K; raise for more aggressive culling, lower (or 0) to keep everything.");
     RTX_OPTION("rtx", uint32_t, maxInstanceSubmissions, 100000u, "Performance: hard cap on the number of (non-culled) main-camera scene instances submitted to the path tracer per frame. Default 100000 effectively means no cap; lower it to bound worst-case instance counts in pathological scenes.");
-    RTX_OPTION("rtx", bool, forceInjection, false, "DX11: forces Remix injection for draws even when normal heuristics would skip them.");
+    RTX_OPTION("rtx", bool, forceInjection, true, "DX11: forces Remix injection for draws even when normal heuristics would skip them. Default ON so games path-trace instead of falling back to rasterization whenever a real camera or a previous scene exists; camera-less pure-UI frames still pass through (injecting those would render black menus).");
     RTX_OPTION("rtx", bool, dx11StrongerDenoising, true, "DX11: strengthen NRD denoising beyond the stock presets - longer temporal accumulation, forced firefly suppression, and wider spatial filtering (the same measures Unreal's path tracer leans on: heavy temporal history + variance-guided spatial reconstruction). The DX11 capture's signal is noisier than native Remix (approximate cameras, absent per-object motion), so the stock tuning under-resolves. Disable per game in rtx.conf if temporal ghosting is objectionable.");
     RTX_OPTION("rtx", bool, useCBufferWorldMatrices, false, "DX11: derives world/view matrices from constant buffers when true.");
-    RTX_OPTION("rtx", bool, enableUnrealTextureFixes, true, "DX11: applies generic albedo texture-selection reinforcement (boost strong-albedo mipmapped textures, demote scene/intermediate surfaces). Despite the legacy name this is engine-agnostic and helps any game/engine, so it defaults ON; set false to disable.");
+    RTX_OPTION("rtx", bool, enableUnrealTextureFixes, false, "DX11: applies generic albedo texture-selection reinforcement (boost strong-albedo mipmapped textures, demote scene/intermediate surfaces). Removed from the default path (it could promote the wrong texture to albedo); set true to re-enable per game.");
     RTX_OPTION("rtx", bool, enableSource2Fixes, false, "DX11: applies Source 2 engine specific fixes when true.");
     RTX_OPTION("rtx", bool, ignoreSecondaryTextures, false, "DX11: only consider the primary color texture per draw when true.");
     RTX_OPTION("rtx", bool, useInputAssemblerNormals, false, "DX11: sources vertex normals from the input assembler layout when true.");
@@ -383,6 +405,55 @@ namespace dxvk {
                "Estimates real camera motion for PC games whose geometry is captured in camera-relative view space because no world/view matrix could be proven from the game's shaders (e.g. an unconfirmed view matrix).\n"
                "Static geometry is re-identified across frames and the camera's rigid motion is solved from it, anchoring the scene in a consistent world space: motion vectors, temporal accumulation and the free camera then behave like a title with a real captured camera.\n"
                "Titles with a proven world or confirmed view matrix never use this path. Disable to restore the fixed camera-relative fallback.");
+    // PC-game D3D11 capture: engines that render camera-relative supply a view
+    // matrix with no translation at all, so the RT camera would otherwise sit
+    // on the world origin forever while the scene slides past it.
+    RTX_OPTION("rtx.dx11", bool, anchorCameraRelativeWorld, true,
+               "Restores the camera's world position for games that render camera-relative - engines that subtract the eye position from every object transform on the CPU and leave the view matrix a pure rotation with a zero translation (Creation Engine among others).\n"
+               "Without it Remix reads that zero translation as 'the camera is at the world origin', anchors captured geometry with a rotation only, and the whole scene translates with the player while the camera stands still. The missing position is solved from the captured geometry itself - the frame-to-frame motion of static meshes, median-filtered so moving objects cannot carry it - and applied to the view matrix and to object placement together, so what the game rasterizes is unchanged.\n"
+               "Games whose view matrix already carries a translation are untouched by this. Disable to restore the origin-anchored behavior.");
+    // DX11_V319_DEFERRED_LIGHT_VOLUMES: recover game lights from the light-volume
+    // draws a deferred renderer already makes.
+    //
+    // D3D11 has no light API - lighting is shader code and light data is untyped
+    // bytes in a constant or structured buffer - so there is nothing to hook and
+    // no layout that is the same between two engines. But a deferred renderer
+    // draws each light as approximate geometry: a unit sphere for a point light,
+    // a unit cone for a spot, positioned and scaled by an ordinary world matrix.
+    // That matrix is already extracted for every draw, so the light's POSITION is
+    // its translation and its RANGE is its scale - no constant-buffer parsing and
+    // nothing engine-specific.
+    //
+    // Colour and intensity genuinely are not recoverable this way (they live in
+    // the shader constants), so they are settings rather than guesses.
+    RTX_OPTION("rtx.dx11", bool, deferredLightVolumeAutoDetect, true,
+               "Detects a deferred renderer from its own draws and starts capturing its light volumes as Remix lights, without needing to know which engine or game is running.\n"
+               "The runtime watches for the light-accumulation signature (additive blend, no depth write, a low-poly volume mesh carrying a real scale) and arms the capture only after several consecutive frames contain enough of them. Until it arms, matching draws are counted but otherwise left completely untouched, so a forward-rendered game that trips the signature occasionally is unaffected.\n"
+               "This is what makes light capture game-agnostic: an engine that lights deferred switches it on by behaving like one. Set to False to require the explicit rtx.dx11.deferredLightVolumeCapture instead.");
+    RTX_OPTION("rtx.dx11", uint, deferredLightVolumeAutoDetectMinPerFrame, 8,
+               "How many light-volume draws a frame must contain to count as evidence of a deferred renderer. Below this the frame is not counted and the run resets.");
+    RTX_OPTION("rtx.dx11", uint, deferredLightVolumeAutoDetectFrames, 30,
+               "How many consecutive qualifying frames are required before light-volume capture arms itself. A run rather than a single frame, so an incidental burst of small additive draws cannot trigger it.");
+    RTX_OPTION("rtx.dx11", bool, deferredLightVolumeCapture, false,
+               "Creates Remix lights from the light-volume draws of a deferred renderer (UE4, Unity deferred, and similar).\n"
+               "The DX11 runtime otherwise captures NO game lights at all - D3D11 has no light API, so a scene is lit only by the fallback light plus anything added in USD. A deferred renderer draws every light as a sphere or cone scaled by its range, so position and range can be read straight off the draw's world matrix without parsing any constant buffer.\n"
+               "Colour and intensity are NOT recoverable from the volume geometry; they come from rtx.dx11.deferredLightVolumeColor and rtx.dx11.deferredLightVolumeIntensity. Off by default: on a forward-rendered game the heuristic has nothing correct to find, and a wrong light is worse than none.");
+    RTX_OPTION("rtx.dx11", uint, deferredLightVolumeMaxPrimitives, 2048,
+               "Largest primitive count still considered a light volume. Light volumes are low-poly stand-ins (a unit sphere or cone); world meshes are far denser, so this separates them. Raise it if lights are being missed, lower it if world geometry is being eaten.");
+    RTX_OPTION("rtx.dx11", float, deferredLightVolumeMinRange, 1.0f,
+               "Smallest world-space range (the volume's scale) accepted as a light. Rejects degenerate or unscaled volumes that would otherwise produce a light with no reach.");
+    RTX_OPTION("rtx.dx11", float, deferredLightVolumeRadiusScale, 0.05f,
+               "Emitter radius as a fraction of the light's range. The volume gives the range the light reaches, not the size of the bulb; this derives a plausible physical emitter size from it. Larger values give softer shadows.");
+    RTX_OPTION("rtx.dx11", float, deferredLightVolumeIntensity, 1.0f,
+               "Brightness multiplier for lights recovered from light volumes. The volume geometry carries no intensity, so this is the single knob that scales all of them.");
+    RTX_OPTION("rtx.dx11", Vector3, deferredLightVolumeColor, Vector3(1.0f, 1.0f, 1.0f),
+               "Colour applied to lights recovered from light volumes, since the volume geometry carries no colour.");
+    RTX_OPTION("rtx.dx11", uint, deferredLightVolumeMaxPerFrame, 64,
+               "Maximum lights created from light volumes in one frame. Bounds the cost when a heuristic misfires on a scene full of small additive draws.");
+    RTX_OPTION("rtx.dx11", uint, worldMatrixScanMaxMissesPerShader, 8,
+               "How many consecutive draws a vertex shader may fail to yield a world matrix before the per-draw search is skipped for that shader. 0 keeps searching forever.\n"
+               "The search caches no location on purpose - a remembered slot/offset can point at a bone, light or post matrix after a shader change - so the full sweep otherwise runs for every draw: every bound constant buffer, every 16-byte offset, an affine/shear/scale test per candidate, plus a second sweep for a derived object-to-view matrix. On a game that exposes no world matrix at all (Skyrim logs 'world=NO') that work runs and fails on every draw of the session.\n"
+               "DX11_V319: measured in Mine Souls III at 3.0ms of a 4.6ms draw-submission budget across 503 draws. What is remembered is a property of the SHADER, not a location, and any success clears it immediately, so a shader that only sometimes binds its world cbuffer is never suppressed by a few early misses.");
     RTX_OPTION("rtx.dx11", bool, stableDynamicTextureHashes, true,
                "Gives sampled textures created without initial data (UI/font atlases, video surfaces, streaming pools) a stable identity derived from their descriptor and creation order, instead of hashing the content of whichever runtime upload happened to arrive first.\n"
                "First-upload hashing made such texture hashes differ between sessions - the first upload depends on which glyphs or frames the menu touched first - so UI texture tags and replacements silently stopped applying on the next run.\n"
@@ -391,13 +462,14 @@ namespace dxvk {
     // titles route their whole scene through capture (50-200 small draws per
     // frame), so the caps default high; the byte cap bounds one frame's GPU
     // copy work against TDR. Lower these per title if a device-lost occurs.
-    RTX_OPTION("rtx.dx11", int, captureMaxDrawsPerFrame, 64,
-               "Maximum post-VS position captures performed per frame. Draws past the cap keep their previous capture or stay on the raster layer until a later frame captures them.");
-    RTX_OPTION("rtx.dx11", int, captureMaxNewBuffersPerFrame, 32,
+    RTX_OPTION("rtx.dx11", int, captureMaxDrawsPerFrame, 128,
+               "Maximum post-VS position captures performed per frame. Draws past the cap keep their previous capture or stay on the raster layer until a later frame captures them.\n"
+               "DX11_V298: raised 64 -> 128 (with new=64, replay=64, 48 MiB). Fallout 4 pinned the old cold lane (new=32/32) during world streaming, so scenery popped in over many seconds. GPU pacing is bounded separately (8 draws / 64K vertices per queue submission) and capture memory is capped, so the wider lanes only shorten pop-in.");
+    RTX_OPTION("rtx.dx11", int, captureMaxNewBuffersPerFrame, 64,
                "Maximum NEW capture buffers allocated per frame (cold captures of meshes never seen before).");
-    RTX_OPTION("rtx.dx11", int, captureMaxReplaysPerFrame, 32,
+    RTX_OPTION("rtx.dx11", int, captureMaxReplaysPerFrame, 64,
                "Maximum dynamic-mesh capture replays per frame (meshes whose vertex data changes every frame).");
-    RTX_OPTION("rtx.dx11", int, captureMaxMiBPerFrame, 24,
+    RTX_OPTION("rtx.dx11", int, captureMaxMiBPerFrame, 48,
                "Maximum bytes (MiB) of post-VS capture copied per frame. Bounds a single frame's GPU copy work so capture can never push one queue submission past the TDR limit.");
     RTX_OPTION("rtx.dx11", bool, dynamicTextureHashUsesOrdinal, true,
                "Includes a same-descriptor slot ordinal in the stable dynamic-texture identity. Slots are recycled when a texture is destroyed, so a recreated UI atlas keeps its hash across recreation.\n"
@@ -453,9 +525,13 @@ namespace dxvk {
                      "Disable only to diagnose a driver compiler problem or reduce first-run compilation time; disabled variants compile asynchronously when first selected.");
       RTX_OPTION_ENV("rtx.shader", bool, prewarmOnBoot, true, "DXVK_REMIX_PREWARM",
                      "Registers the Remix path-tracing pipeline set with the asynchronous compiler during startup so required shaders are compiled before their first rendered use. Disable only when diagnosing a driver-specific compiler failure.");
-      RTX_OPTION("rtx.shader", bool, waitForPrewarmOnBoot, false,
+      RTX_OPTION("rtx.shader", bool, waitForPrewarmOnBoot, true,
                  "Waits for boot shader prewarming to finish before Remix completes game initialization. The wait is bounded so a driver compiler failure cannot hang startup forever.\n"
-                 "DX11_V295: defaults OFF - on slower GPUs the full-variant prewarm can take several MINUTES (6 minutes observed on an RTX 3050), which froze the game at a black screen for that whole time. Pipelines compile in the background instead and first use is non-blocking; enable only for benchmarking or capture workflows that need every pipeline ready up front.");
+                 "DX11_V298: defaults ON - the game holds at the prewarm window and does not initialize past it until every Remix pipeline is compiled, so gameplay never overlaps compilation. The multi-minute cost the old OFF default avoided is now first-boot-only: compiled pipelines persist to rtx-remix/cache and later boots drain the wait in seconds.");
+      RTX_OPTION("rtx.shader", uint, maxBootPrewarmWaitSeconds, 45,
+                 "Longest the boot shader prewarm may hold the game before the remaining pipelines are handed to the background compiler and the game is allowed to start. Only applies to the boot wait; the shutdown drain always finishes.\n"
+                 "DX11_V319: with rtx.shader.prewarmAllVariants on there was previously NO total limit - only a 180s no-progress timeout - so a cold per-game pipeline cache blocked startup for as long as compilation kept making progress. Measured: Call of Duty Advanced Warfare 7m21s, Saints Row IV 8m02s, with no log output during the wait, which is indistinguishable from a hang and was reported as the game never loading.\n"
+                 "The handoff keeps the benefit: compiled pipelines still persist to rtx-remix/cache, so a later launch drains the wait in seconds. Raise it to favour compiling before play, or set to 0 for the old unbounded wait.");
       RTX_OPTION("rtx.shader", bool, showPrewarmDialog, true,
                  "Shows a responsive native Please Wait window with live shader count while boot shader prewarming is running before the game can render Remix's in-game UI.");
       RTX_OPTION_ENV("rtx.shader", bool, enableAsyncCompilation, true, "RTX_ENABLE_ASYNC_COMPILATION",
@@ -1181,6 +1257,80 @@ namespace dxvk {
                "The amount of GPU memory in gibibytes to reserve away from consideration for adaptive resolution replacement textures.\n"
                "This value should only be changed to reflect the estimated amount of memory Remix itself consumes on the GPU (aside from texture loading, mostly from rendering-related buffers) and should not be changed otherwise.\n"
                "Only relevant when force high resolution replacement textures is disabled and adaptive resolution replacement textures is enabled. See asset estimated size parameter for more information.\n");
+    RTX_OPTION("rtx", uint, positionCaptureThrottleMinDrawsPerFrame, 64,
+               "How many position captures a frame must already have performed before the capture\n"
+               "submission throttle engages. That throttle flushes and then blocks the render thread\n"
+               "until the GPU retires the capture write - a full round trip that costs on the order of\n"
+               "100ms under FIFO present, because it queues behind pending presents.\n"
+               "It exists to stop a capture storm outrunning the GPU during heavy loads, so it should\n"
+               "not fire on light frames: those have no storm to prevent and simply pay the stall.\n"
+               "Lower it if a capture-heavy scene shows GPU-side stalls; raise it if light frames still\n"
+               "report a single draw dominating rtx.logDrawSubmissionPerf. Set to 0 to throttle always.");
+    RTX_OPTION("rtx", bool, logDrawSubmissionPerf, true,
+               "Reports the CPU time the capture layer spends in draw submission each frame, and\n"
+               "attributes the worst single draw. Drawing is the GPU's job; time spent here is the\n"
+               "render thread being held up before the GPU is even asked to do anything, so a large\n"
+               "figure points at capture work (buffer readbacks, stream-out replays, per-draw locking)\n"
+               "stalling the frame rather than at raytracing cost. The raytracing passes time\n"
+               "themselves separately and are typically low single-digit milliseconds.");
+    RTX_OPTION("rtx", uint, logDrawSubmissionPerfThresholdMs, 4,
+               "Only report a frame's draw-submission cost once it exceeds this many milliseconds, so\n"
+               "healthy frames stay silent. 4ms is roughly a quarter of a 60Hz frame budget spent\n"
+               "before rendering starts. Set to 0 to report every frame.");
+    RTX_OPTION("rtx", uint, logDrawSubmissionPerfIntervalFrames, 600,
+               "After the first few reports, emit rtx.logDrawSubmissionPerf at most once every this many\n"
+               "frames. A game that sits permanently above the threshold otherwise writes one warning per\n"
+               "frame for the whole session: Saints Row IV produced 21,966 of them in a single 5.8 MB log,\n"
+               "which buries every other diagnostic and is itself a per-frame cost in a probe meant to\n"
+               "measure per-frame cost. The opening burst still reports the problem immediately, and a\n"
+               "frame markedly worse than anything reported so far is always logged regardless of the\n"
+               "interval, so a genuine escalation is never throttled away. Set to 0 to report every frame.");
+    RTX_OPTION("rtx", bool, logCameraObstruction, true,
+               "Logs any accepted draw whose bounding box, transformed into view space, encloses the eye.\n"
+               "Geometry that genuinely sits elsewhere in the world lands away from the view origin; anything\n"
+               "bracketing it on all three axes is pinned to the viewpoint and will fill the screen no matter\n"
+               "where the player looks. Each entry names the draw, its texture hash, whether it was captured\n"
+               "camera-relative, and both its object-space and view-space boxes, so the obstructing mesh can\n"
+               "be identified and tagged rather than guessed at.");
+    RTX_OPTION("rtx", uint, logCameraObstructionMaxEntries, 32,
+               "Caps how many camera-obstruction entries are logged per session, so a mesh submitted every\n"
+               "frame cannot flood the log. Raise it when several distinct meshes need identifying.");
+    RTX_OPTION("rtx", bool, dropCollapsedEyeGeometry, true,
+               "Drops geometry that has collapsed onto the viewpoint: its bounding box encloses the eye\n"
+               "AND both the object-to-world and world-to-view translations are zero, meaning the mesh\n"
+               "was never actually placed in the world. Such a mesh occludes the scene that renders\n"
+               "correctly behind it - the long-standing 'black box around the camera'.\n"
+               "\n"
+               "Enclosing the eye alone is NOT enough to cull: a room, cave or water volume you are\n"
+               "standing inside legitimately brackets the camera on all three axes. The zero-translation\n"
+               "test is what separates a collapsed mesh from an interior you are genuinely inside.\n"
+               "\n"
+               "This is a safety net. The real fix is submitting the draw in the correct coordinate\n"
+               "space (see rtx.dx11UseResolvedTransformSpace); when that works this never fires.");
+    RTX_OPTION("rtx", bool, dx11UseResolvedTransformSpace, true,
+               "Let the DX11 camera resolver decide which coordinate space a draw's vertices are in,\n"
+               "instead of the legacy cameraRelativeView flag (which is written from 13 separate sites,\n"
+               "so the last writer wins regardless of evidence quality).\n"
+               "\n"
+               "Field logs showed 64 of 64 accepted draws disagreeing with a single signature:\n"
+               "  resolved=view legacy=world reason='confirmed camera-relative identity view'\n"
+               "i.e. the runtime confirms the view is camera-relative (vertices already in camera space)\n"
+               "and then submits them as world space. With the camera at the origin that collapses the\n"
+               "geometry onto the eye, which is the long-standing 'black box around the camera'.\n"
+               "\n"
+               "Set to False to fall back to the legacy flag if this makes things worse - the resolver\n"
+               "only overrides when its confidence is high, and every override is logged.");
+    RTX_OPTION("rtx", uint, vramBudgetLimitMiB, 3584,
+               "Ceiling, in mebibytes, on how much VRAM Remix allocates for itself.\n"
+               "This budgets only Remix's own resources - material textures, its buffers, acceleration\n"
+               "structures, opacity micromaps, render targets and replacement geometry. The rest of the\n"
+               "card stays available to the game, so the GPU is still fully utilised; this only stops\n"
+               "Remix's texture budget from expanding to fill whatever VRAM happens to be free.\n"
+               "The texture budget is what actually gets clamped: it receives whatever the ceiling has\n"
+               "left after Remix's non-texture allocations, and textures are demoted to fit. Resources\n"
+               "sized by the scene rather than by budget (render targets, acceleration structures) are\n"
+               "counted against the ceiling but cannot themselves be shrunk to honour it.\n"
+               "Set to 0 to disable the cap and use the driver-reported budget as before.");
     RTX_OPTION("rtx", uint, limitedBonesPerVertex, 4,
                "Limit the number of bone influences per vertex for replacement geometry.  D3D11 games were limited to 4, which is the default.  In rare instances you may want to increase this based on your preference for replaced assets.  This config only takes affect when set on startup via the rtx.conf.");
 
@@ -1297,6 +1447,915 @@ namespace dxvk {
                "instead of being rasterized to the sky cubemap. This fixes a class of bugs where auto-detect misclassifies "
                "world geometry as sky (due to shared camera positions), causing that geometry to become invisible. "
                "Only effective when Sky Auto-Detect and Reproject Sky to Main Camera are both enabled.");
+
+    RTX_OPTION("rtx", SkyMode, skyMode, SkyMode::SkyboxRasterization,
+               "Sky rendering mode. SkyboxRasterization uses traditional skybox rasterization, PhysicalAtmosphere uses Hillaire atmospheric scattering.");
+    RTX_OPTION("rtx", bool, skyAutoPhysicalAtmosphereFallback, true,
+               "Whether the DX11 runtime may switch rtx.skyMode from SkyboxRasterization to PhysicalAtmosphere (Numos) on its own.\n"
+               "DX11_V319: this promotion used to be unconditional, so Numos always replaced the game's sky regardless of rtx.skyMode and there was no setting to stop it. It also only changed an internal variable, leaving rtx.skyMode still reporting SkyboxRasterization - so the game-sky suppression and the Numos-gated night sky/cloud features stayed switched off while Numos was actually being drawn, and the game's own sky was composited alongside it.\n"
+               "It defaults ON because rasterized skybox mode genuinely cannot work here: the sky cubemap has no usable per-face reprojection, its faces stay at the clear value, and the result is a black box around the camera. Set to False to keep Numos out of the way and take the rasterized path as-is, or set rtx.skyMode=1 to choose Numos explicitly rather than by fallback.");
+
+    // Atmosphere parameters
+    RTX_OPTION("rtx.atmosphere", float, sunSize, 0.545f, "Size of sun disc in degrees.");
+    RTX_OPTION("rtx.atmosphere", float, sunShadowSoftnessDeg, 0.0f,
+               "Decoupled sun shadow softness, as the distant light's angular half-angle in degrees. "
+               "0 = physical (use sunSize / 2, so shadow softness tracks the visible disc). When > 0 it "
+               "overrides the sun light's half-angle WITHOUT changing the visible sun disc — larger = "
+               "softer penumbra, for artistic soft shadows under a small sun.");
+    RTX_OPTION("rtx.atmosphere", float, sunIntensity, 1.0f, "Strength of Sun.");
+    RTX_OPTION("rtx.atmosphere", float, sunElevation, 15.0f,
+               "Sun elevation in degrees. Game-drivable per-frame; persists when saved unless overridden by a runtime push.");
+    RTX_OPTION("rtx.atmosphere", float, sunRotation, 0.0f,
+               "Sun rotation in degrees. Game-drivable per-frame; persists when saved unless overridden by a runtime push.");
+    RTX_OPTION("rtx.atmosphere", float, altitude, 100.0f, "Height from sea level in meters.");
+    RTX_OPTION("rtx.atmosphere", float, airDensity, 1.0f, "Density of air molecules multiplier (1.0 = clear sky).");
+    RTX_OPTION("rtx.atmosphere", float, aerosolDensity, 1.1f, "Density of aerosols/dust multiplier (1.0 = typical).");
+    RTX_OPTION("rtx.atmosphere", float, ozoneDensity, 1.0f, "Density of ozone layer multiplier (1.0 = typical).");
+    
+    // Advanced/Internal Atmosphere Parameters
+    RTX_OPTION("rtx.atmosphere", float, planetRadius, 6371.0f, "Planet radius in kilometers.");
+    RTX_OPTION("rtx.atmosphere", float, atmosphereThickness, 100.0f, "Atmosphere thickness in kilometers.");
+    RTX_OPTION("rtx.atmosphere", float, mieAnisotropy, 0.97f, "Mie phase function anisotropy (g parameter, -1 to 1).");
+    
+    // Base coefficients (can be used for non-Earth atmospheres, scaled by density sliders)
+    RTX_OPTION("rtx.atmosphere", Vector3, rayleighScattering, Vector3(5.8e-3f, 13.5e-3f, 33.1e-3f), "Base Rayleigh scattering coefficients (km^-1).");
+    RTX_OPTION("rtx.atmosphere", Vector3, mieScattering, Vector3(3.996e-3f, 3.996e-3f, 3.996e-3f), "Base Mie scattering coefficients (km^-1).");
+    RTX_OPTION("rtx.atmosphere", Vector3, ozoneAbsorption, Vector3(2.04e-3f, 4.97e-3f, 2.14e-4f), "Base Ozone absorption coefficients (km^-1).");
+    RTX_OPTION("rtx.atmosphere", float, ozoneLayerAltitude, 25.0f, "Altitude of ozone layer peak in kilometers.");
+    RTX_OPTION("rtx.atmosphere", float, ozoneLayerWidth, 15.0f, "Width of the ozone layer in kilometers.");
+    RTX_OPTION("rtx.atmosphere", Vector3, sunIlluminance, Vector3(15.0f, 15.0f, 15.0f), "Base Sun illuminance color/intensity.");
+    RTX_OPTION("rtx.atmosphere", float, multiScatterPhysicalStrength, 1.0f, "Blend between the analytical multiscatter fit (0) and the physical Hillaire multiscattering LUT (1). Default 1.0 = physical: the LUT is the correct directional, transmittance-aware hemisphere integration and gives a believable zenith->horizon gradient with warm horizon tones. 0 = the legacy analytical inline fit, which is a flat isotropic blue-biased fill that flattens the gradient and desaturates the warm horizon (kept only for A/B). Intermediate values blend.");
+    RTX_OPTION("rtx.atmosphere", float, multiScatterStrength, 1.0f, "Artistic global scale on the atmosphere's multiscattering 'fill' term. The physical two-term model adds a broadband (pale-blue) multiscatter term that desaturates warm sunset color. Lower this (e.g. 0.3-0.6) to let warm single-scatter dominate for a punchier sunset; 1.0 = physical. Feeds the sky-view LUT, so clouds inherit it.");
+    RTX_OPTION("rtx.atmosphere", float, sunsetSaturation, 1.0f, "Artistic saturation adjustment applied to sky radiance, ramped in as the sun approaches the horizon (midday sky is untouched). 1.0 = no change (default — the physical multiscatter path now produces correct horizon color at the source, so the former 0.5 desaturation band-aid is retired); <1 desaturates the near-horizon sky toward neutral; >1 amplifies the warm horizon hues. Feeds the sky-view LUT, so clouds inherit it.");
+
+    RTX_OPTION_ARGS("rtx.atmosphere", float, skyIndirectRadianceScale, 1.0f,
+               "Artistic multiplier for sky radiance gathered by diffuse indirect bounces only. "
+               "1.0 = physical (default). Raise it to brighten diffuse sky fill (the distant-light "
+               "sun has a much higher radiance than the sky, so indirect lighting reads dull). "
+               "Applies only to genuine diffuse sky gather; sky seen via reflection, refraction, "
+               "alpha-cutout, or the primary view stays at physical brightness so reflections match "
+               "the visible sky.",
+      args.minValue = 0.0f);
+
+    RTX_OPTION("rtx.atmosphere", bool, useSkyViewLut, true,
+               "Sample the precomputed sky-view LUT at sky-miss instead of per-ray evalSkyRadiance. "
+               "Improves performance with minimal visual difference when Numos atmosphere is active.");
+
+    // ----- Night-sky shading (fork) -----
+    // Stars, Milky Way, shooting stars, airglow. Active when skyMode == Numos.
+    RTX_OPTION("rtx.atmosphere", float, starBrightness, 0.5f,
+               "Overall brightness multiplier for stars. Game-drivable per-frame (plugins can fade stars in/out around sunset/sunrise); persists when saved unless overridden by a runtime push.");
+    RTX_OPTION("rtx.atmosphere", float, starDensity, 0.5f,
+               "Star density on a linear-feel slider: 0 = no stars, 1 = maximum stars. Internally "
+               "maps via pow(starDensity, 4) * 0.05 to a per-cell visible-star fraction, so the "
+               "useful range (~0.1% to 5% of cells) spans the whole slider instead of compressing "
+               "into the top 1% (the prior behavior, which made 0.98/0.99/1.0 the only viable "
+               "settings). 0.5 = ~0.3% stars, 0.7 = ~1.2%, 1.0 = ~5%.");
+    RTX_OPTION("rtx.atmosphere", float, starTwinkleSpeed, 1.0f,
+               "Speed of star twinkling animation (0 = no twinkle).");
+    RTX_OPTION("rtx.atmosphere", float, starRotation, 0.0f,
+               "Sidereal sky rotation angle in degrees, 0-360. Game-drivable per-frame; persists when saved unless overridden by a runtime push.");
+    RTX_OPTION("rtx.atmosphere", float, starAxisElevation, 90.0f,
+               "Celestial pole elevation from horizon in degrees. 90 = pole at zenith (default, matches pre-rotation behavior).");
+    RTX_OPTION("rtx.atmosphere", float, starAxisRotation, 0.0f,
+               "Celestial pole azimuth in degrees (0 = North). Only relevant when starAxisElevation != 90.");
+    RTX_OPTION("rtx.atmosphere", float, nightSkyBrightness, 0.002f,
+               "Ambient night-sky brightness from airglow and zodiacal light.");
+    RTX_OPTION("rtx.atmosphere", Vector3, nightSkyColor, Vector3(0.15f, 0.2f, 0.4f),
+               "Base color tint of the night-sky airglow.");
+    // ----- Milky Way controls (fork) -----
+    RTX_OPTION("rtx.atmosphere", bool, milkyWayEnabled, false,
+               "Master toggle for the galactic-band Milky Way effects: increased star density "
+               "inside the band, and the diffuse background dust glow. When disabled, the star "
+               "field is uniformly distributed at the base density across the whole sky. Off by "
+               "default -- stylized opt-in for users who want the band aesthetic.");
+    RTX_OPTION("rtx.atmosphere", float, milkyWayDensityBoost, 0.3f,
+               "Density threshold reduction inside the galactic band. Higher = more (and dimmer) "
+               "stars visible only in the band region, producing the dense-band look.");
+    RTX_OPTION("rtx.atmosphere", float, milkyWayBackgroundBrightness, 0.05f,
+               "Diffuse background glow brightness for the Milky Way band -- represents unresolved "
+               "stars + dust haze. 0 disables the glow. Default 0.05 gives a subtle ambient.");
+    RTX_OPTION("rtx.atmosphere", Vector3, milkyWayBackgroundColor, Vector3(0.5f, 0.55f, 0.75f),
+               "Outer-edge tint for the Milky Way glow (the cool blue periphery away from the "
+               "galactic center, where young stars dominate). Default cool blue (0.5, 0.55, 0.75).");
+    RTX_OPTION("rtx.atmosphere", Vector3, milkyWayCoreColor, Vector3(1.0f, 0.85f, 0.55f),
+               "Bright core tint for the Milky Way glow (warm yellow-cream toward the galactic "
+               "center where stellar density peaks). Default warm cream (1.0, 0.85, 0.55).");
+    RTX_OPTION("rtx.atmosphere", Vector3, milkyWayDustColor, Vector3(0.15f, 0.08f, 0.05f),
+               "Dust-lane tint for the Milky Way glow (dark red-brown patches that occlude the "
+               "bright band, mirroring interstellar dust clouds). Default dark red-brown.");
+    RTX_OPTION("rtx.atmosphere", float, milkyWayDustAmount, 0.6f,
+               "How strongly dust-lane patches darken the Milky Way glow. 0 = no dust (smooth "
+               "uniform band), 1 = full dust contrast. Default 0.6.");
+
+    RTX_OPTION("rtx.atmosphere", float, starPsfSharpness, 20.0f,
+               "PSF Gaussian exponent for procedural stars. Controls the per-star spread "
+               "in cube-grid-cell space (gridScale=400 -> 13.5 arcmin/cell). Lower = wider "
+               "softer stars; higher = sharper pinpoints. At 1080p/90 deg FOV, k=20 yields "
+               "~1-pixel-FWHM (anti-aliased), k=800 yields ~0.08-pixel-FWHM (severe sub-"
+               "pixel flicker on camera motion). 8-30 is the useful range for typical "
+               "render resolutions; reduce starBrightness if widening the PSF makes stars "
+               "too bright overall.");
+    RTX_OPTION("rtx.atmosphere", float, starCloudExtinctionPower, 2.5f,
+               "Power exponent applied to cloud view-transmittance when extincting stars. "
+               "Stars are HDR point sources; standard alpha compositing (T^1) leaves bright "
+               "pinpoints visible through cumulus cores. Raising to 2.5 makes stars die as "
+               "T^2.5, well below cloud body brightness at typical T<0.1 cores while leaving "
+               "clear sky (T=1) unaffected. Lower = stars survive thicker clouds; 1.0 = no "
+               "extra extinction (pure standard composite).");
+    RTX_OPTION("rtx.atmosphere", float, starAmbientCouplingStrength, 0.25f,
+               "Coupling strength of starlight/airglow into the cloud-march nightLight term "
+               "(O(1) knob; the sub-0.01 night-radiance scale is folded into the internal "
+               "kStarCloudCoupling constant in the shader). Adds a faint per-ray ambient based "
+               "on (nightSkyColor * starBrightness * this) so cloud bodies lift slightly under "
+               "starry skies. Default 0.25 = user-tested night level; higher brightens, 0 "
+               "disables the coupling. This is the largest uniform night cloud term, so lower "
+               "it first if night clouds glow.");
+
+    // ----- Per-moon parameters (fork) -----
+    // MAX_MOONS in atmosphere_args.h must equal the number of DECLARE_MOON_OPTIONS
+    // invocations below. Default state: all moons disabled - opt-in via game plugin
+    // or rtx.conf. Pose fields (elevation/rotation/phase) are game-drivable per-frame
+    // but also persist when saved (last writer wins during a session; cold start uses
+    // the saved value until any plugin push lands).
+#define DECLARE_MOON_OPTIONS(N)                                                                 \
+    RTX_OPTION("rtx.atmosphere.moon" #N, bool, enabled##N, false,                               \
+               "Enable moon " #N " rendering.");                                                \
+    RTX_OPTION("rtx.atmosphere.moon" #N, float, angularRadius##N, 3.5f,                         \
+               "Moon " #N " angular diameter in degrees.");                                     \
+    RTX_OPTION("rtx.atmosphere.moon" #N, float, brightness##N, 1.0f,                            \
+               "Moon " #N " brightness multiplier. Default 1.0 = physical neutral; "            \
+               ">1 brightens for stylized scenes (e.g. 4.0 reproduces pre-Phase-2 look).");     \
+    RTX_OPTION("rtx.atmosphere.moon" #N, Vector3, color##N, Vector3(0.12f, 0.12f, 0.12f),       \
+               "Moon " #N " surface albedo. Default (0.12, 0.12, 0.12) ≈ Earth's lunar Bond "   \
+               "albedo; raise per-channel for tinted moons (blood-red, sulfur-yellow, etc.).");\
+    RTX_OPTION("rtx.atmosphere.moon" #N, uint32_t, surfaceStyle##N, 0u,                         \
+               "Moon " #N " surface preset: 0 = Rocky, 1 = Volcanic.");                         \
+    RTX_OPTION("rtx.atmosphere.moon" #N, float, craterDensity##N, 1.0f,                         \
+               "Moon " #N " crater density multiplier [0,1].");                                 \
+    RTX_OPTION("rtx.atmosphere.moon" #N, float, surfaceContrast##N, 1.0f,                       \
+               "Moon " #N " surface light/dark contrast multiplier.");                          \
+    RTX_OPTION("rtx.atmosphere.moon" #N, float, surfaceNoiseScale##N, 1.0f,                     \
+               "Moon " #N " surface feature size multiplier.");                                 \
+    RTX_OPTION("rtx.atmosphere.moon" #N, float, darkSideBrightness##N, 0.005f,                  \
+               "Moon " #N " dark-side brightness as fraction of lit side.");                    \
+    RTX_OPTION("rtx.atmosphere.moon" #N, float, roughnessAmount##N, 1.0f,                       \
+               "Moon " #N " micro-detail surface roughness amplitude.");                        \
+    RTX_OPTION("rtx.atmosphere.moon" #N, float, elevation##N, 45.0f,                            \
+               "Moon " #N " elevation in degrees. Game-drivable per-frame; persists when saved unless overridden by a runtime push."); \
+    RTX_OPTION("rtx.atmosphere.moon" #N, float, rotation##N, 90.0f,                             \
+               "Moon " #N " rotation in degrees. Game-drivable per-frame; persists when saved unless overridden by a runtime push."); \
+    RTX_OPTION("rtx.atmosphere.moon" #N, float, phase##N, 0.5f,                                 \
+               "Moon " #N " phase [0,1]. Game-drivable per-frame; persists when saved unless overridden by a runtime push.")
+
+    DECLARE_MOON_OPTIONS(0);
+    DECLARE_MOON_OPTIONS(1);
+    DECLARE_MOON_OPTIONS(2);
+    DECLARE_MOON_OPTIONS(3);
+#undef DECLARE_MOON_OPTIONS
+
+    // ----- Weather preset declarations (fork, 2026-05-08) -----
+    // 348 RTX_OPTIONs: 12 presets x 29 fields under rtx.weather.preset.<name>.
+    // (Buckets: 19 cloud + 3 atmosphere + 3 sky/moon mood + 4 volumetric.)
+    // Neutral defaults here; per-archetype tuning lands in a follow-up commit.
+    // Getter form: RtxOptions::clear_cloudDensity(), etc.
+    // See src/dxvk/rtx_render/rtx_fork_weather.h for macro definitions.
+    DECLARE_ALL_WEATHER_PRESETS();
+#undef DECLARE_ALL_WEATHER_PRESETS
+#undef DECLARE_WEATHER_PRESET
+#undef WEATHER_PRESET_RTX_OPTION_FOR
+#undef WEATHER_PRESET_BIND_clear
+#undef WEATHER_PRESET_BIND_partlyCloudy
+#undef WEATHER_PRESET_BIND_overcast
+#undef WEATHER_PRESET_BIND_hazy
+#undef WEATHER_PRESET_BIND_foggy
+#undef WEATHER_PRESET_BIND_drizzle
+#undef WEATHER_PRESET_BIND_rainstorm
+#undef WEATHER_PRESET_BIND_thunderstorm
+#undef WEATHER_PRESET_BIND_snow
+#undef WEATHER_PRESET_BIND_blizzard
+#undef WEATHER_PRESET_BIND_sandstorm
+#undef WEATHER_PRESET_BIND_smoggy
+    // NOTE: WEATHER_PRESET_FIELD_LIST is intentionally NOT undef'd here -
+    // Task 2 consumes it to declare WeatherSnapshot struct members.
+
+    // ----- Moon NEE / atmospheric-coupling strengths (fork) -----
+    RTX_OPTION("rtx.atmosphere", float, moonNeeStrength, 1.0f,
+               "World-side master multiplier on direct moon lighting (surface NEE + clouds + future volumetric). "
+               "0 = moon does not light the world; 1 = default physical-baseline magnitude; "
+               ">1 = brighten across all world-side paths simultaneously. Per-path fine-tuning available "
+               "via surfaceMoonBrightness / cloudMoonBrightness / haloMoonBrightness.");
+    RTX_OPTION("rtx.atmosphere", float, moonAtmosphericCouplingStrength, 1.0f,
+               "Sky-side multiplier on the moon's contribution to atmospheric scattering. "
+               "0 = no blue-dome around the moon (sky stays pure black); 1 = default physical-baseline; "
+               ">1 = exaggerated for stylized scenes.");
+
+    // ----- Sun/moon as real distant lights (fork — 2026-06-21) -----
+    // Physical-atmosphere mode injects the sun (and each enabled, above-horizon
+    // moon) as real Remix RtDistantLight sources driven by the atmosphere model,
+    // so they flow through the standard RTXDI/NEE path — the sole sun/moon path
+    // in Numos. This makes subsurface scattering, decals, viewmodels, etc.
+    // automatically correct. Cloud-on-terrain shadows are folded per-pixel onto
+    // the real sun in the NEE (integrator_direct.slangh, gated on
+    // cloudVoxelShadowsEnable). The older bespoke evalAtmosphereSunNEE/MoonNEE
+    // shader path was removed 2026-06-21.
+    RTX_OPTION("rtx.atmosphere", float, directionalLightRadianceScale, 1.0f,
+               "Global tuning multiplier on the injected sun/moon distant-light radiance. "
+               "1.0 targets parity with the reference atmosphere NEE magnitude; "
+               "adjust if the real-light sun/moon reads globally too bright or too dim.");
+
+    // ----- Per-path moon stylistic multipliers (fork, Phase 3) -----
+    // These are tonemapper-correction stylistic axes layered on top of the unified
+    // physical irradiance scaffold from Phase 2. Defaults are empirically tuned by
+    // in-game testing on 2026-05-08 against the Fallout: New Vegas test scene at
+    // m.brightness=1.0 (the new physical-neutral default). Set all three to 1.0
+    // for architecturally-pure physical baseline; the shipped defaults represent
+    // the offset between physical-correct and what the FNV tonemapper makes
+    // visually readable.
+    RTX_OPTION("rtx.atmosphere", float, surfaceMoonBrightness, 50.0f,
+               "Per-path stylistic multiplier on surface NEE (ground moonlight). "
+               "Default 50.0 = user-tested baseline for visible ground under FNV tonemapper "
+               "at m.brightness=1.0; 1.0 = physically-pure (very dim under typical tonemappers); "
+               "raise for brighter ground.");
+    RTX_OPTION("rtx.atmosphere", float, cloudMoonBrightness, 0.2f,
+               "Per-path stylistic multiplier on cloud-moon directional lighting + ambient airglow. "
+               "Default 0.2 = user-tested baseline for cloud silver-lining under FNV tonemapper "
+               "at m.brightness=1.0; 1.0 = physically-pure; 0 = no moon-cloud illumination. "
+               "Higher values produce a stronger silver-lining peak on the cloud directly in front "
+               "of the moon.");
+    RTX_OPTION("rtx.atmosphere", float, haloMoonBrightness, 15.0f,
+               "Per-path stylistic multiplier on disk halo Gaussian glow. "
+               "Default 15.0 = user-tested baseline for visible halo glow under FNV tonemapper "
+               "at m.brightness=1.0; 1.0 = physically-pure; 0 = no halo.");
+
+    // ----- Moon cloud-look + halo shape constants (fork, Phase 3 Task 2) -----
+    // Tunable shape parameters for cloud-moon silver-lining contrast and halo glow.
+    // Defaults preserve current calibrated values; exposed for in-game tuning.
+    RTX_OPTION("rtx.atmosphere", float, moonCloudDiffuseGain, 0.10f,
+               "Cloud-moon Lambert diffuse weight controlling off-axis cloud illumination. "
+               "Lower = stronger contrast (off-axis clouds dimmer relative to peak). "
+               "Higher = more uniform cloud lighting. Default 0.10.");
+    RTX_OPTION("rtx.atmosphere", float, moonCloudPhaseGain, 1.0f,
+               "Cloud-moon HG phase weight controlling peak silver-lining intensity. "
+               "Higher = brighter cloud directly in front of moon. Default 0.30.");
+    RTX_OPTION("rtx.atmosphere", float, moonCloudAnisotropy, 0.85f,
+               "Henyey-Greenstein anisotropy for cloud-moon forward scatter. Higher = "
+               "sharper silver-lining peak (concentrated on cloud directly in front of "
+               "moon); lower = softer falloff. Default 0.85.");
+    RTX_OPTION("rtx.atmosphere", float, moonHaloMagnitude, 0.0015f,
+               "Disk halo Gaussian strength multiplier. Tuned alongside haloMoonBrightness; "
+               "use this for the underlying SHAPE strength and haloMoonBrightness for the "
+               "tonemapper-correction multiplier. Default 0.0015.");
+    RTX_OPTION("rtx.atmosphere", float, moonAmbientAirglow, 1.0f,
+               "Ambient airglow per-moon strength contribution to nightLight, as a multiple of "
+               "the calibrated night level (the 0.0015 night-radiance scale is folded into the "
+               "internal kMoonAirglowScale constant in the shader, so this knob is O(1)). The "
+               "cloud volume gets a uniform sky-bounce from each enabled moon scaled by this. "
+               "Default 1.0 = calibrated level.");
+    RTX_OPTION("rtx.atmosphere", float, moonSilverLiningIntensity, 2.0f,
+               "Master multiplier on the combined cloud-moon silver-lining contribution "
+               "(Lambert diffuse + HG phase). Composes with moonCloudDiffuseGain/PhaseGain "
+               "for ratio tuning.");
+    RTX_OPTION("rtx.atmosphere", float, moonHaloGlowStrength, 2.0f,
+               "Master multiplier on the combined moon halo + ambient airglow contribution. "
+               "Composes with moonHaloMagnitude / moonAmbientAirglow for ratio tuning.");
+
+    // Cloud parameters (procedural FBM cloud layer)
+    RTX_OPTION("rtx.atmosphere", bool, cloudEnabled, true, "Enable procedural cloud rendering.");
+    RTX_OPTION("rtx.atmosphere", float, cloudDensity, 1.8f, "Cloud opacity/density multiplier.");
+    RTX_OPTION("rtx.atmosphere", float, cloudAltitude, 1.3f, "Cloud layer altitude in kilometers.");
+    RTX_OPTION("rtx.atmosphere", Vector3, cloudColor, Vector3(0.89f, 0.92f, 1.0f), "Base cloud color (albedo).");
+    RTX_OPTION("rtx.atmosphere", float, cloudWindSpeed, 0.02f, "Cloud drift speed in km/s. Clouds scroll with this velocity.");
+    RTX_OPTION("rtx.atmosphere", float, cloudWindDirection, 45.0f, "Cloud wind direction in degrees (0 = +X, 90 = +Z).");
+    RTX_OPTION("rtx.atmosphere", float, cloudEvolutionSpeed, 0.0015f,
+               "Cloud field-evolution (morph) speed in km/s. Slowly scrolls the base 3D noise "
+               "sample position through the volume — dominated by a vertical scroll through the "
+               "decorrelated, tile-wrapping Y axis — so cloud formations form and dissolve in "
+               "place instead of translating rigidly with the wind. Decorrelated from wind, so it "
+               "also breaks the wind tile-repeat. 0 = field frozen (legacy rigid behavior).");
+    RTX_OPTION("rtx.atmosphere", float, cloudBoilSpeed, 0.004f,
+               "Cloud edge-boil speed in km/s. Scrolls the high-frequency edge-detail tap "
+               "independently of the base shape so cauliflower billows churn and rebuild at the "
+               "silhouette. Only has effect when cloudDetailStrength > 0. 0 = edges frozen.");
+    RTX_OPTION("rtx.atmosphere", float, cloudEvolutionVerticalBias, 0.8f,
+               "Fraction of the cloud field-evolution scroll directed along the volume's vertical "
+               "(Y) axis [0..1]. Higher = more in-place morphing (clouds form/dissolve); lower = "
+               "more lateral sliding. The remainder is split into a fixed diagonal X/Z drift for "
+               "decorrelation.");
+    RTX_OPTION("rtx.atmosphere", float, cloudShadowStrength, 0.5f,
+               "How strongly overcast clouds dim ground and atmosphere lighting [0..1]. "
+               "1.0 = full physical voxel-grid shadow contribution from cloudVoxelShadowsEnable; "
+               "0 = shadows fully muted (voxel grid still runs but its output is mixed away).");
+    // Cloud volumetric / appearance enhancements
+    RTX_OPTION("rtx.atmosphere", uint32_t, cloudViewSamples, 32,
+               "Number of ray-march steps through the cloud slab. Higher = better quality, more cost. Range 1..32.");
+    RTX_OPTION("rtx.atmosphere", float, cloudThickness, 3.05f,
+               "Vertical depth of the cloud slab in km.");
+    RTX_OPTION("rtx.atmosphere", float, cloudCurvature, 0.38f,
+               "Sky-dome curvature for the cloud layer: 0 = real-planet radius "
+               "(nearly flat ceiling), 1 = tight dome (clouds visibly curve down "
+               "to the horizon). Only affects cloud sphere intersections; "
+               "atmospheric scattering still uses the real planet radius.");
+
+    // Volumetric sky-ambient illumination (fork — 2026-05-12)
+    // Feeds the volumetric froxel pass with sky-view-LUT radiance attenuated
+    // by cloud coverage along each hemisphere sample direction. Default-off
+    // ship strategy: skyAmbientStrength=0 means baseline rendering is
+    // unchanged until the user flips this on. See
+    // docs/superpowers/specs/2026-05-12-volumetric-sky-ambient-design.md.
+    RTX_OPTION("rtx.atmosphere", float, cloudSkyAmbientStrength, 0.0f,
+               "Overall strength of the volumetric sky-ambient illumination term "
+               "[0..3]. 0 = feature disabled (baseline rendering). 1 = physical "
+               "baseline. Higher values brighten shadowed fog with sky-tinted "
+               "ambient. Gated on rtx.skyMode = 1 (Numos).");
+    RTX_OPTION("rtx.atmosphere", float, cloudSkyAmbientCloudOcclusionStrength, 1.0f,
+               "Strength of cloud occlusion applied to the volumetric sky-ambient "
+               "term [0..1]. 1 = full physical cloud occlusion (overcast scenes "
+               "have visibly darker volumetric ambient than clear-sky scenes). "
+               "0 = sky ambient ignores cloud cover (debug only — visually "
+               "inverted versus reality).");
+    // Independent scale on the sun's contribution to volumetric in-scattering
+    // (fork — issue #35). rtx.volumetrics.fogSunVisibilityGain multiplies the
+    // whole froxel SH cache at the fog consumer, so it scales the sun AND every
+    // remix scene light together — forcing it low for balanced scene lights
+    // leaves daytime sun-fog too weak. This knob scales ONLY the atmosphere sun
+    // term, applied where it is added to the SH in volume_integrator.slangh, so
+    // sun-fog can be boosted without over-brightening scene-light fog. Default
+    // 1.0 leaves the sun's contribution unchanged (bit-identical baseline).
+    RTX_OPTION_ARGS("rtx.atmosphere", float, atmosphereSunVolumetricRadianceScale, 1.0f,
+               "Independent multiplier on the physical sun's contribution to "
+               "volumetric fog in-scattering. Unlike rtx.volumetrics.fogSunVisibilityGain "
+               "(which scales the whole froxel cache, sun + all scene lights), this "
+               "affects only the atmosphere sun term. Gated on rtx.skyMode = 1 (Numos). "
+               "Default 1.0 = physical sun contribution unchanged.",
+               args.minValue = 0.0f, args.maxValue = 50.0f);
+
+    // Wrenninge / Hillaire (Frostbite 2016) multi-scatter approximation for the
+    // sun-cloud interaction. Replaces the prior flat-Lambert + single-HG approximation
+    // with a sum of N octaves (each with reduced energy, extinction and phase
+    // asymmetry) plus an isotropic deep-scatter floor — collectively the
+    // "milky-bright bottom" look real cumulus has when viewed from below.
+    RTX_OPTION("rtx.atmosphere", uint32_t, cloudMultiScatterOctaves, 3,
+               "Number of Wrenninge multi-scatter octaves summed per cloud sample. "
+               "3 is the standard cost/quality tradeoff. 1 disables multi-scatter "
+               "(single direct anisotropic term only). Range clamped to 1..4 in-shader.");
+
+    // Master multiplier on the Nubis Cubed sigma_ms remap (page 137 of the
+    // Nubis Cubed 2023 paper). Scales the per-sample multi-scatter sigma
+    // before it enters M = dim_profile * exp(-sigma_ms * D_sun). At 1.0 the
+    // paper baseline is unchanged; raise to brighten cumulus bottoms (more
+    // multi-scatter), lower to flatten lighting. The 4 individual sigma_ms
+    // sub-knobs (cloudMsSigmaShallow/Deep, cloudMsSunDotMax, cloudMsSdfDepth)
+    // remain accessible via user.conf for power tuning.
+    RTX_OPTION("rtx.atmosphere", float, cloudMsScale, 1.0f,
+               "Multi-scatter strength multiplier on the Nubis Cubed sigma_ms term [0..2]. "
+               "1.0 = paper baseline; higher brightens cumulus bottoms, lower flattens.");
+
+    // Cloud spatial variation (Nubis-style — spec 2026-05-06)
+    RTX_OPTION("rtx.atmosphere", float, cloudTypeMean, 0.5f,
+               "Mean cloud type across the sky [0,1]: 0=stratus, 0.5=stratocumulus, 1=cumulus.");
+    RTX_OPTION("rtx.atmosphere", float, cloudTypeSpread, 0.2f,
+               "Spatial variation amplitude for cloud type [0,1]. 0=uniform, 1=full range across the sky.");
+    RTX_OPTION("rtx.atmosphere", float, cloudTypeNoiseScale, 0.0034f,
+               "Region size frequency for type noise. Numerically smaller = larger spatial features. "
+               "Capped at 0.0034 in the UI because faster variation puts visible 2D-noise cell "
+               "structure at sub-cumulus scales (regular grid of cumulus blobs).");
+    RTX_OPTION("rtx.atmosphere", float, cloudCoverageMean, 0.64f,
+               "Mean cloud coverage across the sky [0,1]: 0=clear, 1=overcast.");
+    RTX_OPTION("rtx.atmosphere", float, cloudCoverageSpread, 0.16f,
+               "Spatial variation amplitude for coverage [0,1]. 0=uniform, 1=full range.");
+    RTX_OPTION("rtx.atmosphere", float, cloudCoverageNoiseScale, 0.0033f,
+               "Region size frequency for coverage noise. Independent from type noise scale.");
+    RTX_OPTION("rtx.atmosphere", float, cloudAnvilBias, 0.3f,
+               "Cumulus top inflation strength [0,1]. 0=flat tops, 1=fully spread mushroom-cap anvils.");
+    RTX_OPTION("rtx.atmosphere", float, cloudNoiseTileKm, 12.0f,
+               "World-space tile period (km) for the prebaked 3D cloud noise texture. "
+               "Smaller = more visible repetition; larger = lower-frequency cloud detail. "
+               "Default 12.0; viable range 6-24. Re-bakes the cloud noise volume live on change.");
+    // Hex de-tiling (fork — 2026-06-11, de-tile rework). Root-cause fix for
+    // the prebaked noise volume's periodic repeat: a stochastic
+    // triangle-lattice randomization (Heitz & Neyret 2018 variance-preserving
+    // blending) destroys the tile period at the source while preserving the
+    // field's statistics. Replaced the former anti-tile domain warp
+    // (cloudNoiseWarpStrength), removed once this was validated in-game.
+    RTX_OPTION("rtx.atmosphere", bool, cloudHexTilingEnable, true,
+               "Stochastically randomize the cloud noise tiling on a "
+               "triangle lattice so the 12 km texture repeat can never "
+               "show, with statistics-preserving blending (the cloud look "
+               "is unchanged). Disable for the legacy periodic field "
+               "(visible repetition at the tile period).");
+    RTX_OPTION("rtx.atmosphere", float, cloudNoiseBaseFreqScale, 1.0f,
+               "Multiplier on the cloud noise bake's base + detail FBM "
+               "frequencies [0.25..4]. 1.0 = legacy bake. Raise for "
+               "smaller/busier cloud features, lower for larger ones. "
+               "Re-bakes the noise volume live on change.");
+
+    // Per-column cloud model (fork — 2026-06-11, column-shaping rework; the
+    // legacy global-slab alternative was removed 2026-06-19 and the column
+    // model is now unconditional). Root-cause fix for the "stacked separated
+    // layers" read: the old global-slab path keyed every vertical shaping
+    // signal (density envelope, coverage-threshold scale, anvil pow, dim
+    // profile, bottom darkening) on the GLOBAL slab height fraction — one
+    // vertical recipe pinned to absolute altitude across the whole sky — while
+    // the thresholded 3D noise placed mass independently per altitude (stacked
+    // disconnected puffs in a column). The column model derives a per-column
+    // cloud base/top from a baked 2D placement map (cluster field, top jitter,
+    // base lift) and re-keys all vertical shaping + the Nubis lighting proxies
+    // on each cloud's OWN normalized height.
+    RTX_OPTION("rtx.atmosphere", float, cloudCellSizeKm, 2.0f,
+               "Average cloud-cluster footprint in km [0.5..6] for the "
+               "placement map bake. Smaller = many small clouds; larger = "
+               "fewer, broader banks. Re-bakes the placement map live on "
+               "change (the effective value snaps so an integer number of "
+               "clusters fits the noise tile).");
+    RTX_OPTION("rtx.atmosphere", float, cloudColumnTopVariation, 0.45f,
+               "Per-cloud tower-height jitter [0..1]. 0 = all cloud tops at "
+               "one altitude (flat deck); higher = a varied skyline. "
+               "Applies live.");
+    RTX_OPTION("rtx.atmosphere", float, cloudColumnTopShape, 0.6f,
+               "Exponent mapping column presence to cloud-top height "
+               "[0.1..2]. Low = thin cluster edges still tower (blockier); "
+               "high = only dense cores rise (domed tops, feathered "
+               "edges). Applies live.");
+    RTX_OPTION("rtx.atmosphere", float, cloudColumnBaseVariation, 0.12f,
+               "Max local cloud-base lift as a fraction of the layer depth "
+               "[0..0.4]. 0 = machined-flat cloud ceiling; higher = gently "
+               "undulating bases. Applies live.");
+    RTX_OPTION("rtx.atmosphere", float, cloudColumnFeather, 0.35f,
+               "Coverage-remap feather band at cloud-cluster edges "
+               "[0.05..1]. Narrow = crisp solid-cored clouds; wide = soft "
+               "wispy transitions. Applies live.");
+    // Adaptive march sampling (fork — 2026-06-12). A fixed step COUNT
+    // across a slab span that varies ~4 km (zenith) to 50+ km (horizon
+    // through the curved shell) undersamples horizon rays — ~1.6 km steps
+    // against ~2 km cloud features — and the aliasing reads as soft
+    // horizontal banding concentrated toward the horizon. Hold a target
+    // step LENGTH instead; the count floors at cloudViewSamples and caps
+    // at cloudViewSamplesMax.
+    RTX_OPTION("rtx.atmosphere", float, cloudViewStepKm, 0.1f,
+               "Distance between cloud samples along each view ray, in km "
+               "[0.1..1]. Fixes the horizontal banding near the horizon "
+               "(sightlines there cross 50+ km of cloud layer, which the "
+               "legacy fixed 32-sample march could not resolve). "
+               "PERFORMANCE: cost scales with samples per ray — overhead "
+               "views are unchanged, horizon-heavy views can cost up to "
+               "cloudViewSamplesMax/32 times more cloud time (2x at "
+               "defaults). Raise the spacing or lower the cap to trade "
+               "quality for speed; 0 = legacy fixed count (banding "
+               "returns). Applies live.");
+    RTX_OPTION("rtx.atmosphere", uint32_t, cloudViewSamplesMax, 64,
+               "Hard cap on cloud samples per ray [32..256] — the "
+               "performance governor for cloudViewStepKm. 64 resolves the "
+               "default spacing out to ~6 km of cloud span; lower costs "
+               "less but lets some banding back in at the far horizon. "
+               "32 = legacy cost ceiling. Applies live.");
+    RTX_OPTION("rtx.atmosphere", float, cloudUndersideLightSigma, 0.12f,
+               "Extinction of the light filtering down through each cloud, "
+               "per km of overlying water [0..0.5]. Drives the analytic "
+               "per-column underside light field: brightness varies "
+               "continuously with the water above every point (dark cores, "
+               "bright thin spots, smooth gradients) instead of one flat-lit "
+               "sheet. Higher = darker, more dramatic undersides; 0 = "
+               "underside darkening off (flat-lit base). Overall strength and "
+               "the sun-elevation fade are set by Bottom Darkening. Applies "
+               "live.");
+
+    // Edge detail (fork — 2026-06-10, rev 3 — additive). Concentrates
+    // high-frequency detail at cloud edges: a second, higher-frequency tap of
+    // the prebaked noise volume grows billows OUTWARD from the density field
+    // where it is weak (silhouettes), leaving saturated cores untouched.
+    // Nubis detail remap, bias mirrored across the field mean for growth.
+    RTX_OPTION("rtx.atmosphere", float, cloudDetailStrength, 0.6f,
+               "Edge detail strength [0..1]. Grows high-frequency "
+               "cauliflower billows OUTWARD from cloud EDGES while leaving dense "
+               "cores solid. 0 = off (smooth legacy silhouettes). Note: the "
+               "added billows thicken the silhouette band slightly, so high "
+               "values read as marginally higher coverage.");
+    RTX_OPTION("rtx.atmosphere", float, cloudDetailScale, 4.3f,
+               "Edge-detail noise frequency as a multiple of the base cloud "
+               "noise frequency (cloudNoiseTileKm). Higher = finer edge "
+               "filigree; lower = chunkier edge billows. Non-integer values "
+               "keep the combined base+detail repeat period long. Default 4.3, "
+               "viable range 2-12. Applies live (no re-bake).");
+
+    // Cloud-edge / halo tuning (fork — 2026-06-13). Two live knobs for the soft
+    // fringe around cloud silhouettes: cloudEdgeSoftness sets how wide the
+    // coverage-gate transition band is (the EXTENT of the skirt), and
+    // cloudEdgeAmbientFade fades the horizon-tinted ambient on thin samples (the
+    // discolored COLOR of the skirt). Both apply live, no re-bake.
+    RTX_OPTION("rtx.atmosphere", float, cloudEdgeSoftness, 0.15f,
+               "Cloud silhouette softness [0.02..0.4] — width of the view-path "
+               "coverage-gate transition band. Lower = crisper edges and a "
+               "tighter silhouette; higher = softer edges but a broader faint "
+               "skirt of sub-threshold cloud that can read as a halo. The "
+               "shadow/optical-depth gate is held at 0.25 so self-shadow bakes "
+               "are unaffected. Applies live.");
+    RTX_OPTION("rtx.atmosphere", float, cloudEdgeAmbientFade, 0.15f,
+               "Thin-edge ambient fade [0..0.5]. Sub-threshold skirt samples are "
+               "ambient-dominated, and the ambient is sampled at the horizon (a "
+               "dirty grey-brown), so the soft fringe can read as discolored "
+               "haze. This fades the ambient term toward 0 below the given "
+               "(gated) density, so the faintest edge samples fall to transparent "
+               "instead of horizon-tinted. Direct/moon/night light is untouched, "
+               "so backlit edges keep their glow. 0 = off. Applies live.");
+
+    // Vertical coherence (fork — 2026-06-10, rev 2; EXPERIMENTAL, default
+    // off). Blends the 3D noise sample toward a fixed-Y slice so cloud
+    // cross-sections stay correlated with altitude (connected towers
+    // instead of stacked blobs). Rev 1 (Y-domain stretch) beaded the small
+    // octaves into stacked puffs; rev 2 reads as vertical smearing at
+    // higher values — neither look shipped. Default 1.0 = bit-exact
+    // identity (feature inert) until the towering-cumulus problem is
+    // solved properly, likely at the sky-system level.
+    RTX_OPTION("rtx.atmosphere", float, cloudVerticalStretch, 1.0f,
+               "EXPERIMENTAL vertical connectedness of cloud bodies [1..3]. "
+               "1 = fully 3D noise (default; feature inert); higher anchors "
+               "clouds to a stable vertical footprint so cumulus reads as "
+               "connected towers — but currently smears vertically at high "
+               "values. Applies live; also reshapes the baked self-shadow "
+               "grids so lighting tracks the shapes.");
+
+    // Underside darkening strength (fork — 2026-06-10; reworked 2026-06-19 to
+    // scale the realistic analytic underside light field instead of a constant
+    // gradient). Modulates the Nubis Cubed multi-scatter + ambient terms so
+    // cumulus undersides read darker than tops. The direct-beam term is exempt
+    // so backlit silver linings are unaffected, and the effect fades out as the
+    // sun nears the horizon so low-sun bases light up (sunset glow).
+    RTX_OPTION("rtx.atmosphere", float, cloudBottomDarkening, 1.0f,
+               "Strength of the cloud-underside darkening [0..1]. Scales the "
+               "analytic per-column light field (shaped by Underside Shading) "
+               "applied to the multi-scatter and ambient terms; the direct sun "
+               "beam (silver lining) is unaffected. The darkening is strongest "
+               "with the sun overhead and fades out toward the horizon, where "
+               "the low sun rakes under the deck and lights the bases (sunset "
+               "glow). 0 = off (uniformly lit undersides).");
+    RTX_OPTION("rtx.atmosphere", float, cloudSkyAmbientFill, 0.5f,
+               "How strongly cloud undersides pick up the open sky around them "
+               "[0..1]. Adds a sky-dome fill - the overhead sky color, "
+               "bypassing the bottom-darkening since that skylight reaches the "
+               "base from below/around rather than through the cloud. Lifts "
+               "gloomy undersides under a bright daytime sky and tints them with "
+               "the actual sky color; naturally fades at sunset (the overhead "
+               "sky is dim then). Higher = brighter, more sky-colored bases; "
+               "0 = off (legacy, undersides ignore the open sky). Applies live.");
+    RTX_OPTION("rtx.atmosphere", float, cloudSkyBleedStrength, 0.15f,
+               "How strongly the clouds tint the surrounding sky [0..1+]. The "
+               "sky picks up cloud-colored inscatter sampled from the (smooth) "
+               "cloud field, so an orange sunset deck warms the blue gaps "
+               "between clouds and a grey overcast greys the sky around it, "
+               "instead of clouds and sky reading as two separate layers. "
+               "Strongest next to clouds, fading to nothing in open sky far "
+               "from any. Higher = more cloud color in the sky; 0 = off "
+               "(legacy, sky ignores clouds). Needs the secondary cloud LUT "
+               "(on by default). Applies live.");
+
+    // Worley carve (Schneider15 — slide 17 of RDR2 SIGGRAPH 2019).
+    // These knobs control how chunky / cell-shaped the prebaked cloud noise is.
+    // Changing any of them (or cloudNoiseTileKm) re-bakes the 256^3 noise volume
+    // live via RtxAtmosphere::needsCloudNoiseRebake — no relaunch needed, though
+    // dragging a slider re-bakes each frame the value changes and may hitch.
+    RTX_OPTION("rtx.atmosphere", float, cloudWorleyCarveStrength, 0.6f,
+               "Schneider15 cauliflower carve strength. The Worley FBM is "
+               "subtracted from the Perlin base in the cloud noise bake to "
+               "produce chunky 3D cell silhouettes. 0 = pure Perlin (smooth "
+               "blobs, flat pancake look); 1.0 = aggressive carve (crushed "
+               "base shape). 0.6 default. Re-bakes the cloud noise volume live on change.");
+    RTX_OPTION("rtx.atmosphere", float, cloudWorleyFrequency, 1.0f,
+               "Worley feature-point density, cycles per km. Smaller = larger "
+               "cumulus cells (boulder-sized chunks); larger = smaller cells "
+               "(cauliflower bumps). Default 1.0 targets cumulus-cell scale. "
+               "Re-bakes the cloud noise volume live on change.");
+    RTX_OPTION("rtx.atmosphere", uint32_t, cloudWorleyOctaves, 3,
+               "Worley FBM octave count (clamped 1..4 in the bake shader). "
+               "Higher = more sub-scale detail on cell boundaries. Default 3. "
+               "Re-bakes the cloud noise volume live on change.");
+
+    // Cloud aerial perspective (fork — 2026-05-16). Distant cloud samples
+    // attenuate exponentially with march distance, mimicking real atmospheric
+    // extinction. Without this, horizon-grazing rays integrate through ~100 km
+    // of cloud volume and produce a solid white wall at the horizon. Live-
+    // tunable.
+    RTX_OPTION("rtx.atmosphere", float, cloudAerialHazePerKm, 0.05f,
+               "Per-km haze extinction applied to cloud RADIANCE (effect A of "
+               "the aerial-perspective fork). Dims distant cloud samples "
+               "toward atmospheric color so they read as 'softer / duller "
+               "with distance.' Visual softness control - does NOT prevent "
+               "the horizon white wall by itself. 0 = no haze. Default 0.05.");
+    RTX_OPTION("rtx.atmosphere", float, cloudAerialFadePerKm, 0.15f,
+               "Per-km fade extinction applied to cloud ALPHA accumulation "
+               "(effect B of the aerial-perspective fork). Distant samples "
+               "stop piling up extinction so horizon-grazing rays don't form "
+               "a solid white wall. Does NOT affect cloud appearance close to "
+               "camera. 0 = no fade (legacy white-wall behavior). Default 0.05.");
+
+    // Nubis Cubed 2023 lighting (fork — 2026-05-12).
+    // Tuning knobs for the per-sample lighting equations in cloud_render.comp.slang.
+    // The paper's magic constants for the sigma_ms remap (page 137) are unexplained,
+    // so all six surface as ImGui knobs for in-game tuning. Defaults pulled from
+    // paper renders + the 2026-05-12 spec.
+    RTX_OPTION("rtx.atmosphere", float, cloudPhaseG1, 0.8f,
+               "Primary HG asymmetry; strong forward-scatter, drives silver lining at backlit edges.");
+    RTX_OPTION("rtx.atmosphere", float, cloudPhaseG2, 0.3f,
+               "Secondary HG asymmetry; mild forward-scatter, drives broader in-scatter envelope.");
+    // Energy conservation of the direct dual-lobe (fork — 2026-06-19). The legacy
+    // direct term summed two full-amplitude phase lobes (T_primary*HG1 + M*HG2),
+    // whose combined phase integrated to up to ~2 over the sphere — the cloud
+    // scattered up to ~2x the energy a single event can redistribute, brightest
+    // exactly at the sunlit edge, which is why lit clouds out-brightened the
+    // physical sky LUT regardless of the ambient sliders. cloudEnergyConserve
+    // lerps that additive sum toward a convex (1-w)*HG1 + w*HG2 blend whose phase
+    // integrates to exactly 1; cloudMsLobeWeight is w.
+    RTX_OPTION("rtx.atmosphere", float, cloudEnergyConserve, 1.0f,
+               "[0,1] Energy conservation of the cloud direct lighting. 0 = legacy additive "
+               "dual-lobe (phase integral up to 2, brighter-than-sky look). 1 = convex blend "
+               "(phase integral 1, energy-conserving). Set 0 to A/B against the old look.");
+    RTX_OPTION("rtx.atmosphere", float, cloudMsLobeWeight, 0.5f,
+               "[0,1] Convex weight between the forward single-scatter lobe (silver lining, "
+               "weight 1-w) and the broader multi-scatter body fill (weight w) when "
+               "cloudEnergyConserve > 0. Higher = flatter/softer body, dimmer silver lining.");
+    RTX_OPTION("rtx.atmosphere", float, cloudMsSunDotMax, 0.9f,
+               "Nubis Cubed sigma_ms remap upper bound on sun_dot. Lower = wider 'shallow extinction' zone.");
+    RTX_OPTION("rtx.atmosphere", float, cloudMsSigmaShallow, 0.25f,
+               "Nubis Cubed sigma_ms value at cloud surface / shallow penetration.");
+    RTX_OPTION("rtx.atmosphere", float, cloudMsSigmaDeep, 0.05f,
+               "Nubis Cubed sigma_ms value deep inside cloud (sdf <= -cloudMsSdfDepth).");
+    RTX_OPTION("rtx.atmosphere", float, cloudMsSdfDepth, 128.0f,
+               "Nubis Cubed SDF depth in meters at which sigma_ms saturates to deep value.");
+
+    // Sunset ambient warm/cool blend (fork — 2026-05-21).
+    // At low sun, the ambient sky color used for cloud volumetric scattering is
+    // sampled both in the sun direction (warm) and the anti-sun horizon (cool),
+    // and per-sample blended by the D_sun voxel grid so shadowed cloud interiors
+    // pick up the cool side while sun-lit edges stay warm. The effect smoothly
+    // ramps off above cloudSunsetAmbientRampHighSun so daytime clouds are
+    // unaffected. cloudSunsetAmbientStrength = 0 disables the feature entirely.
+    RTX_OPTION("rtx.atmosphere", float, cloudSunsetAmbientStrength, 1.0f,
+               "Master strength of the sunset warm/cool ambient blend. 0 = feature off, "
+               "1 = baseline contrast, >1 = exaggerated cool side.");
+    RTX_OPTION("rtx.atmosphere", float, cloudSunsetAmbientReachInvKm, 1.0f,
+               "How aggressively D_sun (self-shadow optical depth, km) penetrates the cool blend. "
+               "Higher = clouds turn cool faster with shadow depth.");
+    RTX_OPTION("rtx.atmosphere", float, cloudSunsetAmbientRampHighSun, 0.4f,
+               "sin(sun elevation) at which the sunset ambient effect smooth-fades to zero. "
+               "Default 0.4 (~24 degrees above horizon). Effect is at full strength when sun is at the horizon.");
+
+    // Half-res cloud render RT (fork — 2026-06-11, perf). The visible cloud
+    // march runs once per cloud-RT pixel; clouds are soft, low-frequency
+    // content, so marching at a fraction of the DLSS-input resolution and
+    // bilinearly upsampling at the sky-miss composite cuts the pass cost
+    // by ~1/scale^2 with little visible difference. The temporal smoothing
+    // path runs AFTER the upsample, at full downscale resolution, so its
+    // stabilization is unaffected.
+    RTX_OPTION("rtx.atmosphere", float, cloudRenderResolutionScale, 0.5f,
+               "Resolution scale of the cloud render target relative to the "
+               "internal (DLSS-input) resolution [0.25..1]. 0.5 = quarter the "
+               "pixels (~4x cheaper cloud march); 1.0 = native (legacy, "
+               "bit-exact). Applies on the next frame; live-tunable.");
+
+    // Secondary-ray cloud LUT (fork — 2026-06-10, perf). Every indirect /
+    // PSR / reflection ray that reaches sky-miss would otherwise run a full
+    // per-ray cloud march — a hidden per-ray cost rivaling the visible cloud
+    // pass. With this on, those rays sample a 256x128 dome LUT baked once per
+    // frame with the same Nubis Cubed march the visible clouds use
+    // (cloud_secondary_lut.comp.slang). With it off, secondary sky-miss rays
+    // are cloudless.
+    RTX_OPTION("rtx.atmosphere", bool, cloudSecondaryLutEnable, true,
+               "Supply clouds to secondary rays (indirect bounces, PSR, "
+               "reflections) from a small per-frame baked dome LUT instead of a "
+               "per-ray cloud march. Large performance win on cloudy skies, and "
+               "reflected/indirect clouds match the primary Nubis look. Disable "
+               "to make secondary sky-miss rays cloudless.");
+
+    // Cloud voxel-grid re-bake granularity (fork — 2026-06-11, perf). The
+    // D_sun / D_ambient grids re-baked every frame; the perf-bisect freeze
+    // showed a large win with only slowly-accumulating staleness (the bake
+    // inputs — wind scroll, camera position, sun direction — move slowly).
+    // Quantizing those inputs inside a cache key re-bakes once per step of
+    // actual motion instead of once per frame, bounding staleness by the
+    // step. Sun direction shares skyViewRebakeGranularityDeg (same 0.1 deg
+    // perceptual class); this option is the distance step for wind + camera.
+    // Cloud parameter changes and noise-volume re-bakes always force an
+    // immediate grid re-bake.
+    RTX_OPTION("rtx.atmosphere", float, cloudVoxelGridRebakeGranularityKm, 0.1f,
+               "Distance (km) the cloud wind scroll or camera must travel "
+               "before the D_sun/D_ambient cloud lighting grids re-bake. "
+               "Default 0.1 (in-game validated 2026-06-11: ~0.7 ms saved, "
+               "no visible stepping in cloud lighting or terrain shadows). "
+               "0 = legacy: re-bake every frame.");
+
+    // Sky perf bisect toggles (fork — 2026-06-11, diagnostic). The
+    // atmosphere pass runs several per-frame dispatches that no production
+    // option can skip — so frame-time A/B tests (skyMode, cloudEnabled)
+    // mis-attribute their cost. These default-ON toggles let a live ImGui
+    // session bisect the per-dispatch cost: uncheck one, read the
+    // frame-time delta, re-check. Skipping a dispatch leaves its consumer
+    // reading STALE data (frozen clouds / shadows) — diagnostic only, not
+    // a production setting.
+    RTX_OPTION("rtx.atmosphere", bool, debugDispatchCloudVoxelGrids, true,
+               "Diagnostic: dispatch the per-frame D_sun + D_ambient cloud "
+               "voxel-grid bakes (256x256x32 x 8/6 taps each). Uncheck to "
+               "skip both and read the frame-time delta; cloud lighting and "
+               "cumulus terrain shadows freeze at their last state while "
+               "unchecked.");
+    RTX_OPTION("rtx.atmosphere", bool, debugDispatchCloudRender, true,
+               "Diagnostic: dispatch the per-frame screen-space cloud render "
+               "pass. NOTE this pass runs even when cloudRenderRTEnable is "
+               "off, so this toggle is the only way to remove its cost. "
+               "Uncheck to skip; primary-ray clouds freeze in place while "
+               "unchecked.");
+    RTX_OPTION("rtx.atmosphere", bool, debugDispatchCloudSkyTransmittance, true,
+               "Diagnostic: dispatch the per-frame 32x16 cloud-sky-"
+               "transmittance bake (volumetric sky-ambient occlusion). "
+               "Uncheck to skip; expected to be near-free.");
+    RTX_OPTION("rtx.atmosphere", bool, debugDispatchSkyLuts, true,
+               "Diagnostic: run the sky LUT bake cascade (transmittance / "
+               "multiscatter / sky-view). With a continuously-animating "
+               "time-of-day sun the sky-view LUT legitimately re-bakes every "
+               "frame; uncheck to freeze all three LUTs at their last state "
+               "and read the frame-time delta. Sky colors stop tracking the "
+               "sun while unchecked.");
+    RTX_OPTION("rtx.atmosphere", bool, debugEnableSkyMissShading, true,
+               "Diagnostic: run the full evalSkyRadiance miss path. Uncheck "
+               "to return flat grey for every sky-miss ray and read the "
+               "frame-time delta (isolates the per-ray sky shading cost: "
+               "LUT taps, night sky, moons, cloud composite, temporal "
+               "smoothing I/O). Sky renders grey while unchecked.");
+
+    // Sky-view re-bake granularity (fork — 2026-06-11, perf). With a
+    // continuously-animating time-of-day sun, the sky-view LUT re-bakes
+    // every frame because its cache key sees a new sun direction each
+    // frame — bisect-measured as the last reducible chunk of the sky cost,
+    // and an in-game frozen-cascade test confirmed no visual hit from far
+    // sparser re-bakes (the sun moves ~0.1 deg/sec at FNV's default
+    // timescale). Quantizing the sun/moon directions inside the cache key
+    // re-bakes only when they have moved past the granularity step; all
+    // other parameter changes (sliders, presets) still re-bake immediately.
+    RTX_OPTION("rtx.atmosphere", float, skyViewRebakeGranularityDeg, 0.1f,
+               "Angular granularity (degrees) of sun/moon motion that "
+               "triggers a sky-view LUT re-bake. Default 0.1 (in-game "
+               "validated 2026-06-11: ~one re-bake per second of game time "
+               "at default timescale, sky tracks the sun smoothly, objective "
+               "frame-time win). 0 = legacy: re-bake every frame while the "
+               "sun animates. Non-direction parameter changes always "
+               "re-bake immediately.");
+
+    // Split sky-LUT cache keys (fork — 2026-06-11, perf). The three sky LUT
+    // bakes (transmittance / multiscatter / sky-view) were gated by ONE
+    // memcmp over the whole normalized arg struct, with two per-frame
+    // failure modes: the game-driven sidereal starRotation (animated every
+    // frame at night, feeds no LUT bake) re-baked the full cascade every
+    // frame, and a moving time-of-day sun re-baked the heavy transmittance +
+    // multiscatter pair even though neither depends on sun direction.
+    RTX_OPTION("rtx.atmosphere", bool, skyLutCacheKeySplitEnable, true,
+               "Re-bake each atmosphere LUT only when its actual inputs "
+               "change: star-field animation no longer re-bakes any LUT, and "
+               "sun/moon motion re-bakes only the small sky-view LUT instead "
+               "of the full transmittance + multiscatter cascade. No visual "
+               "difference; disable to restore the legacy single-gate "
+               "re-bake behavior for comparison.");
+
+    // Nubis Cubed sky-miss composite gate (fork — 2026-05-12, C5).
+    // When true, the primary-ray sky-miss path samples the AtmosphereCloudRender
+    // RT (written by cloud_render.comp.slang each frame); when false, primary
+    // sky-miss is cloudless. Indirect, PSR, and reflection rays instead use the
+    // secondary dome LUT (cloudSecondaryLutEnable) — the cloud RT is at
+    // primary-ray pixel coordinates, so sampling it for a non-primary ray
+    // direction would return the wrong cloud. Default false; flip after in-game
+    // visual confirmation.
+    RTX_OPTION("rtx.atmosphere", bool, cloudRenderRTEnable, true,
+               "Composite the Nubis Cubed cloud render RT at primary sky-miss. "
+               "When off, primary sky-miss is cloudless. Indirect/PSR/reflection "
+               "rays get clouds from the secondary dome LUT instead. Default on "
+               "as of C7 (2026-05-13) -- in-game validation confirmed Nubis Cubed "
+               "lighting produces the expected perceptual wins across "
+               "day/sunset/night.");
+
+    // Voxel-grid cloud-on-terrain shadows at NEE entry points (fork — 2026-05-12, C6).
+    // When true, sampleAtmosphereSunLight / sampleAtmosphereSunLightVolume apply
+    // a multiplicative ratio correction that replaces the legacy
+    // evalCloudGroundShadow uniform-dimmer with the rich 3D D_sun voxel-grid
+    // lookup (via sampleCloudGroundShadow_OptionB). Terrain shows cumulus-
+    // shaped drifting shadow patches that match cloud positions overhead.
+    // Default false; flip after in-game visual confirmation (C7 ship pass).
+    RTX_OPTION("rtx.atmosphere", bool, cloudVoxelShadowsEnable, true,
+               "Use the D_sun voxel grid for cloud-on-terrain shadows at NEE "
+               "entry points (sampleAtmosphereSunLight + volume variant). "
+               "Replaces the 2D coverage proxy evalCloudGroundShadow for the "
+               "NEE path only. Default on as of C7 (2026-05-13) -- terrain "
+               "now shows cumulus-shaped drifting shadow patches matching "
+               "cloud positions overhead.");
+    RTX_OPTION("rtx.atmosphere", float, cloudShadowMarchStrength, 1.0f,
+               "Beer-Lambert exponent multiplier applied to the D_sun voxel "
+               "grid lookup inside sampleCloudGroundShadow_OptionB. 1.0 = "
+               "physical baseline (transmittance = exp(-OD * density)); higher "
+               "values darken cloud-on-terrain shadows, lower values lighten "
+               "them. Only consumed when cloudVoxelShadowsEnable is on.");
+
+    // Post-denoise shadow-strength knob applied at composite time. The
+    // per-pixel cloud shadow factor written by integrate_direct is in [0, 1],
+    // where 1.0 means "no occlusion" and 0.0 means "fully shadowed". Composite
+    // applies `pow(factor, cloudShadowFactorStrength)` before multiplying it
+    // into the denoised direct radiance. Exponent rather than linear so the
+    // factor=1 (no-cloud) invariant is preserved at any strength value:
+    //   1.0 = unchanged (matches the raw factor from the wire-in)
+    //   > 1 = darker shadows (factor^2 at strength=2 → cumulus pixels at
+    //         factor=0.5 read as 0.25, a 2x deepening)
+    //   < 1 = fainter shadows (factor^0.5 at strength=0.5)
+    // Independent of cloudShadowMarchStrength (which acts pre-denoise inside
+    // the exp(-OD * density * march) call); this is a perception-side knob.
+    RTX_OPTION("rtx.atmosphere", float, cloudShadowFactorStrength, 4.0f,
+               "Post-denoise pow exponent applied to the per-pixel cloud "
+               "shadow factor in composite. 1.0 = unchanged, higher values "
+               "deepen cumulus-on-terrain shadows, lower values fade them. "
+               "Default 4.0 chosen against the FNV reference scene on "
+               "2026-05-19 after the ratio->newShadow simplification — the "
+               "raw newShadow alone reads too faint, strength=4 lands the "
+               "cumulus-shadow contrast in the visible-but-not-aggressive "
+               "range. Lets the shadow strength be tuned independently of "
+               "the bake magnitude (cloudShadowMarchStrength) without re-baking.");
+
+    // cloudShadowIndirectStrength REMOVED (fork — 2026-06-18, was issue #37).
+    // This knob fed a screen-space multiply of the per-pixel cloud shadow factor
+    // onto the primary INDIRECT lobes in composite. It was removed because it
+    // double-counted the cloud occlusion already carried physically by
+    // evalSkyRadiance on indirect rays that escape to the sky, and — being
+    // geometry-blind (the factor projects straight up with no roof knowledge) —
+    // it was the actual root cause of interiors darkening under overcast for
+    // every surface type. See the removal note in composite.comp.slang. The
+    // legitimate outdoor whole-mesh-ambient dimming under a cumulus is preserved
+    // through evalSkyRadiance; no replacement knob is needed.
+
+    // Cloud Height LUT (slide 3 lift — RDR2 SIGGRAPH 2019, fork — 2026-05-15).
+    // 64x128 R8 lookup table indexed by (cloud type slice, height fraction).
+    // Replaces the 3-keypoint procedural trapezoid in cloudTypeProfile() with a
+    // baked curve family — stratus / stratocumulus / cumulus stay close to the
+    // procedural shape so default-on doesn't regress the shipped Nubis Cubed
+    // look, but the high-type end gains an anvil lift and the low-type end can
+    // be re-tuned per weather without rebuilding shaders.
+    RTX_OPTION("rtx.atmosphere", bool, cloudHeightLutEnable, true,
+               "When true, cloud_render.comp.slang samples a 64x128 baked "
+               "height LUT to determine the per-altitude shape modulator "
+               "instead of the procedural cloudTypeProfile trapezoid. The LUT "
+               "is baked once at startup and keyed by (typeSlice, heightFrac). "
+               "The voxel grid bakers still use the procedural curve, so this "
+               "flag affects only the cloud render and secondary-LUT passes.");
+
+    // Two-layer cloud map (slide 1 lift — RDR2 SIGGRAPH 2019, fork — 2026-05-15).
+    // Adds an independent second cloud slab at a higher altitude (cirrus deck
+    // by default) on top of the existing cumulus layer. cloud_render marches
+    // the lower slab first and composites layer 2 onto residual transmittance.
+    // Default off so today's look is preserved bit-for-bit.
+    RTX_OPTION("rtx.atmosphere", bool, cloudLayer2Enable, true,
+               "When true, cloud_render.comp.slang marches a second 'echo' "
+               "cloud deck above the primary slab — the same cloud-slab density "
+               "model at a higher, gapped altitude, marched cheaply (low step "
+               "budget, analytic sun shadow, no moon path). Layer 2 has its own "
+               "altitude / thickness / type / coverage / density-scale / "
+               "noise-seed knobs (the cloudLayer2* options below); the seed "
+               "decorrelates the deck's coverage/type field from layer 1 so it "
+               "reads as a related-but-different cloudscape. Voxel-grid terrain "
+               "shadows + ground-shadow NEE remain layer-1-only.");
+    RTX_OPTION("rtx.atmosphere", float, cloudLayer2Altitude, 5.5f,
+               "Altitude (km) of the layer-2 deck base. The gap between the "
+               "layer-1 top (cloudAltitude + cloudThickness) and this value is "
+               "the clear-sky band separating the two decks.");
+    RTX_OPTION("rtx.atmosphere", float, cloudLayer2Thickness, 2.0f,
+               "Vertical depth (km) of the layer-2 deck.");
+    RTX_OPTION("rtx.atmosphere", float, cloudLayer2TypeMean, 0.6f,
+               "[0,1] mean cloud type for layer 2. Low values (~0.05) sample "
+               "the LUT's stratus-shaped column — appropriate for cirrus.");
+    RTX_OPTION("rtx.atmosphere", float, cloudLayer2CoverageMean, 0.85f,
+               "[0,1] mean coverage for layer 2. Defaults sparser than layer 1 "
+               "so cirrus reads as wispy patches rather than overcast.");
+    RTX_OPTION("rtx.atmosphere", float, cloudLayer2TypeSpread, 1.0f,
+               "[0,1] cloud-type variation for layer 2. Independent of layer 1's spread.");
+    RTX_OPTION("rtx.atmosphere", float, cloudLayer2NoiseSeed, 1000.0f,
+               "Seed offset added to layer 2's 2D coverage/type noise. Layer 2's smoothNoise2D "
+               "hash receives (200/250 + this), producing a fully decorrelated noise pattern at "
+               "the same XZ. 0 = layer 2 shares layer 1's noise pattern exactly. Any non-zero "
+               "value produces decorrelation; the magnitude itself does not matter beyond ~10. "
+               "Default 1000.");
+    RTX_OPTION("rtx.atmosphere", float, cloudLayer2DensityScale, 0.65f,
+               "Per-step density multiplier applied to layer 2 only. Lower "
+               "values keep the echo deck from competing visually with the "
+               "cumulus deck below.");
+    RTX_OPTION("rtx.atmosphere", uint32_t, cloudLayer2StepFloor, 8,
+               "Minimum ray-march steps through the layer-2 echo deck [2..64]. "
+               "The deck is marched more cheaply than layer 1 (which floors at "
+               "cloudViewSamples = 32); this is the deck's own floor, hit on "
+               "short (near-zenith) sightlines. Raise for a smoother deck at "
+               "higher cost. Applies live.");
+    RTX_OPTION("rtx.atmosphere", uint32_t, cloudLayer2StepMax, 32,
+               "Hard cap on layer-2 echo-deck samples per ray [2..128] — the "
+               "deck's performance governor, analogous to cloudViewSamplesMax "
+               "for layer 1. Between the floor and this cap the step count "
+               "follows the cloudViewStepKm step-length target. Applies live.");
+    RTX_OPTION("rtx.atmosphere", Vector3, cloudLayer2Color, Vector3(0.89f, 0.92f, 1.0f),
+               "Base color (albedo) of the layer-2 echo deck, independent of the "
+               "main cloudColor. Defaults to the same near-white so the deck "
+               "matches layer 1 until changed; tint it to differentiate the upper "
+               "deck (e.g. cooler high cirrus). The deck shares all other look "
+               "knobs with layer 1 (phase, multi-scatter, detail, etc.).");
 
     // TODO (REMIX-656): Remove this once we can transition content to new hash
     RTX_OPTION("rtx", bool, logLegacyHashReplacementMatches, false, "");

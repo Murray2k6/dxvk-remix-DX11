@@ -115,12 +115,14 @@ void applyVertexAndTextureOperationsToOpacity(inout float opacity, vec3 albedo, 
       vertexInterpolatedOpacity = interpolateHitAttribute(vertexOpacities, bary); 
     }
 
-    // Fixed function texture stage state for alpha channel
-    float textureAlphaArg1, textureAlphaArg2;
-    float tFactorAlpha = float((surface.tFactor >> 24) & 0xff) / 255.0f;
-    chooseTextureArgument(textureAlphaArg1, surface.textureAlphaArg1Source, opacity, vertexInterpolatedOpacity, tFactorAlpha, opacity);
-    chooseTextureArgument(textureAlphaArg2, surface.textureAlphaArg2Source, opacity, vertexInterpolatedOpacity, tFactorAlpha, float(1.0));
-    chooseTextureOperationAlpha(opacity, surface.textureAlphaOperation, textureAlphaArg1, textureAlphaArg2);
+    // Resolve alpha to whichever input the capture layer recorded. Must match the
+    // opaque surface material path so baked micromap opacity agrees with what the
+    // material evaluates at hit time.
+    opacity = resolveAlphaSource(surface.alphaSource, opacity,
+                                 vertexInterpolatedOpacity, surface.blendConstantAlpha);
+    if (surface.modulateVertexAlpha) {
+      opacity *= vertexInterpolatedOpacity;
+    }
 
     // Unused
     float emissiveBlendOverrideInfluence = float(0);

@@ -181,69 +181,35 @@ void calcOpaqueSurfaceMaterialOpacity(
   }
 }
 
-// Generic function choosing texture argument
-#define chooseTextureArgument(argument , source, textureColor, vertexColor0, tFactor, defaultValue)  \
-{                                                                                                    \
-  switch (uint(source))                                                                              \
-  {                                                                                                  \
-  case uint(RtTextureArgSource::VertexColor0):                                                       \
-    argument = vertexColor0; break;                                                                  \
-  case uint(RtTextureArgSource::Texture):                                                            \
-    argument = textureColor; break;                                                                  \
-  case uint(RtTextureArgSource::TFactor):                                                            \
-    argument = tFactor; break;                                                                       \
-  default:                                                                                           \
-  case uint(RtTextureArgSource::None):                                                               \
-    argument = defaultValue; break;                                                                  \
-  }                                                                                                  \
-}
-
-// Choosing texture operation for color channel
-// When modulation option is used, we assume vertex color is used as a filter color and ignore any lighting contribution in it.
-// Therefore, we treat three modulate options equally.
-// If it's known that the modulation does not have a lighting info, then use Force_Modulate2x
-void chooseTextureOperationColor(inout vec3 target, uint8_t textureOperation, vec3 textureArg1, vec3 textureArg2)
+// Resolves a surface colour or alpha channel to its source value.
+//
+// D3D11 has no fixed-function texture stages - the game's pixel shader already
+// produced the final colour - so the capture layer records which input the value
+// came from rather than a stage program. See D3D11ColorSource.
+vec3 resolveColorSource(uint8_t source, vec3 textureColor, vec3 vertexColor, vec3 blendConstant)
 {
-  switch (uint(textureOperation))
+  switch (uint(source))
   {
   default:
-  case uint(DxvkRtTextureOperation::Disable):
-    break;
-  case uint(DxvkRtTextureOperation::SelectArg1):
-    target = textureArg1; break;
-  case uint(DxvkRtTextureOperation::SelectArg2):
-    target = textureArg2; break;
-  case uint(DxvkRtTextureOperation::Modulate):
-  case uint(DxvkRtTextureOperation::Modulate2x):
-  case uint(DxvkRtTextureOperation::Modulate4x):
-    target = textureArg1 * textureArg2; break;
-  case uint(DxvkRtTextureOperation::Force_Modulate2x):
-    target = min(float(1), textureArg1 * textureArg2 * float(2.0)); break;
-  case uint(DxvkRtTextureOperation::Add):
-    target = textureArg1 + textureArg2; break;
+  case uint(D3D11ColorSource::Texture):
+    return textureColor;
+  case uint(D3D11ColorSource::VertexColor):
+    return vertexColor;
+  case uint(D3D11ColorSource::BlendConstant):
+    return blendConstant;
   }
 }
 
-// Choosing texture operation for alpha channel
-// Consider different modulation options separately because there is no lighting contribution to remove in alpha channel 
-void chooseTextureOperationAlpha(inout float target, uint8_t textureOperation, float textureArg1, float textureArg2)
+float resolveAlphaSource(uint8_t source, float textureAlpha, float vertexAlpha, float blendConstantAlpha)
 {
-  switch (uint(textureOperation))
+  switch (uint(source))
   {
   default:
-  case uint(DxvkRtTextureOperation::Disable):
-    break;
-  case uint(DxvkRtTextureOperation::SelectArg1):
-    target = textureArg1; break;
-  case uint(DxvkRtTextureOperation::SelectArg2):
-    target = textureArg2; break;
-  case uint(DxvkRtTextureOperation::Modulate):
-    target = textureArg1 * textureArg2; break;
-  case uint(DxvkRtTextureOperation::Modulate2x):
-    target = min(float(1), textureArg1 * textureArg2 * float(2.0)); break;
-  case uint(DxvkRtTextureOperation::Modulate4x):
-    target = min(float(1), textureArg1 * textureArg2 * float(4.0)); break;
-  case uint(DxvkRtTextureOperation::Add):
-    target = min(float(1), textureArg1 + textureArg2); break;
+  case uint(D3D11ColorSource::Texture):
+    return textureAlpha;
+  case uint(D3D11ColorSource::VertexColor):
+    return vertexAlpha;
+  case uint(D3D11ColorSource::BlendConstant):
+    return blendConstantAlpha;
   }
 }

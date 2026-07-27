@@ -386,7 +386,10 @@ namespace dxvk {
     double dot1 = (dot0.x + dot0.y) + (dot0.z + dot0.w);
 
     // Note: Ensure the matrix is invertable.
-    mathValidationAssert(dot1 != 0.0, "Attempted invert a non-invertible matrix.");
+    if (dot1 == 0.0) {
+      mathValidationAssert(false, "Attempted invert a non-invertible matrix.");
+      return Matrix4Base<T>();
+    }
 
     Matrix4Base<T> output;
 

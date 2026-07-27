@@ -68,6 +68,15 @@ namespace dxvk {
     // the REAL game process after the launcher hands off - a launcher must
     // never burn the scan budget, pop the compile window, or write its own
     // scan marker.
+    // DX11_V298_SILENT_PREWARMER: the shader scan/preload (the "prewarmer")
+    // emits no log output unless DXVK_REMIX_PREWARM_LOG=1. Matches the
+    // initializer-side prewarm logging gate.
+    bool prewarmLoggingEnabled() {
+      static const bool enabled =
+        env::getEnvVar("DXVK_REMIX_PREWARM_LOG") == "1";
+      return enabled;
+    }
+
     bool isHelperOrLauncherProcess() {
       static const bool result = [] {
         std::string executable = env::getExeNameNoSuffix();
@@ -239,7 +248,13 @@ namespace dxvk {
         uint64_t budgetOverrideMs = 0u,
         bool ignoreResumeMarker = false) {
       constexpr uintmax_t kMaximumFileSize = 2ull << 30;
-      uint64_t budgetMs = 45000u;
+      // DX11_V298_COMPLETE_BOOT_SCAN: the shader cache is built from the
+      // game's data at init, BEFORE play. The old 45 s budget spread the
+      // harvest across many launches, so early sessions still hit un-cached
+      // shaders mid-game. Ten minutes covers even large titles on the first
+      // boot (Fallout 4: ~25 GB scanned in roughly 3 minutes); the resume
+      // marker makes every later launch skip the scan entirely.
+      uint64_t budgetMs = 800000u;
       const std::string budgetOverride =
         env::getEnvVar("DXVK_GAME_SHADER_SCAN_BUDGET_MS");
       if (!budgetOverride.empty()) {
@@ -294,11 +309,13 @@ namespace dxvk {
         }
       }
 
-      Logger::info(str::format(
-        "[Remix-DX11][game-shader-scan] scanning game data for embedded shader bytecode: files=",
-        files.size(), " totalMiB=", totalBytes >> 20,
-        " startIndex=", resumeIndex, " budgetMs=", budgetMs,
-        " (resumes next launch if the budget runs out)"));
+      if (prewarmLoggingEnabled()) {
+        Logger::info(str::format(
+          "[Remix-DX11][game-shader-scan] scanning game data for embedded shader bytecode: files=",
+          files.size(), " totalMiB=", totalBytes >> 20,
+          " startIndex=", resumeIndex, " budgetMs=", budgetMs,
+          " (resumes next launch if the budget runs out)"));
+      }
 
       const auto nowMs = [] {
         return static_cast<uint64_t>(
@@ -374,10 +391,12 @@ namespace dxvk {
           }
           if (nowMs() - lastLogMs >= 5000u) {
             lastLogMs = nowMs();
-            Logger::info(str::format(
-              "[Remix-DX11][game-shader-scan] progress: file=", fileIndex + 1u,
-              "/", files.size(), " newShaders=", extracted,
-              " elapsedMs=", elapsed));
+            if (prewarmLoggingEnabled()) {
+              Logger::info(str::format(
+                "[Remix-DX11][game-shader-scan] progress: file=", fileIndex + 1u,
+                "/", files.size(), " newShaders=", extracted,
+                " elapsedMs=", elapsed));
+            }
           }
 
           if (input.eof())
@@ -402,13 +421,15 @@ namespace dxvk {
 
       RtxShaderPrecompiler::reportScanProgress(
         uint32_t(fileIndex), uint32_t(files.size()), extracted);
-      Logger::info(str::format(
-        "[Remix-DX11][game-shader-scan] ", budgetExhausted ? "paused (budget)" : "complete",
-        ": examinedFiles=", fileIndex - resumeIndex,
-        " candidateBlobs=", candidateBlobs,
-        " newShaders=", extracted,
-        " elapsedMs=", nowMs() - startMs,
-        budgetExhausted ? " - the scan resumes from this point on the next launch." : ""));
+      if (prewarmLoggingEnabled()) {
+        Logger::info(str::format(
+          "[Remix-DX11][game-shader-scan] ", budgetExhausted ? "paused (budget)" : "complete",
+          ": examinedFiles=", fileIndex - resumeIndex,
+          " candidateBlobs=", candidateBlobs,
+          " newShaders=", extracted,
+          " elapsedMs=", nowMs() - startMs,
+          budgetExhausted ? " - the scan resumes from this point on the next launch." : ""));
+      }
       return extracted;
     }
   }
@@ -457,14 +478,17 @@ namespace dxvk {
     static bool prewarmComplete = false;
     std::lock_guard<dxvk::mutex> prewarmLock(prewarmMutex);
     if (prewarmComplete) {
-      Logger::info(
-        "[Remix-DX11][game-shader-cache] shared-device preload already complete; reusing cached modules for this D3D11 device.");
+      if (prewarmLoggingEnabled()) {
+        Logger::info(
+          "[Remix-DX11][game-shader-cache] shared-device preload already complete; reusing cached modules for this D3D11 device.");
+      }
       return;
     }
     prewarmComplete = true;
 
     if (env::getEnvVar("DXVK_GAME_SHADER_CACHE") == "0") {
-      Logger::info("[Remix-DX11][game-shader-cache] disabled by DXVK_GAME_SHADER_CACHE=0.");
+      if (prewarmLoggingEnabled())
+        Logger::info("[Remix-DX11][game-shader-cache] disabled by DXVK_GAME_SHADER_CACHE=0.");
       return;
     }
 
@@ -472,10 +496,12 @@ namespace dxvk {
     // that happens to create a D3D11 device from the same folder first.
     if (isHelperOrLauncherProcess()
      && env::getEnvVar("DXVK_REMIX_FORCE_CURRENT_PROCESS") != "1") {
-      Logger::info(str::format(
-        "[Remix-DX11][game-shader-cache] helper/launcher-style process '",
-        env::getExeName(),
-        "' detected; skipping shader scan and preload. The game process prewarms after launcher handoff (override: DXVK_REMIX_FORCE_CURRENT_PROCESS=1)."));
+      if (prewarmLoggingEnabled()) {
+        Logger::info(str::format(
+          "[Remix-DX11][game-shader-cache] helper/launcher-style process '",
+          env::getExeName(),
+          "' detected; skipping shader scan and preload. The game process prewarms after launcher handoff (override: DXVK_REMIX_FORCE_CURRENT_PROCESS=1)."));
+      }
       return;
     }
 
@@ -488,13 +514,19 @@ namespace dxvk {
     // data files into the cache BEFORE enumerating it, so even the very
     // first boot compiles the game's shaders game-wide during startup
     // instead of stalling at each first use in gameplay.
+    // DX11_V298: the scan now runs inside the shared prewarm window (visible
+    // progress instead of a silent windowless stall) and completes on the
+    // first boot rather than resuming across many launches.
     if (env::getEnvVar("DXVK_GAME_SHADER_SCAN") != "0") {
       std::error_code scanDirectoryError;
       std::filesystem::create_directories(cacheDirectory, scanDirectoryError);
       if (!scanDirectoryError) {
-        scanGameDataForShaders(
-          std::filesystem::path(env::getExePath()).parent_path(),
-          cacheDirectory);
+        m_dxvkDevice->getCommon()->getRtxInitializer().runBootShaderScanPhase(
+          [this, &cacheDirectory] {
+            scanGameDataForShaders(
+              std::filesystem::path(env::getExePath()).parent_path(),
+              cacheDirectory);
+          });
       }
     }
 
@@ -518,7 +550,7 @@ namespace dxvk {
       iterator.increment(error);
     }
 
-    if (error) {
+    if (error && prewarmLoggingEnabled()) {
       Logger::warn(str::format(
         "[Remix-DX11][game-shader-cache] could not enumerate '",
         cacheDirectory.string(), "': ", error.message()));
@@ -540,11 +572,13 @@ namespace dxvk {
 
     RtxShaderPrecompiler::reportCacheCounts(
       static_cast<uint32_t>(cacheFiles.size()), loadedShaders, rejectedShaders);
-    Logger::info(str::format(
-      "[Remix-DX11][game-shader-cache] executable='", env::getExeName(),
-      "' directory='", cacheDirectory.string(), "' discovered=",
-      cacheFiles.size(), " loaded=", loadedShaders,
-      " rejected=", rejectedShaders));
+    if (prewarmLoggingEnabled()) {
+      Logger::info(str::format(
+        "[Remix-DX11][game-shader-cache] executable='", env::getExeName(),
+        "' directory='", cacheDirectory.string(), "' discovered=",
+        cacheFiles.size(), " loaded=", loadedShaders,
+        " rejected=", rejectedShaders));
+    }
   }
 
 
@@ -554,11 +588,46 @@ namespace dxvk {
       uint32_t&                                 loadedShaders,
       uint32_t&                                 rejectedShaders) {
     constexpr uintmax_t kMaximumShaderSize = 8u << 20;
+
+    // DX11_V298_POISON_BLOB_QUARANTINE: the game-data scan harvests raw DXBC
+    // candidates; a malformed-but-header-plausible blob can wedge or crash
+    // the DXBC->SPIR-V compiler, which hangs the whole boot inside device
+    // creation (observed: CoD Advanced Warfare froze at "pre-init preload
+    // started"). Before each compile, record the file being processed; if a
+    // previous boot died mid-compile the marker still names the culprit -
+    // quarantine (delete) it and the boot self-heals. The marker is removed
+    // after every successful pass, so healthy boots leave nothing behind.
+    const std::filesystem::path quarantineMarker = !cacheFiles.empty()
+      ? cacheFiles.front().parent_path() / "compiling.marker"
+      : std::filesystem::path();
+    if (!quarantineMarker.empty()) {
+      std::ifstream marker(quarantineMarker);
+      std::string previousVictim;
+      if (marker && std::getline(marker, previousVictim) && !previousVictim.empty()) {
+        marker.close();
+        std::error_code quarantineError;
+        std::filesystem::remove(std::filesystem::path(previousVictim), quarantineError);
+        Logger::warn(str::format(
+          "[Remix-DX11][game-shader-cache] previous boot died while compiling '",
+          previousVictim, "'; quarantined that cache entry and continuing."));
+      }
+    }
+
     for (size_t i = 0; i < cacheFiles.size(); ++i) {
       if (RtxShaderPrecompiler::cancelRequested())
         break;
 
       const std::filesystem::path& path = cacheFiles[i];
+      if (!quarantineMarker.empty()) {
+        std::ofstream marker(quarantineMarker, std::ios::trunc);
+        marker << path.string() << '\n';
+        marker.flush();
+      }
+      std::error_code victimError;
+      if (!std::filesystem::exists(path, victimError) || victimError) {
+        updateProgress(static_cast<uint32_t>(cacheFiles.size() - i - 1u));
+        continue;
+      }
       VkShaderStageFlagBits stage = VK_SHADER_STAGE_FLAG_BITS_MAX_ENUM;
       const std::string filename = path.filename().string();
       if      (filename.rfind("VS_",  0) == 0) stage = VK_SHADER_STAGE_VERTEX_BIT;
@@ -606,14 +675,24 @@ namespace dxvk {
         ++loadedShaders;
       } else {
         ++rejectedShaders;
-        Logger::warn(str::format(
-          "[Remix-DX11][game-shader-cache] rejected invalid cache entry '",
-          path.string(), "'."));
+        if (prewarmLoggingEnabled()) {
+          Logger::warn(str::format(
+            "[Remix-DX11][game-shader-cache] rejected invalid cache entry '",
+            path.string(), "'."));
+        }
         std::error_code removeError;
         std::filesystem::remove(path, removeError);
       }
 
       updateProgress(static_cast<uint32_t>(cacheFiles.size() - i - 1u));
+    }
+
+    // Every entry compiled (or was rejected) without taking the boot down -
+    // clear the quarantine marker so the next launch does not delete a
+    // perfectly good cache entry.
+    if (!quarantineMarker.empty()) {
+      std::error_code markerCleanupError;
+      std::filesystem::remove(quarantineMarker, markerCleanupError);
     }
   }
 
@@ -680,12 +759,14 @@ namespace dxvk {
       loadedShaders, rejectedShaders);
 
     RtxShaderPrecompiler::reportCacheCounts(total, loadedShaders, rejectedShaders);
-    Logger::info(str::format(
-      "[Remix-DX11][precompiler] job finished: fullRescan=", fullRescan ? 1 : 0,
-      " cachedShaders=", total,
-      " loaded=", loadedShaders,
-      " rejected=", rejectedShaders,
-      RtxShaderPrecompiler::cancelRequested() ? " (cancelled)" : ""));
+    if (prewarmLoggingEnabled()) {
+      Logger::info(str::format(
+        "[Remix-DX11][precompiler] job finished: fullRescan=", fullRescan ? 1 : 0,
+        " cachedShaders=", total,
+        " loaded=", loadedShaders,
+        " rejected=", rejectedShaders,
+        RtxShaderPrecompiler::cancelRequested() ? " (cancelled)" : ""));
+    }
   }
   
   
@@ -2585,11 +2666,45 @@ namespace dxvk {
     enabled.extRobustness2.robustImageAccess2                     = supported.extRobustness2.robustImageAccess2;
     enabled.extRobustness2.nullDescriptor                         = supported.extRobustness2.nullDescriptor;
 
+    // DX11_V298_DEVICE_FAULT: lets the submission queue query the GPU fault
+    // report (fault type + faulting addresses) when the device is lost, so
+    // TDR investigations name the culprit instead of guessing.
+    enabled.extDeviceFault.deviceFault                            = supported.extDeviceFault.deviceFault;
+
     enabled.extShaderDemoteToHelperInvocation.shaderDemoteToHelperInvocation  = supported.extShaderDemoteToHelperInvocation.shaderDemoteToHelperInvocation;
 
     enabled.extVertexAttributeDivisor.vertexAttributeInstanceRateDivisor      = supported.extVertexAttributeDivisor.vertexAttributeInstanceRateDivisor;
     enabled.extVertexAttributeDivisor.vertexAttributeInstanceRateZeroDivisor  = supported.extVertexAttributeDivisor.vertexAttributeInstanceRateZeroDivisor;
-    
+
+    // DX11_V316_ENABLE_TRANSFORM_FEEDBACK: request transform feedback.
+    //
+    // Every other extension feature above is copied from `supported`, but
+    // extTransformFeedback was never listed, so it stayed zero-initialised and
+    // vkCreateDevice was told the app does not want it. DxvkAdapter chains the
+    // feature struct into pNext when the EXTENSION is present, which is why the
+    // banner listed VK_EXT_transform_feedback as enabled while reporting
+    //   transformFeedback : 0
+    // - extension present, feature off. Nothing in the stack noticed.
+    //
+    // The consequence was the entire black-box class of bugs. Post-VS position
+    // capture (TryCapturePositionsViaStreamOut) replays the game's own vertex
+    // shader through stream-out to recover the position the rasterizer actually
+    // saw. Its fourth line is
+    //   if (!features().extTransformFeedback.transformFeedback) return false;
+    // so capture returned false for EVERY draw - posCapture=0 in every submit
+    // summary ever logged. Skyrim uses a pre-combined WorldViewProj, so no
+    // separate world matrix exists to find (the camera line reports world=NO and
+    // objectToWorld stays identity). With capture dead and no world matrix, the
+    // geometry had no placement transform at all: every mesh collapsed onto the
+    // world origin, and with the camera also at the origin that is a box wrapped
+    // around the eye.
+    //
+    // geometryStreams is requested alongside it because the capture path may use
+    // a geometry-shader stream; both are gated on what the driver reports.
+    enabled.extTransformFeedback.transformFeedback                            = supported.extTransformFeedback.transformFeedback;
+    enabled.extTransformFeedback.geometryStreams                              = supported.extTransformFeedback.geometryStreams;
+
+
     if (supported.extCustomBorderColor.customBorderColorWithoutFormat) {
       enabled.extCustomBorderColor.customBorderColors             = VK_TRUE;
       enabled.extCustomBorderColor.customBorderColorWithoutFormat = VK_TRUE;
@@ -2616,16 +2731,14 @@ namespace dxvk {
     
     if (featureLevel >= D3D_FEATURE_LEVEL_9_3) {
       enabled.core.features.independentBlend                      = VK_TRUE;
-      enabled.core.features.multiViewport                         = VK_TRUE;
     }
-    
+
     if (featureLevel >= D3D_FEATURE_LEVEL_10_0) {
-      enabled.core.features.fullDrawIndexUint32                   = VK_TRUE;
-      enabled.core.features.logicOp                               = supported.core.features.logicOp;
+      enabled.core.features.dualSrcBlend                          = VK_TRUE;
+      enabled.core.features.fragmentStoresAndAtomics              = VK_TRUE;
       enabled.core.features.shaderImageGatherExtended             = VK_TRUE;
-      enabled.core.features.variableMultisampleRate               = supported.core.features.variableMultisampleRate;
-      enabled.extTransformFeedback.transformFeedback              = VK_TRUE;
-      enabled.extTransformFeedback.geometryStreams                = VK_TRUE;
+      enabled.core.features.shaderResourceResidency               = supported.core.features.shaderResourceResidency;
+      enabled.core.features.shaderResourceMinLod                  = supported.core.features.shaderResourceMinLod;
     }
     
     if (featureLevel >= D3D_FEATURE_LEVEL_10_1) {
@@ -2634,13 +2747,12 @@ namespace dxvk {
     }
     
     if (featureLevel >= D3D_FEATURE_LEVEL_11_0) {
+      enabled.core.features.tessellationShader                    = VK_TRUE;
       enabled.core.features.drawIndirectFirstInstance             = VK_TRUE;
-      enabled.core.features.fragmentStoresAndAtomics              = VK_TRUE;
-      enabled.core.features.multiDrawIndirect                     = VK_TRUE;
+      enabled.core.features.multiViewport                         = VK_FALSE;
       enabled.core.features.shaderFloat64                         = supported.core.features.shaderFloat64;
       enabled.core.features.shaderInt64                           = supported.core.features.shaderInt64;
-      enabled.core.features.shaderStorageImageReadWithoutFormat   = supported.core.features.shaderStorageImageReadWithoutFormat;
-      enabled.core.features.tessellationShader                    = VK_TRUE;
+      enabled.core.features.shaderInt16                           = supported.core.features.shaderInt16;
     }
     
     if (featureLevel >= D3D_FEATURE_LEVEL_11_1) {

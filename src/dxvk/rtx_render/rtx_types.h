@@ -46,7 +46,6 @@ class RtInstance;
 struct RtLight;
 class GraphInstance;
 struct D3D11FixedFunctionVS;
-struct D3D11FixedFunctionPS;
 struct DrawCallState;
 struct AssetReplacement;
 struct ReplacementInstance;
@@ -676,8 +675,7 @@ using CategoryFlags = Flags<InstanceCategories>;
 #define DECAL_CATEGORY_FLAGS InstanceCategories::DecalStatic, InstanceCategories::DecalDynamic, InstanceCategories::DecalSingleOffset, InstanceCategories::DecalNoOffset
 
 // DX11_V225: lightweight shader-model version (major.minor) recorded by the DX11
-// layer. D3D11 shaders are always SM 4.0+. Separate from the D3D11 DxsoProgramInfo
-// since the DX11 bridge does not have DXSO bytecode info.
+// layer, parsed from each shader's DXBC version token. D3D11 shaders are always SM 4.0+.
 struct ShaderProgramInfo {
   uint32_t majorVersion = 0;
   uint32_t minorVersion = 0;
@@ -714,6 +712,14 @@ struct DrawCallState {
     return skinningData;
   }
 
+  bool hasSkinnedWorldAnchor() const {
+    return m_hasSkinnedWorldAnchor;
+  }
+
+  const Vector3& getSkinnedWorldAnchor() const {
+    return m_skinnedWorldAnchor;
+  }
+
   const FogState& getFogState() const {
     return fogState;
   }
@@ -737,13 +743,30 @@ struct DrawCallState {
   // Uses programmamble VS/PS
   bool usesVertexShader = false, usesPixelShader = false;
 
-  // Contains valid values only if usesVertex/PixelShader is set
-  DxsoProgramInfo programmableVertexShaderInfo;
-  DxsoProgramInfo programmablePixelShaderInfo;
-
   // DX11_V225: D3D11/DXGI shader-model version recorded by the DX11 layer.
+  // Contains valid values only if usesVertex/PixelShader is set.
   ShaderProgramInfo vertexShaderInfo;
   ShaderProgramInfo pixelShaderInfo;
+
+  // Bytecode hash of the bound programmable vertex shader (0 when unavailable); lets camera-manager
+  // log lines be correlated back to the originating draw.
+  XXH64_hash_t programmableVertexShaderBytecodeHash = 0;
+
+  // False when the camera matrices came from unverified fallback shader constants rather than
+  // reflection-named view-projection/camera-position constant buffer variables (see
+  // rtx.d3d11.requireReflectedCameraConstants). Such draws render normally but must not update
+  // the Main camera: engine utility passes (e.g. shadow depth) upload light-space matrices
+  // through those registers that can reconstruct as a plausible camera.
+  bool allowMainCameraUpdate = true;
+
+  // Material identity hashes this draw would have produced under lightmap policy permutations
+  // that reference fewer material symbols; tried against the replacement database when the
+  // draw's own identity tiers miss (see rtx.d3d11.lightmapPermutationBridgeLookup). Shared
+  // immutable list, memoized per material identity; null when inapplicable.
+  std::shared_ptr<const std::vector<XXH64_hash_t>> lightmapPermutationAlternateHashes;
+
+  // Render-pass classification for diagnostics (points to a static string).
+  const char* passDescription = "Unknown";
 
   float minZ = 0.0f;
   float maxZ = 1.0f;
@@ -764,6 +787,12 @@ struct DrawCallState {
 
   void setupCategoriesForTexture();
   void setupCategoriesForGeometry();
+
+  // REMIX-231: rebuilds the merged hash->category-bits lookup table used by
+  // setupCategoriesForTexture when any category option set changed. Called once per
+  // frame (D3D11Rtx::EndFrame) and lazily on first use; must only be called from the
+  // thread that submits draw calls.
+  static void refreshCategoryLookupTable();
   void setupCategoriesForHeuristics(uint32_t prevFrameSeenCamerasCount,
                                     std::vector<Vector3>& seenCameraPositions);
 
@@ -859,6 +888,16 @@ private:
   SkinningData skinningData;
   Future<SkinningData> futureSkinningData;
 
+  // For vertex-shader skinned (GPU skinning) draws, objectToWorld is identity and both the
+  // geometry position hash and the bounding box are derived from the static bindpose source
+  // buffer - that makes every instance of a shared skeletal mesh look identical to the BLAS
+  // cache, which then cross-assigns BlasEntries between unrelated instances. This is a
+  // worldspace anchor derived from the bone matrices in the VS constants, giving the cache a
+  // per-instance, frame-stable position so it can tell simultaneous skinned instances apart
+  // and rematch them across frames.
+  Vector3 m_skinnedWorldAnchor = Vector3(0.0f, 0.0f, 0.0f);
+  bool m_hasSkinnedWorldAnchor = false;
+
   FogState fogState;
 
   CategoryFlags categories = 0;
@@ -928,13 +967,24 @@ struct BlasEntry {
     }
   }
 
-  const LegacyMaterialData& getMaterialData(XXH64_hash_t matHash) const {
+  // `input` is overwritten by whichever draw touched the entry last and the material cache is
+  // cleared once per frame, so a linked instance that wasn't re-drawn recently can hold a
+  // hash this BlasEntry no longer knows - returns nullptr in that case.
+  const LegacyMaterialData* tryGetMaterialData(XXH64_hash_t matHash) const {
     if (input.getMaterialData().getHash() == matHash) {
-      return input.getMaterialData();
+      return &input.getMaterialData();
     }
     auto iter = m_materials.find(matHash);
     if (iter != m_materials.end()) {
-      return iter->second;
+      return &iter->second;
+    }
+    return nullptr;
+  }
+
+  const LegacyMaterialData& getMaterialData(XXH64_hash_t matHash) const {
+    const LegacyMaterialData* pMaterial = tryGetMaterialData(matHash);
+    if (pMaterial != nullptr) {
+      return *pMaterial;
     }
     assert(false); // tried to get a material that the BlasEntry doesn't know about.
     return input.getMaterialData();

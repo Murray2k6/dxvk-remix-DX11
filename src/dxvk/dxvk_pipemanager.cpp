@@ -165,5 +165,12 @@ namespace dxvk {
     if (m_stateCache != nullptr)
       m_stateCache->stopWorkerThreads();
   }
+
+// NV-DXVK start
+  void DxvkPipelineManager::savePipelineCache() const {
+    if (m_cache != nullptr)
+      m_cache->save();
+  }
+// NV-DXVK end
   
 }

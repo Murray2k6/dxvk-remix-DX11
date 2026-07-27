@@ -135,10 +135,45 @@ namespace dxvk {
     static HRESULT NormalizeBufferProperties(
             D3D11_BUFFER_DESC*      pDesc);
 
+  public:
+
+    // DX11_V319_INDEX_SHADOW: CPU-readable copy of a static index buffer's
+    // contents.
+    //
+    // The RT submit path must know the highest index a draw references, to size
+    // the vertex range it copies. It reads the index data through
+    // DxvkBuffer::mapPtr, which returns null for a DEVICE_LOCAL allocation - and
+    // a static index buffer is always device-local. Without the maximum it falls
+    // back to "assume the whole vertex buffer", which the exact-capture path
+    // cannot flatten, so the draw is DROPPED: logged as
+    // "skipped unsafe uncaptured draw: reason=gpu-index-flatten-required".
+    // Dropped geometry is invisible, which is what "the geometry is transparent"
+    // looks like in-game. Granny Chapter Two hit this on 100% of its indexed
+    // draws (indexCpuVisible=0, wholeVbFallback=1, 48/48).
+    //
+    // The data is already in hand at creation time (it is hashed there for the
+    // content cookie), so keeping it costs one copy of the index buffer and no
+    // GPU readback, no stall, and no change to how the buffer is used.
+    void SetIndexShadow(const void* data, size_t bytes) {
+      m_indexShadow.resize(bytes);
+      std::memcpy(m_indexShadow.data(), data, bytes);
+    }
+
+    // Returns nullptr when no shadow exists or the requested range is not fully
+    // covered - callers must treat that exactly like an unreadable buffer.
+    const void* GetIndexShadow(VkDeviceSize offset, VkDeviceSize bytes) const {
+      if (m_indexShadow.empty() || bytes == 0)
+        return nullptr;
+      if (offset > m_indexShadow.size() || bytes > m_indexShadow.size() - offset)
+        return nullptr;
+      return m_indexShadow.data() + offset;
+    }
+
   private:
-    
+
     D3D11_BUFFER_DESC             m_desc;
     D3D11_COMMON_BUFFER_MAP_MODE  m_mapMode;
+    std::vector<uint8_t>          m_indexShadow;
     
     Rc<DxvkBuffer>                m_buffer;
     Rc<DxvkBuffer>                m_soCounter;

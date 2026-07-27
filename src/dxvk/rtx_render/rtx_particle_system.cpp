@@ -825,13 +825,12 @@ namespace dxvk {
       newDrawCallState.transformData.worldToView = camera.getWorldToView();
       newDrawCallState.materialData = particleSystem.legacyMaterialData;
 
-      // We want to always have particles support vertex colour for now.
-      newDrawCallState.materialData.textureColorArg1Source = RtTextureArgSource::Texture;
-      newDrawCallState.materialData.textureColorArg2Source = RtTextureArgSource::VertexColor0;
-      newDrawCallState.materialData.textureColorOperation = DxvkRtTextureOperation::Modulate;
-      newDrawCallState.materialData.textureAlphaArg1Source = RtTextureArgSource::Texture;
-      newDrawCallState.materialData.textureAlphaArg2Source = RtTextureArgSource::VertexColor0;
-      newDrawCallState.materialData.textureAlphaOperation = DxvkRtTextureOperation::Modulate;
+      // We want to always have particles support vertex colour for now: sample the
+      // particle texture and modulate it (and its alpha) by the per-particle colour.
+      newDrawCallState.materialData.colorSource = D3D11ColorSource::Texture;
+      newDrawCallState.materialData.alphaSource = D3D11ColorSource::Texture;
+      newDrawCallState.materialData.modulateVertexColor = true;
+      newDrawCallState.materialData.modulateVertexAlpha = true;
       newDrawCallState.materialData.isVertexColorBakedLighting = false;
 
       ctx->getSceneManager().submitDrawState(ctx, newDrawCallState, &particleSystem.materialData);

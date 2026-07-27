@@ -3,6 +3,7 @@
 #include "../dxvk/dxvk_shader.h"
 
 #include "dxbc_chunk_isgn.h"
+#include "dxbc_chunk_rdef.h"
 #include "dxbc_chunk_shex.h"
 #include "dxbc_header.h"
 #include "dxbc_modinfo.h"
@@ -46,6 +47,14 @@ namespace dxvk {
      * input or output signature of the shader.
      */
     Rc<DxbcIsgn> isgn() const { return m_isgnChunk; }
+
+    /**
+     * rief Resource definition chunk
+     *
+     * Reflection data naming the shader's bound resources and constant-buffer
+     * variables. Null when the shader shipped without an RDEF chunk.
+     */
+    Rc<DxbcRdef> rdef() const { return m_rdefChunk; }
     Rc<DxbcIsgn> osgn() const { return m_osgnChunk; }
 
     // Read-only instruction stream access for lightweight D3D11 capture
@@ -90,6 +99,7 @@ namespace dxvk {
     Rc<DxbcIsgn> m_osgnChunk;
     Rc<DxbcIsgn> m_psgnChunk;
     Rc<DxbcShex> m_shexChunk;
+    Rc<DxbcRdef> m_rdefChunk;
     
     void runAnalyzer(
             DxbcAnalyzer&       analyzer,

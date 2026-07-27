@@ -644,6 +644,12 @@ struct RtLight {
 
   uint32_t isStaticCount = 0;
   bool isDynamic = false;
+  // Set on the sun light injected by the atmosphere system. Upstream also
+  // encodes this as a distant-light GPU flag so NEE can multiply the light's
+  // contribution by the per-pixel cloud-on-terrain transmittance. That encoding
+  // is not wired here yet - our writeGPUData predates the flag parameter - so
+  // the field currently only marks the light on the CPU side.
+  bool atmosphereCloudShadowed = false;
 
 private:
   // Type-specific Light Information

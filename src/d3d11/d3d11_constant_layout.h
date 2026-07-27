@@ -5,7 +5,7 @@
 namespace dxvk {
 
   // DX11_V225: register-count/offset layout of the shader-constant buffer used by
-  // the DXSO compiler. DX11 packs the legacy int/float/bitmask constant regions
+  // the shader compiler. DX11 packs the legacy int/float/bitmask constant regions
   // into a single buffer; these helpers give the byte offsets of each region.
   struct D3D11ConstantLayout {
     uint32_t floatCount   = 0;

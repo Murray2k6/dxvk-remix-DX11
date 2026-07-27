@@ -27,12 +27,91 @@
 #include "GFSDK_Aftermath_GpuCrashDump.h"
 
 namespace dxvk {
-  
+
   DxvkSubmissionQueue::DxvkSubmissionQueue(DxvkDevice* device)
   : m_device(device),
     m_submitThread([this] () { submitCmdLists(); }),
     m_finishThread([this] () { finishCmdLists(); }) {
+    // DX11_V319_FAULT_ADDRESS_NAMING: start tracking GPU virtual address ranges
+    // only when a fault could actually be reported. Without VK_EXT_device_fault
+    // the registry could never be read, so it would be pure overhead.
+    if (m_device->features().extDeviceFault.deviceFault) {
+      DxvkGpuAddressRegistry::get().setEnabled(true);
+      Logger::info("[device-fault] VK_EXT_device_fault enabled; tracking GPU address ranges "
+                   "so a faulting address can be attributed to an allocation.");
+    }
   }
+
+
+  // NV-DXVK start: DX11_V298_DEVICE_FAULT - vkd3d-proton-style device-loss
+  // diagnostics. When the GPU faults, VK_ERROR_DEVICE_LOST alone says nothing
+  // about WHY; VK_EXT_device_fault returns the fault kind and the faulting
+  // GPU virtual addresses, which distinguishes an out-of-bounds read (bad
+  // geometry/index data) from a shader instruction-pointer fault (bad
+  // pipeline) from a page fault in a freed allocation (lifetime bug).
+  void DxvkSubmissionQueue::logDeviceFaultInfo() {
+    static std::atomic<bool> s_faultLogged = { false };
+    if (s_faultLogged.exchange(true))
+      return;
+
+    if (!m_device->features().extDeviceFault.deviceFault) {
+      Logger::err("[device-fault] VK_EXT_device_fault not supported/enabled; no GPU fault details available.");
+      return;
+    }
+
+    auto vkd = m_device->vkd();
+
+    VkDeviceFaultCountsEXT counts = {};
+    counts.sType = VK_STRUCTURE_TYPE_DEVICE_FAULT_COUNTS_EXT;
+    if (vkd->vkGetDeviceFaultInfoEXT(vkd->device(), &counts, nullptr) < VK_SUCCESS) {
+      Logger::err("[device-fault] vkGetDeviceFaultInfoEXT (counts) failed.");
+      return;
+    }
+
+    std::vector<VkDeviceFaultAddressInfoEXT> addressInfos(counts.addressInfoCount);
+    std::vector<VkDeviceFaultVendorInfoEXT>  vendorInfos(counts.vendorInfoCount);
+    counts.vendorBinarySize = 0; // the opaque vendor blob is not useful in a text log
+
+    VkDeviceFaultInfoEXT info = {};
+    info.sType = VK_STRUCTURE_TYPE_DEVICE_FAULT_INFO_EXT;
+    info.pAddressInfos     = addressInfos.empty() ? nullptr : addressInfos.data();
+    info.pVendorInfos      = vendorInfos.empty()  ? nullptr : vendorInfos.data();
+    info.pVendorBinaryData = nullptr;
+
+    if (vkd->vkGetDeviceFaultInfoEXT(vkd->device(), &counts, &info) < VK_SUCCESS) {
+      Logger::err("[device-fault] vkGetDeviceFaultInfoEXT (info) failed.");
+      return;
+    }
+
+    Logger::err(str::format("[device-fault] GPU fault report: '", info.description, "'"));
+
+    static const char* const kAddressTypeNames[] = {
+      "none", "read-invalid", "write-invalid", "execute-invalid",
+      "instruction-pointer-unknown", "instruction-pointer-invalid",
+      "instruction-pointer-fault",
+    };
+    for (uint32_t i = 0; i < counts.addressInfoCount && i < addressInfos.size(); i++) {
+      const auto& address = addressInfos[i];
+      const uint32_t type = uint32_t(address.addressType);
+      Logger::err(str::format("[device-fault]   address[", i, "]: type=",
+        type < 7u ? kAddressTypeNames[type] : "unknown",
+        " gpuVA=0x", std::hex, address.reportedAddress, std::dec,
+        " precision=", address.addressPrecision));
+
+      // DX11_V319_FAULT_ADDRESS_NAMING: a bare GPU virtual address names
+      // nothing and cannot be acted on. Resolve it against the allocations
+      // currently reachable by device address; "no live allocation" is itself
+      // the answer when the fault is a use-after-free.
+      Logger::err(str::format("[device-fault]     -> ",
+        DxvkGpuAddressRegistry::get().describe(address.reportedAddress)));
+    }
+    for (uint32_t i = 0; i < counts.vendorInfoCount && i < vendorInfos.size(); i++) {
+      const auto& vendor = vendorInfos[i];
+      Logger::err(str::format("[device-fault]   vendor[", i, "]: '", vendor.description,
+        "' code=", vendor.vendorFaultCode, " data=", vendor.vendorFaultData));
+    }
+  }
+  // NV-DXVK end
   
   
   DxvkSubmissionQueue::~DxvkSubmissionQueue() {
@@ -94,9 +173,26 @@ namespace dxvk {
     ScopedCpuProfileZone();
     std::unique_lock<dxvk::mutex> lock(m_mutex);
 
-    m_submitCond.wait(lock, [status] {
-      return status->result.load() != VK_NOT_READY;
+    // The submission worker is what publishes this result. If it has exited -
+    // which is what happens once the device is lost - nothing will ever set it,
+    // and an unconditional wait here parks the game's present thread forever
+    // (the "not responding" hang). Let a dead queue break the wait too.
+    m_submitCond.wait(lock, [this, status] {
+      return status->result.load() != VK_NOT_READY
+          || m_stopped.load()
+          || m_lastError.load() == VK_ERROR_DEVICE_LOST;
     });
+
+    // Surface the failure to the caller rather than letting a never-completed
+    // submission look like it succeeded.
+    if (status->result.load() == VK_NOT_READY) {
+      const VkResult lastError = m_lastError.load();
+      status->result.store(lastError != VK_SUCCESS ? lastError : VK_ERROR_DEVICE_LOST);
+
+      ONCE(Logger::err(
+        "DxvkSubmissionQueue: submission never completed (queue stopped or device lost); "
+        "failing the wait instead of blocking present forever."));
+    }
   }
 
 
@@ -104,8 +200,12 @@ namespace dxvk {
     ScopedCpuProfileZone();
     std::unique_lock<dxvk::mutex> lock(m_mutex);
 
+    // Same hazard as synchronizeSubmission: only the worker drains this queue,
+    // so a stopped or device-lost queue would never satisfy an unconditional wait.
     m_submitCond.wait(lock, [this] {
-      return m_submitQueue.empty();
+      return m_submitQueue.empty()
+          || m_stopped.load()
+          || m_lastError.load() == VK_ERROR_DEVICE_LOST;
     });
 
     // NV-DXVK start: DLFG integration
@@ -241,13 +341,22 @@ namespace dxvk {
       // On success, pass it on to the queue thread
       lock = std::unique_lock<dxvk::mutex>(m_mutex);
 
+      bool needsWaitForIdle = false;
+
       if (status == VK_SUCCESS) {
         if (entry.submit.cmdList != nullptr)
           m_finishQueue.push(std::move(entry));
       } else if (status == VK_ERROR_DEVICE_LOST || entry.submit.cmdList != nullptr) {
         Logger::err(str::format("DxvkSubmissionQueue: Command submission failed: ", status));
         m_lastError = status;
-        
+
+        // VK_ERROR_DEVICE_LOST on its own says nothing about what faulted.
+        // VK_EXT_device_fault is enabled, so ask the driver for the fault
+        // addresses and vendor detail while the device is still queryable -
+        // this has to happen before anything tears the device down.
+        if (status == VK_ERROR_DEVICE_LOST)
+          logDeviceFaultInfo();
+
         if (m_device->config().enableAftermath) {
           // Stall the pending exception until aftermath has finished writing (or hits some error)
           uint32_t counter = 0;
@@ -266,11 +375,25 @@ namespace dxvk {
             counter += kTimeoutPerTry;
           }
         }
-        m_device->waitForIdle();
+        // Deliberately NOT waiting for idle here - see below.
+        needsWaitForIdle = true;
       }
 
+      // Retire the entry before any wait-for-idle. waitForIdle() goes through
+      // lockSubmission() -> synchronize(), which blocks until m_submitQueue is
+      // empty; this worker is the only thing that drains that queue, so waiting
+      // while the just-failed entry is still queued deadlocks the worker against
+      // itself and takes the render thread down with it.
       m_submitQueue.pop();
       m_submitCond.notify_all();
+
+      if (needsWaitForIdle) {
+        // Drop the queue lock across the wait: synchronize() acquires it, and
+        // the loop below expects to re-enter holding it.
+        lock.unlock();
+        m_device->waitForIdle();
+        lock.lock();
+      }
     }
   }
   

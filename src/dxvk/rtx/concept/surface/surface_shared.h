@@ -62,23 +62,20 @@ enum class AlphaTestType : uint8_t {
 
 static const uint32_t alphaTestTypeMask = 0x7u;
 
-enum class RtTextureArgSource : uint8_t {
-  None = 0,
-  Texture,
-  VertexColor0,
-  TFactor
-};
+// Where a surface's colour or alpha channel gets its value.
+//
+// D3D11 has no fixed-function texture stages: the game's pixel shader already
+// produced the final colour, and the capture layer's job is only to record which
+// input it came from. This replaces the previous two-argument/eight-operation
+// combiner, whose full generality was never used - the DX11 capture path only
+// ever emitted "the texture", "the texture modulated by vertex colour", and
+// "a constant".
+enum class D3D11ColorSource : uint8_t {
+  Texture = 0,    // The selected albedo / emissive texture.
+  VertexColor,    // Interpolated vertex colour (rgb, or a for the alpha channel).
+  BlendConstant,  // The OMSetBlendState blend factor carried on the surface.
 
-// Texture stage operation, correspond to D3DTEXTUREOP
-enum class DxvkRtTextureOperation : uint8_t {
-  Disable = 0,
-  SelectArg1,
-  SelectArg2,
-  Modulate,
-  Modulate2x,
-  Modulate4x,
-  Add,
-  Force_Modulate2x,
+  Count
 };
 
 enum class TexGenMode : uint8_t {

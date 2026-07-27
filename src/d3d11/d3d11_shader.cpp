@@ -8,6 +8,14 @@
 
 namespace dxvk {
 
+  // DX11_V298_SILENT_PREWARMER: shader-cache writes emit no log output unless
+  // DXVK_REMIX_PREWARM_LOG=1 (matches the prewarm logging gate elsewhere).
+  static bool shaderCacheLoggingEnabled() {
+    static const bool enabled =
+      env::getEnvVar("DXVK_REMIX_PREWARM_LOG") == "1";
+    return enabled;
+  }
+
   static void persistGameShaderBytecode(
       const DxvkShaderKey& shaderKey,
       const void* shaderBytecode,
@@ -27,9 +35,11 @@ namespace dxvk {
     std::error_code error;
     std::filesystem::create_directories(cacheDirectory, error);
     if (error) {
-      Logger::warn(str::format(
-        "[Remix-DX11][game-shader-cache] could not create '",
-        cacheDirectory.string(), "': ", error.message()));
+      if (shaderCacheLoggingEnabled()) {
+        Logger::warn(str::format(
+          "[Remix-DX11][game-shader-cache] could not create '",
+          cacheDirectory.string(), "': ", error.message()));
+      }
       return;
     }
 
@@ -59,9 +69,11 @@ namespace dxvk {
       if (!output) {
         output.close();
         std::filesystem::remove(temporary, error);
-        Logger::warn(str::format(
-          "[Remix-DX11][game-shader-cache] failed to write '",
-          target.string(), "'."));
+        if (shaderCacheLoggingEnabled()) {
+          Logger::warn(str::format(
+            "[Remix-DX11][game-shader-cache] failed to write '",
+            target.string(), "'."));
+        }
         return;
       }
     }
@@ -72,9 +84,11 @@ namespace dxvk {
     if (error) {
       std::error_code cleanupError;
       std::filesystem::remove(temporary, cleanupError);
-      Logger::warn(str::format(
-        "[Remix-DX11][game-shader-cache] failed to publish '",
-        target.string(), "': ", error.message()));
+      if (shaderCacheLoggingEnabled()) {
+        Logger::warn(str::format(
+          "[Remix-DX11][game-shader-cache] failed to publish '",
+          target.string(), "': ", error.message()));
+      }
     }
   }
 
@@ -1428,138 +1442,6 @@ namespace dxvk {
     }
   }
 
-  // DX11_V290_POST_VS_POSITION_CAPTURE: find a conservative non-system output
-  // that represents the position immediately before projection. Skyrim and
-  // other deferred D3D11 renderers commonly write world position as POSITION1
-  // while SV_Position receives viewProjection * POSITION1. We deliberately do
-  // not accept POSITION0: it is frequently just an object-space passthrough.
-  // Explicit VIEW/EYE/CAMERA position names are classified as view space. This
-  // classification is only the one-time discovery seed; the executable's exact
-  // shader-hash profile is authoritative on every subsequent run.
-  static bool parseDxbcOutputPosition(
-    const void*  pBytecode,
-    size_t       length,
-    std::string& outName,
-    uint32_t&    outIndex,
-    D3D11CapturedPositionSpace& outSpace) {
-    const uint8_t* bytes = reinterpret_cast<const uint8_t*>(pBytecode);
-    if (bytes == nullptr || length < 0x20)
-      return false;
-
-    auto readU32 = [&](size_t offset) -> uint32_t {
-      uint32_t v = 0;
-      std::memcpy(&v, bytes + offset, sizeof(v));
-      return v;
-    };
-
-    if (readU32(0) != 0x43425844u) // 'DXBC'
-      return false;
-
-    const uint32_t chunkCount = readU32(0x1C);
-    if (chunkCount == 0 || chunkCount > 64
-     || 0x20 + size_t(chunkCount) * 4 > length)
-      return false;
-
-    constexpr uint32_t kFourCcOsgn = 0x4E47534Fu; // 'OSGN'
-    constexpr uint32_t kFourCcOsg5 = 0x3547534Fu; // 'OSG5'
-    constexpr uint32_t kFourCcOsg1 = 0x3147534Fu; // 'OSG1'
-
-    for (uint32_t i = 0; i < chunkCount; ++i) {
-      const uint32_t chunkOffset = readU32(0x20 + size_t(i) * 4);
-      if (size_t(chunkOffset) + 16 > length)
-        continue;
-
-      const uint32_t fourCc = readU32(chunkOffset);
-      if (fourCc != kFourCcOsgn && fourCc != kFourCcOsg5 && fourCc != kFourCcOsg1)
-        continue;
-
-      const uint32_t chunkSize = readU32(size_t(chunkOffset) + 4);
-      const size_t dataStart = size_t(chunkOffset) + 8;
-      if (dataStart + chunkSize > length || chunkSize < 8)
-        return false;
-
-      const uint32_t elementCount = readU32(dataStart);
-      if (elementCount == 0 || elementCount > 64)
-        return false;
-
-      const size_t elemSize     = (fourCc == kFourCcOsgn) ? 24 : (fourCc == kFourCcOsg5 ? 28 : 32);
-      const size_t nameFieldOff = (fourCc == kFourCcOsgn) ? 0 : 4;
-      const size_t tableStart   = dataStart + 8;
-      if (8 + size_t(elementCount) * elemSize > chunkSize)
-        return false;
-
-      bool found = false;
-      int bestScore = -1;
-      uint32_t bestIndex = 0;
-      std::string bestName;
-      D3D11CapturedPositionSpace bestSpace = D3D11CapturedPositionSpace::View;
-
-      for (uint32_t e = 0; e < elementCount; ++e) {
-        const size_t el = tableStart + size_t(e) * elemSize;
-        if (fourCc != kFourCcOsgn && readU32(el) != 0)
-          continue;
-
-        const uint32_t nameOffset    = readU32(el + nameFieldOff + 0);
-        const uint32_t semanticIdx   = readU32(el + nameFieldOff + 4);
-        const uint32_t systemValue   = readU32(el + nameFieldOff + 8);
-        const uint32_t componentType = readU32(el + nameFieldOff + 12);
-        const uint8_t  mask          = bytes[el + nameFieldOff + 20];
-
-        if (systemValue != 0 || componentType != 3 || (mask & 0x7u) != 0x7u)
-          continue;
-        if (size_t(nameOffset) >= chunkSize)
-          continue;
-
-        const char* name = reinterpret_cast<const char*>(bytes + dataStart + nameOffset);
-        const size_t maxLen = chunkSize - nameOffset;
-        size_t n = 0;
-        while (n < maxLen && name[n] != '\0')
-          ++n;
-        if (n == 0 || n >= maxLen || n > 63)
-          continue;
-
-        std::string upper(name, n);
-        for (auto& c : upper)
-          c = char(::toupper(static_cast<unsigned char>(c)));
-
-        const bool explicitViewPosition =
-             upper.find("VIEW")   != std::string::npos
-          || upper.find("EYE")    != std::string::npos
-          || upper.find("CAMERA") != std::string::npos;
-        const bool plainPosition = upper == "POSITION" && semanticIdx > 0;
-        if (upper.find("WORLD") != std::string::npos
-         || (!explicitViewPosition && !plainPosition))
-          continue;
-
-        // Prefer explicit view-space naming, then the widespread POSITION1
-        // convention, then the lowest remaining non-zero POSITION index.
-        int score = explicitViewPosition ? 100 : 50;
-        if (semanticIdx == 1)
-          score += 20;
-        score -= int(std::min(semanticIdx, 16u));
-        if (!found || score > bestScore) {
-          found = true;
-          bestScore = score;
-          bestIndex = semanticIdx;
-          bestName.assign(name, n);
-          bestSpace = explicitViewPosition
-            ? D3D11CapturedPositionSpace::View
-            : D3D11CapturedPositionSpace::World;
-        }
-      }
-
-      if (found) {
-        outName = std::move(bestName);
-        outIndex = bestIndex;
-        outSpace = bestSpace;
-        return true;
-      }
-      return false;
-    }
-
-    return false;
-  }
-
   D3D11CommonShader:: D3D11CommonShader() { }
   D3D11CommonShader::~D3D11CommonShader() { }
 
@@ -1578,6 +1460,11 @@ namespace dxvk {
     parseDxbcShaderModel(pShaderBytecode, BytecodeLength,
                          m_shaderModelMajor, m_shaderModelMinor);
 
+    // Cache the bytecode hash once so per-draw RTX lookups (shader-keyed material
+    // identity, camera diagnostics) never rehash the container.
+    if (pShaderBytecode != nullptr && BytecodeLength != 0)
+      m_bytecodeHash = XXH3_64bits(pShaderBytecode, BytecodeLength);
+
     // DX11_V281_FIXED_FUNCTION: pixel shaders that discard are this API
     // generation's alpha test; parse once so draw capture can mark cutout
     // geometry (FillMaterialData).
@@ -1589,6 +1476,11 @@ namespace dxvk {
       BytecodeLength);
     
     DxbcModule module(reader);
+
+    // Retain the reflection chunk (resource / constant-buffer names) so the RTX
+    // capture layer can tell material inputs apart from engine-wide ones without
+    // reparsing the container per draw. Null when the shader shipped stripped.
+    m_reflection = module.rdef();
 
     if (pShaderKey->type() == VK_SHADER_STAGE_FRAGMENT_BIT
      || pShaderKey->type() == VK_SHADER_STAGE_VERTEX_BIT)

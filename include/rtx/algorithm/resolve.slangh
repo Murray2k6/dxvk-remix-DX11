@@ -585,7 +585,7 @@ void resolveVertex<T: IBasePayloadState>(
     // Render Portal outline
     {
       const bool portalFadeInEffect = cb.enablePortalFadeInEffect && rayPortalSurfaceMaterial.maskTextureIndex != BINDING_INDEX_INVALID;
-      const float tFactor = portalFadeInEffect ? float((surface.tFactor >> 24) & 0xff) / 255.0f : 0.0f;
+      const float tFactor = portalFadeInEffect ? surface.blendConstantAlpha : 0.0f;
       const float ringTransparency =
         saturate(1.0f - rayPortalSurfaceMaterialInteraction.mask.a) *
         (rayPortalSurfaceMaterialInteraction.isInsidePortal ? saturate(1.0f - tFactor) : 1.0f);

@@ -41,6 +41,10 @@ namespace dxvk {
     this->maxSharedMemory = VkDeviceSize(config.getOption<int32_t>("dxgi.maxSharedMemory", 0)) << 20;
 
     this->nvapiHack   = config.getOption<bool>("dxgi.nvapiHack", false);
+    // DX11_V319: see DxgiOptions::overrideRefreshRate. Defaults on to keep the
+    // 60Hz-locked-title behaviour; set False to leave the game's requested
+    // refresh rate untouched.
+    this->overrideRefreshRate = config.getOption<bool>("dxgi.overrideRefreshRate", true);
 
     this->emulateFullscreen = config.getOption<bool>("dxgi.emulateFullscreen", false);
   }

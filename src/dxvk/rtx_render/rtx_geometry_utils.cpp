@@ -854,9 +854,17 @@ namespace dxvk {
     // Required
     assert(input.positionBuffer.defined());
 
+    // This pass writes through the destination's device address. An assert alone
+    // is not enough - it compiles out in release, where a failed allocation would
+    // become a GPU write to address 0 and a lost device. Refuse the dispatch.
+    if (output.buffer == nullptr) {
+      ONCE(Logger::err("interleaveGeometry: null destination buffer; skipping dispatch to avoid a GPU write to address 0."));
+      return;
+    }
+
     // Calculate stride - when forceNormals is true, reserve space for normals even if input has none
     output.stride = computeOptimalVertexStride(input, forceNormals);
-    
+
     assert(output.buffer->info().size == align(output.stride * input.vertexCount, CACHE_LINE_SIZE));
 
     bool mustUseGPU = input.positionBuffer.isPendingGpuWrite() || input.positionBuffer.mapPtr() == nullptr;

@@ -49,14 +49,8 @@ namespace dxvk {
     float   jitterY = 0.0f;
   };
 
-  // DX11_V225: pixel-side fixed-function constant block (kept minimal; DX11 does
-  // not emit a fixed-function pixel shader).
-  struct D3D11FixedFunctionPS {
-    Vector4 textureFactor = Vector4(0.0f);
-  };
-
   // DX11_V225: named members of D3D11RtxVertexCaptureData (excludes the trailing
-  // padding). The DXSO compiler asserts this count matches the SPIR-V struct it
+  // padding). The shader compiler asserts this count matches the SPIR-V struct it
   // builds for vertex capture.
   enum class D3D11RtxVertexCaptureMembers : uint32_t {
     normalTransform = 0,
@@ -70,7 +64,7 @@ namespace dxvk {
     MemberCount
   };
 
-  // DX11_V225: programmable-pipeline vertex-capture constant block. The DXSO
+  // DX11_V225: programmable-pipeline vertex-capture constant block. The shader
   // compiler builds a matching SPIR-V uniform block via offsetof(), so the field
   // order and types here are authoritative (matrices row-major, stride 16). Kept a
   // plain standard-layout / trivially-copyable POD so offsetof() is well-defined.
@@ -86,7 +80,7 @@ namespace dxvk {
     uint32_t padding;
   };
 
-  // DX11_V225: field indices within a D3D11SharedPS::Stage. The DXSO compiler reads
+  // DX11_V225: field indices within a D3D11SharedPS::Stage. The shader compiler reads
   // the shared PS state as a flat float array indexed by
   // (D3D11SharedPSStages_Count * stage + field), so D3D11SharedPS::Stage MUST be
   // exactly D3D11SharedPSStages_Count floats laid out in this order.

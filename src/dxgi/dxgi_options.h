@@ -43,6 +43,19 @@ namespace dxvk {
     /// Disabled by default in this DX11 Remix fork so adapters
     /// report their real vendor unless explicitly overridden.
     bool nvapiHack;
+
+    /// DX11_V319: raise a game's requested fullscreen refresh rate to the
+    /// monitor's current desktop rate. This exists so 60Hz-locked titles
+    /// (Skyrim SE) run at the display's real rate, and it only ever upgrades -
+    /// a game asking for more than the desktop rate is left alone.
+    ///
+    /// It is a setting because it changes a mode the game explicitly asked for,
+    /// which is a plausible way to upset a title that cares. Call of Duty
+    /// Advanced Warfare requests 50Hz, gets 144Hz, and its log ends at the
+    /// ChangeDisplaySettingsEx that follows with no further output and no draws
+    /// - set dxgi.overrideRefreshRate = False to take this out of the picture
+    /// when diagnosing a game that stops at the fullscreen transition.
+    bool overrideRefreshRate;
   };
   
 }

@@ -59,6 +59,50 @@ inline float f16tof32(uint32_t h16) {
   return f;
 }
 
+// CPU-side float to half-float (IEEE 754 binary16) conversion, the inverse of
+// f16tof32 above. On the GPU f32tof16 is a built-in intrinsic; host code needs
+// this to pack values into the half-precision fields of GPU structs.
+//
+// Rounds to nearest-even, and saturates to +-Inf rather than wrapping when the
+// input exceeds the half range (65504). Denormals are produced for very small
+// magnitudes instead of being flushed, so round-tripping a half through
+// f16tof32/f32tof16 is exact.
+inline uint32_t f32tof16(float f) {
+  uint32_t bits;
+  std::memcpy(&bits, &f, sizeof(bits));
+
+  const uint32_t sign     = (bits >> 16u) & 0x8000u;
+  const int32_t  exponent = int32_t((bits >> 23u) & 0xffu) - 127 + 15;
+  const uint32_t mantissa =  bits & 0x7fffffu;
+
+  // Inf / NaN pass through; a NaN must stay a NaN (non-zero mantissa).
+  if (((bits >> 23u) & 0xffu) == 0xffu) {
+    return sign | 0x7c00u | (mantissa != 0u ? 0x200u : 0u);
+  }
+
+  if (exponent >= 0x1f) {
+    return sign | 0x7c00u; // overflow -> +-Inf
+  }
+
+  if (exponent <= 0) {
+    // Subnormal half, or underflow to zero.
+    if (exponent < -10) {
+      return sign;
+    }
+    const uint32_t subnormalMantissa = mantissa | 0x800000u;
+    const uint32_t shift = uint32_t(14 - exponent);
+    const uint32_t rounded =
+      (subnormalMantissa + (1u << (shift - 1u)) - 1u + ((subnormalMantissa >> shift) & 1u)) >> shift;
+    return sign | rounded;
+  }
+
+  const uint32_t roundedMantissa =
+    (mantissa + 0x00000fffu + ((mantissa >> 13u) & 1u)) >> 13u;
+
+  // Rounding can carry into the exponent; the shifted value absorbs it.
+  return sign | ((uint32_t(exponent) << 10u) + roundedMantissa);
+}
+
 #endif // __cplusplus
 
 #endif // RTX_UTILITY_F16_CONVERSION_H_DX11V225

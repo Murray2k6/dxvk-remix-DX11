@@ -49,3 +49,16 @@ python.dxvk-cache
 *.bak-*
 *.bak.*
 *.pre-*.bak
+
+# Orchestrator-generated patch reports (build_dxvk_all_ninja.ps1 rewrites these
+# on every build; they are build output, not source). Root-level only: the
+# DX11_V219_*.txt files inside bridge_dx11_work/_dx11_* are hand-written notes
+# describing those staging folders and must stay tracked.
+/DX11_V219_*.txt
+/V106_*.txt
+
+# Per-file source backups made by the orchestrator's patchers. Never restored
+# from (patchers guard on file CONTENT, not on backup existence), so they are
+# pure noise in the tree.
+*.before
+*.v219.before

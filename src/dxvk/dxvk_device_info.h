@@ -45,6 +45,9 @@ namespace dxvk {
     VkPhysicalDevice4444FormatsFeaturesEXT                    ext4444Formats;
     VkPhysicalDeviceCustomBorderColorFeaturesEXT              extCustomBorderColor;
     VkPhysicalDeviceDepthClipEnableFeaturesEXT                extDepthClipEnable;
+    // NV-DXVK start: DX11_V298_DEVICE_FAULT
+    VkPhysicalDeviceFaultFeaturesEXT                          extDeviceFault;
+    // NV-DXVK end
     VkPhysicalDeviceExtendedDynamicStateFeaturesEXT           extExtendedDynamicState;
     VkPhysicalDeviceMemoryPriorityFeaturesEXT                 extMemoryPriority;
     VkPhysicalDeviceRobustness2FeaturesEXT                    extRobustness2;

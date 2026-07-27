@@ -31,6 +31,9 @@ namespace dxvk {
       
       if ((tag == "PCSG") || (tag == "PSG1"))
         m_psgnChunk = new DxbcIsgn(chunkReader, tag);
+
+      if (tag == "RDEF")
+        m_rdefChunk = new DxbcRdef(chunkReader);
     }
   }
   
