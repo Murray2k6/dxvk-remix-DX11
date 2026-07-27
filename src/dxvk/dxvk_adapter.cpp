@@ -343,13 +343,14 @@ namespace dxvk {
           DxvkDeviceFeatures  enabledFeatures) {
     DxvkDeviceExtensions devExtensions;
 
-    std::array<DxvkExt*, 43> devExtensionList = {{
+    std::array<DxvkExt*, 44> devExtensionList = {{
       &devExtensions.amdMemoryOverallocationBehaviour,
       &devExtensions.amdShaderFragmentMask,
       &devExtensions.ext4444Formats,
       &devExtensions.extConservativeRasterization,
       &devExtensions.extCustomBorderColor,
       &devExtensions.extDepthClipEnable,
+      &devExtensions.extDeviceFault,
       &devExtensions.extExtendedDynamicState,
       &devExtensions.extFullScreenExclusive,
       &devExtensions.extMemoryBudget,
@@ -577,6 +578,13 @@ namespace dxvk {
       enabledFeatures.extRobustness2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT;
       enabledFeatures.extRobustness2.pNext = std::exchange(enabledFeatures.core.pNext, &enabledFeatures.extRobustness2);
     }
+
+    // NV-DXVK start: DX11_V298_DEVICE_FAULT (vkd3d-proton-style diagnostics)
+    if (devExtensions.extDeviceFault) {
+      enabledFeatures.extDeviceFault.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT;
+      enabledFeatures.extDeviceFault.pNext = std::exchange(enabledFeatures.core.pNext, &enabledFeatures.extDeviceFault);
+    }
+    // NV-DXVK end
 
     if (devExtensions.extTransformFeedback) {
       enabledFeatures.extTransformFeedback.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TRANSFORM_FEEDBACK_FEATURES_EXT;
@@ -1089,6 +1097,13 @@ namespace dxvk {
       m_deviceFeatures.extRobustness2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT;
       m_deviceFeatures.extRobustness2.pNext = std::exchange(m_deviceFeatures.core.pNext, &m_deviceFeatures.extRobustness2);
     }
+
+    // NV-DXVK start: DX11_V298_DEVICE_FAULT
+    if (m_deviceExtensions.supports(VK_EXT_DEVICE_FAULT_EXTENSION_NAME)) {
+      m_deviceFeatures.extDeviceFault.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT;
+      m_deviceFeatures.extDeviceFault.pNext = std::exchange(m_deviceFeatures.core.pNext, &m_deviceFeatures.extDeviceFault);
+    }
+    // NV-DXVK end
 
     if (m_deviceExtensions.supports(VK_EXT_SHADER_DEMOTE_TO_HELPER_INVOCATION_EXTENSION_NAME)) {
       m_deviceFeatures.extShaderDemoteToHelperInvocation.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_DEMOTE_TO_HELPER_INVOCATION_FEATURES_EXT;

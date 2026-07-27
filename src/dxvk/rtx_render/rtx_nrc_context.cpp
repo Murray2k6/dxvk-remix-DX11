@@ -498,6 +498,19 @@ namespace dxvk {
     // Create a new buffer
     buffer = m_device->createBuffer(bufferCreateInfo, memoryFlags, DxvkMemoryStats::Category::RTXBuffer, "NRC buffer");
 
+    // NRC reaches these buffers by DEVICE ADDRESS, not through descriptors, so
+    // robustness2's nullDescriptor does not cover them. Dereferencing a failed
+    // allocation below would crash outright, and publishing the zeroed
+    // BufferInfo would hand the SDK a null base pointer that its kernels then
+    // write through - surfacing as write-invalid gpuVA=0x0 and a lost device.
+    // Leave the info zeroed and report it; the caller re-tries next frame.
+    if (buffer == nullptr) {
+      ONCE(Logger::err(str::format(
+        "NrcContext: allocation of ", bufferSize,
+        " bytes failed; leaving this NRC buffer unbound rather than publishing a null device address.")));
+      return;
+    }
+
     // Fill out buffer info
     bufferInfo.resource = buffer->getSliceHandle().handle;
     bufferInfo.allocatedSize = buffer->getSliceHandle().length;

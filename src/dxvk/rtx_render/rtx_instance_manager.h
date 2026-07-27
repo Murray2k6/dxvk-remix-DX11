@@ -374,6 +374,11 @@ private:
   // DX11_V229: per-frame state for significance culling / maxInstanceSubmissions cap.
   uint32_t m_significanceFrameId = kInvalidFrameIndex;
   uint32_t m_significanceKeptThisFrame = 0;
+  // DX11_V311_SIGNIFICANCE_NEEDS_A_REAL_CAMERA: diagnostics only. How many
+  // instances significance culling hid, and which frame that was last reported
+  // for, so the per-frame report is emitted once rather than per instance.
+  uint32_t m_significanceCulledThisFrame = 0;
+  uint32_t m_significanceReportedFrameId = kInvalidFrameIndex;
   std::vector<IntersectionBillboard> m_billboards;
 
   RtInstance* targetInstance = nullptr;

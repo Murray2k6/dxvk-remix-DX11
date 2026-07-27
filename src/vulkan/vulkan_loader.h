@@ -241,6 +241,9 @@ namespace dxvk::vk {
     VULKAN_FN(vkDestroyPipelineCache);
     VULKAN_FN(vkGetPipelineCacheData);
     VULKAN_FN(vkMergePipelineCaches);
+    // NV-DXVK start: DX11_V298_DEVICE_FAULT (VK_EXT_device_fault)
+    VULKAN_FN(vkGetDeviceFaultInfoEXT);
+    // NV-DXVK end
     VULKAN_FN(vkCreateGraphicsPipelines);
     VULKAN_FN(vkCreateComputePipelines);
     VULKAN_FN(vkDestroyPipeline);

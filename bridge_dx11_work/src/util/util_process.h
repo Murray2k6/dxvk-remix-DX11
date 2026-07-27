@@ -54,6 +54,22 @@ namespace bridge_util {
       releaseChildProcess();
     }
 
+    /**
+     * \brief Whether the child process was actually created
+     *
+     * DX11_V319_LAUNCH_FAILURE_IS_VISIBLE: the constructor cannot report a
+     * failed CreateProcess - it does not throw, so `try { new Process(...) }
+     * catch (...)` never fires and a failed launch is indistinguishable from a
+     * successful one. Callers that go on to wait for the child to do something
+     * (the DX11 bridge waits for NvRemixLauncher32.exe to publish a server PID
+     * and duplicate a handle) then spend the whole timeout before reporting a
+     * failure they blame on the wrong step. Check this immediately after
+     * construction and fail fast with an accurate message instead.
+     */
+    bool isValid() const {
+      return hProcess != NULL && hProcess != INVALID_HANDLE_VALUE;
+    }
+
     bool PostMessageToMainThread(UINT msg, WPARAM wParam, LPARAM lParam) const;
 
     bool RegisterExitCallback(ProcessExitCallback callback);

@@ -321,11 +321,47 @@ namespace dxvk {
     auto predicate = D3D11Query::FromPredicate(pPredicate);
     m_state.pr.predicateObject = predicate;
     m_state.pr.predicateValue  = PredicateValue;
+  }
 
-    static bool s_errorShown = false;
 
-    if (pPredicate && !std::exchange(s_errorShown, true))
-      Logger::err("D3D11DeviceContext::SetPredication: Stub");
+  bool D3D11DeviceContext::IsPredicatedOff() {
+    if (!D3D11Rtx::respectPredicatedDraws())
+      return false;
+
+    // On a deferred context the predicate is being recorded into a command list
+    // that executes at an unknown later point, so whatever the query reads now
+    // describes a different frame. Record the work unconditionally and let the
+    // immediate context decide when it replays.
+    if (GetType() == D3D11_DEVICE_CONTEXT_DEFERRED)
+      return false;
+
+    D3D11Query* predicate = m_state.pr.predicateObject.ptr();
+
+    if (predicate == nullptr)
+      return false;
+
+    // Only occlusion predicates describe visibility. Stream-output overflow
+    // predicates report whether a previous SO pass overflowed its buffer, which
+    // says nothing about whether this geometry is on screen.
+    D3D11_QUERY_DESC predicateDesc = { };
+    predicate->GetDesc(&predicateDesc);
+
+    if (predicateDesc.Query != D3D11_QUERY_OCCLUSION_PREDICATE)
+      return false;
+
+    // Never block. D3D11 permits predication to be conservative - an
+    // implementation may execute a predicated-off operation, but must never skip
+    // one the predicate allows. So an unresolved predicate means "execute it":
+    // that is always correct, whereas guessing "skip" would drop visible
+    // geometry whenever a readback happened to be late.
+    BOOL occluded = FALSE;
+
+    if (predicate->GetData(&occluded, D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK)
+      return false;
+
+    // The operation is skipped when the predicate result matches the value
+    // supplied to SetPredication.
+    return occluded == m_state.pr.predicateValue;
   }
   
   
@@ -1132,6 +1168,9 @@ namespace dxvk {
   
   void STDMETHODCALLTYPE D3D11DeviceContext::DrawAuto() {
     D3D11DeviceLock lock = LockContext();
+    if (IsPredicatedOff())
+      return;
+
 
     if (!m_rtx.OnDrawAuto())
       return;
@@ -1159,6 +1198,9 @@ namespace dxvk {
           UINT            VertexCount,
           UINT            StartVertexLocation) {
     D3D11DeviceLock lock = LockContext();
+    if (IsPredicatedOff())
+      return;
+
 
     if (!m_rtx.OnDraw(VertexCount, StartVertexLocation))
       return;
@@ -1176,6 +1218,9 @@ namespace dxvk {
           UINT            StartIndexLocation,
           INT             BaseVertexLocation) {
     D3D11DeviceLock lock = LockContext();
+    if (IsPredicatedOff())
+      return;
+
 
     if (!m_rtx.OnDrawIndexed(IndexCount, StartIndexLocation, BaseVertexLocation))
       return;
@@ -1195,6 +1240,9 @@ namespace dxvk {
           UINT            StartVertexLocation,
           UINT            StartInstanceLocation) {
     D3D11DeviceLock lock = LockContext();
+    if (IsPredicatedOff())
+      return;
+
     
     if (!m_rtx.OnDrawInstanced(VertexCountPerInstance, InstanceCount, StartVertexLocation, StartInstanceLocation))
       return;
@@ -1216,6 +1264,9 @@ namespace dxvk {
           INT             BaseVertexLocation,
           UINT            StartInstanceLocation) {
     D3D11DeviceLock lock = LockContext();
+    if (IsPredicatedOff())
+      return;
+
     
     if (!m_rtx.OnDrawIndexedInstanced(IndexCountPerInstance, InstanceCount, StartIndexLocation, BaseVertexLocation, StartInstanceLocation))
       return;
@@ -1235,6 +1286,9 @@ namespace dxvk {
           ID3D11Buffer*   pBufferForArgs,
           UINT            AlignedByteOffsetForArgs) {
     D3D11DeviceLock lock = LockContext();
+    if (IsPredicatedOff())
+      return;
+
     if (!m_rtx.OnDrawIndexedInstancedIndirect(pBufferForArgs, AlignedByteOffsetForArgs))
       return;
     SetDrawBuffers(pBufferForArgs, nullptr);
@@ -1271,6 +1325,9 @@ namespace dxvk {
           ID3D11Buffer*   pBufferForArgs,
           UINT            AlignedByteOffsetForArgs) {
     D3D11DeviceLock lock = LockContext();
+    if (IsPredicatedOff())
+      return;
+
     if (!m_rtx.OnDrawInstancedIndirect(pBufferForArgs, AlignedByteOffsetForArgs))
       return;
     SetDrawBuffers(pBufferForArgs, nullptr);
@@ -1308,6 +1365,9 @@ namespace dxvk {
           UINT            ThreadGroupCountY,
           UINT            ThreadGroupCountZ) {
     D3D11DeviceLock lock = LockContext();
+    if (IsPredicatedOff())
+      return;
+
     
     EmitCs([=] (DxvkContext* ctx) {
       ctx->dispatch(
@@ -1322,6 +1382,9 @@ namespace dxvk {
           ID3D11Buffer*   pBufferForArgs,
           UINT            AlignedByteOffsetForArgs) {
     D3D11DeviceLock lock = LockContext();
+    if (IsPredicatedOff())
+      return;
+
     SetDrawBuffers(pBufferForArgs, nullptr);
     
     if (!ValidateDrawBufferSize(pBufferForArgs, AlignedByteOffsetForArgs, sizeof(VkDispatchIndirectCommand)))

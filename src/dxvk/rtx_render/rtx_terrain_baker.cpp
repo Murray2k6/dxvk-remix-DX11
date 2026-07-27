@@ -35,9 +35,8 @@
 
 #include "../d3d11/d3d11_state.h"
 #include "../d3d11/d3d11_spec_constants.h"
-#include "../dxso/dxso_util.h"
 #include "../../d3d11/d3d11_rtx.h"
-#include "../../dxso/dxso_util.h"
+#include "../../d3d11/d3d11_resource_slot.h"
 #include "../../d3d11/d3d11_caps.h"
 
 namespace {
@@ -102,11 +101,20 @@ namespace dxvk {
     }
   }
 
+  // The two gates below came from the legacy shader-object path, where the baker could
+  // only drive replacement PBR textures through a shader-model-1 pixel shader. The DX11
+  // capture layer never populated the field they read, so both have always resolved to
+  // the "shader model <= 1" branch. Keep that behavior explicit rather than switching to
+  // the real DXBC shader model (always 4.0+ in D3D11), which would silently disable PS
+  // replacement support and start erroring on every terrain draw. Revisit alongside
+  // REMIX-2223 if the baker gains real SM4+ handling.
+  static constexpr uint32_t kLegacyProgrammablePsMajorVersion = 0;
+
   bool TerrainBaker::isPSReplacementSupportEnabled(const DrawCallState& drawCallState) {
     if (drawCallState.usesPixelShader) {
-      return Material::replacementSupportInPS() && 
+      return Material::replacementSupportInPS() &&
              Material::replacementSupportInPS_programmableShaders() &&
-             drawCallState.programmablePixelShaderInfo.majorVersion() <= 1;
+             kLegacyProgrammablePsMajorVersion <= 1;
     } else {
       return Material::replacementSupportInPS() && Material::replacementSupportInPS_fixedFunction();
     }
@@ -292,7 +300,7 @@ namespace dxvk {
       return false;
     }
 
-    // DX11_V296_NULL_STATE_CB_GUARD: the D3D9-era state constant buffers
+    // DX11_V296_NULL_STATE_CB_GUARD: the D3D11-era state constant buffers
     // (vertexCaptureCB / vsFixedFunctionCB / psSharedStateCB) are never created
     // in the DX11 fork - RtxContext::setConstantBuffers has no caller and the
     // DXBC shader path has no CustomVertexTransform hook that would consume
@@ -396,15 +404,28 @@ namespace dxvk {
     uint32_t secondaryTextureSlot = kInvalidResourceSlot;
 
     if (bakeReplacementTextures) {
-      colorTextureSlot = drawCallState.getMaterialData().getColorTextureSlot(0);
+      // LegacyMaterialData stores the raw D3D11 shader register the game sampled
+      // the texture from (see D3D11Rtx::FillMaterialData, which also bounds-checks
+      // it against D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT before using it to
+      // index shader reflection). DxvkContext's resource array is a different
+      // space whose low end the RTX passes own - t0..t19 alias the common
+      // bindings - so the register has to be mapped into the reserved band before
+      // it can be bound, exactly as the secondary stage below already does.
+      const uint32_t colorTextureRegister = drawCallState.getMaterialData().getColorTextureSlot(0);
+
+      if (colorTextureRegister != kInvalidResourceSlot) {
+        colorTextureSlot = computeResourceSlotId(
+          D3D11ShaderStages::PixelShader, D3D11BindingType::ShaderResource, colorTextureRegister);
+      }
 
       // Check that the slot for secondary textures is available
       const uint32_t textureSlot = drawCallState.getMaterialData().getColorTextureSlot(kTerrainBakerSecondaryTextureStage);
 
       if (textureSlot == kInvalidResourceSlot) {
-        auto shaderSampler = RemapStateSamplerShader(static_cast<uint8_t>(kTerrainBakerSecondaryTextureStage));
+        auto shaderSampler = remapStateSamplerShader(static_cast<uint8_t>(kTerrainBakerSecondaryTextureStage));
         const uint32_t bindingIndex = shaderSampler.second;
-        secondaryTextureSlot = computeResourceSlotId(DxsoProgramType::PixelShader, DxsoBindingType::Image, bindingIndex);
+        secondaryTextureSlot = computeResourceSlotId(
+          D3D11ShaderStages::PixelShader, D3D11BindingType::ShaderResource, bindingIndex);
       }
     }
 
@@ -446,13 +467,20 @@ namespace dxvk {
         textureScale = replacementTextures[iTexture].scale;
         texturePreOffset = replacementTextures[iTexture].offset;
 
-        ctx->bindResourceView(colorTextureSlot, replacementTexture.getImageView(), nullptr);
+        // A register outside the addressable reserved band maps to the invalid
+        // sentinel; binding it would land on slot 0 (the acceleration structure).
+        if (colorTextureSlot != kInvalidResourceSlot) {
+          ctx->bindResourceView(colorTextureSlot, replacementTexture.getImageView(), nullptr);
+        } else {
+          ONCE(Logger::warn("[RTX Terrain Baker] Replacement albedo texture skipped: the draw's "
+                            "shader register falls outside the addressable resource-slot band."));
+        }
 
         if (isPSReplacementSupportEnabled(drawCallState)) {
 
           if (drawCallState.usesPixelShader) {
             if (textureType != ReplacementMaterialTextureType::Enum::AlbedoOpacity &&
-                drawCallState.programmablePixelShaderInfo.majorVersion() >= 2) {
+                kLegacyProgrammablePsMajorVersion >= 2) {
               // Unsupported right now - REMIX-2223 
               ONCE(Logger::err("[RTX Terrain Baker] Draw call associated with a terrain texture uses a shader model version 2 or higher. This is currently not supported when baking replacement PBR material textures other than albedoOpacity. Skipping baking of the replacement texture of all but albedoOpacity."));
               continue;

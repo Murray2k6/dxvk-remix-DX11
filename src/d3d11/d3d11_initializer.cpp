@@ -72,6 +72,22 @@ namespace dxvk {
         if (cookie == 0ull)
           cookie = 1ull; // zero is reserved for "unset"
         pBuffer->GetBuffer()->setContentCookie(cookie);
+
+        // DX11_V319_INDEX_SHADOW: keep the index data the RT submit path needs
+        // to size a draw's vertex range. See D3D11Buffer::SetIndexShadow - a
+        // device-local index buffer cannot be mapped, and without the maximum
+        // index the exact-capture path drops the draw entirely and the mesh
+        // renders as nothing at all.
+        //
+        // Only index buffers, and only the static (created-with-data) case that
+        // covers ordinary level geometry. The cap keeps a pathological buffer
+        // from doubling its own footprint in system memory; anything larger
+        // simply keeps the old behaviour.
+        if (desc.BindFlags & D3D11_BIND_INDEX_BUFFER) {
+          constexpr size_t kMaxIndexShadowBytes = 32ull << 20;
+          if (desc.ByteWidth > 0 && desc.ByteWidth <= kMaxIndexShadowBytes)
+            pBuffer->SetIndexShadow(pInitialData->pSysMem, desc.ByteWidth);
+        }
       }
     }
   }
@@ -263,6 +279,41 @@ namespace dxvk {
   uint32_t D3D11Initializer::AcquireDynamicTextureSlot(uint64_t descriptorHash) {
     std::lock_guard<dxvk::mutex> lock(dynamicSlotMutex());
     std::vector<bool>& pool = dynamicSlotPools()[descriptorHash];
+
+    // DX11_V319_STREAMING_POOL_COLLAPSES_TO_ONE_IDENTITY: once a descriptor has
+    // grown past a handful of simultaneous slots it is a STREAMING POOL, not a
+    // small set of dedicated buffers, and the per-slot ordinal stops being an
+    // identity.
+    //
+    // A game holding two or three live buffers for one UI element gets a stable
+    // hash per buffer, which is what the ordinal is for. A streaming pool works
+    // the other way round: one logical texture is cycled through whichever pool
+    // entry is free, so the slot a texture lands in varies frame to frame, the
+    // hash changes underneath the material, and the result is flickering plus
+    // texture tags that refuse to stick.
+    //
+    // Pool size is the structural signal for that, and it is measured from the
+    // game's own behaviour rather than assumed from which engine is running -
+    // any engine that streams through a rotating pool is handled, and none has
+    // to be recognised by name. Past the threshold every texture sharing the
+    // descriptor collapses to ordinal 0, i.e. one identity for the whole
+    // rotation: one tag covers it, at the cost of unrelated same-descriptor
+    // textures sharing that tag. That is the right trade for a pool whose
+    // members are interchangeable by construction.
+    constexpr size_t kRotationPoolSlotThreshold = 4;
+    if (pool.size() >= kRotationPoolSlotThreshold) {
+      static uint32_t sPoolCollapseLogCount = 0;
+      if (sPoolCollapseLogCount < 8u) {
+        ++sPoolCollapseLogCount;
+        Logger::info(str::format(
+          "[D3D11] dynamic-texture descriptor 0x", std::hex, descriptorHash, std::dec,
+          " reached ", pool.size(), " simultaneous slots; treating it as a streaming pool and "
+          "collapsing it to a single stable identity (per-slot hashes on a rotating pool change "
+          "underneath the material, which shows up as flicker and as tags that do not stick)."));
+      }
+      return 0u;
+    }
+
     for (size_t slot = 0; slot < pool.size(); ++slot) {
       if (!pool[slot]) {
         pool[slot] = true;

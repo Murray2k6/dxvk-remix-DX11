@@ -827,13 +827,67 @@ dxvk::ExternalDrawState dxvk::RemixAPIPrivateAccessor::toRtDrawState(const remix
     prototype.materialData.alphaTestReferenceValue = extBlend->alphaTestReferenceValue;
     prototype.materialData.alphaTestCompareOp = (VkCompareOp) extBlend->alphaTestCompareOp;
     prototype.materialData.blendMode.enableBlending = extBlend->alphaBlendEnabled;
-    prototype.materialData.textureColorOperation = (DxvkRtTextureOperation) extBlend->textureColorOperation;
-    prototype.materialData.textureColorArg1Source = (RtTextureArgSource) extBlend->textureColorArg1Source;
-    prototype.materialData.textureColorArg2Source = (RtTextureArgSource) extBlend->textureColorArg2Source;
-    prototype.materialData.textureAlphaOperation = (DxvkRtTextureOperation) extBlend->textureAlphaOperation;
-    prototype.materialData.textureAlphaArg1Source = (RtTextureArgSource) extBlend->textureAlphaArg1Source;
-    prototype.materialData.textureAlphaArg2Source = (RtTextureArgSource) extBlend->textureAlphaArg2Source;
-    prototype.materialData.tFactor = extBlend->tFactor;
+    // remixapi_InstanceInfoBlendEXT is a published ABI: external clients still
+    // describe blending with the old two-argument / texture-operation vocabulary,
+    // so it keeps its shape and gets translated into the runtime's DX11 model
+    // here. Only the combinations that model can express survive; the rest fall
+    // back to sampling the texture, which is what those draws did in practice.
+    {
+      // Mirrors the retired RtTextureArgSource ordering.
+      enum ApiArgSource : uint32_t { kArgNone = 0, kArgTexture = 1, kArgVertexColor = 2, kArgTFactor = 3 };
+      // Mirrors the retired DxvkRtTextureOperation ordering.
+      enum ApiTextureOp : uint32_t { kOpDisable = 0, kOpSelectArg1 = 1, kOpSelectArg2 = 2, kOpModulate = 3,
+                                     kOpModulate2x = 4, kOpModulate4x = 5, kOpAdd = 6, kOpForceModulate2x = 7 };
+
+      auto toColorSource = [](uint32_t apiArg) {
+        switch (apiArg) {
+          case kArgVertexColor: return D3D11ColorSource::VertexColor;
+          case kArgTFactor:     return D3D11ColorSource::BlendConstant;
+          default:              return D3D11ColorSource::Texture;
+        }
+      };
+
+      // Reduces an (op, arg1, arg2) triple to a single source plus an optional
+      // vertex-colour modulate, which is all the DX11 model represents.
+      auto reduce = [&](uint32_t op, uint32_t arg1, uint32_t arg2, bool& outModulateVertexColor) {
+        outModulateVertexColor = false;
+
+        switch (op) {
+          case kOpSelectArg2:
+            return toColorSource(arg2);
+          case kOpModulate:
+          case kOpModulate2x:
+          case kOpModulate4x:
+          case kOpForceModulate2x:
+            // The one modulate pairing the runtime can reproduce is
+            // texture * vertex colour; anything else keeps its first argument.
+            if (arg1 == kArgVertexColor || arg2 == kArgVertexColor) {
+              outModulateVertexColor = true;
+              return toColorSource(arg1 == kArgVertexColor ? arg2 : arg1);
+            }
+            return toColorSource(arg1);
+          default:
+            return toColorSource(arg1);
+        }
+      };
+
+      bool modulateFromColor = false;
+      bool modulateFromAlpha = false;
+      prototype.materialData.colorSource = reduce(extBlend->textureColorOperation,
+        extBlend->textureColorArg1Source, extBlend->textureColorArg2Source, modulateFromColor);
+      prototype.materialData.alphaSource = reduce(extBlend->textureAlphaOperation,
+        extBlend->textureAlphaArg1Source, extBlend->textureAlphaArg2Source, modulateFromAlpha);
+      prototype.materialData.modulateVertexColor = modulateFromColor;
+      prototype.materialData.modulateVertexAlpha = modulateFromAlpha;
+
+      // The API still carries the factor as a packed ARGB colour.
+      const uint32_t packed = extBlend->tFactor;
+      prototype.materialData.blendConstant = Vector4(
+        float((packed >> 16) & 0xff) / 255.0f,
+        float((packed >>  8) & 0xff) / 255.0f,
+        float( packed        & 0xff) / 255.0f,
+        float((packed >> 24) & 0xff) / 255.0f);
+    }
     prototype.materialData.isTextureFactorBlend = extBlend->isTextureFactorBlend;
     prototype.materialData.isVertexColorBakedLighting = (s_apiVersion >= REMIXAPI_VERSION_MAKE(0, 5, 2)) ? extBlend->isVertexColorBakedLighting : RtxOptions::vertexColorIsBakedLighting();
     prototype.materialData.blendMode.colorSrcFactor = (VkBlendFactor) extBlend->srcColorBlendFactor;

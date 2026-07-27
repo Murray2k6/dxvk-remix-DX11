@@ -80,6 +80,12 @@ namespace dxvk {
     
     dxvk::mutex   m_mutex;
     std::ofstream m_fileStream;
+
+    // The DLL-named log (d3d11.<pid>.log) that this logger owned before
+    // initRtxLog() repointed the singleton at remix-dxvk.log. Kept open and
+    // written in parallel so that file is populated too, rather than being
+    // created and then abandoned empty. See initRtxLog.
+    std::ofstream m_secondaryFileStream;
     
     void emitMsg(LogLevel level, const std::string& message);
     

@@ -1518,12 +1518,46 @@ namespace dxvk {
         (device->getMemoryStats(i).totalUsed() >> 20);
 
       VkDeviceSize memBudgetMib = memHeapInfo.heaps[i].memoryBudget >> 20;
+
       VkDeviceSize memUsedMib = (memHeapInfo.heaps[i].memoryAllocated >> 20) - remixFreeMemMib;
 
       if (memBudgetMib > memUsedMib) {
         availableMemorySizeMib = std::max(memBudgetMib - memUsedMib, availableMemorySizeMib);
       }
     }
+    // Cap Remix's own footprint without taking VRAM away from the game.
+    //
+    // The driver reports the whole device-local heap as available, so the texture
+    // budget grows to fill whatever the card has. This bounds what *Remix*
+    // allocates - material textures plus its buffers, acceleration structures,
+    // micromaps, render targets and replacement geometry - while leaving the rest
+    // of the heap to the application's own resources, which are accounted
+    // separately and are not touched here.
+    if (RtxOptions::vramBudgetLimitMiB() > 0) {
+      VkDeviceSize remixNonTextureMib = 0;
+      for (uint32_t i = 0; i < memory.memoryHeapCount; i++) {
+        if (!(memory.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)) {
+          continue;
+        }
+        const DxvkMemoryStats& stats = device->getMemoryStats(i);
+        remixNonTextureMib +=
+          (stats.usedByCategory(DxvkMemoryStats::Category::RTXBuffer) +
+           stats.usedByCategory(DxvkMemoryStats::Category::RTXAccelerationStructure) +
+           stats.usedByCategory(DxvkMemoryStats::Category::RTXOpacityMicromap) +
+           stats.usedByCategory(DxvkMemoryStats::Category::RTXRenderTarget) +
+           stats.usedByCategory(DxvkMemoryStats::Category::RTXReplacementGeometry)) >> 20;
+      }
+
+      // Whatever the ceiling leaves after Remix's non-texture allocations is all
+      // the textures may claim; if those alone already exceed it, the texture
+      // budget collapses to the floor below and textures get demoted.
+      const VkDeviceSize limitMib = RtxOptions::vramBudgetLimitMiB();
+      const VkDeviceSize textureCeilingMib =
+        limitMib > remixNonTextureMib ? limitMib - remixNonTextureMib : 0;
+
+      availableMemorySizeMib = std::min(availableMemorySizeMib, textureCeilingMib);
+    }
+
     if (!device->getCommon()->getResources().isResourceReady()) {
       // Reserve space for various non-texture GPU resources (buffers, etc)
 

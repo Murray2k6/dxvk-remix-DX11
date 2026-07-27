@@ -57,6 +57,19 @@ namespace interleaver {
     VK_FORMAT_R32G32B32A32_SFLOAT = 109,
   };
 
+  static inline int signExtend10(uint x) {
+    // keep lower 10 bits and sign extend to 32-bit integer
+    return (int(x << 22)) >> 22;
+  }
+
+  static inline float snorm10ToF32_packed(uint x) {
+    const int v = signExtend10(x);
+    float f = float(v) / 511.0f;
+    // clamp to [-1, 1] (since -512 / 511 < -1)
+    f = (f < -1.0f) ? -1.0f : ((f > 1.0f) ? 1.0f : f);
+    return f;
+  }
+
   bool formatConversionFloatSupported(uint32_t format) {
     switch (format) {
     case SupportedVkFormats::VK_FORMAT_R16G16_SFLOAT:
@@ -114,9 +127,9 @@ namespace interleaver {
     case SupportedVkFormats::VK_FORMAT_A2B10G10R10_SNORM_PACK32:
     {
       uint data = asuint(input[index]);
-      float b = unorm10ToF32(data >> 20);
-      float g = unorm10ToF32(data >> 10);
-      float r = unorm10ToF32(data >> 0);
+      float b = snorm10ToF32_packed(data >> 20);
+      float g = snorm10ToF32_packed(data >> 10);
+      float r = snorm10ToF32_packed(data >> 0);
       return float3(r, g, b);
     }
     }

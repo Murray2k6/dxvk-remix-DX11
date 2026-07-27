@@ -22,6 +22,8 @@
 
 #include "rtx_materials.h"
 
+#include <algorithm>
+
 #include "rtx_options.h"
 
 namespace dxvk {
@@ -69,6 +71,16 @@ template<> OpaqueMaterialData LegacyMaterialData::as() const {
   OpaqueMaterialData opaqueMat(defaultLegacyOpaqueMaterial);
   if (LegacyMaterialDefaults::useAlbedoTextureIfPresent()) {
     opaqueMat.setAlbedoOpacityTexture(getColorTexture());
+  }
+  // Constant-color materials carry their color in shader constant registers rather than a
+  // texture; without this they render plain white. Opacity stays at the default - the
+  // vector's w component rarely holds opacity.
+  if (hasConstantAlbedo && !getColorTexture().isValid()) {
+    const Vector3 clampedAlbedo(
+      std::clamp(constantAlbedo.x, 0.0f, 1.0f),
+      std::clamp(constantAlbedo.y, 0.0f, 1.0f),
+      std::clamp(constantAlbedo.z, 0.0f, 1.0f));
+    opaqueMat.setAlbedoConstant(clampedAlbedo);
   }
   if (getColorTexture2().isValid()) {
     opaqueMat.setSecondaryTexture(getColorTexture2());

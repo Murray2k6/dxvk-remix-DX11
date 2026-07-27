@@ -56,7 +56,40 @@ namespace bridge_util {
       &siStartInfo,  // STARTUPINFO pointer
       &piProcInfo);  // receives PROCESS_INFORMATION
     if (bFuncRetn == 0) {
-      printf("CreateProcess failed (%d)\n", GetLastError());
+      // DX11_V319_LAUNCH_FAILURE_IS_VISIBLE: this used to be a printf. A game
+      // is a GUI process with no console, so the one message naming the real
+      // failure went nowhere and no log file ever received it.
+      //
+      // The consequence was a badly misdiagnosed bridge: createChildProcess
+      // returns INVALID_HANDLE_VALUE and the constructor does NOT throw, so the
+      // caller's try/catch around `new Process(...)` cannot fire. The client
+      // therefore carried on as though NvRemixLauncher32.exe had started, waited
+      // out the full handle-duplication timeout, and reported "launcher did not
+      // provide a real game handle duplicated into NvRemixBridge.exe" - blaming
+      // handle duplication for a process that was never created. Field signature
+      // (Saints Row the Third): no NvRemixLauncher32.log, no
+      // .trex\dx11_bridge_server_pid.txt, a ~9s stall, then that error.
+      //
+      // Log the command line too: every plausible cause here - a missing or
+      // mislocated NvRemixLauncher32.exe, a quoting mistake, an AV or policy
+      // block - is identifiable from the exact string that was handed to
+      // CreateProcess plus the error code.
+      const DWORD lastError = GetLastError();
+      char message[4096] = {};
+#ifdef UNICODE
+      char narrowCmdLine[3072] = {};
+      WideCharToMultiByte(CP_UTF8, 0, lpCommandLine ? lpCommandLine : L"", -1,
+                          narrowCmdLine, sizeof(narrowCmdLine), nullptr, nullptr);
+      const char* const cmdLineText = narrowCmdLine;
+#else
+      const char* const cmdLineText = lpCommandLine ? lpCommandLine : "";
+#endif
+      sprintf_s(message, sizeof(message),
+        "CreateProcess FAILED err=%lu - the child process was never started. Command line: %s",
+        lastError, cmdLineText);
+      Logger::err(message);
+
+      free(lpCommandLine);
       return INVALID_HANDLE_VALUE;
     } else {
       processMainThreadId = GetThreadId(piProcInfo.hThread);

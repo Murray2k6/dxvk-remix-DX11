@@ -386,7 +386,22 @@ namespace dxvk {
 
     m_submissionQueue.present(presentInfo, status);
 
-    incrementPresentCount();
+    // DX11_V305_SINGLE_FRAME_ID_ADVANCE: the frame counter is NOT advanced here.
+    //
+    // getCurrentFrameId() is QueuePresentCount, and RtCamera::isValid(fid) is an
+    // exact `m_frameLastTouched == fid` match. Incrementing here as well as in
+    // D3D11SwapChain::SubmitPresent (which owns the primary-only policy) moved
+    // the counter by TWO per primary present, so a camera touched during frame N
+    // was checked against N+2 and was never valid - not once, in any frame, in
+    // either menu or gameplay. Every frame then silently fell through to the
+    // camera-carryover fallback and path traced against a two-frame-old camera,
+    // with the 45/90-frame grace windows hiding it permanently.
+    //
+    // This call was also unconditional, so secondary (video/loading) chains bumped
+    // the counter too - the exact desync the caller's comment says must not happen.
+    // The single remaining increment lives in SubmitPresent under `if (cIsPrimary)`,
+    // which is the policy this fork wants. DxvkDevice::presentImage has exactly one
+    // caller, so nothing else depends on the counter moving here.
 
     // NV-DXVK end
 

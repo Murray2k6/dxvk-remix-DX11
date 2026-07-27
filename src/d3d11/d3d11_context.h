@@ -54,6 +54,12 @@ namespace dxvk {
     void STDMETHODCALLTYPE SetPredication(
             ID3D11Predicate*                  pPredicate,
             BOOL                              PredicateValue);
+
+    // True when the currently bound predicate says this operation should be
+    // skipped. Non-blocking, and conservative in the direction D3D11 permits:
+    // an unresolved predicate reports false, so an operation is never dropped
+    // because a readback was late. Gated by rtx.d3d11.respectPredicatedDraws.
+    bool IsPredicatedOff();
     
     void STDMETHODCALLTYPE GetPredication(
             ID3D11Predicate**                 ppPredicate,

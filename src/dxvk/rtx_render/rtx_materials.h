@@ -29,10 +29,11 @@
 #include "../../util/util_color.h"
 #include "../../util/util_macro.h"
 #include "rtx/utility/shared_constants.h"
+#include "rtx/utility/blend_constant_packing.h"
 #include "rtx/concept/surface/surface_shared.h"
 #include "rtx/pass/common_binding_indices.h"
 #include "rtx/pass/instance_definitions.h"
-#include "../../dxso/dxso_util.h"
+#include "../../d3d11/d3d11_resource_slot.h"
 #include "rtx_material_data.h"
 #include "../../lssusd/mdl_helpers.h"
 #include "rtx/pass/particles/particle_system_common.h"
@@ -118,7 +119,8 @@ struct RtSurface {
     uint16_t flags0 = 0;
     flags0 |= normalFormat == VK_FORMAT_R32_UINT ? 1 : 0;
     flags0 |= isVertexColorBakedLighting ? (1 << 1) : 0;
-    // NOTE: Spare flags bits here
+    flags0 |= colorTextureIsSrgb ? (1 << 2) : 0;
+    flags0 |= emissiveTextureIsSrgb ? (1 << 3) : 0;
 
     writeGPUHelper(data, offset, flags0);
 
@@ -258,27 +260,38 @@ struct RtSurface {
 
     writeGPUHelper(data, offset, textureSpritesheetData);
 
-    writeGPUHelper(data, offset, tFactor);
+    // Blend-constant rgb, in the slot the packed D3DCOLOR texture factor used to
+    // occupy. R11G11B10 keeps the surface struct exactly the same size and layout
+    // while raising precision from 8/8/8. Alpha rides in the freed texture-flag
+    // bits below at 10 bits. See blend_constant_packing.h.
+    writeGPUHelper(data, offset,
+      packBlendConstantRGB(blendConstant.x, blendConstant.y, blendConstant.z));
 
     std::uint32_t textureFlags = 0;
 
-    assert((static_cast<uint32_t>(textureColorOperation) & 0x7) == static_cast<uint32_t>(textureColorOperation));
-    assert((static_cast<uint32_t>(textureAlphaOperation) & 0x7) == static_cast<uint32_t>(textureAlphaOperation));
-    assert(textureAlphaOperation != DxvkRtTextureOperation::Force_Modulate2x);
+    static_assert(static_cast<uint32_t>(D3D11ColorSource::Count) <= 4);
 
-    textureFlags |= ((static_cast<uint32_t>(textureColorArg1Source) & 0x3));
-    textureFlags |= ((static_cast<uint32_t>(textureColorArg2Source) & 0x3) << 2);
-    textureFlags |= ((static_cast<uint32_t>(textureColorOperation)  & 0x7) << 4);
-    textureFlags |= ((static_cast<uint32_t>(textureAlphaArg1Source) & 0x3) << 7);
-    textureFlags |= ((static_cast<uint32_t>(textureAlphaArg2Source) & 0x3) << 9);
-    textureFlags |= ((static_cast<uint32_t>(textureAlphaOperation)  & 0x7) << 11);
+    textureFlags |= ((static_cast<uint32_t>(colorSource) & 0x3));
+    textureFlags |= ((static_cast<uint32_t>(alphaSource) & 0x3) << 2);
+    textureFlags |= modulateVertexColor ? (1u << 4) : 0u;
+    textureFlags |= modulateVertexAlpha ? (1u << 5) : 0u;
+    // textureFlags bits 6-13 unused
 
     textureFlags |= eyeParams ? (1 << 14) : 0;
     // textureFlags bits 15-16 unused
 
     static_assert(static_cast<uint32_t>(TexGenMode::Count) <= 4);
     textureFlags |= ((static_cast<uint32_t>(texgenMode) & 0x3) << 17);
-    // textureFlags bits 19-30 unused
+
+    // Blend-constant alpha at 10 bits, in what were spare flag bits. This is the
+    // channel most likely to carry a meaningful non-white value (a fade weight),
+    // so it gets more precision than the 8 bits the old packed factor gave it.
+    {
+      const float saturatedAlpha = std::min(1.0f, std::max(0.0f, blendConstant.w));
+      const uint32_t quantizedAlpha = static_cast<uint32_t>(saturatedAlpha * 1023.0f + 0.5f);
+      textureFlags |= ((quantizedAlpha & 0x3ffu) << 19);
+    }
+    // textureFlags bits 29-30 unused
 
     writeGPUHelper(data, offset, textureFlags);
 
@@ -334,17 +347,26 @@ struct RtSurface {
   bool isClipPlaneEnabled = false;
   bool isTextureFactorBlend = false;
   bool isVertexColorBakedLighting = true;
+  bool colorTextureIsSrgb = false;
+  bool emissiveTextureIsSrgb = false;
   bool isMotionBlurMaskOut = false;
   bool skipSurfaceInteractionSpritesheetAdjustment = false;
   bool ignoreTransparencyLayer = false;
 
-  RtTextureArgSource textureColorArg1Source = RtTextureArgSource::Texture;
-  RtTextureArgSource textureColorArg2Source = RtTextureArgSource::None;
-  DxvkRtTextureOperation textureColorOperation = DxvkRtTextureOperation::Modulate;
-  RtTextureArgSource textureAlphaArg1Source = RtTextureArgSource::Texture;
-  RtTextureArgSource textureAlphaArg2Source = RtTextureArgSource::None;
-  DxvkRtTextureOperation textureAlphaOperation = DxvkRtTextureOperation::SelectArg1;
-  uint32_t tFactor = 0xffffffff;   // Value for D3DRS_TEXTUREFACTOR, default value of is opaque white
+  // Where the surface's colour and alpha come from, and whether vertex colour
+  // modulates the result. See D3D11ColorSource - this replaces the old
+  // fixed-function texture-stage combiner, whose generality the DX11 capture
+  // path never used.
+  D3D11ColorSource colorSource = D3D11ColorSource::Texture;
+  D3D11ColorSource alphaSource = D3D11ColorSource::Texture;
+  bool modulateVertexColor = false;
+  // Vertex alpha modulates separately: many DX11 vertex-colour streams carry
+  // padding or zero in the alpha channel, so folding it into opacity by default
+  // erases surfaces that only meant to tint their colour.
+  bool modulateVertexAlpha = false;
+  // The D3D11 OMSetBlendState blend factor, kept as real floats on the CPU and
+  // packed for the GPU by writeGPUData. Opaque white is the neutral default.
+  Vector4 blendConstant = Vector4(1.0f, 1.0f, 1.0f, 1.0f);
   TexGenMode texgenMode = TexGenMode::None;
   std::optional<RtEyeParams> eyeParams = {};
 
@@ -1765,21 +1787,56 @@ struct LegacyMaterialData {
 
   DxvkBlendMode blendMode;
 
-  RtTextureArgSource diffuseColorSource= RtTextureArgSource::None;
-  RtTextureArgSource specularColorSource = RtTextureArgSource::None;
-  RtTextureArgSource textureColorArg1Source = RtTextureArgSource::Texture;
-  RtTextureArgSource textureColorArg2Source = RtTextureArgSource::None;
-  DxvkRtTextureOperation textureColorOperation = DxvkRtTextureOperation::Modulate;
-  RtTextureArgSource textureAlphaArg1Source = RtTextureArgSource::Texture;
-  RtTextureArgSource textureAlphaArg2Source = RtTextureArgSource::None;
-  DxvkRtTextureOperation textureAlphaOperation = DxvkRtTextureOperation::SelectArg1;
-  uint32_t tFactor = 0xffffffff;  // Value for D3DRS_TEXTUREFACTOR, default value of is opaque white
+  // Capture-side counterpart of the RtSurface fields; see D3D11ColorSource.
+  D3D11ColorSource colorSource = D3D11ColorSource::Texture;
+  D3D11ColorSource alphaSource = D3D11ColorSource::Texture;
+  bool modulateVertexColor = false;
+  bool modulateVertexAlpha = false;
+  // The D3D11 OMSetBlendState blend factor, in real floats.
+  Vector4 blendConstant = Vector4(1.0f, 1.0f, 1.0f, 1.0f);
   Dx11RuntimeMaterial dx11Material = {};
   bool isTextureFactorBlend = false;
   bool isVertexColorBakedLighting = true;
+  bool colorTextureIsSrgb = false;
+  // Constant-color materials: shaders with no material texture samplers carry their
+  // color in shader constant registers. Captured at draw time so the legacy->opaque
+  // conversion can use it as the albedo constant instead of rendering white.
+  Vector4 constantAlbedo = Vector4(1.0f, 1.0f, 1.0f, 1.0f);
+  bool hasConstantAlbedo = false;
 
   void setHashOverride(XXH64_hash_t hash) {
     m_cachedHash = hash;
+  }
+
+  // Material-instance compat - when set, material hashes include shader identity
+  // in addition to the material texture set.
+  void setPixelShaderHashForMaterialInstance(XXH64_hash_t hash) {
+    m_pixelShaderHashForMaterialInstance = hash;
+  }
+
+  // Hash over the ordered (sampler index, image hash) set of all textures bound to the pixel
+  // shader's material samplers (identified by name in the DXBC resource-definition chunk).
+  // Differentiates material instances that override texture parameters in any material
+  // sampler, not just the primary color texture.
+  void setMaterialTextureSetHashForMaterialInstance(XXH64_hash_t hash) {
+    m_materialTextureSetHash = hash;
+  }
+
+  // Hash over the material constant-buffer variables (identified by name in the DXBC
+  // resource-definition chunk). Differentiates material instances that override vector/scalar
+  // parameters on an identical texture set. kEmptyHash for shaders listed in
+  // rtx.d3d11.materialInstanceIdentityExcludedShaders (frame-varying constants) or for
+  // shaders without reflected constant ranges.
+  void setPixelShaderConstantsHashForMaterialInstance(XXH64_hash_t hash) {
+    m_pixelShaderConstantsHashForMaterialInstance = hash;
+  }
+
+  // Intermediate identity tier: PS bytecode + material texture set, without constants.
+  // Shared by all material-instance siblings that only differ via constants, and stable
+  // even for shaders with frame-varying constant registers. kEmptyHash unless the
+  // material-instance identity path is active.
+  XXH64_hash_t getTextureSetAndShaderHash() const {
+    return m_textureSetShaderHash;
   }
 
 private:
@@ -1790,11 +1847,33 @@ private:
   friend struct RemixAPIPrivateAccessor;
 
   void updateCachedHash() {
-    // Note: Currently only based on the color texture's data hash. This may have to be changed later to
-    // incorporate more textures used to identify a material uniquely. Note this is not the same as the
-    // plain data hash used by the RtSurfaceMaterial for storage in map-like data structures, but rather
-    // one used to identify a material and compare to user-provided hashes.
-    m_cachedHash = colorTextures[0].getImageHash();
+    // Note: by default this is based on the color texture's data hash. This is not the same as
+    // the plain data hash used by the RtSurfaceMaterial for storage in map-like data structures,
+    // but rather one used to identify a material and compare to user-provided hashes.
+    //
+    // For material-instance compat the identity is a deterministic seed chain:
+    //   PS bytecode hash -> material texture set -> material constants
+    // Every input is a pure function of the current draw, so the same material instance always
+    // produces the same hash.
+    const XXH64_hash_t textureHash = colorTextures[0].getImageHash();
+    if (m_pixelShaderHashForMaterialInstance != kEmptyHash) {
+      // When the shader reflection exposes no material samplers, fall back to the primary
+      // color texture so the identity keeps the texture+shader structure.
+      const XXH64_hash_t textureSetHash =
+        (m_materialTextureSetHash != kEmptyHash) ? m_materialTextureSetHash : textureHash;
+      XXH64_hash_t hash = XXH3_64bits_withSeed(&textureSetHash, sizeof(textureSetHash), m_pixelShaderHashForMaterialInstance);
+      m_textureSetShaderHash = hash;
+      if (m_pixelShaderConstantsHashForMaterialInstance != kEmptyHash) {
+        hash = XXH3_64bits_withSeed(
+          &m_pixelShaderConstantsHashForMaterialInstance,
+          sizeof(m_pixelShaderConstantsHashForMaterialInstance),
+          hash);
+      }
+      m_cachedHash = hash;
+    } else {
+      m_textureSetShaderHash = kEmptyHash;
+      m_cachedHash = textureHash;
+    }
   }
 
   const static uint32_t kMaxSupportedTextures = 2;
@@ -1804,6 +1883,11 @@ private:
   uint32_t colorTextureSlot[kMaxSupportedTextures] = { kInvalidResourceSlot };
 
   XXH64_hash_t m_cachedHash = kEmptyHash;
+  XXH64_hash_t m_pixelShaderHashForMaterialInstance = kEmptyHash;
+  XXH64_hash_t m_materialTextureSetHash = kEmptyHash;
+  XXH64_hash_t m_pixelShaderConstantsHashForMaterialInstance = kEmptyHash;
+  // Derived in updateCachedHash: PS bytecode + material texture set (no constants).
+  XXH64_hash_t m_textureSetShaderHash = kEmptyHash;
 };
 
 struct MaterialData {

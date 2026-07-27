@@ -412,6 +412,15 @@ namespace dxvk {
         info.size = align(output.indexCount * indexStride, CACHE_LINE_SIZE);
         output.indexCacheBuffer = m_device->createBuffer(info, memoryProperty, DxvkMemoryStats::Category::RTXAccelerationStructure, "Index Cache Buffer");
 
+        // Allocation can fail under memory pressure. These buffers are written by
+        // GPU passes through their device address, so a null here is not a dropped
+        // draw - it is a write to address 0, which faults the device and takes the
+        // whole process down with it.
+        if (output.indexCacheBuffer == nullptr) {
+          ONCE(Logger::err("processGeometryInfo: index cache buffer allocation failed; dropping geometry rather than writing to a null address."));
+          return ObjectCacheState::kInvalid;
+        }
+
         if (!RtxGeometryUtils::cacheIndexDataOnGPU(ctx, input, output)) {
           ONCE(Logger::err("processGeometryInfo: failed to cache index data on GPU"));
           return ObjectCacheState::kInvalid;
@@ -421,6 +430,13 @@ namespace dxvk {
 
         info.size = align(vertexBufferSize, CACHE_LINE_SIZE);
         output.historyBuffer[0] = m_device->createBuffer(info, memoryProperty, DxvkMemoryStats::Category::RTXAccelerationStructure, "Geometry Buffer");
+
+        // The interleaver writes vertex data straight through this buffer's device
+        // address; a null one becomes a GPU write to 0x0 and a lost device.
+        if (output.historyBuffer[0] == nullptr) {
+          ONCE(Logger::err("processGeometryInfo: geometry buffer allocation failed; dropping geometry rather than interleaving into a null address."));
+          return ObjectCacheState::kInvalid;
+        }
 
         RtxGeometryUtils::cacheVertexDataOnGPU(ctx, input, output, forceNormals);
 
@@ -435,6 +451,11 @@ namespace dxvk {
           desc.size = align(vertexStride * input.vertexCount, CACHE_LINE_SIZE);
           output.historyBuffer[0] = m_device->createBuffer(desc, memoryProperty, DxvkMemoryStats::Category::RTXAccelerationStructure, "Geometry Buffer");
 
+          if (output.historyBuffer[0] == nullptr) {
+            ONCE(Logger::err("processGeometryInfo: geometry buffer reallocation failed on stride change; dropping geometry rather than writing to a null address."));
+            return ObjectCacheState::kInvalid;
+          }
+
           // Invalidate the current buffer
           output.historyBuffer[1] = nullptr;
 
@@ -448,7 +469,12 @@ namespace dxvk {
         if (output.historyBuffer[0].ptr() == nullptr) {
           // First frame this object has been dynamic need to allocate a 2nd frame of data to preserve history.
           output.historyBuffer[0] = m_device->createBuffer(output.historyBuffer[1]->info(), memoryProperty, DxvkMemoryStats::Category::RTXAccelerationStructure, "Geometry Buffer");
-        } 
+
+          if (output.historyBuffer[0] == nullptr) {
+            ONCE(Logger::err("processGeometryInfo: history buffer allocation failed; dropping geometry rather than writing to a null address."));
+            return ObjectCacheState::kInvalid;
+          }
+        }
 
         RtxGeometryUtils::cacheVertexDataOnGPU(ctx, input, output, forceNormals);
 
@@ -756,8 +782,72 @@ namespace dxvk {
     } 
 
     // test if any direct material replacements exist
-    MaterialData* pReplacementMaterial = m_pReplacer->getReplacementMaterial(input.getMaterialData().getHash());
+    //
+    // Tiered material-instance lookup - every tier is a pure function of the current draw
+    // (no session history), so the same surface always resolves to the same replacement:
+    //   1. materialHash          - exact child identity (PS + material texture set + constants)
+    //   2. lightmap-permutation alternates - exact identities this draw would have produced under
+    //                              lightmap policy permutations that reference fewer material
+    //                              symbols (see rtx.d3d11.lightmapPermutationBridgeLookup)
+    //   3. textureSetShaderHash  - all material-instance siblings sharing the shader and texture
+    //                              set (constants ignored; stable even for shaders with
+    //                              frame-varying constants)
+    //   4. textureHash           - parent-level tag on the primary color texture
+    // Exact identities come before family/parent fallbacks so the same replacement wins
+    // regardless of which permutation is running. For games without material-instance identity
+    // the tiers collapse into the legacy single texture-hash lookup.
+    const LegacyMaterialData& inputMaterial = input.getMaterialData();
+    const XXH64_hash_t materialHash = inputMaterial.getHash();
+    const XXH64_hash_t textureHash = inputMaterial.getColorTexture().getImageHash();
+    const XXH64_hash_t textureSetShaderHash = inputMaterial.getTextureSetAndShaderHash();
+
+    const char* matchedTier = "material";
+    MaterialData* pReplacementMaterial = m_pReplacer->getReplacementMaterial(materialHash);
+
+    if (pReplacementMaterial == nullptr && input.lightmapPermutationAlternateHashes != nullptr) {
+      for (const XXH64_hash_t alternateHash : *input.lightmapPermutationAlternateHashes) {
+        if (alternateHash == kEmptyHash || alternateHash == materialHash ||
+            alternateHash == textureSetShaderHash || alternateHash == textureHash) {
+          continue;
+        }
+        pReplacementMaterial = m_pReplacer->getReplacementMaterial(alternateHash);
+        if (pReplacementMaterial != nullptr) {
+          matchedTier = "lightmap-permutation bridge";
+          static fast_unordered_set s_loggedBridgedMaterials;
+          if (s_loggedBridgedMaterials.insert(materialHash).second) {
+            Logger::info(str::format(
+              "[RTX-Compatibility] Lightmap-permutation bridge: materialHash=0x", std::hex, materialHash,
+              " matched replacement keyed 0x", alternateHash, std::dec,
+              " (authored under a simpler lightmap permutation)."));
+          }
+          break;
+        }
+      }
+    }
+
+    if (pReplacementMaterial == nullptr &&
+        textureSetShaderHash != kEmptyHash && textureSetShaderHash != materialHash) {
+      pReplacementMaterial = m_pReplacer->getReplacementMaterial(textureSetShaderHash);
+      matchedTier = "textureSet+shader";
+    }
+
+    if (pReplacementMaterial == nullptr &&
+        textureHash != kEmptyHash && textureHash != materialHash && textureHash != textureSetShaderHash) {
+      pReplacementMaterial = m_pReplacer->getReplacementMaterial(textureHash);
+      matchedTier = "texture";
+    }
+
     if (pReplacementMaterial != nullptr) {
+      if (Logger::logLevel() <= LogLevel::Debug && materialHash != textureHash) {
+        static fast_unordered_set s_loggedReplacementTierMaterials;
+        if (s_loggedReplacementTierMaterials.insert(materialHash).second) {
+          Logger::debug(str::format(
+            "[RTX-Compatibility] Replacement matched at tier '", matchedTier,
+            "' for materialHash=0x", std::hex, materialHash,
+            " (textureSetShader=0x", textureSetShaderHash, ", texture=0x", textureHash, ")", std::dec));
+        }
+      }
+
       // Make a copy - dont modify the replacement data.
       MaterialData renderMaterialData = *pReplacementMaterial;
       // merge in the input material from game
@@ -1205,6 +1295,11 @@ namespace dxvk {
       {
         XXH64_hash_t h;
         h = drawCallState.getMaterialData().getColorTexture().getImageHash();
+        // Texture-less (constant-color) materials have no albedo texture; fall back to
+        // the material hash so clicking the surface resolves to its texture-UI entry.
+        if (h == kEmptyHash) {
+          h = drawCallState.getMaterialData().getHash();
+        }
         if (h != kEmptyHash) {
           meta.legacyTextureHash = h;
         }

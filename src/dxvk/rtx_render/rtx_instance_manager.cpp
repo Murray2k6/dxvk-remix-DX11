@@ -34,6 +34,7 @@
 #include "rtx_terrain_baker.h"
 
 #include "../d3d11/d3d11_state.h"
+#include "../dxvk_format.h"
 #include "rtx_matrix_helpers.h"
 #include "dxvk_scoped_annotation.h"
 
@@ -60,6 +61,24 @@ namespace dxvk {
     // (x cross y) through the series of transformations
     Vector3 x(m[0].data), y(m[1].data), z(m[2].data);
     return dot(cross(x, y), z) < 0;
+  }
+
+  static bool isTextureRefSrgb(const TextureRef& textureRef) {
+    auto formatIsSrgb = [](VkFormat format) {
+      const DxvkFormatInfo* formatInfo = imageFormatInfo(format);
+      return formatInfo != nullptr && formatInfo->flags.test(DxvkFormatFlag::ColorSpaceSrgb);
+    };
+
+    if (const DxvkImageView* imageView = textureRef.getImageView()) {
+      return formatIsSrgb(imageView->info().format);
+    }
+
+    const Rc<ManagedTexture>& managedTexture = textureRef.getManagedTexture();
+    if (managedTexture != nullptr) {
+      return formatIsSrgb(managedTexture->imageCreateInfo().format);
+    }
+
+    return false;
   }
 
   static uint32_t determineInstanceFlags(const DrawCallState& drawCall, const RtSurface& surface) {
@@ -151,7 +170,10 @@ namespace dxvk {
   namespace {
     template<int RtInstanceSize> struct CheckRtInstanceSize {
       // The second line of the build error should contain the new size of RtInstance in the template argument, i.e. `dxvk::CheckRtInstanceSize<newSize>`
-      static_assert(RtInstanceSize == 768, "RtInstance size has changed.  Fix the copy constructor above this message, then update the expected size.");
+      // 768 -> 784: RtSurface's fixed-function texture-stage fields (six 1-byte
+      // enums plus a packed 4-byte texture factor) were replaced by two source
+      // enums, two modulate flags, and a float4 blend constant.
+      static_assert(RtInstanceSize == 784, "RtInstance size has changed.  Fix the copy constructor above this message, then update the expected size.");
     };
     CheckRtInstanceSize<sizeof(RtInstance)> _rtInstanceSizeTest;
   }
@@ -806,18 +828,12 @@ namespace dxvk {
       }
     }
 
-    // Special case for the player model eyes in Portal:
-    // They are rendered with blending enabled but 1.0 is added to alpha from the texture.
-    // Detect this case here and turn such geometry into non-alpha-blended, otherwise
-    // the eyes end up in the unordered TLAS and are not rendered correctly.
-    const auto& drawMaterialData = drawCall.getMaterialData();
-    if (blendEnabled && blendType == BlendType::kAlpha && !invertedBlend &&
-        drawMaterialData.textureAlphaOperation == DxvkRtTextureOperation::Add &&
-        drawMaterialData.textureAlphaArg1Source == RtTextureArgSource::Texture &&
-        drawMaterialData.textureAlphaArg2Source == RtTextureArgSource::TFactor &&
-        (drawMaterialData.tFactor >> 24) == 0xff) {
-      blendEnabled = false;
-    }
+    // A fixed-function-era special case used to sit here: it recognised alpha
+    // built as Add(Texture, TFactor) with an opaque factor and forced such draws
+    // out of the alpha-blended path. That pattern could only be produced by the
+    // D3D11 texture-stage combiner; the DX11 capture layer resolves alpha to a
+    // single source (see D3D11ColorSource) and never emits an additive
+    // two-argument alpha, so the test could never fire here.
 
     if (blendEnabled) {
       out.blendType = blendType;
@@ -1043,19 +1059,37 @@ namespace dxvk {
         // Surface meta data
         currentInstance.surface.isEmissive = false;
         currentInstance.surface.isMatte = false;
-        currentInstance.surface.textureColorArg1Source = drawCall.getMaterialData().textureColorArg1Source;
-        currentInstance.surface.textureColorArg2Source = drawCall.getMaterialData().textureColorArg2Source;
-        currentInstance.surface.textureColorOperation = drawCall.getMaterialData().textureColorOperation;
-        currentInstance.surface.textureAlphaArg1Source = drawCall.getMaterialData().textureAlphaArg1Source;
-        currentInstance.surface.textureAlphaArg2Source = drawCall.getMaterialData().textureAlphaArg2Source;
-        currentInstance.surface.textureAlphaOperation = drawCall.getMaterialData().textureAlphaOperation;
+        currentInstance.surface.colorSource = drawCall.getMaterialData().colorSource;
+        currentInstance.surface.alphaSource = drawCall.getMaterialData().alphaSource;
+        currentInstance.surface.modulateVertexColor = drawCall.getMaterialData().modulateVertexColor;
+        currentInstance.surface.modulateVertexAlpha = drawCall.getMaterialData().modulateVertexAlpha;
         currentInstance.surface.texgenMode = drawCall.getTransformData().texgenMode; // NOTE: Make it material data...
-        currentInstance.surface.tFactor = drawCall.getMaterialData().tFactor;
+        currentInstance.surface.blendConstant = drawCall.getMaterialData().blendConstant;
         currentInstance.surface.alphaState = alphaState;
         currentInstance.surface.isAnimatedWater = currentInstance.testCategoryFlags(InstanceCategories::AnimatedWater);
         currentInstance.surface.associatedGeometryHash = drawCall.getHash(RtxOptions::geometryAssetHashRule());
         currentInstance.surface.isTextureFactorBlend = drawCall.getMaterialData().isTextureFactorBlend;
         currentInstance.surface.isVertexColorBakedLighting = drawCall.getMaterialData().isVertexColorBakedLighting;
+        bool colorTextureIsSrgb = drawCall.getMaterialData().colorTextureIsSrgb;
+        bool emissiveTextureIsSrgb = false;
+        if (materialData.getType() == MaterialDataType::Opaque) {
+          const OpaqueMaterialData& opaque = materialData.getOpaqueMaterialData();
+
+          const TextureRef& albedoTexture = opaque.getAlbedoOpacityTexture();
+          if (albedoTexture.isValid()) {
+            colorTextureIsSrgb = isTextureRefSrgb(albedoTexture);
+          }
+
+          // The shader gamma-corrects the emissive input the same way it does albedo, so an
+          // sRGB-format emissive mask would be linearized twice (once by the hardware on
+          // sample, once in-shader) and read far too dark.
+          const TextureRef& emissiveTexture = opaque.getEmissiveColorTexture();
+          if (emissiveTexture.isValid()) {
+            emissiveTextureIsSrgb = isTextureRefSrgb(emissiveTexture);
+          }
+        }
+        currentInstance.surface.colorTextureIsSrgb = colorTextureIsSrgb;
+        currentInstance.surface.emissiveTextureIsSrgb = emissiveTextureIsSrgb;
         currentInstance.surface.isMotionBlurMaskOut = currentInstance.testCategoryFlags(InstanceCategories::IgnoreMotionBlur);
         currentInstance.surface.ignoreTransparencyLayer = currentInstance.testCategoryFlags(InstanceCategories::IgnoreTransparencyLayer);
 
@@ -1296,21 +1330,59 @@ namespace dxvk {
           m_significanceKeptThisFrame = 0;
         }
 
+        // DX11_V311_SIGNIFICANCE_NEEDS_A_REAL_CAMERA: this test divides the
+        // object's world size by its distance FROM THE CAMERA. That is only a
+        // screen-size estimate if camPos is actually where the player is. When
+        // the camera has not been resolved for this frame, getPosition() returns
+        // whatever the last-known (or default, i.e. the world ORIGIN) pose was,
+        // and the ratio becomes "size / distance from the world origin". In a
+        // large worldspace that denominator is enormous for every object, so
+        // essentially the whole scene falls under the threshold, gets hidden,
+        // takes mask = 0 below, and produces NO surface - the path tracer then
+        // has nothing to intersect and the frame resolves to a flat wash.
+        //
+        // Culling is an optimisation; it must never run on a guessed camera.
+        const RtCamera& significanceCamera = cameraManager.getMainCamera();
+        const bool significanceCameraTrustworthy =
+          significanceCamera.isValid(m_device->getCurrentFrameId());
+
         const AxisAlignedBoundingBox& obb = blas.input.getGeometryData().boundingBox;
-        if (obb.isValid()) {
+        if (obb.isValid() && significanceCameraTrustworthy) {
           const Vector3 ext = obb.maxPos - obb.minPos;
           const float objDiag = std::sqrt(ext.x * ext.x + ext.y * ext.y + ext.z * ext.z);
           const Matrix4& o2w = currentInstance.surface.objectToWorld;
           auto axisLen = [](const Vector4& v) { return std::sqrt(v.x * v.x + v.y * v.y + v.z * v.z); };
           const float scale = std::max(axisLen(o2w[0]), std::max(axisLen(o2w[1]), axisLen(o2w[2])));
           const float worldSize = objDiag * scale;
-          const Vector3 camPos = cameraManager.getMainCamera().getPosition(false);
+          const Vector3 camPos = significanceCamera.getPosition(false);
           const Vector3 d = Vector3(o2w[3].x, o2w[3].y, o2w[3].z) - camPos;
           const float dist = std::sqrt(d.x * d.x + d.y * d.y + d.z * d.z);
           if (worldSize > 0.0f && dist > 0.0f &&
               (worldSize / dist) < RtxOptions::significanceCullingMinScreenFraction()) {
             currentInstance.m_isHidden = true;
+            ++m_significanceCulledThisFrame;
           }
+        }
+
+        // The decisive fact nobody has logged yet: where the culler thinks the
+        // camera is, and how much of the scene it removed. If camPos is the world
+        // origin while the player is somewhere else, that is the bug; if it is a
+        // real position and culled is 0, significance culling is exonerated.
+        if (m_significanceFrameId != m_significanceReportedFrameId) {
+          m_significanceReportedFrameId = m_significanceFrameId;
+          static uint32_t s_significanceReportCount = 0;
+          if (s_significanceReportCount < 24u) {
+            ++s_significanceReportCount;
+            const Vector3 reportedCamPos = significanceCamera.getPosition(false);
+            // m_significanceCulledThisFrame still holds the PREVIOUS frame's
+            // total at this point; it is reset just below.
+            Logger::info(str::format(
+              "[RTX][significance] camPos=[", reportedCamPos.x, ",", reportedCamPos.y, ",",
+              reportedCamPos.z, "] cameraValid=", significanceCameraTrustworthy ? 1 : 0,
+              " culledPrevFrame=", m_significanceCulledThisFrame,
+              " minScreenFraction=", RtxOptions::significanceCullingMinScreenFraction()));
+          }
+          m_significanceCulledThisFrame = 0;
         }
 
         // Hard per-frame instance cap (default 100000 => inert). Kept instances count up.

@@ -729,6 +729,26 @@ bool EnsureServer() {
     return false;
   }
 
+  // DX11_V319_LAUNCH_FAILURE_IS_VISIBLE: Process does NOT throw when
+  // CreateProcess fails - it just stores INVALID_HANDLE_VALUE - so the catch
+  // above can never fire, and a launcher that never started was indistinguishable
+  // from one that did. The client went on to wait out the full handle-duplication
+  // timeout and then reported "launcher did not provide a real game handle
+  // duplicated into NvRemixBridge.exe", blaming the handshake for a process that
+  // was never created. Field signature (Saints Row the Third): no
+  // NvRemixLauncher32.log, no .trex\dx11_bridge_server_pid.txt, ~9s stall, then
+  // that error. Ask the object whether the launch actually happened.
+  if (gpServer == nullptr || !gpServer->isValid()) {
+    LogLine("bridge",
+      "DX11_V319 ERROR: NvRemixLauncher32.exe did not start - CreateProcess failed, so the .trex "
+      "bridge server was never launched and Remix cannot load. The preceding 'CreateProcess FAILED' "
+      "line carries the error code and the exact command line; check that NvRemixLauncher32.exe sits "
+      "beside the game executable and is not blocked by security software.");
+    delete gpServer;
+    gpServer = nullptr;
+    return false;
+  }
+
   BridgeState::setServerState(BridgeState::ProcessState::Init);
   LogLine("bridge", "Sending Bridge_Syn and waiting for Bridge_Ack from .trex x64 server on DeviceBridge using DX11 DLL->Launcher->.trex Bridge_Ack sequence. DX11_V219_USE_DX11_BRIDGE_ACK_SEQUENCE");
   uintptr_t realClientHandleForServerV219 = WaitForLauncherDuplicatedClientHandleV219(gRemixFolder);

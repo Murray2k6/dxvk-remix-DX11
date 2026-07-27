@@ -114,12 +114,15 @@ struct DistantLight {
 struct Material {
   std::string matName;
   std::string albedoTexPath;
+  // Texture-less (constant-color) materials export their color instead of a texture.
+  bool         hasAlbedoConstant = false;
+  pxr::GfVec3f albedoConstant{ 1.f, 1.f, 1.f };
   bool        enableOpacity = false;
   struct Sampler {
-    VkSamplerAddressMode addrModeU;
-    VkSamplerAddressMode addrModeV;
-    VkFilter             filter;
-    VkClearColorValue    borderColor;
+    VkSamplerAddressMode addrModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+    VkSamplerAddressMode addrModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+    VkFilter             filter = VK_FILTER_LINEAR;
+    VkClearColorValue    borderColor = {};
   } sampler;
   // TODO: std::string normalTexPath;
   // TODO: etc...
@@ -158,13 +161,13 @@ struct RenderingMetaData {
   uint32_t dstAlphaBlendFactor;
   uint32_t alphaBlendOp;
   uint32_t writeMask;
-  uint32_t textureColorArg1Source;
-  uint32_t textureColorArg2Source;
-  uint32_t textureColorOperation;
-  uint32_t textureAlphaArg1Source;
-  uint32_t textureAlphaArg2Source;
-  uint32_t textureAlphaOperation;
-  uint32_t tFactor;
+  // Where the surface's colour and alpha came from, matching D3D11ColorSource.
+  uint32_t colorSource;
+  uint32_t alphaSource;
+  bool     modulateVertexColor;
+  bool     modulateVertexAlpha;
+  // The D3D11 blend factor, exported as real floats.
+  float    blendConstant[4];
   bool isTextureFactorBlend;
   bool isVertexColorBakedLighting;
 };

@@ -23,6 +23,7 @@
 
 #include "../util/rc/util_rc_ptr.h"
 #include "rtx_types.h"
+#include "rtx/concept/surface/surface_shared.h"  // D3D11ColorSource
 #include "rtx_geometry_utils.h"
 #include "rtx_option.h"
 #include "rtx_common_object.h"
@@ -210,14 +211,17 @@ namespace dxvk {
 
     Matrix4 textureTransform = {};        // 16B alignment
 
-    RtSurface::AlphaState alphaState = {};
-    uint8_t tFactorAlpha = 0;
-    RtTextureArgSource textureColorArg1Source = RtTextureArgSource::None;
-    RtTextureArgSource textureColorArg2Source = RtTextureArgSource::None;
-    DxvkRtTextureOperation textureColorOperation = DxvkRtTextureOperation::Disable;
-    RtTextureArgSource textureAlphaArg1Source = RtTextureArgSource::None;
-    RtTextureArgSource textureAlphaArg2Source = RtTextureArgSource::None;
-    DxvkRtTextureOperation textureAlphaOperation = DxvkRtTextureOperation::Disable;
+    RtSurface::AlphaState alphaState = {};                 // 9B
+    // Explicit padding so blendConstantAlpha lands on its natural alignment and
+    // this block stays exactly 16 bytes; the struct size is asserted below.
+    uint8_t pad8_0 = 0;                                    // 1B
+    // Quantized to the same 10 bits the surface carries, so the cache key changes
+    // exactly when the baked opacity would.
+    uint16_t blendConstantAlpha = 0;                       // 2B
+    D3D11ColorSource colorSource = D3D11ColorSource::Texture; // 1B
+    D3D11ColorSource alphaSource = D3D11ColorSource::Texture; // 1B
+    bool modulateVertexColor = false;                      // 1B
+    bool modulateVertexAlpha = false;                      // 1B
 
     XXH64_hash_t materialHash = kEmptyHash;
     XXH64_hash_t texCoordHash = kEmptyHash;

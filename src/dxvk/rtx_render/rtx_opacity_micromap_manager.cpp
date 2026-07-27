@@ -248,7 +248,20 @@ namespace dxvk {
       bufferCreateInfo.access = VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR | VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR;
       bufferCreateInfo.stages = VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR;
       bufferCreateInfo.usage = VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR;
-      m_scratchBuffer = device()->createBuffer(bufferCreateInfo, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, DxvkMemoryStats::Category::RTXAccelerationStructure, "OMM Scratch");
+      // Assigning the result directly would destroy a perfectly good existing
+      // buffer when a grow fails, turning a transient shortage into a permanent
+      // null. Micromap builds reference this by DEVICE ADDRESS, so a null here
+      // is not a skipped build - it is a GPU write to address 0.
+      Rc<DxvkBuffer> grownScratch = device()->createBuffer(bufferCreateInfo, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, DxvkMemoryStats::Category::RTXAccelerationStructure, "OMM Scratch");
+
+      if (grownScratch == nullptr) {
+        ONCE(Logger::err(str::format(
+          "OpacityMicromapManager: scratch allocation of ", requiredScratchAllocSize,
+          " bytes failed; keeping the previous buffer rather than binding a null scratch address.")));
+        return nullptr;
+      }
+
+      m_scratchBuffer = std::move(grownScratch);
     }
 
     return m_scratchBuffer;
@@ -282,13 +295,14 @@ namespace dxvk {
     {
       hashSourceData.materialHash = instance.getMaterialHash();
       hashSourceData.alphaState = instance.surface.alphaState;
-      hashSourceData.textureColorArg1Source = instance.surface.textureColorArg1Source;
-      hashSourceData.textureColorArg2Source = instance.surface.textureColorArg2Source;
-      hashSourceData.textureColorOperation = instance.surface.textureColorOperation;
-      hashSourceData.textureAlphaArg1Source = instance.surface.textureAlphaArg1Source;
-      hashSourceData.textureAlphaArg2Source = instance.surface.textureAlphaArg2Source;
-      hashSourceData.textureAlphaOperation = instance.surface.textureAlphaOperation;
-      hashSourceData.tFactorAlpha = instance.surface.tFactor >> 24;
+      hashSourceData.colorSource = instance.surface.colorSource;
+      hashSourceData.alphaSource = instance.surface.alphaSource;
+      hashSourceData.modulateVertexColor = instance.surface.modulateVertexColor;
+      hashSourceData.modulateVertexAlpha = instance.surface.modulateVertexAlpha;
+      // Quantized to the same 10 bits the surface carries, so the key changes
+      // exactly when the baked opacity would.
+      hashSourceData.blendConstantAlpha = static_cast<uint16_t>(
+        std::min(1.0f, std::max(0.0f, instance.surface.blendConstant.w)) * 1023.0f + 0.5f);
       hashSourceData.textureTransform = instance.surface.textureTransform;
     }
 
@@ -1068,19 +1082,13 @@ namespace dxvk {
     if (useOpacityMicromap) {
       // ToDo: cover all cases to avoid OMM generation unnecessarily
       if (alphaState.alphaTestType == AlphaTestType::kAlways && alphaState.blendType == BlendType::kAlpha) {
-        float tFactorAlpha = ((surface.tFactor >> 24) & 0xff) / 255.f;
-        switch (surface.textureAlphaOperation) {
-        case DxvkRtTextureOperation::SelectArg1:
-          if (surface.textureAlphaArg1Source == RtTextureArgSource::TFactor)
-            useOpacityMicromap &= tFactorAlpha > RtxOptions::resolveTransparencyThreshold();
-          break;
-        case DxvkRtTextureOperation::SelectArg2:
-          if (surface.textureAlphaArg2Source == RtTextureArgSource::TFactor)
-            useOpacityMicromap &= tFactorAlpha > RtxOptions::resolveTransparencyThreshold();
-          break;
-        default:
-          // This code currently only optimizes a couple of common cases.
-          break;
+        // When alpha comes wholly from the blend constant, the surface's opacity
+        // is known up front: skip building a micromap for something that resolves
+        // to fully transparent. Alpha sourced from the texture or vertex colour
+        // varies per texel, so it still needs the bake.
+        if (surface.alphaSource == D3D11ColorSource::BlendConstant) {
+          useOpacityMicromap &=
+            surface.blendConstant.w > RtxOptions::resolveTransparencyThreshold();
         }
       }
     }
@@ -2107,7 +2115,18 @@ namespace dxvk {
       assert(ommBuildInfo.data.deviceAddress % 256 == 0);
       ommBuildInfo.triangleArray.deviceAddress = triangleArrayBuffer->getDeviceAddress();
       assert(ommBuildInfo.triangleArray.deviceAddress % 256 == 0);
-      ommBuildInfo.scratchData.deviceAddress = getScratchMemory(align(m_scratchMemoryUsedThisFrame + requiredScratchAllocSize, scratchAlignment))->getDeviceAddress() + m_scratchMemoryUsedThisFrame;
+      // Null means the grow failed. Reject the bake rather than dereference it
+      // or hand the build a zero scratch base, which would write at gpuVA 0.
+      const Rc<DxvkBuffer> ommScratch =
+        getScratchMemory(align(m_scratchMemoryUsedThisFrame + requiredScratchAllocSize, scratchAlignment));
+
+      if (ommScratch == nullptr) {
+        ONCE(Logger::err(
+          "OpacityMicromapManager: skipping micromap build - no scratch memory."));
+        return OmmResult::OutOfMemory;
+      }
+
+      ommBuildInfo.scratchData.deviceAddress = ommScratch->getDeviceAddress() + m_scratchMemoryUsedThisFrame;
       assert(ommBuildInfo.scratchData.deviceAddress % scratchAlignment == 0);
       m_scratchMemoryUsedThisFrame += requiredScratchAllocSize;
       ommBuildInfo.triangleArrayStride = sizeof(VkMicromapTriangleEXT);

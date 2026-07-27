@@ -50,6 +50,37 @@ namespace dxvk {
     RTX_OPTION("rtx", float, integerTexcoordScale, 1.0f / 2048.0f, "Scale applied when decoding fixed-point integer (SINT/UINT) texcoord vertex formats to floating point UVs. Engines that store UVs as 16-bit integers use an engine-specific divisor; 1/2048 fits common fixed-point conventions (Saints Row IV: TEXCOORD0 = R16G16_SINT). Adjust per game in rtx.conf if textures tile incorrectly.");
     RTX_OPTION("rtx", float, fallbackCameraFovDegrees, 60.0f, "Vertical field of view (degrees) of the synthesized fallback camera used when no projection matrix is found in any constant buffer. Tune per game in rtx.conf when the traced image looks zoomed relative to the raster view. Clamped to [20, 140].");
 
+    RTX_OPTION("rtx.d3d11", int, csChunkFlushesPerFrame, 8,
+               "How many times per frame the capture layer hands recorded work to the command-stream thread, so the GPU can start on a batch while the CPU is still recording the rest of the frame.\n"
+               "The flush interval is derived each frame from the previous frame's draw volume to hit this count, clamped to a sane range. The old behaviour was a fixed 512-draw interval, which meant any title submitting fewer than 512 draws per frame never flushed mid-frame at all - the GPU idled through recording and then received the whole frame at once, which reads as stutter in scenes that should be cheap.\n"
+               "Raise it for smoother pacing on light frames at the cost of more submissions; lower it if a title is submission-bound. Set to 0 to restore the old fixed-interval behaviour.");
+
+    RTX_OPTION("rtx.d3d11", bool, conservativeOcclusionQueries, false,
+               "Answer the game's occlusion queries as 'visible' immediately instead of reporting what the rasterized scene actually measured.\n"
+               "When Remix path traces, the draws a game brackets in an occlusion query are captured rather than rasterized, so the query's scope measures nothing and returns zero samples. The game reads that as 'fully occluded' and culls the object, which removes it from the ray-traced scene too - typically as flicker, popping, or geometry that vanishes when the camera moves.\n"
+               "Answering conservatively keeps that geometry alive. It also removes the readback stall: games spin on GetData waiting for a GPU result that is meaningless here, and each poll is a synchronous round trip (especially costly for 32-bit titles going through the bridge).\n"
+               "Enable for games that lose geometry or flicker under path tracing. Leave off if the title still relies on real occlusion results for gameplay-visible logic, since every query will report visible.");
+    RTX_OPTION("rtx.d3d11", bool, respectPredicatedDraws, false,
+               "Implement D3D11 predication instead of ignoring it.\n"
+               "Games call SetPredication with an occlusion predicate to drop work for geometry an earlier query proved invisible. This runtime previously recorded the predicate and did nothing with it, so every predicated draw and dispatch executed anyway and the capture layer submitted it - adding ray-traced instances, BLAS builds and raster work for objects the game had already determined the player cannot see.\n"
+               "Enabling this honours the predicate across all draw and dispatch entry points, skipping the raster command and the RTX capture together so the two can never disagree.\n"
+               "The predicate is read without blocking, and only a resolved result can skip work: an unresolved predicate always executes. That is the direction D3D11 permits implementations to be conservative in, so geometry is never lost to a late readback.\n"
+               "Note that copies, clears and resolves remain unpredicated - executing them is always spec-legal and they are not a meaningful cost here.\n"
+               "Do not combine with rtx.d3d11.conservativeOcclusionQueries: that option forces every predicate to report visible, which makes this one a no-op.");
+    RTX_OPTION("rtx.d3d11", bool, logOcclusionQueries, false,
+               "Log a one-time summary the first time an occlusion query is answered conservatively, and count how often the game polls a still-pending occlusion readback. Use to confirm whether a title's missing geometry is occlusion-query driven.");
+
+    RTX_OPTION("rtx.d3d11", bool, materialInstanceIdentity, false,
+               "Identify a material by the pixel shader that renders it plus the full set of textures bound to the slots that shader declares, instead of by its primary albedo texture alone.\n"
+               "Engines that build many material instances from one shader (varying only which textures/parameters are bound) otherwise collapse into a single hash, so tagging or replacing one of them hits all of them.\n"
+               "With this enabled such instances get distinct hashes, and the replacement lookup falls back through shader+texture-set and then plain texture hashes, so existing texture-keyed replacements keep working.\n"
+               "Requires shaders to retain their DXBC reflection (RDEF) chunk; draws whose shaders were compiled with reflection stripped fall back to texture-hash identity automatically.\n"
+               "Off by default because it changes material hashes: captures and replacements authored before enabling it are keyed by the old hashes.");
+    RTX_OPTION("rtx.d3d11", fast_unordered_set, materialInstanceIdentityExcludedShaders, {},
+               "Bytecode hashes of pixel shaders that must not participate in rtx.d3d11.materialInstanceIdentity.\n"
+               "Use for uber-shaders whose bound texture set varies frame to frame (dynamic atlases, streaming feedback), where including it in the identity would mint a new material hash every frame.\n"
+               "Excluded shaders fall back to primary-texture identity.");
+
     void Initialize();
     bool OnDrawAuto();
     bool OnDraw(UINT vertexCount, UINT startVertex);
@@ -81,6 +112,42 @@ namespace dxvk {
     std::unique_ptr<GeometryProcessor>   m_pGeometryWorkers;
     uint32_t                             m_drawCallID = 0;
 
+    // DX11_V301_PERF_LOG: CPU cost of the draw-submission path, accumulated per
+    // frame. The raytracing passes already time themselves and come in around a
+    // couple of milliseconds, so when frames are slow the time is being spent
+    // here - this attributes it to a specific draw rather than a whole frame.
+    uint64_t                             m_frameDrawCpuNs = 0;
+    uint64_t                             m_frameSlowestDrawNs = 0;
+    // DX11_V312_PHASE_TIMERS: per-frame wall time inside the three candidate
+    // blockers, to locate the fixed ~96ms stall that one draw absorbs each
+    // frame. mutable because FillMaterialData is const.
+    mutable uint64_t                     m_framePhaseExtractNs = 0;
+    mutable uint64_t                     m_framePhaseMaterialNs = 0;
+    mutable uint64_t                     m_framePhaseHelperNs = 0;
+    uint32_t                             m_frameSlowestDrawId = 0;
+    uint32_t                             m_frameSlowestDrawIndices = 0;
+    XXH64_hash_t                         m_frameSlowestDrawHash = kEmptyHash;
+    uint32_t                             m_frameTimedDraws = 0;
+    // DX11_V319_PERF_LOG_THROTTLE: opening-burst counter, last reported frame
+    // and the worst cost reported so far, so a permanently slow game samples
+    // the probe periodically instead of writing one warning per frame.
+    // DX11_V319_DEFERRED_LIGHT_VOLUMES: lights created from light-volume draws
+    // this frame, bounded by rtx.dx11.deferredLightVolumeMaxPerFrame.
+    uint32_t                             m_deferredLightVolumesThisFrame = 0;
+    // DX11_V319_LIGHT_VOLUMES_SELF_ARM: evidence that this game lights deferred,
+    // gathered from the draws themselves so no engine has to be recognised.
+    uint32_t                             m_deferredLightVolumeCandidatesThisFrame = 0;
+    uint32_t                             m_deferredLightVolumeArmingFrames = 0;
+    bool                                 m_deferredLightVolumeAutoArmed = false;
+    // DX11_V319_WORLD_SCAN_GIVE_UP: consecutive draws in which the world-matrix
+    // search found nothing, per vertex shader. Keyed by shader because that is
+    // what the answer is a property of - a different shader re-arms the search,
+    // so this can never mismatch the way a cached location would.
+    std::unordered_map<const void*, uint32_t> m_worldScanMissesByShader;
+    uint32_t                             m_drawPerfLogCount = 0;
+    uint32_t                             m_drawPerfLogLastFrame = ~0u;
+    double                               m_drawPerfLogWorstMs = 0.0;
+
     // Cached projection cbuffer location — found on first draw with a perspective
     // matrix and reused for the rest of the frame. Reset to invalid in EndFrame.
     uint32_t                             m_projSlot   = UINT32_MAX;
@@ -109,6 +176,15 @@ namespace dxvk {
     bool                                 m_viewCameraRelative = false;
     // The confirmed location stores camera-to-world; invert on each re-read.
     bool                                 m_viewInverted = false;
+
+    // DX11_V309_CAMERA_RESOLVER (shadow mode, step 1 of the camera replacement).
+    // TryCapturePositionsViaStreamOut and SubmitDraw are separate functions, so
+    // the capture path's two pieces of evidence have to be carried across to the
+    // accept site where the comparison is made. These are READ-ONLY inputs to
+    // the shadow log and must never influence rendering - the whole point of
+    // step 1 is that behaviour is unchanged while the two opinions are compared.
+    bool                                 m_shadowCapturedPostTransform = false;
+    bool                                 m_shadowCaptureWorldAnchored = false;
     // Throttles late-session confirmation attempts to once per frame.
     uint32_t                             m_lastViewConfirmFrame = UINT32_MAX;
 
@@ -152,7 +228,21 @@ namespace dxvk {
     // from queuing unbounded work while the GPU is still on a prior batch.
     // Without this, frame latency spikes and memory pressure builds from
     // thousands of buffered DrawCallState objects.
-    static constexpr uint32_t kDrawsPerFlush = 512;
+    //
+    // A fixed interval cannot serve both ends of the range. At 512 a title that
+    // submits fewer than 512 draws per frame never flushes mid-frame at all: the
+    // entire frame accumulates in one chunk and is handed over at end-of-frame,
+    // so the GPU sits idle while the CPU records and is then handed the whole
+    // backlog at once. That is the case that "should be fast but isn't" - light
+    // and mid-weight frames get the worst overlap. The interval is therefore
+    // derived per frame from the previous frame's draw volume (see
+    // ResetCommandListState) and only clamped by these bounds.
+    static constexpr uint32_t kMinDrawsPerFlush = 32;
+    static constexpr uint32_t kMaxDrawsPerFlush = 512;
+    // Used until a frame's draw volume has been observed. Deliberately far below
+    // kMaxDrawsPerFlush so the first frames of a level load overlap too.
+    static constexpr uint32_t kInitialDrawsPerFlush = 128;
+    uint32_t                             m_drawsPerFlush = kInitialDrawsPerFlush;
     // Bound per-draw frontend analysis so large meshes do not dominate DX11
     // CPU time when a real scene first appears.
     static constexpr uint32_t kMaxHashedVertices = 1024;
@@ -199,6 +289,9 @@ namespace dxvk {
       uint32_t noIndexBuffer = 0;
       uint32_t compositeSkip = 0;
       uint32_t screenSpaceUiSkip = 0;
+      // DX11_V314: meshes dropped because they collapsed onto the viewpoint
+      // (enclose the eye AND both object and camera translations are zero).
+      uint32_t collapsedEyeGeometry = 0;
       uint32_t screenSpaceGarbageSkip = 0;
       uint32_t geometryHashScheduleFailed = 0;
       uint32_t forceInjectionIdle = 0;
@@ -403,11 +496,59 @@ namespace dxvk {
       Matrix4        capturedClipToPosition;
       bool           hasCapturedClipToPosition = false;
       bool           capturedClipUsesWDepth = false;
+      // DX11_V319_WORLD_ANCHOR_CAMERA: everything needed to turn the bytes
+      // sitting in this buffer back into camera-relative world offsets one
+      // frame after they were written. Stored with the buffer rather than read
+      // live because a capture's bytes belong to the view that produced them,
+      // not to whichever view happens to be current when they are sampled.
+      Matrix4        capturedViewRotationToWorld;
+      bool           hasCapturedViewRotationToWorld = false;
+      uint32_t       capturedVertexCount = 0;
+      uint32_t       capturedStride = 0;
     };
     std::unordered_map<uint64_t, PositionCaptureEntry> m_positionCaptureCache;
     std::unordered_map<uint64_t, uint32_t> m_positionCaptureOccurrencesThisFrame;
     VkDeviceSize m_positionCaptureCacheBytes = 0;
     void SweepPositionCaptureCache(uint32_t currentFrame);
+
+    // DX11_V319_WORLD_ANCHOR_CAMERA: bounded, stall-free readback of a few
+    // vertices per mesh out of the post-VS capture buffers, feeding the
+    // camera-position solve for engines that render camera-relative.
+    //
+    // Those capture buffers are DEVICE_LOCAL and cannot be mapped at all, so
+    // the samples are copied into a small host-visible buffer by copyBuffer on
+    // the CS thread and read one frame later, when the copy has certainly
+    // retired. Two buffers ping-pong so the batch being read is never the batch
+    // being written. Reading the CURRENT frame's copies instead would mean
+    // blocking the render thread on the GPU - the ~100ms round trip the capture
+    // path already goes out of its way to avoid (DX11_V303).
+    //
+    // The resulting camera position therefore lags the game by two frames. That
+    // is deliberately not compensated: the camera and the geometry are anchored
+    // with the SAME position, so a constant lag is a constant offset of the
+    // whole scene, which is invisible. Only acceleration leaves a residual, and
+    // the next frame's solve absorbs it.
+    static constexpr uint32_t kCameraAnchorSampleVertices  = 4u;
+    static constexpr uint32_t kCameraAnchorSampleSlotBytes = 128u;
+    static constexpr uint32_t kCameraAnchorMaxSampleMeshes = 48u;
+    static constexpr float    kCameraAnchorMaxTranslationPerFrame = 2000.0f;
+    struct CameraAnchorSampleRequest {
+      uint64_t meshKey = 0;
+      Matrix4  viewRotationToWorld;
+      Matrix4  clipToPosition;
+      bool     clipUsesWDepth = false;
+      uint32_t vertexCount = 0;
+      uint32_t stride = 0;
+    };
+    Rc<DxvkBuffer>                         m_cameraAnchorStaging[2];
+    std::vector<CameraAnchorSampleRequest> m_cameraAnchorRequests[2];
+    uint32_t                               m_cameraAnchorWriteIndex = 0;
+    uint32_t                               m_cameraAnchorLastConsumedFrame = ~0u;
+    // Set per draw by ExtractTransforms: the game supplied a real view matrix
+    // whose translation is exactly zero, i.e. it renders camera-relative.
+    bool                                   m_cameraAnchorViewTranslationFree = false;
+    void QueueCameraAnchorSample(const PositionCaptureEntry& entry, uint64_t meshKey);
+    void ConsumeCameraAnchorSamples();
 
     // DX11_V285_HELPER_BUFFER_POOL: host-visible helper buffers (dynamic
     // vertex/index snapshots, format-conversion outputs, skinning streams)
@@ -427,6 +568,10 @@ namespace dxvk {
     std::vector<HelperPoolItem> m_helperRetired;
     std::vector<HelperPoolItem> m_helperFree;
     VkDeviceSize m_helperPoolBytes = 0;
+    // DX11_V298_BOUNDED_HELPER_OVERFLOW: per-frame budget for allocations past
+    // the pool cap; once exhausted, acquisitions fail instead of growing VRAM.
+    VkDeviceSize m_helperUnpooledBytesThisFrame = 0;
+    uint32_t m_helperUnpooledFrame = ~0u;
     Rc<DxvkBuffer> AcquireHostVisibleHelperBuffer(VkDeviceSize size, const char* name);
     void RecycleHelperBuffers();
 

@@ -23,6 +23,9 @@
 #include <algorithm>
 #include <optional>
 
+// Add your perf_debug header here! (Fix the path if it's in a different folder)
+#include "perf_debug.h" 
+
 namespace RemixGui {
 
   constexpr float kFixedTooltipWidth = 540; // so the text doesn't spread too wide
@@ -284,4 +287,33 @@ namespace RemixGui {
 
     return value_changed;
   }
+
+  // =========================================================
+  // Performance Debug Menu Implementation
+  // =========================================================
+  void DrawPerformanceDebugMenu() {
+    if (ImGui::CollapsingHeader("Performance Debug")) {
+      if (ImGui::Checkbox("Performance Debug Mode", &g_PerfDebugMode)) {
+        PerfDebug_Log(g_PerfDebugMode ? "Performance Debug Mode ENABLED" : "Performance Debug Mode DISABLED");
+      }
+
+      if (g_PerfDebugMode) {
+        ImGui::Separator();
+        
+        static const char* featureNames[] = {
+          "Disable Shadows", "Disable Reflections", "Disable PostFX", 
+          "Disable Ambient Occlusion", "Disable Volumetrics", "Disable Ray Tracing", 
+          "Disable Particles", "Disable Decals", "Disable Lighting", "Disable Fog"
+        };
+        
+        for (int i = 0; i < FEATURE_COUNT; i++) {
+          bool isDisabled = PerfDebug_IsFeatureDisabled(static_cast<PerfFeature>(i));
+          if (ImGui::Checkbox(featureNames[i], &isDisabled)) {
+            PerfDebug_SetFeatureDisabled(static_cast<PerfFeature>(i), isDisabled);
+          }
+        }
+      }
+    }
+  }
+
 }

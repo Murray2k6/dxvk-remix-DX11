@@ -29,6 +29,14 @@
 namespace dxvk {
   void fillHashVector(const std::vector<std::string>& rawInput, std::vector<XXH64_hash_t>& hashVectorOutput) {
     for (auto&& hashStr : rawInput) {
+      // Note: a leading '-' is NOT corruption. Texture hashes are unsigned 64-bit
+      // values, and one whose high bit is set round-trips through a signed
+      // serializer as a negative literal - "-0x5625FA584D0DD30C" is the two's
+      // complement spelling of 0xA9DA05A7BF22CCF4, a distinct texture from
+      // 0x5625FA584D0DD30C. std::stoull performs exactly that conversion, so
+      // both spellings resolve to the correct hash. Do not "sanitize" the sign:
+      // stripping it retags a different texture, and skipping the entry silently
+      // drops a real category assignment.
       const XXH64_hash_t h = std::stoull(hashStr, nullptr, 16);
       hashVectorOutput.emplace_back(h);
     }

@@ -71,7 +71,19 @@ namespace dxvk {
   , m_doublePrintToStdErr(getDoublePrintToStdErr())
   // NV-DXVK end
   {
-    if (m_minLevel != LogLevel::None) {
+    // DX11_V319_NO_LOG_FOR_BYPASSED_PROCESSES: this singleton is constructed at
+    // DLL load, long before anything decides whether Remix runs in this
+    // process, so a bypassed process still created and left behind an empty
+    // d3d11.<pid>.log. Games that spawn a swarm of short-lived helpers turned
+    // that into real clutter: one Yooka-Laylee session left 171 log files, 120
+    // of them empty and 49 from the Epic overlay renderer. A process that
+    // forwards straight to the system D3D11 has nothing to say, so it should
+    // not open a file to say it in.
+    //
+    // env::shouldBypassRemixForCurrentProcess() reads only environment
+    // variables and this process's own module name - no other static state -
+    // so it is safe to consult this early.
+    if (m_minLevel != LogLevel::None && !env::shouldBypassRemixForCurrentProcess()) {
       const auto path = getFilePath(fileName);
 
       if (!path.empty()) {
@@ -82,7 +94,18 @@ namespace dxvk {
   }
   
   void Logger::initRtxLog() {
+    // The singleton already owns the DLL-named log (d3d11.<pid>.log), opened when
+    // the static was constructed. Move-assigning a new Logger over it destroyed
+    // that stream, which is why the file existed but never received a byte.
+    // Carry it across so both files receive every message: the DLL-named one is
+    // what a person looks for first, and the runtime keeps its remix-dxvk log.
+    std::ofstream previousStream = std::move(s_instance.m_fileStream);
+
     s_instance = std::move(Logger("remix-dxvk.log"));
+
+    if (previousStream.is_open()) {
+      s_instance.m_secondaryFileStream = std::move(previousStream);
+    }
   }
 
   void Logger::trace(const std::string& message) {
@@ -137,8 +160,15 @@ namespace dxvk {
         }
         // NV-DXVK end
 
+        // std::endl flushes, so both files stay readable while the game is still
+        // running - a log that only lands on exit is useless for watching a live
+        // session, which is exactly when it is needed most.
         if (m_fileStream) {
           m_fileStream << timeString << prefix << line << std::endl;
+        }
+
+        if (m_secondaryFileStream) {
+          m_secondaryFileStream << timeString << prefix << line << std::endl;
         }
       }
     }

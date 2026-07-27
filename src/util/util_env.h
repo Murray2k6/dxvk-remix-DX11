@@ -407,6 +407,33 @@ namespace dxvk::env {
       lowerName[n] = '\0';
       if (std::strstr(lowerName, "launcher") != nullptr)
         return true;
+
+      // DX11_V319_OVERLAY_BYPASS: store overlays and engine helper processes
+      // ship beside the game, load the game folder's d3d11.dll, and render a
+      // small D3D11 UI of their own - so each one spun up a COMPLETE Remix
+      // runtime: its own Vulkan device, RTX initializer, shader prewarm and
+      // log file. Saints Row IV (Epic) starts the EOS overlay renderer over and
+      // over: one session produced 33 d3d11 logs, 31 of them from
+      // EOSOverlayRenderer-Win64-Shipping.exe, each holding a full Remix device
+      // and its allocations for as long as it lived. None of them draws
+      // anything the player sees ray traced.
+      //
+      // Matching on the helper ROLE rather than on one title's executable keeps
+      // this general: every Epic/EOS overlay renderer, Unreal's CEF browser
+      // subprocess and any crash reporter are handled by the same rule. As with
+      // the launcher rule above, DXVK_REMIX_FORCE_CURRENT_PROCESS=1 opts a
+      // process back in.
+      static const char* const kHelperProcessMarkers[] = {
+        "eosoverlay",           // Epic Online Services overlay renderer
+        "overlayrenderer",      // its generic name, and other stores' equivalents
+        "unrealcefsubprocess",  // Unreal's embedded browser helper
+        "crashreport",          // CrashReportClient.exe and friends
+        "webhelper",            // store web UI helpers
+      };
+      for (const char* marker : kHelperProcessMarkers) {
+        if (std::strstr(lowerName, marker) != nullptr)
+          return true;
+      }
     }
 
     return false;

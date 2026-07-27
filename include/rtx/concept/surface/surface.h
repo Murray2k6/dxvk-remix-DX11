@@ -30,6 +30,7 @@
 
 #include "surface_shared.h"
 #include "rtx/utility/packing.slangh"
+#include "rtx/utility/blend_constant_packing.h"
 
 struct Surface
 {
@@ -305,6 +306,18 @@ struct Surface
     set { data0b.z = newValue ? packedFlagSet(data0b.z, 1 << 1) : packedFlagUnset(data0b.z, 1 << 1); }
   }
 
+  property bool colorTextureIsSrgb
+  {
+    get { return packedFlagGet(data0b.z, 1 << 2); }
+    set { data0b.z = newValue ? packedFlagSet(data0b.z, 1 << 2) : packedFlagUnset(data0b.z, 1 << 2); }
+  }
+
+  property bool emissiveTextureIsSrgb
+  {
+    get { return packedFlagGet(data0b.z, 1 << 3); }
+    set { data0b.z = newValue ? packedFlagSet(data0b.z, 1 << 3) : packedFlagUnset(data0b.z, 1 << 3); }
+  }
+
   property uint16_t hashPacked
   {
     get { return data0b.w; }
@@ -416,40 +429,32 @@ struct Surface
     set { data2.w = (data2.w & ~(surfaceBlendTypeMask << 14)) | (uint32_t(newValue & surfaceBlendTypeMask) << 14); }
   }
 
-  property uint8_t textureColorArg1Source
+  // Bit layout matches RtSurface::writeGPUData: colour source at 0-1, alpha
+  // source at 2-3, the vertex-colour modulate flag at 4, then spare bits.
+  property uint8_t colorSource
   {
     get { return uint8_t(data13.z & 0x3); }
     set { data13.z = (data13.z & ~0x3) | uint32_t(newValue & 0x3); }
   }
 
-  property uint8_t textureColorArg2Source
+  property uint8_t alphaSource
   {
     get { return uint8_t((data13.z >> 2) & 0x3); }
     set { data13.z = (data13.z & ~(0x3 << 2)) | (uint32_t(newValue & 0x3) << 2); }
   }
 
-  property uint8_t textureColorOperation
+  property bool modulateVertexColor
   {
-    get { return uint8_t((data13.z >> 4) & 0x7); }
-    set { data13.z = (data13.z & ~(0x7 << 4)) | (uint32_t(newValue & 0x7) << 4); }
+    get { return packedFlagGet(data13.z, 1 << 4); }
+    set { data13.z = newValue ? packedFlagSet(data13.z, 1 << 4) : packedFlagUnset(data13.z, 1 << 4); }
   }
 
-  property uint8_t textureAlphaArg1Source
+  // Kept separate from modulateVertexColor: vertex alpha is often padding in DX11
+  // layouts, so it only folds into opacity when the draw genuinely used it.
+  property bool modulateVertexAlpha
   {
-    get { return uint8_t((data13.z >> 7) & 0x3); }
-    set { data13.z = (data13.z & ~(0x3 << 7)) | (uint32_t(newValue & 0x3) << 7); }
-  }
-
-  property uint8_t textureAlphaArg2Source
-  {
-    get { return uint8_t((data13.z >> 9) & 0x3); }
-    set { data13.z = (data13.z & ~(0x3 << 9)) | (uint32_t(newValue & 0x3) << 9); }
-  }
-
-  property uint8_t textureAlphaOperation
-  {
-    get { return uint8_t((data13.z >> 11) & 0x7); }
-    set { data13.z = (data13.z & ~(0x7 << 11)) | (uint32_t(newValue & 0x7) << 11); }
+    get { return packedFlagGet(data13.z, 1 << 5); }
+    set { data13.z = newValue ? packedFlagSet(data13.z, 1 << 5) : packedFlagUnset(data13.z, 1 << 5); }
   }
 
   property uint8_t texcoordGenerationMode
@@ -464,10 +469,16 @@ struct Surface
     set { data13.z = newValue ? packedFlagSet(data13.z, 1 << 14) : packedFlagUnset(data13.z, 1 << 14); }
   }
 
-  property uint tFactor
+  // The D3D11 blend factor. rgb is R11G11B10 in its own word; alpha is 10 bits
+  // in the spare texture-flag range. See blend_constant_packing.h.
+  property vec3 blendConstantRGB
   {
-    get { return data13.y; }
-    set { data13.y = newValue; }
+    get { return unpackBlendConstantRGB(data13.y); }
+  }
+
+  property float blendConstantAlpha
+  {
+    get { return float((data13.z >> 19) & 0x3ff) / 1023.0f; }
   }
 
   // Misc

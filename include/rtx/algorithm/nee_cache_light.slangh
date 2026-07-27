@@ -105,11 +105,9 @@ struct NEECacheUtils
     // Don't override following settings because they may affect some emissive objects
     // surface.isEmissive = false;
     // surface.isEmissiveBlend = false;
-    // surface.tFactor = 0;
+    // surface.blendConstant = 0;
     // surface.color0BufferIndex = BINDING_INDEX_INVALID;
-    // surface.textureAlphaArg1Source = uint(RtTextureArgSource::None);
-    // surface.textureAlphaArg2Source = uint(RtTextureArgSource::None);
-    // surface.textureAlphaOperation = uint(DxvkRtTextureOperation::Disable);
+    // surface.alphaSource = uint(D3D11ColorSource::Texture);
     surface.isStatic = true;
     surface.isMatte = true;
     surface.texcoordGenerationMode = uint(TexGenMode::None);

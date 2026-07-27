@@ -183,6 +183,17 @@ namespace dxvk {
     if (newFile) {
       Logger::warn("DXVK: Creating new state cache file");
 
+      // The cache lives in rtx-remix/cache next to the game executable. On a
+      // first launch that directory tree does not exist yet, and the old
+      // single-level CreateDirectoryW fallback could not create it (the
+      // rtx-remix parent was missing too) - the open failed silently, no
+      // cache file was ever written, and every later launch recompiled every
+      // pipeline from scratch. Create the full tree up front instead.
+      {
+        std::error_code directoryError;
+        std::filesystem::create_directories(getCacheDir(), directoryError);
+      }
+
       // Start with an empty file
       std::ofstream file(getCacheFileName().c_str(),
         std::ios_base::binary |
@@ -206,6 +217,11 @@ namespace dxvk {
       // case we're recovering a corrupted cache file
       for (auto& e : m_entries)
         writeCacheEntry(file, e);
+
+      if (!file) {
+        Logger::err(str::format("DXVK: Failed to create state cache file: ",
+          str::fromws(getCacheFileName().c_str())));
+      }
     }
 
     // Use half the available CPU cores for pipeline compilation
@@ -1140,10 +1156,25 @@ namespace dxvk {
         m_writerQueue.pop();
       }
 
-      if (!file) {
+      // A default-constructed ofstream reports good() while not being open,
+      // so the old `if (!file)` check never opened the file and the first
+      // entry was written into the void. Check is_open() and recover from a
+      // missing directory so entries recorded this session actually persist.
+      if (!file.is_open() || !file) {
+        std::error_code directoryError;
+        std::filesystem::create_directories(getCacheDir(), directoryError);
         file = std::ofstream(getCacheFileName().c_str(),
           std::ios_base::binary |
           std::ios_base::app);
+        if (!file.is_open()) {
+          static bool s_writeFailureLogged = false;
+          if (!s_writeFailureLogged) {
+            s_writeFailureLogged = true;
+            Logger::err(str::format("DXVK: State cache writer cannot open: ",
+              str::fromws(getCacheFileName().c_str())));
+          }
+          continue;
+        }
       }
 
       writeCacheEntry(file, entry);

@@ -183,6 +183,29 @@ namespace dxvk {
       return m_shaderModelMinor;
     }
 
+    // XXH3 hash of the original DXBC bytecode, computed once at shader creation.
+    // Identical to XXH3_64bits(pShaderBytecode, BytecodeLength), so all hash-keyed
+    // caches and user-tagged hashes stay bit-compatible across runs.
+    XXH64_hash_t GetBytecodeHash() const {
+      return m_bytecodeHash;
+    }
+
+    // DXBC reflection (RDEF): names of bound resources and constant-buffer
+    // variables, parsed once at creation. Null when the shader shipped with
+    // reflection stripped, which callers must tolerate.
+    const DxbcRdef* GetReflection() const {
+      return m_reflection.ptr();
+    }
+
+    // True when this shader's reflection declares a shader-resource (texture)
+    // binding at the given slot. Lets the capture layer restrict material
+    // identity to slots the shader actually samples, rather than every slot the
+    // engine happens to leave bound.
+    bool DeclaresTextureBinding(uint32_t slot) const {
+      return m_reflection != nullptr
+          && m_reflection->findBinding(DxbcResourceKind::Texture, slot) != nullptr;
+    }
+
     // DX11_V280_TEXCOORD_CAPTURE: true when this is a vertex shader whose
     // output signature declares a texcoord-like element, i.e. a stream-out
     // capture variant CAN be built for it (cheap check, no compilation).
@@ -276,9 +299,19 @@ namespace dxvk {
     Rc<DxvkShader> m_shader;
     Rc<DxvkBuffer> m_buffer;
 
-    // DX11_V277_REAL_SHADER_MODEL (defaults match the old hardcoded report)
-    uint32_t m_shaderModelMajor = 4;
-    uint32_t m_shaderModelMinor = 0;
+    // DX11_V277_REAL_SHADER_MODEL: the version token parsed from each DXBC
+    // container overwrites these. The fallback is the highest model D3D11 can
+    // legally express (SM 5.1 at FL 12_x). SM 6.x is DXIL and exists only on
+    // D3D12 - no D3D11 device, real or wrapped, can report or consume it.
+    uint32_t m_shaderModelMajor = 5;
+    uint32_t m_shaderModelMinor = 1;
+
+    // XXH3 of the original DXBC container, computed once at shader creation so
+    // per-draw RTX lookups never rehash the bytecode. See GetBytecodeHash().
+    XXH64_hash_t m_bytecodeHash = 0;
+
+    // Reflection chunk retained from the DXBC module. See GetReflection().
+    Rc<DxbcRdef> m_reflection;
 
     // DX11_V281_FIXED_FUNCTION (parsed for pixel shaders only)
     bool m_usesDiscard = false;

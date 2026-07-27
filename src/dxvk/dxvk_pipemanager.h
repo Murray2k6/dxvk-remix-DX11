@@ -153,7 +153,14 @@ namespace dxvk {
      * \brief Stops async compiler threads
      */
     void stopWorkerThreads() const;
-    
+
+// NV-DXVK start
+    // DX11_V298_PERSISTENT_PIPELINE_CACHE: serializes the shared Vulkan
+    // pipeline cache to disk so later launches reuse compiled pipelines.
+    // Called when a prewarm phase drains and on device teardown.
+    void savePipelineCache() const;
+// NV-DXVK end
+
   private:
     
     DxvkDevice*               m_device;

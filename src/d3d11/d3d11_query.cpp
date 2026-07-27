@@ -1,8 +1,15 @@
 #include "d3d11_device.h"
 #include "d3d11_query.h"
+#include "d3d11_rtx.h"
+
+#include "../dxvk/rtx_render/rtx_options.h"
 
 namespace dxvk {
-  
+
+  // Diagnostic only (rtx.d3d11.logOcclusionQueries). Shared across queries because
+  // the interesting quantity is how hard the game spins overall, not per object.
+  static std::atomic<uint32_t> s_occlusionPendingPolls = { 0u };
+
   D3D11Query::D3D11Query(
           D3D11Device*       device,
     const D3D11_QUERY_DESC1& desc)
@@ -217,6 +224,27 @@ namespace dxvk {
   }
 
 
+  bool D3D11Query::conservativeOcclusionResultRequested() const {
+    if (m_desc.Query != D3D11_QUERY_OCCLUSION
+     && m_desc.Query != D3D11_QUERY_OCCLUSION_PREDICATE)
+      return false;
+
+    // Only meaningful while Remix is actually path tracing; with raytracing off
+    // the rasterized scene is what the game sees, so its occlusion results are
+    // real and must be reported truthfully.
+    if (!D3D11Rtx::conservativeOcclusionQueries() || !RtxOptions::enableRaytracing())
+      return false;
+
+    if (D3D11Rtx::logOcclusionQueries()) {
+      ONCE(Logger::info(
+        "[D3D11Rtx] Answering occlusion queries conservatively (always visible). "
+        "Disable rtx.d3d11.conservativeOcclusionQueries if this title needs real occlusion results."));
+    }
+
+    return true;
+  }
+
+
   HRESULT STDMETHODCALLTYPE D3D11Query::GetData(
           void*                             pData,
           UINT                              GetDataFlags) {
@@ -231,6 +259,31 @@ namespace dxvk {
 
     if (m_resetCtr != 0u)
       return S_FALSE;
+
+    // Conservative occlusion queries. Under path tracing the draws a game brackets
+    // in an occlusion query are captured instead of rasterized, so the query scope
+    // measures nothing and the GPU reports zero samples passed. The game reads that
+    // as "fully occluded" and culls the object, which removes it from the traced
+    // scene as well. Answer "visible" instead, and answer without waiting: the GPU
+    // result is predetermined here, and games spin on GetData until it arrives.
+    if (conservativeOcclusionResultRequested()) {
+      if (m_desc.Query == D3D11_QUERY_OCCLUSION) {
+        if (pData != nullptr)
+          *static_cast<UINT64*>(pData) = kConservativeOcclusionSamplesPassed;
+
+        return S_OK;
+      }
+
+      if (m_desc.Query == D3D11_QUERY_OCCLUSION_PREDICATE) {
+        // A D3D11 occlusion predicate is true when the geometry was fully
+        // occluded, so "visible" is FALSE. Reporting TRUE here would tell
+        // predicated draws to skip, which is the failure this avoids.
+        if (pData != nullptr)
+          *static_cast<BOOL*>(pData) = FALSE;
+
+        return S_OK;
+      }
+    }
 
     if (m_desc.Query == D3D11_QUERY_EVENT) {
       DxvkGpuEventStatus status = m_event[0]->test();
@@ -254,8 +307,25 @@ namespace dxvk {
          || status == DxvkGpuQueryStatus::Failed)
           return S_FALSE;
         
-        if (status == DxvkGpuQueryStatus::Pending)
+        if (status == DxvkGpuQueryStatus::Pending) {
+          // Games spin on GetData until an occlusion result lands. Each poll is a
+          // synchronous round trip, so count them: a large number here means the
+          // title is stalling its render thread on occlusion readback and is a
+          // candidate for rtx.d3d11.conservativeOcclusionQueries.
+          if ((m_desc.Query == D3D11_QUERY_OCCLUSION
+            || m_desc.Query == D3D11_QUERY_OCCLUSION_PREDICATE)
+           && D3D11Rtx::logOcclusionQueries()) {
+            const uint32_t polls = ++s_occlusionPendingPolls;
+
+            if ((polls & 0xFFFu) == 0u) {
+              Logger::info(str::format(
+                "[D3D11Rtx] Occlusion readback still pending after ", polls,
+                " polls; consider rtx.d3d11.conservativeOcclusionQueries."));
+            }
+          }
+
           return S_FALSE;
+        }
       }
       
       if (pData == nullptr)

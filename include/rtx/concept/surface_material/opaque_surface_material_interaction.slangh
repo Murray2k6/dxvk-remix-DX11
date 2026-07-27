@@ -689,7 +689,8 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
 
 #endif
 
-  vec4 tFactor = unorm4x8ToFloat4x32(surface.tFactor).bgra;
+  const vec3 blendConstantRGB = surface.blendConstantRGB;
+  const float blendConstantAlpha = surface.blendConstantAlpha;
 
   // WAR for REMIX-1573: texture ops for opacity should happen during baking and be skipped here for baked terrain,
   // but right now the opacity is not 1 in the baked texture where it is expected to be and thus texture ops
@@ -710,31 +711,37 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
       surfaceInteraction.vertexColor.rgb = mix(vec3(1), surfaceInteraction.vertexColor.rgb, float(cb.vertexColorStrength));
     }
 
-    // Fixed function texture stage setting
-    vec3 textureArg1 = vec3(1.0), textureArg2 = vec3(1.0);
-    chooseTextureArgument(textureArg1, surface.textureColorArg1Source, albedo, surfaceInteraction.vertexColor.rgb, tFactor.rgb, vec3(1.0));
-    chooseTextureArgument(textureArg2, surface.textureColorArg2Source, albedo, surfaceInteraction.vertexColor.rgb, tFactor.rgb, vec3(1.0));
-    chooseTextureOperationColor(albedo, surface.textureColorOperation, textureArg1, textureArg2);
+    // Resolve albedo to whichever input the capture layer recorded, then apply
+    // vertex-colour modulation if the draw had it. This replaces the old
+    // fixed-function stage program; D3D11's pixel shader already produced the
+    // final colour, so there is nothing to re-run here.
+    albedo = resolveColorSource(surface.colorSource, albedo,
+                                surfaceInteraction.vertexColor.rgb, blendConstantRGB);
+    if (surface.modulateVertexColor) {
+      albedo *= surfaceInteraction.vertexColor.rgb;
+    }
     if (surface.isTextureFactorBlend) {
-      albedo *= tFactor.rgb;
+      albedo *= blendConstantRGB;
     }
 
-    // Fixed function texture stage setting (emissive)
-    chooseTextureArgument(textureArg1, surface.textureColorArg1Source, emissiveColor, surfaceInteraction.vertexColor.rgb, tFactor.rgb, vec3(1.0));
-    chooseTextureArgument(textureArg2, surface.textureColorArg2Source, emissiveColor, surfaceInteraction.vertexColor.rgb, tFactor.rgb, vec3(1.0));
-    chooseTextureOperationColor(emissiveColor, surface.textureColorOperation, textureArg1, textureArg2);
-    if (surface.isTextureFactorBlend) {
-      emissiveColor *= tFactor.rgb;
+    // Emissive follows the same source selection as albedo.
+    emissiveColor = resolveColorSource(surface.colorSource, emissiveColor,
+                                       surfaceInteraction.vertexColor.rgb, blendConstantRGB);
+    if (surface.modulateVertexColor) {
+      emissiveColor *= surfaceInteraction.vertexColor.rgb;
     }
-    
-    // Adjust opacity via texture operations.
-    // Fixed function texture stage state for alpha channel
+    if (surface.isTextureFactorBlend) {
+      emissiveColor *= blendConstantRGB;
+    }
 
-    float textureAlphaArg1, textureAlphaArg2;
-    chooseTextureArgument(textureAlphaArg1, surface.textureAlphaArg1Source, opacity, surfaceInteraction.vertexColor.a, tFactor.a, opacity);
-    chooseTextureArgument(textureAlphaArg2, surface.textureAlphaArg2Source, opacity, surfaceInteraction.vertexColor.a, tFactor.a, float(1.0f));
-    chooseTextureOperationAlpha(opacity, surface.textureAlphaOperation, textureAlphaArg1, textureAlphaArg2);
-    
+    // Opacity resolves independently - a draw can take colour from the texture
+    // while taking alpha from the blend constant.
+    opacity = resolveAlphaSource(surface.alphaSource, opacity,
+                                 surfaceInteraction.vertexColor.a, blendConstantAlpha);
+    if (surface.modulateVertexAlpha) {
+      opacity *= surfaceInteraction.vertexColor.a;
+    }
+
     // Ensure we perform these opacity calculations after the texture operations have been applied to abledo and alpha.
     calcOpaqueSurfaceMaterialOpacity(
       albedo, opacity, surface, opacity, emissiveBlendOverrideInfluence, cb.wboitEnabled);
@@ -745,15 +752,22 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
     opacity = 1.f;
   }
   
-  // Note: Gamma correct albedo input (be it from a constant or a texture). Currently assuming all textures are not using sRGB formats which
-  // automatically do this conversion.
-  // Todo: Disable this for when a sRGB texture is the source of the albedo.
-  albedo = gammaToLinear(albedo);
+  // Note: Gamma correct albedo input (be it from a constant or a texture). Avoid a double gamma
+  // conversion for legacy color textures that are already sampled through sRGB views, which the
+  // hardware converts to linear on read.
+  if (!surface.colorTextureIsSrgb)
+  {
+    albedo = gammaToLinear(albedo);
+  }
   
-  // Note: Gamma correct emissive color input (be it from a constant or a texture). Currently assuming all textures are not using sRGB formats which
-  // automatically do this conversion.
-  // Todo: Disable this for when a sRGB texture is the source of the emissive color.
-  emissiveColor = gammaToLinear(emissiveColor);
+  // Note: Gamma correct emissive color input (be it from a constant or a texture). Skip it when
+  // the value came from an sRGB-format emissive texture, since the hardware already linearized it
+  // on sample; converting again would read far too dark. Emissive constants are always authored
+  // in gamma space and still need the conversion.
+  if (!(emissiveColorLoaded && surface.emissiveTextureIsSrgb))
+  {
+    emissiveColor = gammaToLinear(emissiveColor);
+  }
   
   // Apply material modifiers/overrides
   albedo = saturate(albedo * cb.opaqueMaterialArgs.albedoScale + cb.opaqueMaterialArgs.albedoBias);

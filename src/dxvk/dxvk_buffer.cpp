@@ -44,6 +44,9 @@ namespace dxvk {
     // NV-DXVK start: Implement memory profiler
     m_tracker(name, GpuMemoryTracker::Buffer, category, { 1, 1, 1 }, VK_FORMAT_UNDEFINED) {
     // NV-DXVK end
+    // DX11_V319_FAULT_ADDRESS_NAMING: see m_gpuAddressName.
+    if (DxvkGpuAddressRegistry::get().isEnabled() && name != nullptr)
+      m_gpuAddressName = name;
     // Align slices so that we don't violate any alignment
     // requirements imposed by the Vulkan device/driver
     VkDeviceSize sliceAlignment = computeSliceAlignment();
@@ -95,6 +98,11 @@ namespace dxvk {
     }
     // NV-DXVK end
 
+    // DX11_V319_FAULT_ADDRESS_NAMING: the memory is about to go away. Once it
+    // is gone a fault inside this range must report "no live allocation covers
+    // this address", which is precisely the use-after-free signal worth having.
+    DxvkGpuAddressRegistry::get().remove(m_deviceAddress);
+
     const auto& vkd = m_device->vkd();
 
     for (const auto& buffer : m_buffers)
@@ -102,6 +110,69 @@ namespace dxvk {
     vkd->vkDestroyBuffer(vkd->device(), m_buffer.buffer, nullptr);
   }
   
+
+  DxvkGpuAddressRegistry& DxvkGpuAddressRegistry::get() {
+    static DxvkGpuAddressRegistry s_instance;
+    return s_instance;
+  }
+
+
+  void DxvkGpuAddressRegistry::add(VkDeviceAddress address, VkDeviceSize size,
+                                   const char* name) {
+    if (!isEnabled() || address == 0)
+      return;
+
+    std::lock_guard<dxvk::mutex> lock(m_mutex);
+    Entry& entry = m_entries[address];
+    entry.size = size;
+    entry.name = name != nullptr ? name : "<unnamed>";
+  }
+
+
+  void DxvkGpuAddressRegistry::remove(VkDeviceAddress address) {
+    if (!isEnabled() || address == 0)
+      return;
+
+    std::lock_guard<dxvk::mutex> lock(m_mutex);
+    m_entries.erase(address);
+  }
+
+
+  std::string DxvkGpuAddressRegistry::describe(VkDeviceAddress address) const {
+    if (!isEnabled())
+      return "allocation naming disabled (VK_EXT_device_fault not enabled at device creation)";
+
+    std::lock_guard<dxvk::mutex> lock(m_mutex);
+    if (m_entries.empty())
+      return "no tracked allocations";
+
+    // The first entry starting after the address cannot contain it, so the
+    // only candidate is the one immediately before it.
+    auto candidate = m_entries.upper_bound(address);
+    if (candidate == m_entries.begin()) {
+      return str::format("below every tracked allocation (lowest base 0x",
+        std::hex, m_entries.begin()->first, std::dec,
+        ") - freed, or not reached through a device address");
+    }
+
+    --candidate;
+    const VkDeviceAddress base = candidate->first;
+    const VkDeviceSize size = candidate->second.size;
+    if (address >= base + size) {
+      // Landing in the gap after an allocation is the most diagnostic outcome
+      // of all: the GPU dereferenced a pointer into memory nothing live owns.
+      return str::format("NO live allocation covers this address"
+        " (nearest below: '", candidate->second.name, "' base=0x",
+        std::hex, base, " end=0x", base + size, std::dec,
+        ", overrun by ", address - (base + size),
+        " bytes) - a freed or out-of-bounds access");
+    }
+
+    return str::format("'", candidate->second.name, "' base=0x",
+      std::hex, base, std::dec, " size=", size,
+      " offsetIntoAllocation=", address - base);
+  }
+
 
   VkDeviceAddress DxvkBuffer::getDeviceAddress() {
     const auto& vkd = m_device->vkd();
@@ -111,6 +182,14 @@ namespace dxvk {
       bufferInfo.buffer = m_physSlice.handle;
       m_deviceAddress = vkd->vkGetBufferDeviceAddress(vkd->device(), &bufferInfo);
       m_deviceAddress += getDynamicOffset(0);
+
+      // DX11_V319_FAULT_ADDRESS_NAMING: taking the device address is what makes
+      // this buffer reachable by a raw GPU pointer, so this is the exact moment
+      // it becomes capable of producing an unattributable page fault. rename()
+      // drops the registration again along with the cached address.
+      DxvkGpuAddressRegistry::get().add(
+        m_deviceAddress, m_physSlice.length,
+        m_gpuAddressName.empty() ? nullptr : m_gpuAddressName.c_str());
     }
     return m_deviceAddress;
   }

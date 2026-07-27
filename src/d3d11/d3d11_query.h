@@ -97,6 +97,15 @@ namespace dxvk {
 
     std::atomic<uint32_t> m_resetCtr = { 0u };
 
+    // Sample count reported for a conservatively answered occlusion query. Any
+    // nonzero value means "visible"; games only ever compare against zero.
+    static constexpr UINT64 kConservativeOcclusionSamplesPassed = 1u;
+
+    // True when this query is an occlusion query whose result should be
+    // synthesized as visible rather than read back from the GPU. See
+    // rtx.d3d11.conservativeOcclusionQueries.
+    bool conservativeOcclusionResultRequested() const;
+
     UINT64 GetTimestampQueryFrequency() const;
     
   };

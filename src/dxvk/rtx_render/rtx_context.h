@@ -25,10 +25,13 @@
 #include "rtx_resources.h"
 #include "rtx_asset_exporter.h"
 #include "rtx_camera_manager.h"
+#include "rtx_atmosphere.h"
 #include "rtx/pass/nrd_args.h"
 
 #include <cstdint>
 #include <chrono>
+#include <memory>
+#include <array>
 #include "rtx_options.h"
 
 struct VolumeArgs;
@@ -58,6 +61,25 @@ namespace dxvk {
    * This is where the actual rendering commands are
    * recorded.
    */
+
+  // Forward declarations of fork_hooks functions that require friend access to
+  // RtxContext private members, so the friend declarations inside the class body
+  // can name them. See rtx_fork_hooks.h for the full hook catalogue.
+  class RtxContext;
+  namespace fork_weather {
+    class WeatherBlender;
+  } // namespace fork_weather
+  namespace fork_hooks {
+    void initAtmosphere(RtxContext&);
+    void updateAtmosphereConstants(RtxContext&, RaytraceArgs&);
+    void bindAtmosphereLuts(RtxContext&);
+    void dispatchScreenOverlay(RtxContext&, Resources::RaytracingOutput&);
+    void updateWeatherBlender(RtxContext& ctx, float deltaTimeSeconds);
+    Resources::Resource getCloudSkyTransmittanceLut(RtxContext& ctx);
+    Resources::Resource getCloudDSun(RtxContext& ctx);
+    Resources::Resource getCloudDAmbient(RtxContext& ctx);
+    Resources::Resource getCloudRenderRT(RtxContext& ctx);
+  } // namespace fork_hooks
 
   class RtxContext : public DxvkContext {
 
@@ -232,6 +254,27 @@ namespace dxvk {
     VkFormat m_skyRtColorFormat = VK_FORMAT_B10G11R11_UFLOAT_PACK32;
     VkClearValue m_skyClearValue;
     bool m_skyClearDirty = false;
+    SkyMode m_lastSkyMode = SkyMode::SkyboxRasterization;
+
+    // Set when rasterizeToSkyProbe finds it cannot aim the six cube-face draws
+    // (no vertex-capture constant buffer; DXBC vertex shaders cannot be
+    // reprojected by Remix). While true, SkyboxRasterization can only produce a
+    // black cubemap wrapped around the camera, so the sky is served by the
+    // physical atmosphere instead. See DX11_V307_NO_DEGENERATE_SKY_PROBE.
+    bool m_skyProbeReprojectionUnavailable = false;
+
+    std::unique_ptr<RtxAtmosphere> m_atmosphere;
+    std::unique_ptr<fork_weather::WeatherBlender> m_weatherBlender;
+
+    friend void fork_hooks::initAtmosphere(RtxContext&);
+    friend void fork_hooks::updateAtmosphereConstants(RtxContext&, RaytraceArgs&);
+    friend void fork_hooks::bindAtmosphereLuts(RtxContext&);
+    friend void fork_hooks::dispatchScreenOverlay(RtxContext&, Resources::RaytracingOutput&);
+    friend void fork_hooks::updateWeatherBlender(RtxContext& ctx, float deltaTimeSeconds);
+    friend Resources::Resource fork_hooks::getCloudSkyTransmittanceLut(RtxContext& ctx);
+    friend Resources::Resource fork_hooks::getCloudDSun(RtxContext& ctx);
+    friend Resources::Resource fork_hooks::getCloudDAmbient(RtxContext& ctx);
+    friend Resources::Resource fork_hooks::getCloudRenderRT(RtxContext& ctx);
 
     bool shouldUseDLSS() const;
     bool shouldUseRayReconstruction() const;

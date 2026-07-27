@@ -329,6 +329,18 @@ namespace dxvk {
     info.size = sizeof(aabbPositions);
 
     m_aabbBuffer = m_device->createBuffer(info, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, DxvkMemoryStats::Category::RTXAccelerationStructure, "AABB Buffer");
+
+    // Both of these feed an acceleration-structure build by device address, so a
+    // null is a GPU write/read at address 0 rather than a skipped build. The
+    // scratch buffer is not allocated here - it is expected to already exist from
+    // the main build path, which will not be true if that path bailed on its own
+    // allocation failure this frame.
+    if (m_aabbBuffer == nullptr || m_scratchBuffer == nullptr) {
+      ONCE(Logger::err(
+        "AccelManager: skipping intersection BLAS build - AABB or scratch buffer unavailable."));
+      return;
+    }
+
     // Note: don't use ctx->updateBuffer() because that will place the command on the InitBuffer, not ExecBuffer.
     ctx->getCommandList()->cmdUpdateBuffer(DxvkCmdBuffer::ExecBuffer, m_aabbBuffer->getBufferRaw(), m_aabbBuffer->getSliceHandle().offset, sizeof(aabbPositions), &aabbPositions);
     
@@ -352,7 +364,18 @@ namespace dxvk {
     geometry.geometry.aabbs.data.deviceAddress = m_aabbBuffer->getDeviceAddress();
 
     const size_t requiredScratchAllocSize = sizeInfo.buildScratchSize + m_scratchAlignment;
-    buildInfo.scratchData.deviceAddress = getScratchMemory(requiredScratchAllocSize)->getDeviceAddress();
+    // getScratchMemory returns null when a grow allocation fails. Dereferencing
+    // it here would be a null deref; worse, a zero scratch address makes the
+    // build write at gpuVA 0 and takes the device with it. Skip the build.
+    const Rc<DxvkBuffer> intersectionScratch = getScratchMemory(requiredScratchAllocSize);
+
+    if (intersectionScratch == nullptr) {
+      ONCE(Logger::err(
+        "AccelManager: skipping intersection BLAS build - no scratch memory."));
+      return;
+    }
+
+    buildInfo.scratchData.deviceAddress = intersectionScratch->getDeviceAddress();
     assert(buildInfo.scratchData.deviceAddress % m_scratchAlignment == 0); // Note: Required by the Vulkan specification.
 
     VkAccelerationStructureBuildRangeInfoKHR buildRange {};
@@ -379,7 +402,22 @@ namespace dxvk {
       bufferCreateInfo.access = VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR | VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR;
       bufferCreateInfo.stages = VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR;
       bufferCreateInfo.usage = VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR;
-      m_scratchBuffer = m_device->createBuffer(bufferCreateInfo, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, DxvkMemoryStats::Category::RTXAccelerationStructure, "BVH Scratch");
+      // Allocation can fail under memory pressure. Assigning the result directly
+      // would also destroy a perfectly good existing buffer, turning a transient
+      // shortage into a permanent null. Acceleration-structure builds reference
+      // this by DEVICE ADDRESS, so a null here is not a skipped build - it is a
+      // GPU write to address 0, which faults the device (write-invalid gpuVA=0x0).
+      Rc<DxvkBuffer> grownScratch = m_device->createBuffer(bufferCreateInfo, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, DxvkMemoryStats::Category::RTXAccelerationStructure, "BVH Scratch");
+
+      if (grownScratch == nullptr) {
+        ONCE(Logger::err(str::format(
+          "AccelManager: BVH scratch allocation of ", requiredScratchAllocSize,
+          " bytes failed; keeping the previous buffer and skipping builds that need more room "
+          "rather than binding a null scratch address.")));
+        return nullptr;
+      }
+
+      m_scratchBuffer = std::move(grownScratch);
     }
 
     return m_scratchBuffer;
@@ -1759,7 +1797,19 @@ namespace dxvk {
 
     // Make sure we have enough scratch memory for this build job
     if (totalScratchMemory > 0) {
-      m_scratchBuffer = getScratchMemory(align(totalScratchMemory, m_scratchAlignment));
+      const Rc<DxvkBuffer> requestedScratch =
+        getScratchMemory(align(totalScratchMemory, m_scratchAlignment));
+
+      // Abandon this batch rather than build against a null scratch address.
+      // Dropping the builds costs a frame of missing geometry; proceeding costs
+      // the device.
+      if (requestedScratch == nullptr) {
+        ONCE(Logger::err(
+          "AccelManager: skipping acceleration structure builds this frame - no scratch memory."));
+        return;
+      }
+
+      m_scratchBuffer = requestedScratch;
 
       execBarriers.accessBuffer(
        m_scratchBuffer->getSliceHandle(),
@@ -2035,7 +2085,19 @@ namespace dxvk {
 
     // Allocate the scratch memory, we share the same buffer between all TLAS types, so just ensure we handle the offsetting correctly here.
     const size_t requiredScratchAllocSize = align(sizeInfo.buildScratchSize + m_scratchAlignment, m_scratchAlignment);
-    buildInfo.scratchData.deviceAddress = getScratchMemory(totalScratchSize + requiredScratchAllocSize)->getDeviceAddress() + totalScratchSize;
+    // A failed grow returns null here. Skipping the TLAS build costs one frame
+    // of stale top-level geometry; dereferencing null crashes, and a zero base
+    // address would point the build's scratch writes at gpuVA 0.
+    const Rc<DxvkBuffer> tlasScratch =
+      getScratchMemory(totalScratchSize + requiredScratchAllocSize);
+
+    if (tlasScratch == nullptr) {
+      ONCE(Logger::err(
+        "AccelManager: skipping TLAS build this frame - no scratch memory."));
+      return;
+    }
+
+    buildInfo.scratchData.deviceAddress = tlasScratch->getDeviceAddress() + totalScratchSize;
     totalScratchSize += requiredScratchAllocSize;
 
     // Update build information

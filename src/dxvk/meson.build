@@ -187,6 +187,17 @@ dxvk_src = files([
   'rtx_render/rtx_asset_package.h',
   'rtx_render/rtx_asset_replacer.cpp',
   'rtx_render/rtx_asset_replacer.h',
+  'rtx_render/rtx_atmosphere.cpp',
+  'rtx_render/rtx_atmosphere.h',
+  'rtx_render/rtx_fast_noise.cpp',
+  'rtx_render/rtx_fast_noise.h',
+  'rtx_render/rtx_fast_noise_data.cpp',
+  'rtx_render/rtx_fast_noise_data.h',
+  'rtx_render/rtx_fork_atmosphere.cpp',
+  'rtx_render/rtx_fork_game_state.h',
+  'rtx_render/rtx_fork_hooks.h',
+  'rtx_render/rtx_fork_weather.cpp',
+  'rtx_render/rtx_fork_weather.h',
   'rtx_render/rtx_auto_exposure.cpp',
   'rtx_render/rtx_auto_exposure.h',
   'rtx_render/rtx_bindless_resource_manager.cpp',
@@ -238,6 +249,8 @@ dxvk_src = files([
   'rtx_render/rtx_image_utils.h',
   'rtx_render/rtx_imgui.cpp',
   'rtx_render/rtx_imgui.h',
+  'rtx_render/perf_debug.cpp',
+  'rtx_render/perf_debug.h',
   'rtx_render/rtx_initializer.cpp',
   'rtx_render/rtx_initializer.h',
   'rtx_render/rtx_instance_manager.cpp',
@@ -473,7 +486,157 @@ else
   message('DX11_V219_OPTIONAL_NGX_NO_LIB_BLOCK: NGX import library not found; building runtime without static NGX linkage. DLSS/RR/FG NGX features will be disabled until nvsdk_ngx*.lib is added.')
   dlss_dep = declare_dependency(include_directories : [ dlss_include_dir, dlfg_include_dir ])
 else
+  if not dlss_lib.found()
+  message('DX11_V219_OPTIONAL_NGX_NO_LIB_BLOCK: NGX import library not found; building runtime without static NGX linkage. DLSS/RR/FG NGX features will be disabled until nvsdk_ngx*.lib is added.')
+  dlss_dep = declare_dependency(include_directories : [ dlss_include_dir, dlfg_include_dir ])
+else
+  if not dlss_lib.found()
+  message('DX11_V219_OPTIONAL_NGX_NO_LIB_BLOCK: NGX import library not found; building runtime without static NGX linkage. DLSS/RR/FG NGX features will be disabled until nvsdk_ngx*.lib is added.')
+  dlss_dep = declare_dependency(include_directories : [ dlss_include_dir, dlfg_include_dir ])
+else
+  if not dlss_lib.found()
+  message('DX11_V219_OPTIONAL_NGX_NO_LIB_BLOCK: NGX import library not found; building runtime without static NGX linkage. DLSS/RR/FG NGX features will be disabled until nvsdk_ngx*.lib is added.')
+  dlss_dep = declare_dependency(include_directories : [ dlss_include_dir, dlfg_include_dir ])
+else
+  if not dlss_lib.found()
+  message('DX11_V219_OPTIONAL_NGX_NO_LIB_BLOCK: NGX import library not found; building runtime without static NGX linkage. DLSS/RR/FG NGX features will be disabled until nvsdk_ngx*.lib is added.')
+  dlss_dep = declare_dependency(include_directories : [ dlss_include_dir, dlfg_include_dir ])
+else
+  if not dlss_lib.found()
+  message('DX11_V219_OPTIONAL_NGX_NO_LIB_BLOCK: NGX import library not found; building runtime without static NGX linkage. DLSS/RR/FG NGX features will be disabled until nvsdk_ngx*.lib is added.')
+  dlss_dep = declare_dependency(include_directories : [ dlss_include_dir, dlfg_include_dir ])
+else
+  if not dlss_lib.found()
+  message('DX11_V219_OPTIONAL_NGX_NO_LIB_BLOCK: NGX import library not found; building runtime without static NGX linkage. DLSS/RR/FG NGX features will be disabled until nvsdk_ngx*.lib is added.')
+  dlss_dep = declare_dependency(include_directories : [ dlss_include_dir, dlfg_include_dir ])
+else
+  if not dlss_lib.found()
+  message('DX11_V219_OPTIONAL_NGX_NO_LIB_BLOCK: NGX import library not found; building runtime without static NGX linkage. DLSS/RR/FG NGX features will be disabled until nvsdk_ngx*.lib is added.')
+  dlss_dep = declare_dependency(include_directories : [ dlss_include_dir, dlfg_include_dir ])
+else
+  if not dlss_lib.found()
+  message('DX11_V219_OPTIONAL_NGX_NO_LIB_BLOCK: NGX import library not found; building runtime without static NGX linkage. DLSS/RR/FG NGX features will be disabled until nvsdk_ngx*.lib is added.')
+  dlss_dep = declare_dependency(include_directories : [ dlss_include_dir, dlfg_include_dir ])
+else
+  if not dlss_lib.found()
+  message('DX11_V219_OPTIONAL_NGX_NO_LIB_BLOCK: NGX import library not found; building runtime without static NGX linkage. DLSS/RR/FG NGX features will be disabled until nvsdk_ngx*.lib is added.')
+  dlss_dep = declare_dependency(include_directories : [ dlss_include_dir, dlfg_include_dir ])
+else
+  if not dlss_lib.found()
+  message('DX11_V219_OPTIONAL_NGX_NO_LIB_BLOCK: NGX import library not found; building runtime without static NGX linkage. DLSS/RR/FG NGX features will be disabled until nvsdk_ngx*.lib is added.')
+  dlss_dep = declare_dependency(include_directories : [ dlss_include_dir, dlfg_include_dir ])
+else
+  if not dlss_lib.found()
+  message('DX11_V219_OPTIONAL_NGX_NO_LIB_BLOCK: NGX import library not found; building runtime without static NGX linkage. DLSS/RR/FG NGX features will be disabled until nvsdk_ngx*.lib is added.')
+  dlss_dep = declare_dependency(include_directories : [ dlss_include_dir, dlfg_include_dir ])
+else
+  if not dlss_lib.found()
+  message('DX11_V219_OPTIONAL_NGX_NO_LIB_BLOCK: NGX import library not found; building runtime without static NGX linkage. DLSS/RR/FG NGX features will be disabled until nvsdk_ngx*.lib is added.')
+  dlss_dep = declare_dependency(include_directories : [ dlss_include_dir, dlfg_include_dir ])
+else
+  if not dlss_lib.found()
+  message('DX11_V219_OPTIONAL_NGX_NO_LIB_BLOCK: NGX import library not found; building runtime without static NGX linkage. DLSS/RR/FG NGX features will be disabled until nvsdk_ngx*.lib is added.')
+  dlss_dep = declare_dependency(include_directories : [ dlss_include_dir, dlfg_include_dir ])
+else
+  if not dlss_lib.found()
+  message('DX11_V219_OPTIONAL_NGX_NO_LIB_BLOCK: NGX import library not found; building runtime without static NGX linkage. DLSS/RR/FG NGX features will be disabled until nvsdk_ngx*.lib is added.')
+  dlss_dep = declare_dependency(include_directories : [ dlss_include_dir, dlfg_include_dir ])
+else
+  if not dlss_lib.found()
+  message('DX11_V219_OPTIONAL_NGX_NO_LIB_BLOCK: NGX import library not found; building runtime without static NGX linkage. DLSS/RR/FG NGX features will be disabled until nvsdk_ngx*.lib is added.')
+  dlss_dep = declare_dependency(include_directories : [ dlss_include_dir, dlfg_include_dir ])
+else
+  if not dlss_lib.found()
+  message('DX11_V219_OPTIONAL_NGX_NO_LIB_BLOCK: NGX import library not found; building runtime without static NGX linkage. DLSS/RR/FG NGX features will be disabled until nvsdk_ngx*.lib is added.')
+  dlss_dep = declare_dependency(include_directories : [ dlss_include_dir, dlfg_include_dir ])
+else
+  if not dlss_lib.found()
+  message('DX11_V219_OPTIONAL_NGX_NO_LIB_BLOCK: NGX import library not found; building runtime without static NGX linkage. DLSS/RR/FG NGX features will be disabled until nvsdk_ngx*.lib is added.')
+  dlss_dep = declare_dependency(include_directories : [ dlss_include_dir, dlfg_include_dir ])
+else
+  if not dlss_lib.found()
+  message('DX11_V219_OPTIONAL_NGX_NO_LIB_BLOCK: NGX import library not found; building runtime without static NGX linkage. DLSS/RR/FG NGX features will be disabled until nvsdk_ngx*.lib is added.')
+  dlss_dep = declare_dependency(include_directories : [ dlss_include_dir, dlfg_include_dir ])
+else
+  if not dlss_lib.found()
+  message('DX11_V219_OPTIONAL_NGX_NO_LIB_BLOCK: NGX import library not found; building runtime without static NGX linkage. DLSS/RR/FG NGX features will be disabled until nvsdk_ngx*.lib is added.')
+  dlss_dep = declare_dependency(include_directories : [ dlss_include_dir, dlfg_include_dir ])
+else
+  if not dlss_lib.found()
+  message('DX11_V219_OPTIONAL_NGX_NO_LIB_BLOCK: NGX import library not found; building runtime without static NGX linkage. DLSS/RR/FG NGX features will be disabled until nvsdk_ngx*.lib is added.')
+  dlss_dep = declare_dependency(include_directories : [ dlss_include_dir, dlfg_include_dir ])
+else
+  if not dlss_lib.found()
+  message('DX11_V219_OPTIONAL_NGX_NO_LIB_BLOCK: NGX import library not found; building runtime without static NGX linkage. DLSS/RR/FG NGX features will be disabled until nvsdk_ngx*.lib is added.')
+  dlss_dep = declare_dependency(include_directories : [ dlss_include_dir, dlfg_include_dir ])
+else
+  if not dlss_lib.found()
+  message('DX11_V219_OPTIONAL_NGX_NO_LIB_BLOCK: NGX import library not found; building runtime without static NGX linkage. DLSS/RR/FG NGX features will be disabled until nvsdk_ngx*.lib is added.')
+  dlss_dep = declare_dependency(include_directories : [ dlss_include_dir, dlfg_include_dir ])
+else
+  if not dlss_lib.found()
+  message('DX11_V219_OPTIONAL_NGX_NO_LIB_BLOCK: NGX import library not found; building runtime without static NGX linkage. DLSS/RR/FG NGX features will be disabled until nvsdk_ngx*.lib is added.')
+  dlss_dep = declare_dependency(include_directories : [ dlss_include_dir, dlfg_include_dir ])
+else
+  if not dlss_lib.found()
+  message('DX11_V219_OPTIONAL_NGX_NO_LIB_BLOCK: NGX import library not found; building runtime without static NGX linkage. DLSS/RR/FG NGX features will be disabled until nvsdk_ngx*.lib is added.')
+  dlss_dep = declare_dependency(include_directories : [ dlss_include_dir, dlfg_include_dir ])
+else
+  if not dlss_lib.found()
+  message('DX11_V219_OPTIONAL_NGX_NO_LIB_BLOCK: NGX import library not found; building runtime without static NGX linkage. DLSS/RR/FG NGX features will be disabled until nvsdk_ngx*.lib is added.')
+  dlss_dep = declare_dependency(include_directories : [ dlss_include_dir, dlfg_include_dir ])
+else
+  if not dlss_lib.found()
+  message('DX11_V219_OPTIONAL_NGX_NO_LIB_BLOCK: NGX import library not found; building runtime without static NGX linkage. DLSS/RR/FG NGX features will be disabled until nvsdk_ngx*.lib is added.')
+  dlss_dep = declare_dependency(include_directories : [ dlss_include_dir, dlfg_include_dir ])
+else
+  if not dlss_lib.found()
+  message('DX11_V219_OPTIONAL_NGX_NO_LIB_BLOCK: NGX import library not found; building runtime without static NGX linkage. DLSS/RR/FG NGX features will be disabled until nvsdk_ngx*.lib is added.')
+  dlss_dep = declare_dependency(include_directories : [ dlss_include_dir, dlfg_include_dir ])
+else
+  if not dlss_lib.found()
+  message('DX11_V219_OPTIONAL_NGX_NO_LIB_BLOCK: NGX import library not found; building runtime without static NGX linkage. DLSS/RR/FG NGX features will be disabled until nvsdk_ngx*.lib is added.')
+  dlss_dep = declare_dependency(include_directories : [ dlss_include_dir, dlfg_include_dir ])
+else
+  if not dlss_lib.found()
+  message('DX11_V219_OPTIONAL_NGX_NO_LIB_BLOCK: NGX import library not found; building runtime without static NGX linkage. DLSS/RR/FG NGX features will be disabled until nvsdk_ngx*.lib is added.')
+  dlss_dep = declare_dependency(include_directories : [ dlss_include_dir, dlfg_include_dir ])
+else
+  if not dlss_lib.found()
+  message('DX11_V219_OPTIONAL_NGX_NO_LIB_BLOCK: NGX import library not found; building runtime without static NGX linkage. DLSS/RR/FG NGX features will be disabled until nvsdk_ngx*.lib is added.')
+  dlss_dep = declare_dependency(include_directories : [ dlss_include_dir, dlfg_include_dir ])
+else
   dlss_dep = declare_dependency(dependencies : [ dlss_lib ], include_directories : [ dlss_include_dir, dlfg_include_dir ])
+endif
+endif
+endif
+endif
+endif
+endif
+endif
+endif
+endif
+endif
+endif
+endif
+endif
+endif
+endif
+endif
+endif
+endif
+endif
+endif
+endif
+endif
+endif
+endif
+endif
+endif
+endif
+endif
+endif
+endif
 endif
 endif
 endif
@@ -544,10 +707,30 @@ submodules_dep = declare_dependency(
 )
 
 generated_dxvk_shaders = glsl_generator.process(dxvk_shaders)
+
+# The shader step is a single blanket invocation whose only declared output is a
+# stamp file. Without an explicit dependency list ninja considers that stamp up to
+# date forever, so adding or editing a shader never regenerates SPIR-V and the C++
+# side then fails on a missing rtx_shaders/<name>.h. Enumerate the shader sources
+# at configure time and hand them to custom_target as depend_files.
+rtx_shader_depend_files = run_command(
+  python_interpreter,
+  join_paths(meson.global_source_root(), 'scripts-common', 'list_shader_files.py'),
+  join_paths(meson.global_source_root(), 'src', 'dxvk', 'shaders'),
+  check: true
+).stdout().strip()
+
+if rtx_shader_depend_files == ''
+  rtx_shader_depend_file_list = []
+else
+  rtx_shader_depend_file_list = rtx_shader_depend_files.split('\n')
+endif
+
 rtx_shaders = custom_target(
   'rtx_shaders',
   build_by_default: true,
   output: ['_built_shaders.txt'],
+  depend_files: rtx_shader_depend_file_list,
   command: [ python_interpreter ] + rtx_shaders_command_arguments
 )
 
