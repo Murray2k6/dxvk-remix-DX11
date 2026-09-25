@@ -3,4 +3,7 @@ EXPORTS
   CreateDXGIFactory
   CreateDXGIFactory1
   CreateDXGIFactory2
+  DXGIDeclareAdapterRemovalSupport
+  DXGIGetDebugInterface
+  DXGIGetDebugInterface1
   DX11BridgeInstallPendingSwapChains

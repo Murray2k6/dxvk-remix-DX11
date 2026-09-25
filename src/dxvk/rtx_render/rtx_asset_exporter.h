@@ -46,6 +46,9 @@ namespace dxvk {
 
     void waitForAllExportsToComplete(const float numSecsToWait = 10);
 
+    // Called after all producer contexts and their GPU work have finished.
+    void onDestroy();
+
     void dumpImageToFile(Rc<DxvkContext> ctx, const std::string& dir, const std::string& filename, Rc<DxvkImage> image) {
       env::createDirectory(dir);
       exportImage(ctx, str::format(dir, filename), image);

@@ -30,6 +30,19 @@ foreach external_dll : external_dll_paths
 endforeach
 
 tests = []
+exe = executable('test_dx11_index_range', files('test_dx11_index_range.cpp'),
+  win_subsystem: 'console', override_options: ['cpp_std='+dxvk_cpp_std])
+test('test_dx11_index_range', exe)
+tests += exe
+exe = executable('test_dx11_frame_capture_coverage', files('test_dx11_frame_capture_coverage.cpp'),
+  win_subsystem: 'console', override_options: ['cpp_std='+dxvk_cpp_std])
+test('test_dx11_frame_capture_coverage', exe)
+tests += exe
+exe = executable('test_shader_precompiler_lifetime', files('test_shader_precompiler_lifetime.cpp'),
+  dependencies: [util_dep, tracy_dep, lib_shlwapi], include_directories: dxvk_include_path,
+  win_subsystem: 'console', override_options: ['cpp_std='+dxvk_cpp_std])
+test('test_shader_precompiler_lifetime', exe, timeout: 30)
+tests += exe
 exe = executable('fastop_minmax',  files('test_fastop_minmax.cpp'),  dependencies : test_unit_deps, win_subsystem : 'console', override_options: ['cpp_std='+dxvk_cpp_std])
 test('fastop_minmax', exe, env: test_env)
 tests += exe

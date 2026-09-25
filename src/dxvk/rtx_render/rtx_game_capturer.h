@@ -85,6 +85,7 @@
 #include <vector>
 #include <unordered_map>
 #include <mutex>
+#include <thread>
 
 namespace dxvk 
 {
@@ -134,6 +135,9 @@ public:
 
   GameCapturer(DxvkDevice* const pDevice, SceneManager& sceneManager, AssetExporter& exporter);
   ~GameCapturer();
+
+  // Called after GPU/readback completion, before the scene and device retire.
+  void onDestroy();
 
   void step(const Rc<DxvkContext> ctx, const HWND hwnd);
   void triggerNewCapture() {
@@ -278,7 +282,7 @@ private:
                                     pxr::VtArray<T>& newBuffer,
                                     const float currentCaptureTime,
                                     CompareTReturnBool compareT);
-  void exportUsd(const Rc<DxvkContext> ctx);
+  void exportUsd();
   struct Capture;
   static lss::Export prepExport(const Capture& cap,
                                 const float framesPerSecond);
@@ -364,6 +368,7 @@ private:
     HWND hwnd;
   };
   std::unique_ptr<Capture> m_pCap;
+  std::thread m_exportThread;
 };
 
 }

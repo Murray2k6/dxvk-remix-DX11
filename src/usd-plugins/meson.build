@@ -47,6 +47,9 @@ else
     usd_schema_plugins_nvusd_dir = '_external/nv_usd/release/'
   endif
 endif
+# Runtime and schema plugins declare the same nv-usd package/version. Share
+# the configured SDK instead of requiring a second copy beneath this folder.
+usd_schema_plugins_nvusd_dir = '../../' + usd_debug_release_dir
 usd_schema_plugins_nvusd_libdir = join_paths(meson.current_source_dir(), usd_schema_plugins_nvusd_dir, 'lib')
 usd_schema_plugins_nvusd_bindir = join_paths(meson.current_source_dir(), usd_schema_plugins_nvusd_dir, 'bin')
 usd_libpython_dir = join_paths(usd_schema_plugins_nvusd_libdir, 'python')
@@ -111,11 +114,7 @@ jinja_ok = run_command(
   env: {'PYTHONPATH': usd_libpython_dir}
 )
 if jinja_ok.returncode() != 0
-  pip_install = run_command(
-    usd_schema_plugins_python,
-    ['-m', 'pip', 'install', '--user', 'jinja2'],
-    check: false
-  )
+  error('USD schema generation requires jinja2 in the configured Python 3.10 environment: ' + usd_schema_plugins_python)
 endif
 
 usd_plugins_output_dir = join_paths(meson.project_build_root(), 'remix-usd-plugins', 'usd')
@@ -128,4 +127,3 @@ schema_plugins = [
 foreach plugin : schema_plugins
   subdir(plugin)
 endforeach
-

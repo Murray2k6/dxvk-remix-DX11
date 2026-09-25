@@ -1,4 +1,5 @@
 #include "dxvk_shader.h"
+#include "../spirv/spirv_binding_remap.h"
 
 #include <algorithm>
 #include <unordered_map>
@@ -113,16 +114,13 @@ namespace dxvk {
     for (uint32_t i = 0; i < slotCount; i++)
       m_slots.push_back(slotInfos[i]);
     
-    // Gather the offsets where the binding IDs
-    // are stored so we can quickly remap them.
+    // Remap set-zero resource slots, while retaining fixed external sets.
+    // Collect descriptor sets first so SPIR-V decoration order is irrelevant.
+    m_idOffsets = spirvResourceSlotRemapOffsets(code.data(), code.dwords());
     uint32_t o1VarId = 0;
     
     for (auto ins : code) {
       if (ins.opCode() == spv::OpDecorate) {
-        if (ins.arg(2) == spv::DecorationBinding
-         || ins.arg(2) == spv::DecorationSpecId)
-          m_idOffsets.push_back(ins.offset() + 3);
-        
         if (ins.arg(2) == spv::DecorationLocation && ins.arg(3) == 1) {
           m_o1LocOffset = ins.offset() + 3;
           o1VarId = ins.arg(1);

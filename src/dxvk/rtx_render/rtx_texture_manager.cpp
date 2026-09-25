@@ -436,17 +436,28 @@ namespace dxvk {
     explicit AsyncRunner(const Rc<DxvkDevice>& device)
       : m_ringbuf{ device, stagingBufferSize_Bytes() }
       , m_synchronousAlloc{ device, 4 * Megabytes }
-      , m_thread{ dxvk::thread{ [this] { this->asyncLoop(); } } }
     {
+      // Launch only after the queue mutexes and conditions are constructed.
+      m_thread = dxvk::thread{ [this] { this->asyncLoop(); } };
       m_thread.set_priority(ThreadPriority::Lowest);
     }
 
     ~AsyncRunner() {
-      if (!m_requiresShutdown.load()) {
+      stop();
+    }
+
+    void stop() {
+      {
         auto l = std::unique_lock{ m_texturesToProcess_mutex };
         m_requiresShutdown.store(true);
-        m_texturesToProcess_cond.notify_one();
       }
+      m_texturesToProcess_cond.notify_all();
+      // Synchronize with the backpressure wait as well, so shutdown cannot
+      // lose its wakeup between the predicate and the wait.
+      {
+        auto l = std::unique_lock{ m_readyTextures_mutex };
+      }
+      m_readyTextures_cond.notify_all();
       if (m_thread.joinable()) {
         m_thread.join();
       }
@@ -472,7 +483,7 @@ namespace dxvk {
     // assumed to have an unlimited budget, never fails
     DxvkStagingBuffer         m_synchronousAlloc;
 
-    std::atomic<bool>         m_requiresShutdown;
+    std::atomic<bool>         m_requiresShutdown { false };
     dxvk::thread              m_thread;
 
     dxvk::mutex               m_texturesToProcess_mutex;
@@ -527,7 +538,7 @@ namespace dxvk {
           auto l = std::unique_lock{ m_texturesToProcess_mutex };
 
           m_texturesToProcess_cond.wait(l, [this]() {
-            return !m_texturesToProcess.empty(); // proceed if non-empty
+            return m_requiresShutdown.load() || !m_texturesToProcess.empty();
           });
 
           if (m_requiresShutdown.load()) {
@@ -547,7 +558,12 @@ namespace dxvk {
         // wait a bit, to not over-commit texture uploads in a single frame
         {
           auto l = std::unique_lock{ m_readyTextures_mutex };
-          m_readyTextures_cond.wait(l, [this]() { return m_readyTextures.size() < MAX_TEXTURE_UPLOADS_PER_FRAME; });
+          m_readyTextures_cond.wait(l, [this]() {
+            return m_requiresShutdown.load() || m_readyTextures.size() < MAX_TEXTURE_UPLOADS_PER_FRAME;
+          });
+          if (m_requiresShutdown.load()) {
+            break;
+          }
         }
 
         ReadyToCopy ready;
@@ -563,7 +579,7 @@ namespace dxvk {
             ready = makeStagingForTextureAsset(m_ringbuf, itemToProcess);
           }
 
-          while (!ready.dstTexture.ptr()) {
+          while (!ready.dstTexture.ptr() && !m_requiresShutdown.load()) {
             // alloc failed, retry after wait
             this_thread::yield();
 
@@ -571,6 +587,10 @@ namespace dxvk {
             auto lockAssetInfo = std::unique_lock{ m_assetInfoMutex };
             ready = makeStagingForTextureAsset(m_ringbuf, itemToProcess);
           }
+        }
+
+        if (m_requiresShutdown.load()) {
+          break;
         }
 
         {
@@ -603,22 +623,30 @@ namespace dxvk {
     
     explicit AsyncRunner_RTXIO(const Rc<DxvkDevice>& device)
       : m_device{ device }
-      , m_thread{ dxvk::thread{ [this] { this->asyncLoop(); } } }
       , m_texturesToProcess_count{ 0 }
       , m_requiresSyncFlush{ false }
     {
+      m_thread = dxvk::thread{ [this] { this->asyncLoop(); } };
       m_thread.set_priority(ThreadPriority::Lowest);
     }
 
 
     ~AsyncRunner_RTXIO() {
-      if (!m_requiresShutdown.load()) {
+      stop();
+    }
+
+
+    void stop() {
+      {
         auto l = std::unique_lock{ m_texturesToProcess_mutex };
         m_requiresShutdown.store(true);
-        m_texturesToProcess_cond.notify_one();
       }
+      m_texturesToProcess_cond.notify_all();
       if (m_thread.joinable()) {
         m_thread.join();
+        // The waiting list owns the images referenced by RTXIO requests.
+        // Finish every issued request before those references can be freed.
+        flushRtxIo(false);
       }
     }
 
@@ -667,9 +695,12 @@ namespace dxvk {
           {
             auto l = std::unique_lock{ m_texturesToProcess_mutex };
 
-            while (m_texturesToProcess.empty()) {
+            while (m_texturesToProcess.empty() && !m_requiresShutdown.load()) {
               m_texturesToProcess_cond.wait(l);
 
+              if (m_requiresShutdown.load()) {
+                break;
+              }
               l.unlock();
               flushRtxIo(true);
               l.lock();
@@ -756,7 +787,7 @@ namespace dxvk {
 
   private:
     Rc<DxvkDevice>                  m_device;
-    std::atomic<bool>               m_requiresShutdown;
+    std::atomic<bool>               m_requiresShutdown { false };
     dxvk::thread                    m_thread;
 
     dxvk::mutex                     m_texturesToProcess_mutex;
@@ -826,23 +857,47 @@ namespace dxvk {
   }
 
   void RtxTextureManager::startAsync() {
+#ifdef WITH_RTXIO
     if (RtxIo::enabled()) {
       m_asyncThread_rtxio = new AsyncRunner_RTXIO{ m_device };
-    } else {
+    } else
+#endif
+    {
       m_asyncThread = new AsyncRunner{ m_device };
     }
   }
 
   RtxTextureManager::~RtxTextureManager() {
+    onDestroy();
+
+    delete[] m_sf.m_cachedGpubuf;
+    delete[] m_sf.m_cachedAssetMipcount;
+    delete[] m_sf.m_accumulatedMipcount;
+    delete[] m_sf.m_noisyMipcount;
+    delete[] m_sf.m_related;
+  }
+
+  void RtxTextureManager::stopAsync() {
     FileWatch::get().endThread();
 
-    delete m_sf.m_cachedGpubuf;
-    delete m_sf.m_cachedAssetMipcount;
-    delete m_sf.m_accumulatedMipcount;
-    delete m_sf.m_noisyMipcount;
-    delete m_sf.m_related;
+    if (m_asyncThread) {
+      m_asyncThread->stop();
+    }
+#ifdef WITH_RTXIO
+    if (m_asyncThread_rtxio) {
+      m_asyncThread_rtxio->stop();
+    }
+#endif
+  }
+
+  void RtxTextureManager::onDestroy() {
+    stopAsync();
     delete m_asyncThread;
+    m_asyncThread = nullptr;
+#ifdef WITH_RTXIO
     delete m_asyncThread_rtxio;
+    m_asyncThread_rtxio = nullptr;
+#endif
   }
 
   static ManagedTexture::State processManagedTextureState(ManagedTexture* tex) {

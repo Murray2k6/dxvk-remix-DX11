@@ -265,7 +265,7 @@ endif
 glsl_compiler = find_program('external/glslangvalidator/glslangValidator')
 slang_compiler = find_program('external/slang/slangc')
 spirv_val = find_program('external/spirv_tools/spirv-val')
-python_interpreter = find_program('python3', 'python')
+python_interpreter = import('python').find_installation()
 shader_compile_script = join_paths(global_src_root_norm, 'scripts-common/compile_shaders.py')
 
 # GLSL Compiler
@@ -623,8 +623,10 @@ aftermath_lib_path = join_paths(global_src_root_norm, 'external/aftermath/lib', 
 external_dll_paths += aftermath_lib_path
 aftermath_lib = dxvk_compiler.find_library(aftermath_lib_name, dirs : aftermath_lib_path)
 
-# this is repeated below, since we overwrite dlss_lib_path in src/dxvk/meson.build for some reason
 dlss_root_path = 'external/ngx_sdk_310_6_0'
+if not fs.is_dir(join_paths(dlss_root_path, 'include'))
+  dlss_root_path = 'submodules/_downloads/NVIDIA_DLSS_v310.6.0_source/DLSS-310.6.0'
+endif
 dlss_lib_path = join_paths(global_src_root_norm, dlss_root_path, 'lib', ngx_windows_arch_dir, 'rel')
 external_dll_paths += dlss_lib_path
 dlfg_root_path = 'external/ngx_sdk_dlfg'
@@ -726,11 +728,6 @@ if dxvk_is_ninja
   fs.read('vsgen/testcase_project.args.json.template')
   fs.read('vsgen/vsutil.py')
 
-  # ... and now we do this again, because src/dxvk/meson.build overwrites this for some reason
-  dlss_root_path = 'external/ngx_sdk_310_6_0'
-  dlss_lib_path = join_paths(global_src_root_norm, dlss_root_path, 'lib', ngx_windows_arch_dir, 'rel')
-  dlfg_root_path = 'external/ngx_sdk_dlfg'
-  dlfg_lib_path = join_paths(global_src_root_norm, dlfg_root_path, 'lib', ngx_windows_arch_dir, 'rel')
 
   # meson seems to force / as the path separator in custom_target
   # ... except in the case where the path separators are inconsistent, in which case it does nothing
@@ -955,4 +952,3 @@ endif # dxvk_is_ninja
 if fs.is_file('nv-private/meson.build')
   subdir('nv-private')
 endif
-

@@ -277,6 +277,8 @@ namespace dxvk {
     m_fogStartInMediumMaterialIndex_inCache = kInvalidMaterialCacheIndex;
     m_externalStartInMediumMaterialIndex_inCache = kInvalidMaterialCacheIndex;
     m_startInMediumMaterialIndex_inCache = kInvalidMaterialCacheIndex;
+    m_uploadedStartInMediumMaterialIndex_inCache = kInvalidMaterialCacheIndex;
+    m_uploadedStartInMediumMaterialIndex = SURFACE_INDEX_INVALID;
   }
 
   void SceneManager::garbageCollection() {
@@ -1977,7 +1979,9 @@ namespace dxvk {
     // scene generation, so keep their surface-material upload live.
     const bool updateSurfaceMaterials =
       !m_accelManager.wasSceneUnchangedThisFrame() ||
-      TerrainBaker::needsTerrainBaking();
+      TerrainBaker::needsTerrainBaking() ||
+      m_startInMediumMaterialIndex_inCache != m_uploadedStartInMediumMaterialIndex_inCache;
+    m_startInMediumMaterialIndex = SURFACE_INDEX_INVALID;
     if (updateSurfaceMaterials) {
       DxvkBufferCreateInfo matInfo;
       matInfo.usage = VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT
@@ -2030,6 +2034,12 @@ namespace dxvk {
 
         ctx->writeToBuffer(m_surfaceMaterialBuffer, 0, surfaceMaterialsGPUData.size(), surfaceMaterialsGPUData.data());
       }
+      m_uploadedStartInMediumMaterialIndex_inCache = m_startInMediumMaterialIndex_inCache;
+      m_uploadedStartInMediumMaterialIndex = m_startInMediumMaterialIndex;
+    } else {
+      // onFrameEnd resets the active GPU index, but the medium's material slot
+      // remains valid when the complete surface-material buffer is reused.
+      m_startInMediumMaterialIndex = m_uploadedStartInMediumMaterialIndex;
     }
 
     // GPU-driven PointInstancer culling: overwrites visible instance placeholders

@@ -39,12 +39,12 @@ namespace dxvk {
   constexpr uint32_t D3D11DXGIDevice::DefaultFrameLatency;
 
   namespace {
+    dxvk::mutex g_gameShaderPrewarmMutex;
+    bool g_gameShaderPrewarmComplete = false;
+
     D3D11ShaderModuleSet& sharedD3D11ShaderModules() {
-      // All D3D11 devices in this build reuse one DxvkDevice so Remix is not
-      // initialized repeatedly by engines and emulators that probe adapters.
-      // Shader modules are Vulkan-device objects as well: retaining one shared
-      // set makes cached game shaders immediately available to every probe and
-      // real device without recompiling the complete title cache each time.
+      // Overlapping frontends share modules. The last device lease clears
+      // device-owned buffers before a subsequent Vulkan device is created.
       static D3D11ShaderModuleSet modules;
       return modules;
     }
@@ -448,7 +448,7 @@ namespace dxvk {
     m_d3d11Formats  (m_dxvkAdapter),
     m_d3d11Options  (m_dxvkDevice->instance()->config(), m_dxvkDevice),
     m_dxbcOptions   (m_dxvkDevice, m_d3d11Options) {
-    m_initializer = new D3D11Initializer(this);
+    m_initializer = std::make_unique<D3D11Initializer>(this);
     m_context     = new D3D11ImmediateContext(this, m_dxvkDevice);
     PrewarmCachedGameShaders();
 
@@ -469,22 +469,20 @@ namespace dxvk {
     // can never touch a destroyed device.
     RtxShaderPrecompiler::clearRunner(this);
     m_context = nullptr;
-    delete m_initializer;
+    m_initializer.reset();
   }
 
 
   void D3D11Device::PrewarmCachedGameShaders() {
-    static dxvk::mutex prewarmMutex;
-    static bool prewarmComplete = false;
-    std::lock_guard<dxvk::mutex> prewarmLock(prewarmMutex);
-    if (prewarmComplete) {
+    std::lock_guard<dxvk::mutex> prewarmLock(g_gameShaderPrewarmMutex);
+    if (g_gameShaderPrewarmComplete) {
       if (prewarmLoggingEnabled()) {
         Logger::info(
           "[Remix-DX11][game-shader-cache] shared-device preload already complete; reusing cached modules for this D3D11 device.");
       }
       return;
     }
-    prewarmComplete = true;
+    g_gameShaderPrewarmComplete = true;
 
     if (env::getEnvVar("DXVK_GAME_SHADER_CACHE") == "0") {
       if (prewarmLoggingEnabled())
@@ -2655,6 +2653,9 @@ namespace dxvk {
     enabled.core.features.geometryShader                          = VK_TRUE;
     enabled.core.features.robustBufferAccess                      = VK_TRUE;
     enabled.core.features.shaderStorageImageWriteWithoutFormat    = VK_TRUE;
+    // NRD's texture formats vary independently of its HLSL float vector types.
+    // Its in-place history and motion-vector reads use formatless storage images.
+    enabled.core.features.shaderStorageImageReadWithoutFormat     = supported.core.features.shaderStorageImageReadWithoutFormat;
     enabled.core.features.depthBounds                             = supported.core.features.depthBounds;
 
     // PHASMOPHOBIA REMIX PORTING: shaderDrawParameters removed from Remix fork
@@ -3849,7 +3850,7 @@ namespace dxvk {
   : m_dxgiAdapter   (pAdapter),
     m_dxvkInstance  (pDxvkInstance),
     m_dxvkAdapter   (pDxvkAdapter),
-    m_dxvkDevice    (CreateDevice(FeatureLevel)),
+    m_sharedDevice  (pDxvkInstance, pDxvkAdapter, FeatureLevel),
     m_d3d11Device   (this, FeatureLevel, FeatureFlags),
     m_d3d11DeviceExt(this, &m_d3d11Device),
     m_d3d11Interop  (this, &m_d3d11Device),
@@ -3861,7 +3862,6 @@ namespace dxvk {
   
   
   D3D11DXGIDevice::~D3D11DXGIDevice() {
-    ReleaseSharedDevice();
   }
   
   
@@ -4188,22 +4188,21 @@ namespace dxvk {
   
   
   Rc<DxvkDevice> STDMETHODCALLTYPE D3D11DXGIDevice::GetDXVKDevice() {
-    return m_dxvkDevice;
+    return m_sharedDevice.device();
   }
 
 
-  // Shared DxvkDevice lifecycle: Remix initializes a global RT pipeline per
-  // DxvkDevice.  Multi-device games (Unity, UE4) and emulators (Dolphin, RPCS3)
-  // create 2+ D3D11 devices — each would spin up its own Remix pipeline,
-  // deadlocking the GPU.  We share one DxvkDevice across all D3D11DXGIDevice
-  // instances and release it only when the last one is destroyed.  This lets
-  // emulators safely destroy-and-recreate devices (game switching, plugin reload)
-  // while multi-device games share a single pipeline.
+  // Remix uses process-wide shader state. Serialize both acquisition and the
+  // complete destruction of the last device, so retiring its ShaderManager
+  // cannot destroy a concurrently created device's shader state.
   static std::mutex      g_sharedDeviceMutex;
   static Rc<DxvkDevice>  g_sharedDevice;
   static uint32_t        g_sharedDeviceRefCount = 0;
 
-  Rc<DxvkDevice> D3D11DXGIDevice::CreateDevice(D3D_FEATURE_LEVEL FeatureLevel) {
+  D3D11DXGIDevice::SharedDeviceLease::SharedDeviceLease(
+    const Rc<DxvkInstance>& instance,
+    const Rc<DxvkAdapter>& adapter,
+    D3D_FEATURE_LEVEL featureLevel) {
     std::lock_guard lock(g_sharedDeviceMutex);
 
     // DX11_V230_RTXOPTIONS_ROOT_CREATE: the RtxOptions singleton (RtxOptions::s_instance) is a
@@ -4216,40 +4215,45 @@ namespace dxvk {
     RtxOptions::Create();
 
     if (g_sharedDevice != nullptr) {
+      m_device = g_sharedDevice;
       g_sharedDeviceRefCount++;
       Logger::info("D3D11DXGIDevice::CreateDevice: Reusing shared DxvkDevice");
-      return g_sharedDevice;
+      return;
     }
 
     Logger::info("D3D11DXGIDevice::CreateDevice: Creating new shared DxvkDevice");
-    DxvkDeviceFeatures deviceFeatures = D3D11Device::GetDeviceFeatures(m_dxvkAdapter, FeatureLevel);
+    DxvkDeviceFeatures deviceFeatures = D3D11Device::GetDeviceFeatures(adapter, featureLevel);
     
     // Create device first, then increment ref count only on success
-    Rc<DxvkDevice> newDevice = m_dxvkAdapter->createDevice(m_dxvkInstance, deviceFeatures);
+    Rc<DxvkDevice> newDevice = adapter->createDevice(instance, deviceFeatures);
     
     if (newDevice == nullptr) {
-      Logger::err("D3D11DXGIDevice::CreateDevice: Failed to create DxvkDevice");
-      return nullptr;
+      throw DxvkError("D3D11DXGIDevice::CreateDevice: Failed to create DxvkDevice");
     }
     
     g_sharedDevice = newDevice;
+    m_device = newDevice;
     g_sharedDeviceRefCount++;
-    return g_sharedDevice;
   }
 
-  void D3D11DXGIDevice::ReleaseSharedDevice() {
+  D3D11DXGIDevice::SharedDeviceLease::~SharedDeviceLease() {
     std::lock_guard lock(g_sharedDeviceMutex);
-    if (g_sharedDeviceRefCount > 0)
-      g_sharedDeviceRefCount--;
-
-    if (g_sharedDeviceRefCount == 0) {
-      Logger::info("D3D11DXGIDevice::ReleaseSharedDevice: All D3D11 devices released (DxvkDevice kept alive)");
-      // Keep g_sharedDevice alive. Emulators (Dolphin, RPCS3) and some engines
-      // rapidly create/destroy D3D11 devices during init probing. Releasing the
-      // Vulkan device kills all Remix state (RT, DLSS, Reflex, shader caches)
-      // and costs ~2s per cycle. The device is lightweight when idle and will be
-      // reused on the next D3D11CreateDevice call.
+    if (--g_sharedDeviceRefCount == 0) {
+      Logger::info("D3D11DXGIDevice: Retiring last shared device");
+      // Frontend CS threads and initializer have already been destroyed.
+      // Common cleanup stops background work, drains GPU access and breaks
+      // the contexts/staging allocators' references back to the device.
+      m_device->getCommon()->onDestroy();
+      {
+        std::lock_guard<dxvk::mutex> prewarmLock(g_gameShaderPrewarmMutex);
+        sharedD3D11ShaderModules().Clear();
+        g_gameShaderPrewarmComplete = false;
+      }
+      g_sharedDevice = nullptr;
     }
+    // Release the lease while still holding the lifecycle mutex, including
+    // the final DxvkDevice destructor and ShaderManager singleton teardown.
+    m_device = nullptr;
   }
 
 }

@@ -45,6 +45,7 @@ namespace bridge_util {
     Process(LPCTSTR cmd, ProcessExitCallback callback):
       hProcess(NULL),
       hWait(NULL),
+      hDuplicate(NULL),
       exitCallback(NULL) {
       hProcess = createChildProcess(cmd);
       RegisterExitCallback(callback);
@@ -69,6 +70,8 @@ namespace bridge_util {
     bool isValid() const {
       return hProcess != NULL && hProcess != INVALID_HANDLE_VALUE;
     }
+
+    HANDLE GetProcessHandle() const { return hProcess; }
 
     bool PostMessageToMainThread(UINT msg, WPARAM wParam, LPARAM lParam) const;
 

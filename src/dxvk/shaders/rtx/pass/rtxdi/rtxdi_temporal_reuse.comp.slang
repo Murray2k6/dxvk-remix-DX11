@@ -59,9 +59,21 @@ void main(int2 threadIndex : SV_DispatchThreadID)
   }
 
   const int2 pixelCoordinate = threadIndex;
+  // Initial sampling already wrote the current reservoir. Disabled or reset
+  // history must not enter the SDK's reprojection search: a zero history limit
+  // only limits M, and still reads and evaluates previous-frame data.
+  if (!cb.enableRtxdiTemporalReuse || cb.rtxdiMaxHistoryLength == 0)
+  {
+    ReprojectionConfidence[pixelCoordinate] = 0;
+    TemporalPosition[pixelCoordinate] = ~0u;
+    return;
+  }
+
   RAB_Surface surface = RAB_GetGBufferSurface(pixelCoordinate, false);
   if (!RAB_IsSurfaceValid(surface))
   {
+    ReprojectionConfidence[pixelCoordinate] = 0;
+    TemporalPosition[pixelCoordinate] = ~0u;
     return;
   }
   
@@ -132,7 +144,7 @@ void main(int2 threadIndex : SV_DispatchThreadID)
   float currentReprojectionConfidence = 0;
   if (isGBufferSimilar)
   {
-    currentReprojectionConfidence = ReprojectionConfidence[temporalSamplePixelPos];
+    currentReprojectionConfidence = PreviousReprojectionConfidence[temporalSamplePixelPos];
   }
 
   currentReprojectionConfidence = min(currentReprojectionConfidence + 1.f / kReprojectionConfidenceHistoryLength, 1.f);

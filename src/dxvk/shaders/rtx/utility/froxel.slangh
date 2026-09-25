@@ -204,12 +204,12 @@ struct VolumeLookup
   uint volumeIndex;
 };
 
-VolumeLookup froxelCoordinateToPrev(VolumeArgs volumeArgs, uint froxelDepthSlices, bool teleportationPortalIndex, float3 froxelCoordinate, uint froxelVolume, out bool previousVolumeExists, out bool reprojectionValid)
+VolumeLookup froxelCoordinateToPrev(VolumeArgs volumeArgs, uint froxelDepthSlices, uint teleportationPortalIndex, float3 froxelCoordinate, uint froxelVolume, out bool previousVolumeExists, out bool reprojectionValid, bool useRestirGrid = false)
 {
   // Figure out which volume we'll be pulling the previous data from.
   // Usually it's the same volume, but in case of portal teleportation, that doesn't work.
   uint previousFroxelVolume = froxelVolume;
-  previousVolumeExists = true;
+  previousVolumeExists = !volumeArgs.resetHistory;
   if (teleportationPortalIndex)
   {
     if (froxelVolume == froxelVolumeMain)
@@ -220,13 +220,22 @@ VolumeLookup froxelCoordinateToPrev(VolumeArgs volumeArgs, uint froxelDepthSlice
       previousVolumeExists = false;
   }
   
-  const VolumeDefinitionCamera camera = cb.volumeArgs.cameras[froxelVolume];
-  const VolumeDefinitionCamera previousCamera = cb.volumeArgs.cameras[previousFroxelVolume];
+  // A portal volume may not be allocated or active on the previous frame.
+  // Keep the camera lookup in bounds even when history cannot be reused.
+  if (previousFroxelVolume >= volumeArgs.numActiveFroxelVolumes)
+  {
+    previousVolumeExists = false;
+    previousFroxelVolume = froxelVolumeMain;
+  }
+
+  const VolumeDefinitionCamera camera = useRestirGrid ? volumeArgs.restirCameras[froxelVolume] : volumeArgs.cameras[froxelVolume];
+  const VolumeDefinitionCamera previousCamera = useRestirGrid ? volumeArgs.restirCameras[previousFroxelVolume] : volumeArgs.cameras[previousFroxelVolume];
+  const vec2 inverseGridDimensions = useRestirGrid ? volumeArgs.restirInverseFroxelGridDimensions : volumeArgs.inverseFroxelGridDimensions;
   
   const vec3 previousLookupFroxelCoordinate = froxelCoordinate;
   const vec3 previousLookupFroxelTranslatedWorldPosition = froxelCoordinateToTranslatedWorldPosition(
     camera.projectionToTranslatedWorld, camera.viewToProjection, packedFlagGet(camera.flags, rightHandedFlag),
-    volumeArgs.inverseFroxelGridDimensions, froxelDepthSlices,
+    inverseGridDimensions, froxelDepthSlices,
     volumeArgs.froxelDepthSliceDistributionExponent, volumeArgs.froxelMaxDistance, camera.nearPlane,
     previousLookupFroxelCoordinate);
   // Note: Convert from the current frame's translated world space to the previous frame's translated world space so the look coordinate
@@ -246,10 +255,10 @@ VolumeLookup froxelCoordinateToPrev(VolumeArgs volumeArgs, uint froxelDepthSlice
   reprojectionValid = all(previousFroxelUVW > vec3(0.0f, 0.0f, 0.0f) && previousFroxelUVW < vec3(1.0f, 1.0f, 1.0f)) && !volumeArgs.resetHistory;
   
   // Note: The previous froxel coordinate/index are only valid if the Froxel UVW coordinate is valid (meaning successful reprojection).
-  const uvec3 froxelDimensions = uvec3(volumeArgs.froxelGridDimensions, froxelDepthSlices);
+  const uvec3 froxelDimensions = uvec3(useRestirGrid ? volumeArgs.restirFroxelGridDimensions : volumeArgs.froxelGridDimensions, froxelDepthSlices);
   VolumeLookup lookup;
   lookup.uvw = previousFroxelUVW;
-  lookup.worldPos = previousLookupFroxelTranslatedWorldPosition + previousCamera.previousTranslatedWorldOffset;
+  lookup.worldPos = previousLookupFroxelPreviousTranslatedWorldPosition + previousCamera.previousTranslatedWorldOffset;
   lookup.coordinate = froxelUVWToFroxelCoordinate(previousFroxelUVW, froxelDimensions);
   lookup.volumeIndex = previousFroxelVolume;
   return lookup;

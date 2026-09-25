@@ -28,7 +28,6 @@ endif
 
 if not enable_tests
 	if cpu_family == 'x86'
-subdir('server')
 		subdir('launcher')
 	elif cpu_family == 'x86_64'
 		subdir('server')

@@ -21,7 +21,7 @@
 */
 
 //!variant-matrix gbuffer
-//!> common RAY_TRACING_PRIMARY_RAY
+//!> common RAY_TRACING_PRIMARY_RAY ATMOSPHERE_AVAILABLE
 //!> axis features - GBUFFER_FEATURE_OBJECT_PICKING=0
 //!> axis features debug GBUFFER_FEATURE_DEBUG_VIEW=1 GBUFFER_FEATURE_OBJECT_PICKING=1
 //!> axis features lean_psr GBUFFER_FEATURE_DLSSRR=0 GBUFFER_FEATURE_OBJECT_PICKING=0 GBUFFER_FEATURE_PARTICLE_LAYER=0 GBUFFER_FEATURE_RAYTRACED_RENDER_TARGET=0 GBUFFER_FEATURE_STOCHASTIC_ALPHA=0 GBUFFER_FEATURE_PSR_REPLACEMENT=1
@@ -30,7 +30,7 @@
 //!> axis psr psr GBUFFER_PSR
 //!> axis pipeline raygen.rgen RT_TRACE_RAY RAY_PIPELINE
 //!> axis pipeline raygen_ser.rgen RT_TRACE_RAY RAY_PIPELINE RT_SHADER_EXECUTION_REORDERING
-//!> axis pipeline rayquery_raygen.rgen RAY_PIPELINE ATMOSPHERE_AVAILABLE
+//!> axis pipeline rayquery_raygen.rgen RAY_PIPELINE
 //!> axis nrc -
 //!> axis nrc nrc ENABLE_NRC=1
 //!> axis wboit -

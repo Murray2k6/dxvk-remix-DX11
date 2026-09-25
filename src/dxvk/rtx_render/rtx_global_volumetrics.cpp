@@ -37,6 +37,7 @@
 #include "dxvk_scoped_annotation.h"
 #include "rtx_context.h"
 #include "rtx_imgui.h"
+#include <algorithm>
 
 namespace dxvk {
 
@@ -445,6 +446,10 @@ namespace dxvk {
       return true;
     }
 
+    if (fogState.mode == DX11_FOG_EXP || fogState.mode == DX11_FOG_EXP2) {
+      return fogState.density < fogDensityThrehold;
+    }
+
     // Exponential fog function approximation with linear fog function:
     // Push the linear function start point (x = 0) towards exponential function,
     // then make the exp function as close as to the linear function when x=end (make the exp function curve convergence to the linear)
@@ -476,7 +481,7 @@ namespace dxvk {
 
     // Check if fog density is below the configurable threshold to determine if physical volumetrics should be used.
     // This threshold was created specifically for Portal RTX's underwater fixed function fog.
-    const bool canUsePhysicalFog = shouldConvertToPhysicalFog(fogState, waterFogDensityThreshold());
+    const bool canUsePhysicalFog = !enableFogRemap() || shouldConvertToPhysicalFog(fogState, waterFogDensityThreshold());
 
     if (
       enableFogRemap() &&
@@ -523,7 +528,7 @@ namespace dxvk {
             // Todo: Scene scale stuff ignored for now because scene scale stuff is not actually functioning properly. Add back in if it's ever fixed.
             // Note: Remap the end fog state distance into renderer units so that options can all be in renderer units (to be consistent with everything else).
             // normalizedRange = (fogState.end * sceneScale() - fogRemapMaxDistanceMin) / maxDistanceRange;
-            normalizedRange = (fogState.end - fogRemapMaxDistanceMin) / maxDistanceRange;
+            normalizedRange = std::clamp((fogState.end - fogRemapMaxDistanceMin) / maxDistanceRange, 0.0f, 1.0f);
           }
 
           transmittanceMeasurementDistance = normalizedRange * transmittanceMeasurementDistanceRange + fogRemapTransmittanceMeasurementDistanceMin;
@@ -535,7 +540,8 @@ namespace dxvk {
           if (fogState.density != 0.0f) {
             float const transmittanceColorLuminance { sRGBLuminance(transmittanceColorLinear) };
 
-            transmittanceMeasurementDistance = -log(transmittanceColorLuminance) / fogState.density;
+            const float opticalDepth = -log(transmittanceColorLuminance);
+            transmittanceMeasurementDistance = (fogState.mode == DX11_FOG_EXP2 ? std::sqrt(opticalDepth) : opticalDepth) / fogState.density;
             // Todo: Scene scale stuff ignored for now because scene scale stuff is not actually functioning properly. Add back in if it's ever fixed.
             // Note: Convert transmittance measurement distance into our engine's units (from game-specific world units due to being derived
             // from the D3D11 side of things). This in effect is the same as dividing the density by the scene scale.
@@ -549,6 +555,11 @@ namespace dxvk {
     }
 
     // Calculate scattering and attenuation coefficients for the volume
+
+    // These bounds apply even when legacy-fog remapping is disabled. Both
+    // zero measurement distance and log(0) otherwise poison the froxel cache.
+    transmittanceColorLinear = clamp(transmittanceColorLinear, Vector3(MinTransmittanceValue), Vector3(MaxTransmittanceValue));
+    transmittanceMeasurementDistance = std::max(transmittanceMeasurementDistance, 1e-4f);
 
     Vector3 const volumetricAttenuationCoefficient{
       -log(transmittanceColorLinear.x) / transmittanceMeasurementDistance,
@@ -578,16 +589,17 @@ namespace dxvk {
 
     volumeArgs.maxAccumulationFrames = static_cast<uint16_t>(maxAccumulationFrames());
     volumeArgs.froxelDepthSliceDistributionExponent = froxelDepthSliceDistributionExponent();
-    volumeArgs.froxelMaxDistance = froxelMaxDistanceMeters() * RtxOptions::getMeterToWorldUnitScale();
+    volumeArgs.froxelMaxDistance = std::max(froxelMaxDistanceMeters() * RtxOptions::getMeterToWorldUnitScale(), 1e-4f);
     volumeArgs.froxelFireflyFilteringLuminanceThreshold = froxelFireflyFilteringLuminanceThreshold();
     volumeArgs.attenuationCoefficient = volumetricAttenuationCoefficient;
     volumeArgs.enable = enable() && canUsePhysicalFog;
-    volumeArgs.enableTranslucentShadows = volumeArgs.enable && enableTranslucentShadows();
+    // The radiance cache also lights surfaces when physical fog is disabled.
+    volumeArgs.enableTranslucentShadows = enableTranslucentShadows();
     volumeArgs.scatteringCoefficient = volumetricScatteringCoefficient;
     volumeArgs.enableVolumeRISInitialVisibility = enableInitialVisibility();
     volumeArgs.enablevisibilityReuse = visibilityReuse();
     // Note: We need to invalidate the volumetric reservoir when detecting camera cut to avoid accumulating the history from different scenes
-    volumeArgs.enableVolumeTemporalResampling = enableTemporalResampling() && !cameraManager.getMainCamera().isCameraCut();
+    volumeArgs.enableVolumeTemporalResampling = enableTemporalResampling() && !m_resetHistory && !cameraManager.getMainCamera().isCameraCut();
     volumeArgs.enableVolumeSpatialResampling = enableSpatialResampling() && !cameraManager.getMainCamera().isCameraCut();
     volumeArgs.numSpatialSamples = spatialReuseMaxSampleCount();
     volumeArgs.spatialSamplingRadius = spatialReuseSamplingRadius();
@@ -659,12 +671,14 @@ namespace dxvk {
     }
 
     // Note: We need to invalidate the volumetric history buffers (radiance and age buffers) when detecting camera cut to avoid accumulating the history from different scenes
-    volumeArgs.resetHistory = cameraManager.getMainCamera().isCameraCut();
+    volumeArgs.resetHistory = m_resetHistory || cameraManager.getMainCamera().isCameraCut();
 
     return volumeArgs;
   }
 
   void RtxGlobalVolumetrics::dispatch(RtxContext* ctx, const Resources::RaytracingOutput& rtOutput, uint32_t numActiveFroxelVolumes) {
+    // The froxel radiance cache is also consumed by translucent surfaces and
+    // decals. Do not gate its update on volumeArgs.enable (physical fog).
     // Bind resources
 
     ctx->bindCommonRayTracingResources(rtOutput);
@@ -702,7 +716,8 @@ namespace dxvk {
       ctx->dispatch(workgroups.width, workgroups.height, workgroups.depth);
     }
 
-    if(visibilityReuse()) {
+    if (rtOutput.m_raytraceArgs.volumeArgs.enablevisibilityReuse &&
+        rtOutput.m_raytraceArgs.volumeArgs.enableVolumeRISInitialVisibility) {
       ScopedGpuProfileZone(ctx, "Volume Integrate Restir Visible");
       ctx->setFramePassStage(RtxFramePassStage::VolumeIntegrateRestirVisible);
       VkExtent3D workgroups = util::computeBlockCount(numRestirCellsExtent, VkExtent3D { 16, 8, 1 });
@@ -725,7 +740,8 @@ namespace dxvk {
       ctx->dispatch(workgroups.width, workgroups.height, workgroups.depth);
     }
 
-    {
+    if (rtOutput.m_raytraceArgs.volumeArgs.enableVolumeSpatialResampling &&
+        rtOutput.m_raytraceArgs.volumeArgs.numSpatialSamples > 0) {
       ScopedGpuProfileZone(ctx, "Volume Integrate Restir Spatial Resampling");
       ctx->setFramePassStage(RtxFramePassStage::VolumeIntegrateRestirSpatialResampling);
       VkExtent3D workgroups = util::computeBlockCount(numRestirCellsExtent, VkExtent3D { 16, 8, 1 });
@@ -735,6 +751,10 @@ namespace dxvk {
 
       ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, VolumeRestirShaderSpatialResampling::getShader());
       ctx->dispatch(workgroups.width, workgroups.height, workgroups.depth);
+    } else {
+      // The spatial pass otherwise just copies every reservoir. Keep slot 1
+      // as the completed result/history without dispatching that copy.
+      std::swap(m_volumeReservoirs[0], m_volumeReservoirs[1]);
     }
 
     // Dispatch rays
@@ -748,6 +768,8 @@ namespace dxvk {
       ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, VolumeIntegrateShader::getShader());
       ctx->dispatch(workgroups.width, workgroups.height, workgroups.depth);
     }
+
+    m_resetHistory = false;
 
     // Todo: Implement TraceRay path if needed some day, currently not though.
     /*
@@ -795,14 +817,34 @@ namespace dxvk {
     RtxPass::onFrameBegin(ctx, frameBeginCtx);
 
     m_swapTextures = !m_swapTextures;
+    m_resetHistory |= frameBeginCtx.resetHistory || frameBeginCtx.isCameraCut;
+    // History is indexed using these parameters; changing them invalidates
+    // both grids even when their allocated dimensions remain unchanged.
+    const float maxDistance = froxelMaxDistanceMeters() * RtxOptions::getMeterToWorldUnitScale();
+    m_resetHistory |= m_previousFroxelMaxDistance != maxDistance ||
+      m_previousFroxelDistributionExponent != froxelDepthSliceDistributionExponent() ||
+      m_previousRestirGuardBand != restirGridGuardBandFactor();
+    m_previousFroxelMaxDistance = maxDistance;
+    m_previousFroxelDistributionExponent = froxelDepthSliceDistributionExponent();
+    m_previousRestirGuardBand = restirGridGuardBandFactor();
 
-    if (m_rebuildFroxels) {
+    VkExtent3D expectedFroxelExtent = util::computeBlockCount(frameBeginCtx.downscaledExtent,
+      VkExtent3D { froxelGridResolutionScale(), froxelGridResolutionScale(), 1 });
+    expectedFroxelExtent.depth = froxelDepthSlices();
+    VkExtent3D expectedRestirExtent = util::computeBlockCount(expectedFroxelExtent,
+      VkExtent3D { restirGridScale(), restirGridScale(), 1 });
+    expectedRestirExtent.depth = restirFroxelDepthSlices();
+    if (m_rebuildFroxels || m_froxelVolumeExtent != expectedFroxelExtent ||
+        m_restirFroxelVolumeExtent != expectedRestirExtent ||
+        m_numFroxelVolumes != (enableInPortals() ? maxRayPortalCount + 1 : 1)) {
       createDownscaledResource(ctx, frameBeginCtx.downscaledExtent);
       m_rebuildFroxels = false;
     }
   }
 
   void RtxGlobalVolumetrics::createDownscaledResource(Rc<DxvkContext>& ctx, const VkExtent3D& downscaledExtent) {
+    m_resetHistory = true;
+    m_rebuildFroxels = false;
     m_froxelVolumeExtent = util::computeBlockCount(downscaledExtent, VkExtent3D {
       froxelGridResolutionScale(),
       froxelGridResolutionScale(),
@@ -835,6 +877,7 @@ namespace dxvk {
   }
 
   void RtxGlobalVolumetrics::releaseDownscaledResource() {
+    m_resetHistory = true;
     for (uint32_t i = 0; i < 2; i++) {
       m_volumeAccumulatedRadianceY[i].reset();
       m_volumeAccumulatedRadianceCoCg[i].reset();

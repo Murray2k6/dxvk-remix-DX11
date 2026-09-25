@@ -82,21 +82,23 @@ namespace dxvk {
     // this into a thread count by mulitplying by how many threads per warp there are (typically 32).
     // Example for a RTX 3090: 82 SMs * 64 warps per SM * 32 threads per warp = 167,936 froxels to saturate the GPU. It is fine to be a bit below this though as most gpus will have fewer SMs than this, and higher resolutions
     // will also use more froxels due to how the grid is allocated with respect to the (downscaled when DLSS is in use) resolution, and we don't want the froxel passes to be too expensive (unless higher quality results are desired).
-    RTX_OPTION("rtx.volumetrics", float, restirGridGuardBandFactor, 1.1f, "The scale factor for the restir grid guard band, which is an extended part of the viewing frustum for which we should calculate lighting information for, even though they are technically offscreen.  This helps reduce noise in cases where the camera is moving around.");
+    RTX_OPTION_ARGS("rtx.volumetrics", float, restirGridGuardBandFactor, 1.1f, "The scale factor for the restir grid guard band, which is an extended part of the viewing frustum for which we should calculate lighting information for, even though they are technically offscreen.  This helps reduce noise in cases where the camera is moving around.",
+                    args.minValue = 1.0f);
     // Read by the weather-preset blender, which drives them per weather archetype.
     RTX_OPTION("rtx.volumetrics", float, fogSunVisibilityGain, 1.0f,
                "Artistic visibility gain applied to the sun's contribution to volumetric fog in-scattering.\n"
                "Scales fog-side sun visibility without affecting surface lighting. 1.0 is physical (no boost); raise it if fog reads too weak at normal exposure.");
     RTX_OPTION("rtx.volumetrics", float, volumetricConsumerGain, 0.008f,
                "Gain on the volumetric froxel radiance cache as read by surface consumers (alpha-blended particles/decals, PSR) through evalVolumetricNEE.");
-    RTX_OPTION("rtx.volumetrics", uint32_t, restirGridScale, 4,
+    RTX_OPTION_ARGS("rtx.volumetrics", uint32_t, restirGridScale, 4,
                "The scale factor to divide the x and y froxel grid resolution by to determine the x and y dimensions of the ReSTIR froxel grid.\n"
-               "Note that unlike the rtx.volumetrics.froxelGridResolutionScale option this is not dividing the render resolution, but rather is a scalar on top of the resulting froxel grid resolution after it is divided by the resolution scale.");
+               "Note that unlike the rtx.volumetrics.froxelGridResolutionScale option this is not dividing the render resolution, but rather is a scalar on top of the resulting froxel grid resolution after it is divided by the resolution scale.",
+               args.minValue = static_cast<uint32_t>(1));
     RTX_OPTION_ARGS("rtx.volumetrics", uint32_t, froxelGridResolutionScale, 8, "The scale factor to divide the x and y render resolution by to determine the x and y dimensions of the froxel grid.",
                     args.minValue = static_cast<uint32_t>(1), args.flags = RtxOptionFlags::UserSetting);
-    RTX_OPTION_ARGS("rtx.volumetrics", uint16_t, froxelDepthSlices, 64, "The z dimension of the froxel grid. Must be constant after initialization.",
+    RTX_OPTION_ARGS("rtx.volumetrics", uint16_t, froxelDepthSlices, 64, "The z dimension of the froxel grid. Changing it reallocates the grid and resets its history.",
                     args.minValue = static_cast<uint16_t>(1), args.maxValue = std::numeric_limits<uint16_t>::max(), args.flags = RtxOptionFlags::UserSetting);
-    RTX_OPTION_ARGS("rtx.volumetrics", uint16_t, restirFroxelDepthSlices, 128, "The z dimension of the ReSTIR froxel grid. Must be constant after initialization.",
+    RTX_OPTION_ARGS("rtx.volumetrics", uint16_t, restirFroxelDepthSlices, 128, "The z dimension of the ReSTIR froxel grid. Changing it reallocates the grid and resets its history.",
                     args.minValue = static_cast<uint16_t>(1), args.maxValue = std::numeric_limits<uint16_t>::max());
     RTX_OPTION_ARGS("rtx.volumetrics", uint8_t, maxAccumulationFrames, 128,
                "The number of frames to accumulate volume lighting samples over, maximum of 254.\n"
@@ -268,9 +270,9 @@ namespace dxvk {
     virtual void releaseDownscaledResource() override;
 
   private:
-    VkExtent3D m_froxelVolumeExtent;
-    VkExtent3D m_restirFroxelVolumeExtent;
-    uint32_t m_numFroxelVolumes;
+    VkExtent3D m_froxelVolumeExtent = {};
+    VkExtent3D m_restirFroxelVolumeExtent = {};
+    uint32_t m_numFroxelVolumes = 1;
 
     Resources::Resource m_volumeReservoirs[2];
     Resources::Resource m_volumeAccumulatedRadianceY[2];
@@ -278,6 +280,10 @@ namespace dxvk {
     Resources::Resource m_volumeAccumulatedRadianceAge[2];
     bool m_swapTextures = false;
     bool m_rebuildFroxels = false;
+    bool m_resetHistory = true;
+    float m_previousFroxelMaxDistance = -1.0f;
+    float m_previousFroxelDistributionExponent = -1.0f;
+    float m_previousRestirGuardBand = -1.0f;
 
     DxvkRaytracingPipelineShaders getPipelineShaders(bool useRayQuery) const;
 

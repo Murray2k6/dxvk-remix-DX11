@@ -30,6 +30,7 @@
 #include "rtx_globals.h"
 #include "rtx_options.h"
 #include "rtx_debug_view.h"
+#include "rtx_context.h"
 
 #include "../dxvk_device.h"
 #include "rtx_texture_manager.h"
@@ -56,6 +57,8 @@
 #include <dxgi1_2.h>
 
 #include <optional>
+#include <atomic>
+#include <memory>
 
 namespace dxvk {
   extern bool g_allowSrgbConversionForOutput;
@@ -82,6 +85,8 @@ namespace {
   dxvk::D3D11ImmediateContext* s_d3d11Context { nullptr };
   IDXGISwapChain1*             s_dxgiSwapChain { nullptr };
   HWND                         s_hwnd { nullptr };
+  std::atomic<uint64_t> s_presentSerial { 0 };
+  std::atomic<uint64_t> s_raytracedPresentSerial { 0 };
   dxvk::mutex s_mutex {};
 
 
@@ -1141,11 +1146,44 @@ namespace {
     return REMIXAPI_ERROR_CODE_SUCCESS;
   }
 
+  remixapi_ErrorCode REMIXAPI_CALL remixapi_SetCameraMediumMaterial(
+    const remixapi_CameraMediumInfo* info) {
+    auto* remixCtx = tryGetContext();
+    if (!remixCtx) {
+      return REMIXAPI_ERROR_CODE_REMIX_DEVICE_WAS_NOT_REGISTERED;
+    }
+    if (!info || info->sType != REMIXAPI_STRUCT_TYPE_CAMERA_MEDIUM_INFO) {
+      return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
+    }
+    remixapi_ErrorCode result = REMIXAPI_ERROR_CODE_SUCCESS;
+    std::lock_guard lock { s_mutex };
+    dxvk::RemixAPIPrivateAccessor::EmitCs(remixCtx, [medium = info->medium, &result](dxvk::DxvkContext* ctx) {
+      auto& scene = ctx->getCommonObjects()->getSceneManager();
+      if (!medium) {
+        scene.clearExternalStartInMediumMaterial();
+        return;
+      }
+      const auto* material = scene.getAssetReplacer()->accessExternalMaterial(medium);
+      if (!material || material->getType() != dxvk::MaterialDataType::Translucent) {
+        result = REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
+        return;
+      }
+      scene.setExternalStartInMediumMaterial(*material);
+    });
+    // Material creation/destruction is queued on the same thread. Resolve the
+    // handle after those operations and report invalid/non-medium materials.
+    remixCtx->SynchronizeCsThread(dxvk::DxvkCsThread::SynchronizeAll);
+    return result;
+  }
+
   remixapi_ErrorCode REMIXAPI_CALL remixapi_DrawInstance(
     const remixapi_InstanceInfo* info) {
     auto* remixCtx = tryGetContext();
     if (!remixCtx) {
       return REMIXAPI_ERROR_CODE_REMIX_DEVICE_WAS_NOT_REGISTERED;
+    }
+    if (!info || info->sType != REMIXAPI_STRUCT_TYPE_INSTANCE_INFO) {
+      return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
     }
     std::lock_guard lock { s_mutex };
     dxvk::RemixAPIPrivateAccessor::EmitCs(remixCtx, [cRtDrawState = convert::toRtDrawState(*info)](dxvk::DxvkContext* dxvkCtx) mutable {
@@ -1412,6 +1450,10 @@ namespace {
     if (!dxvkDevice) {
       return REMIXAPI_ERROR_CODE_REGISTERING_NON_REMIX_D3D11_DEVICE;
     }
+    if (s_d3d11Device) {
+      return s_d3d11Device == dxvkDevice
+        ? REMIXAPI_ERROR_CODE_SUCCESS : REMIXAPI_ERROR_CODE_ALREADY_EXISTS;
+    }
     ID3D11DeviceContext* ctx = nullptr;
     dxvkDevice->GetImmediateContext(&ctx);
     if (!ctx) {
@@ -1419,11 +1461,11 @@ namespace {
       return REMIXAPI_ERROR_CODE_GENERAL_FAILURE;
     }
     auto* immCtx = static_cast<dxvk::D3D11ImmediateContext*>(ctx);
-    if (s_d3d11Device) {
-      assert(s_d3d11Device == dxvkDevice);
-    }
+    // The API owns exactly these references; the application retains its own.
+    dxvkDevice->AddRef();
     s_d3d11Device = dxvkDevice;
     s_d3d11Context = immCtx;
+    ++s_presentSerial;
     return REMIXAPI_ERROR_CODE_SUCCESS;
   }
 
@@ -1642,74 +1684,119 @@ namespace {
       }
       assert(s_d3d11Device && s_d3d11Context);
     }
+    device->Release();
+    // Retain the target even if startup happened while the window was minimized.
+    // Present can create the swapchain once the client area becomes nonzero.
+    s_hwnd = hwnd;
     return REMIXAPI_ERROR_CODE_SUCCESS;
   }
 
   remixapi_ErrorCode REMIXAPI_CALL remixapi_Shutdown(void) {
+    ++s_presentSerial;
+    auto* context = s_d3d11Context;
+    auto* device = s_d3d11Device;
     s_d3d11Context = nullptr;
+    s_d3d11Device = nullptr;
     if (s_dxgiSwapChain) {
       s_dxgiSwapChain->Release();
       s_dxgiSwapChain = nullptr;
     }
-    if (s_d3d11Device) {
-      constexpr ULONG maxReleaseIterations = 1000;
-      ULONG iteration = 0;
-      while (true) {
-        ULONG left = s_d3d11Device->Release();
-        if (left == 0) {
-          break;
-        }
-        ++iteration;
-        if (iteration >= maxReleaseIterations) {
-          dxvk::Logger::err(dxvk::str::format("remixapi_Shutdown: Release loop exceeded ", maxReleaseIterations,
-            " iterations with ", left, " references remaining. Breaking to avoid infinite loop."));
-          break;
-        }
-      }
-      s_d3d11Device = nullptr;
-    }
+    if (context) context->Release();
+    if (device) device->Release();
     s_hwnd = nullptr;
     return REMIXAPI_ERROR_CODE_SUCCESS;
   }
 
   remixapi_ErrorCode REMIXAPI_CALL remixapi_Present(const remixapi_PresentInfo* info) {
+    const uint64_t presentSerial = ++s_presentSerial;
     auto* remixCtx = tryGetContext();
     if (!remixCtx) {
       return REMIXAPI_ERROR_CODE_REMIX_DEVICE_WAS_NOT_REGISTERED;
     }
-    if (!s_dxgiSwapChain) {
+    HWND hwnd = info && info->hwndOverride ? info->hwndOverride : s_hwnd;
+    if (!hwnd) {
       return REMIXAPI_ERROR_CODE_NOT_INITIALIZED;
     }
-    HRESULT hr = s_dxgiSwapChain->Present(0, 0);
-    if (FAILED(hr)) {
-      return REMIXAPI_ERROR_CODE_GENERAL_FAILURE;
+    RECT hwndRect = {};
+    if (!IsWindow(hwnd) || !GetClientRect(hwnd, &hwndRect)) {
+      return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
+    }
+    const UINT windowWidth = static_cast<UINT>(std::max(0l, hwndRect.right - hwndRect.left));
+    const UINT windowHeight = static_cast<UINT>(std::max(0l, hwndRect.bottom - hwndRect.top));
+    if (windowWidth == 0 || windowHeight == 0) {
+      return REMIXAPI_ERROR_CODE_SUCCESS;
     }
 
-    UINT windowWidth = 0, windowHeight = 0;
-    {
-      HWND hwnd = info && info->hwndOverride ? info->hwndOverride : s_hwnd;
-      if (hwnd) {
-        RECT hwndRect = {};
-        GetClientRect(hwnd, &hwndRect);
-        windowWidth = static_cast<UINT>(std::max(0l, hwndRect.right - hwndRect.left));
-        windowHeight = static_cast<UINT>(std::max(0l, hwndRect.bottom - hwndRect.top));
-      }
-    }
-
-    if (windowWidth > 0 && windowHeight > 0) {
-      DXGI_SWAP_CHAIN_DESC1 scDesc = {};
-      hr = s_dxgiSwapChain->GetDesc1(&scDesc);
-      if (FAILED(hr)) {
+    DXGI_SWAP_CHAIN_DESC1 scDesc = {};
+    if (s_dxgiSwapChain) {
+      if (FAILED(s_dxgiSwapChain->GetDesc1(&scDesc))) {
         return REMIXAPI_ERROR_CODE_GENERAL_FAILURE;
       }
+    } else {
+      scDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+      scDesc.SampleDesc.Count = 1;
+      scDesc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+      scDesc.BufferCount = 2;
+      scDesc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+      scDesc.Scaling = DXGI_SCALING_NONE;
+    }
 
-      // resize swapchain if window has changed
-      if (scDesc.Width != windowWidth || scDesc.Height != windowHeight) {
-        hr = s_dxgiSwapChain->ResizeBuffers(0, windowWidth, windowHeight, DXGI_FORMAT_UNKNOWN, 0);
-        if (FAILED(hr)) {
-          return REMIXAPI_ERROR_CODE_GENERAL_FAILURE;
-        }
+    if (!s_dxgiSwapChain || hwnd != s_hwnd) {
+      // ResizeBuffers does not change a swapchain's HWND. Games commonly replace
+      // their splash window; construct the replacement before retiring the old one.
+      IDXGIDevice* dxgiDevice = nullptr;
+      HRESULT hr = s_d3d11Device->QueryInterface(__uuidof(IDXGIDevice), reinterpret_cast<void**>(&dxgiDevice));
+      if (FAILED(hr) || !dxgiDevice) {
+        return REMIXAPI_ERROR_CODE_GENERAL_FAILURE;
       }
+      IDXGIAdapter* adapter = nullptr;
+      hr = dxgiDevice->GetAdapter(&adapter);
+      dxgiDevice->Release();
+      if (FAILED(hr) || !adapter) {
+        return REMIXAPI_ERROR_CODE_GENERAL_FAILURE;
+      }
+      IDXGIFactory2* factory = nullptr;
+      hr = adapter->GetParent(__uuidof(IDXGIFactory2), reinterpret_cast<void**>(&factory));
+      adapter->Release();
+      if (FAILED(hr) || !factory) {
+        return REMIXAPI_ERROR_CODE_GENERAL_FAILURE;
+      }
+      scDesc.Width = windowWidth;
+      scDesc.Height = windowHeight;
+      IDXGISwapChain1* replacement = nullptr;
+      hr = factory->CreateSwapChainForHwnd(s_d3d11Device, hwnd, &scDesc, nullptr, nullptr, &replacement);
+      factory->Release();
+      if (FAILED(hr) || !replacement) {
+        return REMIXAPI_ERROR_CODE_GENERAL_FAILURE;
+      }
+      if (s_dxgiSwapChain) {
+        s_dxgiSwapChain->Release();
+      }
+      s_dxgiSwapChain = replacement;
+      s_hwnd = hwnd;
+    } else if (scDesc.Width != windowWidth || scDesc.Height != windowHeight) {
+      if (FAILED(s_dxgiSwapChain->ResizeBuffers(0, windowWidth, windowHeight, DXGI_FORMAT_UNKNOWN, scDesc.Flags))) {
+        return REMIXAPI_ERROR_CODE_GENERAL_FAILURE;
+      }
+    }
+
+    auto previousFrameCount = std::make_shared<uint64_t>(0);
+    {
+      std::lock_guard lock { s_mutex };
+      dxvk::RemixAPIPrivateAccessor::EmitCs(remixCtx, [previousFrameCount](dxvk::DxvkContext* ctx) {
+        *previousFrameCount = static_cast<dxvk::RtxContext*>(ctx)->completedRaytracedFrameCount();
+      });
+    }
+    const HRESULT presentResult = s_dxgiSwapChain->Present(0, 0);
+    if (FAILED(presentResult)) {
+      return REMIXAPI_ERROR_CODE_GENERAL_FAILURE;
+    }
+    if (presentResult == S_OK) {
+      std::lock_guard lock { s_mutex };
+      dxvk::RemixAPIPrivateAccessor::EmitCs(remixCtx, [previousFrameCount, presentSerial](dxvk::DxvkContext* ctx) {
+        if (static_cast<dxvk::RtxContext*>(ctx)->completedRaytracedFrameCount() > *previousFrameCount)
+          s_raytracedPresentSerial.store(presentSerial, std::memory_order_release);
+      });
     }
 
     return REMIXAPI_ERROR_CODE_SUCCESS;
@@ -1741,6 +1828,28 @@ namespace {
 
 extern "C"
 {
+  // Internal bridge contract, separate from the public Remix API table. A
+  // successful DXGI Present may contain no RT output (menus, missing camera,
+  // cold pipelines). Only suppress the native game frame after a complete blit
+  // and when the client captured every draw needed for that frame.
+  REMIXAPI BOOL REMIXAPI_CALL remixapi_dxvk_WasLastPresentRayTraced(BOOL allowTakeover) {
+    auto* context = tryGetContext();
+    if (!context) return FALSE;
+    context->SynchronizeCsThread(dxvk::DxvkCsThread::SynchronizeAll);
+    const uint64_t serial = s_presentSerial.load(std::memory_order_acquire);
+    const bool raytraced = allowTakeover && serial != 0
+      && s_raytracedPresentSerial.load(std::memory_order_acquire) == serial;
+    if (!raytraced) {
+      // Before the bridge resumes native presentation, drain queued Vulkan
+      // presents so a late empty or incomplete Remix submission cannot overwrite it.
+      // This waits for CPU submission/presenter work, not vkDeviceWaitIdle.
+      auto device = s_d3d11Device->GetDXVKDevice();
+      device->lockSubmission();
+      device->unlockSubmission();
+    }
+    return raytraced;
+  }
+
   REMIXAPI remixapi_ErrorCode REMIXAPI_CALL remixapi_InitializeLibrary(const remixapi_InitializeLibraryInfo* info,
                                                                        remixapi_Interface* out_result) {
     if (!info || info->sType != REMIXAPI_STRUCT_TYPE_INITIALIZE_LIBRARY_INFO) {
@@ -1764,6 +1873,7 @@ extern "C"
       interf.CreateMesh = remixapi_CreateMesh;
       interf.DestroyMesh = remixapi_DestroyMesh;
       interf.SetupCamera = remixapi_SetupCamera;
+      interf.SetCameraMediumMaterial = remixapi_SetCameraMediumMaterial;
       interf.DrawInstance = remixapi_DrawInstance;
       interf.CreateLight = remixapi_CreateLight;
       interf.DestroyLight = remixapi_DestroyLight;
@@ -1778,10 +1888,8 @@ extern "C"
       interf.pick_RequestObjectPicking = remixapi_pick_RequestObjectPicking;
       interf.pick_HighlightObjects = remixapi_pick_HighlightObjects;
     }
-    // DX11_BUILD_SAFE_NONFATAL_REMIX_API_REGISTRATION_ASSERT
-// The DX11 bridge/header table can be ahead of this local maintenance sentinel.
-// Keep the real API registration code compiled, but do not fail the DX11 build on the sentinel.
-static_assert(true, "Add/remove function registration");
+    static_assert(sizeof(remixapi_Interface) == 22 * sizeof(PFN_remixapi_Shutdown),
+      "Add/remove function registration when changing the Remix API table");
 
     *out_result = interf;
     return REMIXAPI_ERROR_CODE_SUCCESS;

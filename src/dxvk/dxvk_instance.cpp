@@ -46,9 +46,9 @@
 #include <dbghelp.h>
 // NV-DXVK end
 
-// NV-DXVK start: regex-based filters for VL messages
+// NV-DXVK start: validation message handling
 #include <array>
-#include <regex>
+#include <string_view>
 
 #include "../util/xxHash/xxhash.h"
 #include "../util/util_env.h"
@@ -115,67 +115,13 @@ namespace dxvk {
   };
   // NV-DXVK end
 
-  bool filterErrorMessages(const char* message) {
-    // validation errors that we are currently ignoring --- to fix!
-    constexpr std::array ignoredErrors{
-      // renderpass vs. FB/PSO incompatibilities
-      "MessageID = 0x335edc9a",
-      "MessageID = 0x8cb637c2",
-      "MessageID = 0x50685725",
-
-      // Depth comparison without the proper depth comparison bit set in image view
-      // Expected behavior according to DXVK 2.1's own validation error bypassing logic
-      "MessageID = 0x4b9d1597",
-      "MessageID = 0x534c50ad",
-
-      "You are adding vk.*? to VkCommandBuffer 0x[0-9a-fA-F]+.*? that is invalid because bound Vk[a-zA-Z0-9]+ 0x[0-9a-fA-F]+.*? was destroyed",
-// NV-DXVK start:
-      // NV SER Extension is not supported by VL
-      "SPIR-V module not valid: Invalid capability operand: 5383",
-      "vkCreateShaderModule..: A SPIR-V Capability .Unhandled OpCapability. was declared that is not supported by Vulkan. The Vulkan spec states: pCode must not declare any capability that is not supported by the API, as described by the Capabilities section of the SPIR-V Environment appendix",
-      "SPV_NV_shader_invocation_reorder",
-
-      // createCuModuleNVX
-      "vkCreateCuModuleNVX: value of pCreateInfo->pNext must be NULL. This error is based on the Valid Usage documentation for version [0-9]+ of the Vulkan header.  It is possible that you are using a struct from a private extension or an extension that was added to a later version of the Vulkan header, in which case the use of pCreateInfo->pNext is undefined and may not work correctly with validation enabled The Vulkan spec states: pNext must be NULL",
-
-      // Vulkan 1.4.313.2 VL Errors
-      "vkCmdBeginRenderPass\\(\\): dependencyCount is incompatible between VkRenderPass 0x[0-9a-fA-F]+.* \\(from VkRenderPass 0x[0-9a-fA-F]+.*\\) and VkRenderPass 0x[0-9a-fA-F]+.* \\(from VkFramebuffer 0x[0-9a-fA-F]+.*\\), [0-9]+ != [0-9]+.",
-      "vkCmdDrawIndexed\\(\\): dependencyCount is incompatible between VkRenderPass 0x[0-9a-fA-F]+.* \\(from VkCommandBuffer 0x[0-9a-fA-F]+.*\\) and VkRenderPass 0x[0-9a-fA-F]+.* \\(from VkPipeline 0x[0-9a-fA-F]+.*\\), [0-9]+ != [0-9]+.",
-      "vkCmdDraw\\(\\): dependencyCount is incompatible between VkRenderPass 0x[0-9a-fA-F]+.* \\(from VkCommandBuffer 0x[0-9a-fA-F]+.*\\) and VkRenderPass 0x[0-9a-fA-F]+.* \\(from VkPipeline 0x[0-9a-fA-F]+.*\\), [0-9]+ != [0-9]+.",
-      "vkAcquireNextImageKHR\\(\\): Semaphore must not be currently signaled.",
-      "vkQueueSubmit\\(\\): pSubmits\\[[0-9]+\\].pWaitSemaphores\\[[0-9]+\\] queue \\(VkQueue 0x[0-9a-fA-F]+.*\\) is waiting on semaphore \\(VkSemaphore 0x[0-9a-fA-F]+.*\\[*\\]\\) that has no way to be signaled.",
-      "vkQueuePresentKHR\\(\\): pPresentInfo->pWaitSemaphores\\[[0-9]+\\] queue \\(VkQueue 0x[0-9a-fA-F]+.*\\) is waiting on semaphore \\(VkSemaphore 0x[0-9a-fA-F]+.*\\[Presenter: present semaphore\\]\\) that has no way to be signaled.",
-      "vkAcquireNextImageKHR\\(\\): Semaphore must not have any pending operations.",
-      "vkQueueSubmit\\(\\): pSubmits\\[[0-9]+\\].pCommandBuffers\\[[0-9]+\\] command buffer VkCommandBuffer 0x[0-9a-fA-F]+.* expects VkImage 0x[0-9a-fA-F]+.* \\(subresource: aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, mipLevel = [0-9]+, arrayLayer = [0-9]+\\) to be in layout VK_IMAGE_LAYOUT_PRESENT_SRC_KHR--instead, current layout is VK_IMAGE_LAYOUT_UNDEFINED.",
-      "vkDestroySemaphore\\(\\): can't be called on VkSemaphore 0x[0-9a-fA-F]+.*\\[*\\] that is currently in use by VkQueue 0x[0-9a-fA-F]+.*.",
-// NV-DXVK end
-    };
-
-    for (auto& exp : ignoredErrors) {
-      std::regex regex(exp);
-      std::cmatch res;
-      if (std::regex_search(message, res, regex)) {
-        return true;
-      }
-    }
-
-    return false;
-  }
-
   bool filterPerfWarnings(const char* message) {
-    constexpr std::array validationWarningFilters{
-      "For optimal performance VkImage 0x[0-9a-fA-F]+.*? layout should be VK_IMAGE_LAYOUT_.*? instead of GENERAL",
-    };
-
-    for (auto& exp : validationWarningFilters) {
-      std::regex regex(exp);
-      std::cmatch res;
-      if (std::regex_search(message, res, regex)) {
-        return true;
-      }
-    }
-
-    return false;
+    // Match the one intentional GENERAL-layout performance warning in linear
+    // time. Regex backtracking here can throw out of the Vulkan callback.
+    const std::string_view text(message);
+    return text.find("For optimal performance VkImage ") != std::string_view::npos
+      && text.find(" layout should be VK_IMAGE_LAYOUT_") != std::string_view::npos
+      && text.find(" instead of GENERAL") != std::string_view::npos;
   }
 
   // NV-DXVK start: capture stack trace for debug messages
@@ -276,40 +222,22 @@ namespace dxvk {
     const auto pMsg = pCallbackData->pMessage;
     std::string msgStr = str::format("[VK_DEBUG_REPORT] Code ", pCallbackData->messageIdNumber, ": ", pMsg);
 
-    const bool shouldFilterErrors = true; 
-    const bool showFilteredErrorsAsWarnings = false; // Set it to true to ouput the waived errors as warnings rather than skipping them entirely
-    const bool shouldFilterDuplicateMessages = true;
-
-    bool isWaivedError = 
-      shouldFilterErrors && 
-      (messageSeverity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT) &&
-      filterErrorMessages(pMsg);
-
-    // Only filter duplicate messages that end up being shown since duplicate filtering is constrained in size for performance
-    if (!isWaivedError || showFilteredErrorsAsWarnings) {    
-      if (shouldFilterDuplicateMessages && filterDuplicateMessages(ctx, pMsg)) {
-        return VK_FALSE;
-      }
+    // Validation errors are actionable. Report them instead of masking broad
+    // semaphore, render-pass and destroyed-object errors with regex filters.
+    if (filterDuplicateMessages(ctx, pMsg)) {
+      return VK_FALSE;
     }
 
     if (messageSeverity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT) {
-      if (!isWaivedError) {
-        if (RtxOptions::logCallstacksOnValidationLayerErrors()) {
-          const std::string stackTrace = captureStackTrace(ctx);
-          if (!stackTrace.empty()) {
-            msgStr = str::format(msgStr, "\n[VK_DEBUG_REPORT] Callstack:\n", stackTrace, "\n");
-          }
-        }
-        
-        OutputDebugString(msgStr.c_str());
-        OutputDebugString("\n\n");       // <-- make easier to see
-
-        Logger::err(msgStr);
-      } else {
-        if (showFilteredErrorsAsWarnings) {
-          Logger::warn(str::format("(waived error) ", msgStr));
+      if (RtxOptions::logCallstacksOnValidationLayerErrors()) {
+        const std::string stackTrace = captureStackTrace(ctx);
+        if (!stackTrace.empty()) {
+          msgStr = str::format(msgStr, "\n[VK_DEBUG_REPORT] Callstack:\n", stackTrace, "\n");
         }
       }
+      OutputDebugString(msgStr.c_str());
+      OutputDebugString("\n\n");
+      Logger::err(msgStr);
     } else if (messageSeverity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT) {
       if (messageTypes & VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT) {
         if (!filterPerfWarnings(pMsg)) {

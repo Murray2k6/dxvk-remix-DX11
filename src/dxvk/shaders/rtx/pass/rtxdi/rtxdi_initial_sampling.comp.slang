@@ -62,6 +62,7 @@ void main(int2 threadIndex : SV_DispatchThreadID)
   RAB_Surface surface = RAB_GetGBufferSurface(pixelCoordinate, false);
   if (!RAB_IsSurfaceValid(surface))
   {
+    RAB_StoreReservoir(RTXDI_EmptyReservoir(), pixelCoordinate, RTXDI_GetTemporalOutputPage());
     return;
   }
 

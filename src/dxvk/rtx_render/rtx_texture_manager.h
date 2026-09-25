@@ -68,6 +68,10 @@ namespace dxvk {
 
     void startAsync();
 
+    // Stop producers while retaining resources until the device is idle.
+    void stopAsync();
+    void onDestroy() override;
+
     /**
       * \return Linearized table of textures in the texture cache.
       */

@@ -116,7 +116,7 @@ namespace fork_hooks {
     void fhSyncAtmosphereDistantLights(RtxContext& ctx, const AtmosphereArgs& args) {
       // Mode gate. Sun/moon distant lights are the sole atmosphere sun path in
       // Numos; drop any previously-injected lights when not in Numos.
-      if (RtxOptions::skyMode() != SkyMode::PhysicalAtmosphere) {
+      if (ctx.getEffectiveSkyMode() != SkyMode::PhysicalAtmosphere) {
         fhDropAtmosphereLights();
         return;
       }
@@ -244,65 +244,7 @@ namespace fork_hooks {
   // in RtxContext.
   // ---------------------------------------------------------------------------
   void updateAtmosphereConstants(RtxContext& ctx, RaytraceArgs& constants) {
-    // DX11_V307_NO_DEGENERATE_SKY_PROBE: SkyboxRasterization samples the sky
-    // cubemap (SkyProbe) on every g-buffer/indirect miss. On the DX11 runtime
-    // that cubemap cannot be rasterized correctly - the per-face reprojection
-    // has to run inside the game's own DXBC vertex shader, which Remix does not
-    // author, so all six faces receive the same view-projected sky and five of
-    // them stay at the clear value. The result is a black box around the camera
-    // with the player inside it.
-    //
-    // Prefer the physical atmosphere in that situation. It is the only sky path
-    // that produces correct radiance for an arbitrary ray direction here, and it
-    // is what the rasterized skybox was standing in for. This overrides the
-    // rtx.skyMode option deliberately, because the option's other value cannot
-    // be honoured on this runtime; it is reported once so the reason is visible.
-    SkyMode currentSkyMode = RtxOptions::skyMode();
-
-    // DX11_V319_NUMOS_IS_OPTIONAL: this promotion is now a setting.
-    //
-    // It used to be unconditional, so Numos always won on the DX11 runtime no
-    // matter what rtx.skyMode said, and there was no way to ask for the game's
-    // own sky back. Worse, it only changed this LOCAL variable - the option kept
-    // reporting SkyboxRasterization, so everything gated on the OPTION (the
-    // game-sky suppression in tryHandleSky, the night-sky and cloud features)
-    // stayed off while the runtime was in fact drawing Numos. Option and
-    // behaviour silently disagreed.
-    //
-    // Both halves are fixed here: rtx.skyAutoPhysicalAtmosphereFallback controls
-    // whether the promotion may happen at all, and when it does happen the option
-    // is updated so the rest of the runtime agrees with what is being drawn.
-    //
-    // The fallback still defaults ON because rasterized skybox mode genuinely
-    // cannot work on this runtime - the sky cubemap has no usable per-face
-    // reprojection, and the faces stay at the clear value, which is the black box
-    // around the camera. Turning the option off is therefore choosing "no Numos,
-    // and accept whatever the rasterized path gives"; that is the caller's choice
-    // to make, but it should be a deliberate one.
-    if (ctx.m_skyProbeReprojectionUnavailable && currentSkyMode == SkyMode::SkyboxRasterization) {
-      if (RtxOptions::skyAutoPhysicalAtmosphereFallback()) {
-        currentSkyMode = SkyMode::PhysicalAtmosphere;
-
-        // Keep the option in step with the effective mode, so the game-sky
-        // suppression and the Numos-gated features see the same thing this code
-        // is about to render. Derived layer: this is an inferred decision, not a
-        // user preference, so an explicit rtx.conf/UI setting still wins.
-        RtxOptions::skyModeObject().setDeferred(
-          SkyMode::PhysicalAtmosphere, RtxOptionLayer::getDerivedLayer());
-
-        ONCE(Logger::warn(
-          "[RTX Sky] rtx.skyMode=SkyboxRasterization cannot be honoured on the DX11 runtime "
-          "(the sky cubemap has no usable per-face reprojection). Using PhysicalAtmosphere "
-          "(Numos) instead - rasterized skybox mode would render a black box around the camera. "
-          "Set rtx.skyAutoPhysicalAtmosphereFallback=False to stop Numos taking over."));
-      } else {
-        ONCE(Logger::warn(
-          "[RTX Sky] rtx.skyMode=SkyboxRasterization is not supported on the DX11 runtime and the "
-          "automatic Numos fallback is disabled (rtx.skyAutoPhysicalAtmosphereFallback=False), so "
-          "the sky is left to the rasterized path. Expect a black box around the camera; set "
-          "rtx.skyMode=1 to use Numos explicitly."));
-      }
-    }
+    const SkyMode currentSkyMode = ctx.getEffectiveSkyMode();
 
     constants.skyMode = static_cast<uint32_t>(currentSkyMode);
     if (currentSkyMode != ctx.m_lastSkyMode) {
@@ -438,6 +380,11 @@ namespace fork_hooks {
   // Friend declaration required in RtxContext.
   // ---------------------------------------------------------------------------
   void bindAtmosphereLuts(RtxContext& ctx) {
+    // Skybox mode does not sample atmosphere descriptors. Leave unused slots
+    // to DXVK's dummy descriptors and avoid allocating the cloud resources.
+    if (ctx.getEffectiveSkyMode() != SkyMode::PhysicalAtmosphere) {
+      return;
+    }
     // Bind atmosphere LUTs - must always bind since they're declared in common_bindings.slangh
     // Initialize atmosphere if not already done (needed for dummy resources)
     if (!ctx.m_atmosphere) {
@@ -1083,7 +1030,9 @@ namespace fork_hooks {
     constexpr ImGuiSliderFlags sliderFlags = ImGuiSliderFlags_AlwaysClamp;
 
     // Sky mode selection
-    skyModeCombo.getKey(&RtxOptions::skyModeObject());
+    if (skyModeCombo.getKey(&RtxOptions::skyModeObject())) {
+      RtxOptions::skyAutoPhysicalAtmosphereFallbackObject().setDeferred(false);
+    }
     RemixGui::SetTooltipToLastWidgetOnHover("Skybox Rasterization: Traditional skybox rendering\nNumos: Hillaire atmospheric scattering");
 
     if (RtxOptions::skyMode() == SkyMode::SkyboxRasterization) {

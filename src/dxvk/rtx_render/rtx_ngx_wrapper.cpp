@@ -76,6 +76,7 @@
 
 #include <dxvk_device.h>
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdarg>
 
@@ -126,6 +127,9 @@ namespace dxvk
     // Note: This is done here so that if initialization fails before feature checking the support will be false as expected.
 
     m_supportsDLSS = false;
+    m_supportsDLFG = false;
+    m_dlfgMaxInterpolatedFrames = 0;
+    m_dlfgNotSupportedReason.clear();
     m_supportsRayReconstruction = false;
 
     const std::string exePath = env::getExePath();
@@ -177,15 +181,20 @@ namespace dxvk
       return false;
     }
 
-    NVSDK_NGX_Parameter* tempParams;
-    result = NVSDK_NGX_VULKAN_AllocateParameters(&tempParams);
-    if (NVSDK_NGX_FAILED(result)) {
-      Logger::err(str::format("NVSDK_NGX_VULKAN_AllocateParameters failed: ", resultToString(result)));
-      return false;
-    }
+    // The SDK now owns device resources even if capability discovery fails.
+    // Keep shutdown paired with the successful Init on every exit path.
+    m_initialized = true;
 
+    // GetCapabilityParameters allocates its own map. Allocating an empty map
+    // first would lose that allocation when this call overwrites the pointer.
+    NVSDK_NGX_Parameter* tempParams = nullptr;
     result = NVSDK_NGX_VULKAN_GetCapabilityParameters(&tempParams);
-    if (NVSDK_NGX_FAILED(result)) {
+    const auto destroyParameters = [](NVSDK_NGX_Parameter* params) {
+      NVSDK_NGX_VULKAN_DestroyParameters(params);
+    };
+    const std::unique_ptr<NVSDK_NGX_Parameter, decltype(destroyParameters)>
+      parameterOwner(tempParams, destroyParameters);
+    if (NVSDK_NGX_FAILED(result) || !tempParams) {
       Logger::err(str::format("NVSDK_NGX_VULKAN_GetCapabilityParameters failed: ", resultToString(result)));
       return false;
     }
@@ -252,8 +261,6 @@ namespace dxvk
       m_supportsRayReconstruction = true;
     }
 
-    NVSDK_NGX_VULKAN_DestroyParameters(tempParams);
-    m_initialized = true;
     return true;
   }
 
@@ -266,6 +273,10 @@ namespace dxvk
       NVSDK_NGX_VULKAN_Shutdown1(m_device->handle());
       m_initialized = false;
     }
+    m_supportsDLSS = false;
+    m_supportsDLFG = false;
+    m_supportsRayReconstruction = false;
+    m_dlfgMaxInterpolatedFrames = 0;
   }
 
   std::unique_ptr<NGXDLSSContext> NGXContext::createDLSSContext() {
@@ -465,12 +476,7 @@ namespace dxvk
 
   NGXFeatureContext::NGXFeatureContext(DxvkDevice* device): m_device(device)
   {
-    NVSDK_NGX_Result result = NVSDK_NGX_VULKAN_AllocateParameters(&m_parameters);
-    if (NVSDK_NGX_FAILED(result)) {
-      Logger::err(str::format("NVSDK_NGX_VULKAN_AllocateParameters failed: ", resultToString(result)));
-    }
-
-    result = NVSDK_NGX_VULKAN_GetCapabilityParameters(&m_parameters);
+    NVSDK_NGX_Result result = NVSDK_NGX_VULKAN_GetCapabilityParameters(&m_parameters);
     if (NVSDK_NGX_FAILED(result)) {
       Logger::err(str::format("NVSDK_NGX_VULKAN_GetCapabilityParameters failed: ", resultToString(result)));
     }
@@ -492,6 +498,9 @@ namespace dxvk
                                   bool sharpening,
                                   NVSDK_NGX_PerfQuality_Value perfQuality) {
     ScopedCpuProfileZone();
+
+    if (!m_parameters)
+      return;
 
     const unsigned int CreationNodeMask = 1;
     const unsigned int VisibilityNodeMask = 1;
@@ -539,7 +548,14 @@ namespace dxvk
   NGXDLSSContext::OptimalSettings NGXDLSSContext::queryOptimalSettings(const uint32_t displaySize[2], NVSDK_NGX_PerfQuality_Value perfQuality) const
   {
     ScopedCpuProfileZone();
-    OptimalSettings settings;
+    const OptimalSettings fallback = {
+      { std::max(1u, displaySize[0]), std::max(1u, displaySize[1]) },
+      { std::max(1u, displaySize[0]), std::max(1u, displaySize[1]) },
+      { std::max(1u, displaySize[0]), std::max(1u, displaySize[1]) }
+    };
+    if (!m_parameters)
+      return fallback;
+    OptimalSettings settings = fallback;
     // Note: Deprecated, should not be used but still must be passed into the query function.
     float dummySharpness;
 
@@ -552,9 +568,14 @@ namespace dxvk
 
     if (NVSDK_NGX_FAILED(result)) {
       Logger::err(str::format("Querying optimal settings failed: ", resultToString(result)));
-      return settings;
+      return fallback;
     }
 
+    for (uint32_t i = 0; i < 2; ++i) {
+      settings.optimalRenderSize[i] = std::clamp(settings.optimalRenderSize[i], 1u, fallback.optimalRenderSize[i]);
+      settings.minRenderSize[i] = std::clamp(settings.minRenderSize[i], 1u, settings.optimalRenderSize[i]);
+      settings.maxRenderSize[i] = std::clamp(settings.maxRenderSize[i], settings.optimalRenderSize[i], fallback.maxRenderSize[i]);
+    }
     return settings;
   }
 
@@ -563,7 +584,7 @@ namespace dxvk
     const NGXBuffers& buffers,
     const NGXSettings& settings) const
   {
-    if (!m_featureDLSS)
+    if (!m_featureDLSS || !m_parameters)
       return false;
     
     ScopedCpuProfileZone();
@@ -631,6 +652,9 @@ namespace dxvk
                                   NVSDK_NGX_RayReconstruction_Hint_Render_Preset dlssdModel,
                                   NVSDK_NGX_PerfQuality_Value perfQuality) {
     ScopedCpuProfileZone();
+
+    if (!m_parameters)
+      return;
 
     if (m_featureRayReconstruction) {
       renderContext->getDevice()->waitForIdle();
@@ -706,7 +730,14 @@ namespace dxvk
 
   NGXRayReconstructionContext::QuerySettings NGXRayReconstructionContext::queryOptimalSettings(const uint32_t displaySize[2], NVSDK_NGX_PerfQuality_Value perfQuality) const {
     ScopedCpuProfileZone();
-    QuerySettings settings;
+    const QuerySettings fallback = {
+      { std::max(1u, displaySize[0]), std::max(1u, displaySize[1]) },
+      { std::max(1u, displaySize[0]), std::max(1u, displaySize[1]) },
+      { std::max(1u, displaySize[0]), std::max(1u, displaySize[1]) }
+    };
+    if (!m_parameters)
+      return fallback;
+    QuerySettings settings = fallback;
     // Note: Deprecated, should not be used but still must be passed into the query function.
     float dummySharpness;
 
@@ -719,9 +750,14 @@ namespace dxvk
 
     if (NVSDK_NGX_FAILED(result)) {
       Logger::err(str::format("Querying optimal settings failed: ", resultToString(result)));
-      return settings;
+      return fallback;
     }
 
+    for (uint32_t i = 0; i < 2; ++i) {
+      settings.optimalRenderSize[i] = std::clamp(settings.optimalRenderSize[i], 1u, fallback.optimalRenderSize[i]);
+      settings.minRenderSize[i] = std::clamp(settings.minRenderSize[i], 1u, settings.optimalRenderSize[i]);
+      settings.maxRenderSize[i] = std::clamp(settings.maxRenderSize[i], settings.optimalRenderSize[i], fallback.maxRenderSize[i]);
+    }
     return settings;
   }
 
@@ -729,7 +765,7 @@ namespace dxvk
     Rc<DxvkContext> renderContext,
     const NGXBuffers& buffers,
     const NGXSettings& settings) const {
-    if (!m_featureRayReconstruction) {
+    if (!m_featureRayReconstruction || !m_parameters) {
       return false;
     }
     
@@ -828,6 +864,9 @@ namespace dxvk
                                   VkCommandBuffer commandList,
                                   uint32_t displayOutSize[2],
                                   VkFormat outputFormat) {
+    if (!m_parameters)
+      return;
+
     NVSDK_NGX_DLSSG_Create_Params createParams = { };
     createParams.Width = displayOutSize[0];
     createParams.Height = displayOutSize[1];
@@ -919,6 +958,9 @@ namespace dxvk
                                                           uint32_t interpolatedFrameCount,
                                                           bool resetHistory) {
     ScopedCpuProfileZone();
+
+    if (!m_parameters || !m_feature)
+      return EvaluateResult::Failure;
     
     auto ngxColorBuffer = ViewToResourceVK(compositedColorBuffer, true);
     auto ngxMVec = ViewToResourceVK(motionVectors, false);
@@ -979,6 +1021,7 @@ namespace dxvk
     result = NGX_VK_EVALUATE_DLSSG(clientCommandList, m_feature, m_parameters, &evalParams, &consts);
     if (NVSDK_NGX_FAILED(result)) {
       Logger::err(str::format("NGX_VK_EVALUATE_DLSSG failed: ", resultToString(result)));
+      return EvaluateResult::Failure;
     }
     
     return EvaluateResult::Success;

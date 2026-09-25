@@ -322,7 +322,7 @@ namespace dxvk
       Resource m_postFxIntermediateTexture;
 
       Resource m_gbufferLast;
-      Resource m_reprojectionConfidence;
+      Resource m_reprojectionConfidence[2];
       Resource m_rtxdiGradients;
       AliasedResource m_rtxdiConfidence[2];
       AliasedResource m_rtxdiBestLights;
@@ -353,6 +353,8 @@ namespace dxvk
       const AliasedResource& getPreviousRtxdiIlluminance() const { return m_primaryRtxdiIlluminance[!m_swapTextures]; }
       const AliasedResource& getCurrentRtxdiConfidence() const { return m_rtxdiConfidence[m_swapTextures]; }
       const AliasedResource& getPreviousRtxdiConfidence() const { return m_rtxdiConfidence[!m_swapTextures]; }
+      const Resource& getCurrentReprojectionConfidence() const { return m_reprojectionConfidence[m_swapTextures]; }
+      const Resource& getPreviousReprojectionConfidence() const { return m_reprojectionConfidence[!m_swapTextures]; }
       const AliasedResource& getCurrentPrimaryWorldPositionWorldTriangleNormal() const { return m_primaryWorldPositionWorldTriangleNormal[m_swapTextures]; }
       const AliasedResource& getPreviousPrimaryWorldPositionWorldTriangleNormal() const { return m_primaryWorldPositionWorldTriangleNormal[!m_swapTextures]; }
 
@@ -550,4 +552,3 @@ namespace dxvk
   };
 
 } // namespace dxvk
-

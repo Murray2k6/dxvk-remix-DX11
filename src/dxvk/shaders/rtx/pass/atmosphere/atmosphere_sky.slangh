@@ -751,7 +751,10 @@ vec3 evalSkyRadiance(
   // The cache gate in RtxAtmosphere covers every arg that feeds the integral;
   // sun / atmosphere / moon-coupling changes invalidate the LUT same-frame
   // before raygen samples it.
-  vec3 radiance = sampleSkyViewLutForRay(viewDirYUp, AtmosphereSkyViewLut, AtmosphereSkyViewSampler);
+  vec3 radiance = args.useSkyViewLut != 0
+    ? sampleSkyViewLutForRay(viewDirYUp, AtmosphereSkyViewLut, AtmosphereSkyViewSampler)
+    : evalAtmosphereRadiance(vec3(0.0f), viewDirYUp, args.sunDirection, args,
+        AtmosphereTransmittanceLut, AtmosphereSkyViewSampler, AtmosphereMultiscatteringLut, 32);
 
   // Suppress residual atmosphere glow at deep night.
   // The ray marching and multiscattering approximation produce small non-zero

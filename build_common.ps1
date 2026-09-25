@@ -558,8 +558,6 @@ $script:DxvkDependenciesChecked = $false
 function Get-DxvkMissingUsdPluginDependencies {
   param([Parameter(Mandatory)][string]$SourceDir)
   $expected = @(
-    @{ Relative = 'src\usd-plugins\_external\nv_usd\release\lib'; Description = 'USD plugin release libs' },
-    @{ Relative = 'src\usd-plugins\_external\nv_usd\debug\lib';   Description = 'USD plugin debug libs' },
     @{ Relative = 'src\usd-plugins\_external\python\python.exe';   Description = 'USD plugin Python 3.10 runtime' }
   )
   $missing = @()
@@ -671,9 +669,6 @@ function Ensure-UsdPluginDependencies {
     [bool]$FetchDependencies = $true,
     [int]$TimeoutSeconds = 900
   )
-  Patch-UsdPluginsMesonSkipPackman -SourceDir $SourceDir
-  Repair-StaleUsdPluginPackmanLinks -SourceDir $SourceDir
-
   $missing = @(Get-DxvkMissingUsdPluginDependencies -SourceDir $SourceDir)
   if ($missing.Count -eq 0) {
     Write-Host "[build] USD plugin dependencies are already present; skipping nested packman fetch." -ForegroundColor Cyan
@@ -708,13 +703,11 @@ function Ensure-UsdPluginDependencies {
 }
 
 function Get-DxvkMissingExternalDependencies {
-  param([Parameter(Mandatory)][string]$SourceDir)
+  param([Parameter(Mandatory)][string]$SourceDir, [string]$BuildFlavour = 'release')
   $expected = @(
     'external\aftermath',
     'external\reflex',
     'external\rtxio',
-    'external\nv_usd_release',
-    'external\nv_usd_debug',
     'external\glslangvalidator',
     'external\slang',
     'external\spirv_tools',
@@ -722,6 +715,7 @@ function Get-DxvkMissingExternalDependencies {
     'external\omni_core_materials',
     'external\nv_xxd'
   )
+  $expected += if ($BuildFlavour -eq 'debug') { 'external\nv_usd_debug' } else { 'external\nv_usd_release' }
   $missing = @()
   foreach ($relative in $expected) {
     $full = Join-Path $SourceDir $relative
@@ -742,12 +736,13 @@ function Ensure-DxvkDependencies {
   param(
     [Parameter(Mandatory)][string]$SourceDir,
     [bool]$FetchDependencies = $true,
-    [int]$TimeoutSeconds = 900
+    [int]$TimeoutSeconds = 900,
+    [string]$BuildFlavour = 'release'
   )
   if ($script:DxvkDependenciesChecked) { return }
   $script:DxvkDependenciesChecked = $true
 
-  $missing = @(Get-DxvkMissingExternalDependencies -SourceDir $SourceDir)
+  $missing = @(Get-DxvkMissingExternalDependencies -SourceDir $SourceDir -BuildFlavour $BuildFlavour)
   if ($missing.Count -eq 0) {
     Write-Host "[build] External dependencies are already present; skipping packman fetch." -ForegroundColor Cyan
     Ensure-UsdPluginDependencies -SourceDir $SourceDir -FetchDependencies $FetchDependencies -TimeoutSeconds $TimeoutSeconds
@@ -772,7 +767,7 @@ function Ensure-DxvkDependencies {
   Write-Host ("[build] Fetching dependencies with timeout: {0} seconds" -f $TimeoutSeconds) -ForegroundColor Cyan
   Invoke-CheckedNative -FilePath $updateDeps -Arguments @($packmanXml, 'update-deps.log') -FailureMessage 'Failed to fetch external dependencies with packman' -WorkingDirectory $SourceDir -TimeoutSeconds $TimeoutSeconds
 
-  $stillMissing = @(Get-DxvkMissingExternalDependencies -SourceDir $SourceDir)
+  $stillMissing = @(Get-DxvkMissingExternalDependencies -SourceDir $SourceDir -BuildFlavour $BuildFlavour)
   if ($stillMissing.Count -gt 0) {
     throw ("packman finished, but these dependency folders are still missing/empty: {0}`nCheck update-deps.log in the repo root." -f ($stillMissing -join ', '))
   }
@@ -792,7 +787,7 @@ Write-Host "[build] vswhere found at: $vsWhere" -ForegroundColor Yellow
 # Get path to Visual Studio installation using vswhere.
 $vsWherePrimaryArgs = @(
   '-latest',
-  '-version', '[16.0,18.0)',
+  '-version', '[16.0,)',
   '-products', '*',
   '-requires', 'Microsoft.VisualStudio.Component.VC.Tools.x86.x64',
   '-property', 'installationPath'
@@ -801,7 +796,7 @@ $vsPath = (& $vsWhere @vsWherePrimaryArgs 2>$null | Select-Object -First 1)
 if ([string]::IsNullOrWhiteSpace([string]$vsPath)) {
   $vsWhereFallbackArgs = @(
     '-latest',
-    '-version', '[16.0,18.0)',
+    '-version', '[16.0,)',
     '-products', '*',
     '-requires', 'Microsoft.Component.MSBuild',
     '-property', 'installationPath'
@@ -985,10 +980,16 @@ function Set-VisualStudioBuildEnvironment {
       continue
     }
 
+    $importedNames = @{}
     foreach ($line in $envLines) {
       if ($line -match '=') {
         $v = [string]$line -split '=', 2
         if ($v.Count -eq 2 -and -not [string]::IsNullOrWhiteSpace($v[0])) {
+          # Some launch environments contain both PATH and Path. cmd updates
+          # PATH for vcvarsall but also prints the stale mixed-case duplicate.
+          # Environment names are case-insensitive: retain the first value.
+          if ($importedNames.ContainsKey($v[0])) { continue }
+          $importedNames[$v[0]] = $true
           Set-Item -Force -Path "ENV:\$($v[0])" -Value $v[1]
         }
       }
@@ -1037,6 +1038,25 @@ function PerformBuild {
   if (-not $InstallTags -or $InstallTags.Count -eq 0) {
     $InstallTags = @('output')
   }
+  if ($Architecture -eq 'x86' -and -not $ShadersOnly) {
+    if (-not [string]::IsNullOrWhiteSpace($BuildTarget)) {
+      throw 'An x86 package requires the client, x64 server, and x64 runtime together; individual BuildTarget selection is not supported.'
+    }
+    if ($InstallTags.Count -ne 1 -or $InstallTags[0] -ne 'output') {
+      throw 'The x86 bridge package supports the output installation tag.'
+    }
+    Write-Host '[build] x86 games use the x86 bridge client and x64 Remix runtime. Building the complete matching package with Ninja.' -ForegroundColor Cyan
+    Write-Host '[build] The bridge uses bridge_dx11_work/_Comp32<flavour> and _Comp64<flavour>; the runtime uses _Comp64<flavour>.' -ForegroundColor DarkGray
+    & (Join-Path $DxvkBuildRoot 'build_dxvk_all_ninja.ps1') -BuildFlavour $BuildFlavour -EnableTracy $EnableTracy -ConfigureOnly:$ConfigureOnly -NoDepsFetch:(-not $FetchDependencies) -SkipZip
+    return
+  }
+  if ($Architecture -eq 'x86' -and $ShadersOnly) {
+    # Shader bytecode is architecture-independent and compiled by the x64 runtime.
+    $Architecture = 'x64'
+    if ($BuildSubDir -ieq ('_Comp32' + $BuildFlavour)) {
+      $BuildSubDir = '_Comp64' + $BuildFlavour
+    }
+  }
   $SourceDir = [IO.Path]::GetFullPath($DxvkBuildRoot)
   $OutputDir = [IO.Path]::Combine($SourceDir, '_output', $Architecture)
   $BuildDir = [IO.Path]::Combine($SourceDir, $BuildSubDir)
@@ -1055,7 +1075,7 @@ function PerformBuild {
     Set-DxvkPreferredNinjaEnvironment -VisualStudioPath $vsPath
     [void](Resolve-RequiredCommand -Name 'ninja' -InstallHint 'Install Ninja with: py -m pip install --user ninja')
   }
-  Ensure-DxvkDependencies -SourceDir $SourceDir -FetchDependencies $FetchDependencies -TimeoutSeconds $DepsTimeoutSeconds
+  Ensure-DxvkDependencies -SourceDir $SourceDir -FetchDependencies $FetchDependencies -TimeoutSeconds $DepsTimeoutSeconds -BuildFlavour $BuildFlavour
   $availableOptions = Get-MesonOptionNames -SourceDir $SourceDir
   Write-Host "[build] Starting $Architecture build for $BuildFlavour..." -ForegroundColor Cyan
   Write-Host "[build] Source directory: $SourceDir" -ForegroundColor DarkGray

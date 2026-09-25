@@ -351,6 +351,8 @@ namespace dxvk {
           "It serves as a reference integration mode for validation of other indirect integration modes." },
         {IntegrateIndirectMode::ReSTIRGI, "ReSTIR GI", 
           "ReSTIR GI provides improved indirect path sampling over \"Importance Sampled\" mode with better indirect diffuse and specular GI quality at increased performance cost."},
+        {IntegrateIndirectMode::SpatialHashRadianceCache, "SHARC",
+          "Caches full-path radiance from sparse updates. Rough indirect hits use cached lighting; cold and glossy paths continue tracing."},
         {IntegrateIndirectMode::NeuralRadianceCache, "RTX Neural Radiance Cache", 
           "RTX Neural Radiance Cache (NRC). NRC is an AI based world space radiance cache. It is live trained by the path tracer\n"
           "and allows paths to terminate early by looking up the cached value and saving performance.\n"
@@ -1854,6 +1856,8 @@ namespace dxvk {
           resourceAliasingQueryText += "NRC)";
         } else if (RtxOptions::integrateIndirectMode() == IntegrateIndirectMode::ReSTIRGI) {
           resourceAliasingQueryText += "ReSTIR-GI)";
+        } else if (RtxOptions::integrateIndirectMode() == IntegrateIndirectMode::SpatialHashRadianceCache) {
+          resourceAliasingQueryText += "SHARC)";
         } else {
           resourceAliasingQueryText += "ImportanceSampled)";
         }
@@ -2999,7 +3003,9 @@ namespace dxvk {
       if (RemixGui::CollapsingHeader("Sky Tuning", collapsingHeaderClosedFlags)) {
         ImGui::Indent();
         // Sky mode selection.
-        skyModeCombo.getKey(&RtxOptions::skyModeObject());
+        if (skyModeCombo.getKey(&RtxOptions::skyModeObject())) {
+          RtxOptions::skyAutoPhysicalAtmosphereFallbackObject().setDeferred(false);
+        }
         RemixGui::SetTooltipToLastWidgetOnHover("Skybox Rasterization: Traditional skybox rendering\nPhysical Atmosphere: Hillaire atmospheric scattering");
 
         if (RtxOptions::skyMode() == SkyMode::SkyboxRasterization) {

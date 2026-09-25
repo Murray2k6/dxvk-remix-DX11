@@ -410,6 +410,14 @@ namespace dxvk {
 
     DxvkNameSet extensionsEnabled;
 
+    // The promoted extension requires both Vulkan 1.2 feature bits when that
+    // feature structure is present. Keep the geometry-shader blit fallback
+    // available on devices that cannot enable the pair.
+    if (!m_deviceFeatures.vulkan12Features.shaderOutputViewportIndex ||
+        !m_deviceFeatures.vulkan12Features.shaderOutputLayer) {
+      devExtensions.extShaderViewportIndexLayer.setMode(DxvkExtMode::Disabled);
+    }
+
     if (!m_deviceExtensions.enableExtensions(
           devExtensionList.size(),
           devExtensionList.data(),
@@ -462,6 +470,9 @@ namespace dxvk {
 
     enabledFeatures.vulkan12Features.drawIndirectCount = m_deviceFeatures.vulkan12Features.drawIndirectCount;
     enabledFeatures.vulkan12Features.samplerMirrorClampToEdge = m_deviceFeatures.vulkan12Features.samplerMirrorClampToEdge;
+    enabledFeatures.vulkan12Features.shaderOutputViewportIndex = m_deviceFeatures.vulkan12Features.shaderOutputViewportIndex;
+    enabledFeatures.vulkan12Features.shaderOutputLayer = m_deviceFeatures.vulkan12Features.shaderOutputLayer;
+    enabledFeatures.vulkan12Features.hostQueryReset = m_deviceFeatures.vulkan12Features.hostQueryReset;
 
     enabledFeatures.extExtendedDynamicState.extendedDynamicState = m_deviceFeatures.extExtendedDynamicState.extendedDynamicState;
 
@@ -1212,6 +1223,8 @@ namespace dxvk {
       "\n  shaderInt64                            : ", features.core.features.shaderInt64 ? "1" : "0",
       "\n  variableMultisampleRate                : ", features.core.features.variableMultisampleRate ? "1" : "0",
       "\n  hostQueryReset                         : ", features.vulkan12Features.hostQueryReset ? "1" : "0",
+      "\n  shaderOutputViewportIndex              : ", features.vulkan12Features.shaderOutputViewportIndex ? "1" : "0",
+      "\n  shaderOutputLayer                      : ", features.vulkan12Features.shaderOutputLayer ? "1" : "0",
       // NV-DXVK
       "\n  scalarBlockLayout                      : ", features.vulkan12Features.scalarBlockLayout ? "1" : "0",
       "\n  uniformBufferStandardLayout            : ", features.vulkan12Features.uniformBufferStandardLayout ? "1" : "0",

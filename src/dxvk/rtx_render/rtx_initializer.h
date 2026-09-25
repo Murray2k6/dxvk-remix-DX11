@@ -35,14 +35,18 @@ namespace dxvk {
     explicit RtxInitializer(DxvkDevice* device);
 
     void onDestroy() override {
-      waitForShaderPrewarm();
+      m_stopPrewarmMonitor.store(true);
+      if (m_prewarmMonitorThread.joinable()) {
+        m_prewarmMonitorThread.join();
+      }
 
       if (m_asyncAssetLoadThread.joinable()) {
-        if (!m_assetsLoaded) {
-          Logger::warn("Async asset loading thread is running while device is being destroyed! Attempting to join...");
-        }
         m_asyncAssetLoadThread.join();
       }
+
+      // Asset loading can create pipelines and enqueue texture uploads.
+      // Finish the producer before draining either class of work.
+      waitForShaderPrewarm();
     }
 
     void initialize();

@@ -1,4 +1,5 @@
 #include "../d3d11/d3d11_options.h"
+#include "../dxvk/dxvk_device.h"
 
 #include "dxbc_options.h"
 

@@ -80,6 +80,25 @@ namespace {
 
 namespace dxvk {
 
+  void AssetExporter::onDestroy() {
+    if (!m_exporterThread) {
+      return;
+    }
+
+    // A FIFO marker on this single-worker pool finishes after every export,
+    // including each job's captured device reference. Joining the pool alone
+    // would cancel queued exports and their completion callbacks.
+    Future<void> drained;
+    do {
+      drained = m_exporterThread->Schedule([] {});
+      if (!drained.valid()) {
+        std::this_thread::yield();
+      }
+    } while (!drained.valid());
+    drained.get();
+    m_exporterThread.reset();
+  }
+
   void AssetExporter::waitForAllExportsToComplete(const float numSecsToWait) {
 
     if (m_numExportsInFlight > 0) {

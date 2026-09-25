@@ -221,7 +221,46 @@
 //!>       UNORDERED_RESOLVE_WBOIT
 
 
+//!variant integrate_indirect_sharc_update.comp
+//!>       SHARC_UPDATE=1
+//!>       NEE_CACHE_ENABLE=0
+
+//!variant integrate_indirect_sharc_update_wboit.comp
+//!>       SHARC_UPDATE=1
+//!>       NEE_CACHE_ENABLE=0
+//!>       UNORDERED_RESOLVE_WBOIT
+
+//!variant integrate_indirect_sharc_update_neeCache.comp
+//!>       SHARC_UPDATE=1
+//!>       NEE_CACHE_ENABLE=1
+
+//!variant integrate_indirect_sharc_update_neeCache_wboit.comp
+//!>       SHARC_UPDATE=1
+//!>       NEE_CACHE_ENABLE=1
+//!>       UNORDERED_RESOLVE_WBOIT
+
+//!variant integrate_indirect_sharc_query.comp
+//!>       SHARC_QUERY=1
+//!>       NEE_CACHE_ENABLE=0
+
+//!variant integrate_indirect_sharc_query_wboit.comp
+//!>       SHARC_QUERY=1
+//!>       NEE_CACHE_ENABLE=0
+//!>       UNORDERED_RESOLVE_WBOIT
+
+//!variant integrate_indirect_sharc_query_neeCache.comp
+//!>       SHARC_QUERY=1
+//!>       NEE_CACHE_ENABLE=1
+
+//!variant integrate_indirect_sharc_query_neeCache_wboit.comp
+//!>       SHARC_QUERY=1
+//!>       NEE_CACHE_ENABLE=1
+//!>       UNORDERED_RESOLVE_WBOIT
+
 //!end-variants
+
+// Every variant binds the atmosphere resources, including inline ray queries.
+#define ATMOSPHERE_AVAILABLE
 
 #define INTEGRATE_INDIRECT
 #define RAB_HAS_PREVIOUS_GBUFFER 1

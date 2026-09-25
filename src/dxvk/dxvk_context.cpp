@@ -38,6 +38,7 @@ namespace dxvk {
     m_execAcquires(DxvkCmdBuffer::ExecBuffer),
     m_execBarriers(DxvkCmdBuffer::ExecBuffer),
     m_gfxBarriers(DxvkCmdBuffer::ExecBuffer),
+    m_renderPassTransitions(DxvkCmdBuffer::ExecBuffer),
     m_queryManager(m_common->queryPool()),
     m_staging     (device, StagingBufferSize) {
     if (m_device->features().extRobustness2.nullDescriptor)
@@ -1639,6 +1640,8 @@ namespace dxvk {
         VK_QUERY_TYPE_PIPELINE_STATISTICS);
 
       this->commitComputePostBarriers();
+    } else {
+      ++m_failedDispatchCount;
     }
 
     m_cmd->addStatCtr(DxvkStatCounter::CmdDispatchCalls, 1);
@@ -1676,6 +1679,8 @@ namespace dxvk {
         m_state.id.argBuffer.bufferInfo().access);
 
       this->trackDrawBuffer();
+    } else {
+      ++m_failedDispatchCount;
     }
 
     m_cmd->addStatCtr(DxvkStatCounter::CmdDispatchCalls, 1);
@@ -4393,6 +4398,57 @@ namespace dxvk {
     ScopedCpuProfileZone();
     const DxvkFramebufferSize fbSize = framebufferInfo.size();
 
+    // An attachment view may deliberately restrict usage to attachment-only,
+    // while its image's normal layout is SHADER_READ_ONLY_OPTIMAL. That layout
+    // is legal for the image but not as a render-pass initial/final layout for
+    // this view (VUID-vkCmdBeginRenderPass-initialLayout-00897). Perform those
+    // transitions on the image outside the pass instead. In particular, do not
+    // broaden a 2D attachment view of a 3D image into an unsupported sampled view.
+    DxvkRenderPassOps compatibleOps = ops;
+    DxvkBarrierSet layoutAcquires(DxvkCmdBuffer::ExecBuffer);
+    for (uint32_t i = 0; i < framebufferInfo.numAttachments(); ++i) {
+      const DxvkAttachment& attachment = framebufferInfo.getAttachment(i);
+      const Rc<DxvkImageView>& view = attachment.view;
+      if (view->info().usage & (VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT))
+        continue;
+
+      const int32_t colorIndex = framebufferInfo.getColorAttachmentIndex(i);
+      VkImageLayout& loadLayout = colorIndex >= 0
+        ? compatibleOps.colorOps[colorIndex].loadLayout : compatibleOps.depthOps.loadLayout;
+      VkImageLayout& storeLayout = colorIndex >= 0
+        ? compatibleOps.colorOps[colorIndex].storeLayout : compatibleOps.depthOps.storeLayout;
+      const VkPipelineStageFlags attachmentStages = colorIndex >= 0
+        ? VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT
+        : VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
+      VkAccessFlags attachmentAccess = colorIndex >= 0
+        ? VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT
+        : VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT;
+      if (colorIndex < 0 && (vk::getWritableAspectsForLayout(attachment.layout) & view->info().aspect))
+        attachmentAccess |= VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+
+      if (loadLayout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL) {
+        // Distinct render-target slices of one 3D mip share a single image
+        // layout. Transition that mip once even when several slices are bound.
+        if (view->imageInfo().type != VK_IMAGE_TYPE_3D
+         || !layoutAcquires.isImageDirty(view->image(), view->imageSubresources(), DxvkAccess::Write)) {
+          layoutAcquires.accessImage(view->image(), view->imageSubresources(),
+            loadLayout, view->imageInfo().stages, view->imageInfo().access,
+            attachment.layout, attachmentStages, attachmentAccess);
+        }
+        loadLayout = attachment.layout;
+      }
+      if (storeLayout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL) {
+        if (view->imageInfo().type != VK_IMAGE_TYPE_3D
+         || !m_renderPassTransitions.isImageDirty(view->image(), view->imageSubresources(), DxvkAccess::Write)) {
+          m_renderPassTransitions.accessImage(view->image(), view->imageSubresources(),
+            attachment.layout, attachmentStages, attachmentAccess,
+            storeLayout, view->imageInfo().stages, view->imageInfo().access);
+        }
+        storeLayout = attachment.layout;
+      }
+    }
+    layoutAcquires.recordCommands(m_cmd);
+
     Rc<DxvkFramebuffer> framebuffer = this->lookupFramebuffer(framebufferInfo);
 
     VkRect2D renderArea;
@@ -4402,7 +4458,7 @@ namespace dxvk {
     VkRenderPassBeginInfo info;
     info.sType                = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
     info.pNext                = nullptr;
-    info.renderPass           = framebufferInfo.renderPass()->getHandle(ops);
+    info.renderPass           = framebufferInfo.renderPass()->getHandle(compatibleOps);
     info.framebuffer          = framebuffer->handle();
     info.renderArea           = renderArea;
     info.clearValueCount      = clearValueCount;
@@ -4410,6 +4466,10 @@ namespace dxvk {
 
     m_cmd->cmdBeginRenderPass(&info,
       VK_SUBPASS_CONTENTS_INLINE);
+
+    // startRenderPass resets the pending attachment ops after this call, so
+    // retain the completion barrier belonging to the pass actually begun.
+    m_activeRenderPassBarrier = ops.barrier;
 
     m_cmd->trackResource<DxvkAccess::None>(framebuffer);
 
@@ -4425,6 +4485,21 @@ namespace dxvk {
   void DxvkContext::renderPassUnbindFramebuffer() {
     ScopedCpuProfileZone();
     m_cmd->cmdEndRenderPass();
+
+    // Restore the caller's requested layouts before further uses or layout
+    // tracking observe this pass's result. The original completion scopes below
+    // remain intact, and the render-pass dependency structure is unchanged.
+    m_renderPassTransitions.recordCommands(m_cmd);
+
+    if (m_activeRenderPassBarrier.srcStages && m_activeRenderPassBarrier.dstStages) {
+      emitMemoryBarrier(0,
+        m_activeRenderPassBarrier.srcStages,
+        m_activeRenderPassBarrier.srcAccess,
+        m_activeRenderPassBarrier.dstStages,
+        m_activeRenderPassBarrier.dstAccess);
+    }
+
+    m_activeRenderPassBarrier = { };
   }
 
 
@@ -5962,6 +6037,8 @@ namespace dxvk {
         VK_QUERY_TYPE_PIPELINE_STATISTICS);
 
       this->commitRaytracingPostBarriers();
+    } else {
+      ++m_failedDispatchCount;
     }
 
     m_cmd->addStatCtr(DxvkStatCounter::CmdTraceRaysCalls, 1);

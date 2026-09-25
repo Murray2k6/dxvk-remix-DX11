@@ -27,7 +27,7 @@ project(
   default_options : ['werror=false', 'b_vscrt=static_from_buildtype', 'cpp_std=vc++17']
 )
 
-python_interpreter = find_program('python3', 'python')
+python_interpreter = import('python').find_installation()
 
 global_src_root_norm = meson.global_source_root().replace('\\', '/')
 output_dir = global_src_root_norm + '/_output/'
@@ -191,20 +191,20 @@ message('##############')
 message('# Versioning #')
 message('##############')
 
-full_version = meson.project_version()
+full_version = meson.project_version() + '-dx11-4'
 
-git_rev_parse_out = run_command('git',['rev-parse','--verify','--short=8', 'HEAD'])
-git_hash = ''
-if git_rev_parse_out.returncode() != 0
-  error('Failed to get current git hash')
-else
-  git_hash = git_rev_parse_out.stdout().replace('\n','')
-  message('Current git hash: ' + git_hash)
+git_program = find_program('git', required: false)
+git_hash = 'source'
+if git_program.found()
+  git_rev_parse_out = run_command(git_program, ['rev-parse','--verify','--short=8', 'HEAD'], check: false)
+  if git_rev_parse_out.returncode() == 0
+    git_hash = git_rev_parse_out.stdout().strip()
+  endif
 endif
 
 found_tag = ''
 ci_commit_tag = ''
-get_env_out = run_command(python_interpreter.full_path(),[global_src_root_norm + './scripts-common/get_env.py', 'CI_COMMIT_TAG'])
+get_env_out = run_command(python_interpreter.full_path(),[global_src_root_norm + '/scripts-common/get_env.py', 'CI_COMMIT_TAG'], check: false)
 if get_env_out.returncode() != 0
   warning('get_env.py failed, ' + get_env_out.stderr().strip())
 else
@@ -217,10 +217,11 @@ if b_found_ci_commit_tag
   found_tag = ci_commit_tag
 else
   git_describe_tag = ''
-  git_describe_out = run_command('git',['describe','--always','--exact-match', git_hash])
-  if git_describe_out.returncode() == 0
-    git_describe_tag = git_describe_out.stdout().replace('\n','')
-    message('Found tag via git describe: ' + git_describe_tag)
+  if git_program.found() and git_hash != 'source'
+    git_describe_out = run_command(git_program, ['describe','--always','--exact-match', git_hash], check: false)
+    if git_describe_out.returncode() == 0
+      git_describe_tag = git_describe_out.stdout().strip()
+    endif
   endif
   found_tag = git_describe_tag
 endif
@@ -247,7 +248,7 @@ endif
 message('Full version: ' + full_version)
 
 bridge_version = vcs_tag(
-  command: [python_interpreter.full_path(), global_src_root_norm + './scripts-common/echo.py', full_version],
+  command: [python_interpreter.full_path(), global_src_root_norm + '/scripts-common/echo.py', full_version],
   input:  'version.h.in',
   output: 'version.h')
 
@@ -292,9 +293,9 @@ foreach key : copy_targets.keys()
     
     if cpu_family == 'x86'
         run_target('copy_' + target_suffix,
-          depends: [ d3d11_dll ],
+          depends: [ d3d11_dx11_bridge, dxgi_dx11_bridge ],
           command : [copy_script_path,
-                    meson.current_build_dir().replace('\\', '/') + '/src/client',
+                    meson.current_build_dir().replace('\\', '/') + '/src/client_dx11',
                     output_path,
                     'd3d11*'])
         run_target('copy_' + target_suffix + '_launcher',

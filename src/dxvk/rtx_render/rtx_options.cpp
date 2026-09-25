@@ -503,6 +503,11 @@ namespace dxvk {
     };
 
     auto enableNrcPreset = [&](NeuralRadianceCache::QualityPreset nrcPreset) {
+      // Graphics quality must not silently replace an explicitly selected
+      // SHARC integration mode with the preset's NRC/ReSTIR fallback.
+      if (RtxOptions::integrateIndirectMode() == IntegrateIndirectMode::SpatialHashRadianceCache)
+        return;
+
       NeuralRadianceCache& nrc = device->getCommon()->metaNeuralRadianceCache();
       // TODO[REMIX-4105] trying to use NRC for a frame when it isn't supported will cause a crash, so this needs to be setImmediately.
       // Should refactor this to use a separate global for the final state, and indicate user preference with the option.

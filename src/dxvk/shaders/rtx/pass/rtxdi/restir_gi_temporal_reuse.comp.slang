@@ -191,6 +191,18 @@ void main(int2 thread_id : SV_DispatchThreadID)
   // Store complete initial sample
   RAB_StoreGIReservoir(inputReservoir, thread_id, ReSTIRGI_GetInitSamplePage());
 
+  // Initial sample construction remains necessary, but disabled temporal reuse
+  // must not trace reflection/validation rays or read last frame's reservoirs.
+  if (!cb.enableReSTIRGITemporalReuse)
+  {
+    RAB_StoreGIReservoir(inputReservoir, thread_id, ReSTIRGI_GetTemporalOutputPage());
+    if (cb.debugView == DEBUG_VIEW_RESTIR_GI_INITIAL_SAMPLE)
+      storeInDebugView(thread_id, inputReservoir.radiance);
+    else if (cb.debugView == DEBUG_VIEW_RESTIR_GI_TEMPORAL_REUSE)
+      storeInDebugView(thread_id, vec3(0));
+    return;
+  }
+
   // Reprojection
   // Note: Camera jittering not used for RTXDI. Also not using Ray and rayEvaluate here due to Ray using 16 bit
   // directions currently until we have a way to differentiate that on a per-instance basis (via generics).
@@ -335,10 +347,6 @@ void main(int2 thread_id : SV_DispatchThreadID)
     validateSample(inputReservoir, resultReservoir, isGBufferSimilar);
   }
 
-  if (!cb.enableReSTIRGITemporalReuse)
-  {
-    resultReservoir = inputReservoir;
-  }
   RAB_StoreGIReservoir(resultReservoir, thread_id, ReSTIRGI_GetTemporalOutputPage());
 
   if (cb.debugView == DEBUG_VIEW_RESTIR_GI_INITIAL_SAMPLE)

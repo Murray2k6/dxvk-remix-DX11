@@ -140,7 +140,10 @@ namespace dxvk {
     if (m_format.depth.format == VK_FORMAT_UNDEFINED)
       subpass.pDepthStencilAttachment = nullptr;
     
-    std::array<VkSubpassDependency, 3> subpassDeps;
+    // Dependencies participate in render-pass compatibility. Keep them
+    // identical for every load/store variant, including the default pass
+    // used to create the framebuffer and graphics pipelines.
+    std::array<VkSubpassDependency, 2> subpassDeps;
     uint32_t                           subpassDepCount = 0;
 
     VkPipelineStageFlags renderStages = 0;
@@ -150,15 +153,7 @@ namespace dxvk {
       renderStages |= VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT
                    |  VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
 
-      VkImageAspectFlags loadAspects = 0;
-
-      if (ops.depthOps.loadOpD == VK_ATTACHMENT_LOAD_OP_LOAD)
-        loadAspects |= VK_IMAGE_ASPECT_DEPTH_BIT;
-      if (ops.depthOps.loadOpS == VK_ATTACHMENT_LOAD_OP_LOAD)
-        loadAspects |= VK_IMAGE_ASPECT_STENCIL_BIT;
-
-      if (loadAspects & imageFormatInfo(m_format.depth.format)->aspectMask)
-        renderAccess |= VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT;
+      renderAccess |= VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT;
       
       if (m_format.depth.layout != VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL)
         renderAccess |= VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
@@ -174,10 +169,8 @@ namespace dxvk {
         continue;
 
       renderStages |= VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-      renderAccess |= VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-
-      if (ops.colorOps[i].loadOp == VK_ATTACHMENT_LOAD_OP_LOAD)
-        renderAccess |= VK_ACCESS_COLOR_ATTACHMENT_READ_BIT;
+      renderAccess |= VK_ACCESS_COLOR_ATTACHMENT_READ_BIT
+                   |  VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
     }
 
     if (renderStages) {
@@ -187,26 +180,17 @@ namespace dxvk {
         0, renderAccess };
     }
 
-    if (ops.barrier.srcStages & (
-          VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
-          VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT |
-          VK_PIPELINE_STAGE_ALL_COMMANDS_BIT)) {
-      subpassDeps[subpassDepCount++] = { 0, 0,
-        VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-        VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
-        VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
-        VK_ACCESS_SHADER_READ_BIT,
-        VK_DEPENDENCY_BY_REGION_BIT };
-    }
+    // Authorize attachment feedback barriers even in variants which never
+    // need to record one. A self dependency does not itself execute a barrier.
+    subpassDeps[subpassDepCount++] = { 0, 0,
+      VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+      VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+      VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+      VK_ACCESS_SHADER_READ_BIT,
+      VK_DEPENDENCY_BY_REGION_BIT };
 
-    if (ops.barrier.srcStages && ops.barrier.dstStages) {
-      subpassDeps[subpassDepCount++] = {
-        0, VK_SUBPASS_EXTERNAL,
-        ops.barrier.srcStages,
-        ops.barrier.dstStages,
-        ops.barrier.srcAccess,
-        ops.barrier.dstAccess, 0 };
-    }
+    // The variable outgoing dependency is recorded by the context immediately
+    // after vkCmdEndRenderPass, outside the compatible render-pass definition.
     
     VkRenderPassCreateInfo info;
     info.sType                        = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
@@ -233,17 +217,10 @@ namespace dxvk {
   bool DxvkRenderPass::compareOps(
     const DxvkRenderPassOps& a,
     const DxvkRenderPassOps& b) {
-    bool eq = a.barrier.srcStages == b.barrier.srcStages
-           && a.barrier.srcAccess == b.barrier.srcAccess
-           && a.barrier.dstStages == b.barrier.dstStages
-           && a.barrier.dstAccess == b.barrier.dstAccess;
-    
-    if (eq) {
-      eq &= a.depthOps.loadOpD     == b.depthOps.loadOpD
-         && a.depthOps.loadOpS     == b.depthOps.loadOpS
-         && a.depthOps.loadLayout  == b.depthOps.loadLayout
-         && a.depthOps.storeLayout == b.depthOps.storeLayout;
-    }
+    bool eq = a.depthOps.loadOpD     == b.depthOps.loadOpD
+           && a.depthOps.loadOpS     == b.depthOps.loadOpS
+           && a.depthOps.loadLayout  == b.depthOps.loadLayout
+           && a.depthOps.storeLayout == b.depthOps.storeLayout;
     
     for (uint32_t i = 0; i < MaxNumRenderTargets && eq; i++) {
       eq &= a.colorOps[i].loadOp      == b.colorOps[i].loadOp

@@ -39,6 +39,7 @@
 #include <vector>
 
 #include "dx11_capture_remix.h"
+#include "dx11_frame_capture_coverage.h"
 #include "dx11_bridge_client.h"
 
 #include "util_bridgecommand.h"
@@ -265,6 +266,8 @@ namespace {
   std::unordered_map<ID3D11Resource*, uint64_t> g_textureHashes;
 
   std::atomic<uint64_t> g_meshesStreamed { 0 };
+  std::atomic<bool> g_runtimeStarted { false };
+  std::atomic<bool> g_runtimeFailed { false };
 
   // ===================================================================== //
   // DX11_V265_BRIDGE_PRESENT_CAMERA: camera captured from VS constants.   //
@@ -281,6 +284,7 @@ namespace {
   };
   CameraWire g_camera;                       // guarded by g_mutex
   std::atomic<uint64_t> g_frameIndex { 0 };  // bumped in OnPresent
+  FrameCaptureCoverage g_frameCoverage;  // guarded by g_mutex
   uint64_t g_cameraScanFrame = ~0ull;        // guarded by g_mutex
   uint32_t g_cameraScanAttempts = 0;         // guarded by g_mutex
 
@@ -700,8 +704,13 @@ namespace {
 
     const InputElement& pe = elems[posE];
     const StreamRef& posStream = streams[pe.inputSlot % D3D11_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT];
-    if (!posStream.data || posStream.stride < formatByteSize(pe.format)) return;
-    const uint32_t vertexCount = posStream.size / posStream.stride;
+    const uint32_t positionSize = formatByteSize(pe.format);
+    const uint64_t positionEnd = uint64_t(elemOffsets[posE]) + positionSize;
+    if (!posStream.data || !positionSize || posStream.stride < positionSize
+        || positionEnd > posStream.size) return;
+    // The final position may not extend past the shadow buffer, even when the
+    // buffer ends in a partial stride or the layout starts at a nonzero offset.
+    const uint32_t vertexCount = 1u + uint32_t((posStream.size - positionEnd) / posStream.stride);
     if (vertexCount == 0 || vertexCount > 8'000'000u) return;
 
     // Build the index list (object-space indices into the vertex streams).
@@ -715,11 +724,12 @@ namespace {
       }
     } else {
       const uint32_t idxStride = ib32 ? 4u : 2u;
+      if ((uint64_t(startIndex) + indexCount) * idxStride > ibSize) return;
       for (uint32_t i = 0; i < indexCount; ++i) {
-        const uint32_t byteOff = (startIndex + i) * idxStride;
-        if (byteOff + idxStride > ibSize) return;
-        uint32_t v = ib32 ? *reinterpret_cast<const uint32_t*>(ibData + byteOff)
-                          : *reinterpret_cast<const uint16_t*>(ibData + byteOff);
+        const size_t byteOff = size_t(uint64_t(startIndex + i) * idxStride);
+        uint32_t v = 0;
+        // DXGI buffer offsets need not be aligned for a host integer load.
+        std::memcpy(&v, ibData + byteOff, idxStride);
         const int64_t adj = (int64_t) v + (int64_t) baseVertex;
         if (adj < 0 || adj >= (int64_t) vertexCount) return;
         indices.push_back((uint32_t) adj);
@@ -821,6 +831,7 @@ namespace {
       ClientMessage c(Commands::RemixApi_DrawInstance);
       serializeAndSend<serialize::InstanceInfo>(c, instInfo);
       sendBool(c, false);
+      g_frameCoverage.recordCapturedDraw(g_frameIndex.load(std::memory_order_relaxed));
     }
   }
 
@@ -952,6 +963,13 @@ void RecordVertexShaderRelease(ID3D11VertexShader* shader) {
   if (!shader) return;
   std::lock_guard<std::recursive_mutex> lock(g_mutex);
   g_vsReflect.erase(shader);
+}
+
+void RecordUncapturedDraw(uint32_t primitiveElements, uint32_t instances) {
+  if (primitiveElements == 0 || instances == 0) return;
+  std::lock_guard<std::recursive_mutex> lock(g_mutex);
+  g_frameCoverage.recordUncapturedDraw(g_frameIndex.load(std::memory_order_relaxed),
+    primitiveElements, instances);
 }
 
 void CaptureDrawIndexed(ID3D11DeviceContext* context, uint32_t indexCount,
@@ -1119,28 +1137,48 @@ static HWND ResolvePresentWindowV229(IDXGISwapChain* swapChain) {
 // window - this is what makes the Remix output primary instead of a stray
 // secondary window), SetupCamera feeds the frame's captured camera, Present
 // kicks the path-traced frame with the game HWND as override.
-void OnPresent(IDXGISwapChain* swapChain) {
-  if (!IsStreamingEnabled()) return;
+bool OnPresent(IDXGISwapChain* swapChain) {
+  if (g_runtimeFailed.load(std::memory_order_acquire)
+      || !dx11_bridge_client::EnsureServer()) return false;
 
-  g_frameIndex.fetch_add(1, std::memory_order_relaxed);
+  // Serialize first startup with the capture/cache state. Draws must not cache
+  // material or mesh handles until the runtime has created its D3D11 device.
+  std::lock_guard<std::recursive_mutex> frameLock(g_mutex);
+
+  const uint64_t frame = g_frameIndex.fetch_add(1, std::memory_order_relaxed);
+  const bool hasCapturedScene = g_frameCoverage.canPresent(frame,
+    g_camera.valid && g_camera.viewFound, g_camera.frame);
 
   static uint64_t s_hwnd64 = 0;
   static bool s_startupSent = false;
-  if (!s_startupSent && swapChain) {
-    const HWND presentWindow = ResolvePresentWindowV229(swapChain);
-    if (presentWindow) {
-      s_hwnd64 = (uint64_t)(uintptr_t) presentWindow;
-      ClientMessage c(Commands::RemixApi_Startup);
-      c.send_data((uint32_t) sizeof(s_hwnd64), &s_hwnd64);
+  const HWND presentWindow = ResolvePresentWindowV229(swapChain);
+  if (!presentWindow) return false;
+  s_hwnd64 = (uint64_t)(uintptr_t) presentWindow;
+  if (!s_startupSent) {
+      {
+        ClientMessage c(Commands::RemixApi_Startup);
+        c.send_data((uint32_t) sizeof(s_hwnd64), &s_hwnd64);
+      }
+      if (DeviceBridge::waitForCommand(Commands::RemixApi_Startup,
+          GlobalOptions::getStartupTimeout()) != Result::Success) {
+        logf("capture", "Remix runtime startup did not acknowledge the game window.");
+        g_runtimeFailed.store(true, std::memory_order_release);
+        return false;
+      }
+      const auto response = DeviceBridge::pop_front();
+      if (response.pHandle != REMIXAPI_ERROR_CODE_SUCCESS) {
+        logf("capture", "Remix runtime startup failed with code %u.", (unsigned) response.pHandle);
+        g_runtimeFailed.store(true, std::memory_order_release);
+        return false;
+      }
       s_startupSent = true;
-      logf("capture", "RemixApi_Startup sent (resolved game hwnd=0x%llx)", (unsigned long long) s_hwnd64);
-    }
+      g_runtimeStarted.store(true, std::memory_order_release);
+      logf("capture", "Remix runtime started (game hwnd=0x%llx)", (unsigned long long) s_hwnd64);
   }
-  if (!s_startupSent) return;
 
   {
     std::lock_guard<std::recursive_mutex> lock(g_mutex);
-    if (g_camera.valid) {
+    if (hasCapturedScene) {
       float blob[32];
       memcpy(blob, g_camera.view, sizeof(g_camera.view));
       memcpy(blob + 16, g_camera.proj, sizeof(g_camera.proj));
@@ -1152,11 +1190,33 @@ void OnPresent(IDXGISwapChain* swapChain) {
   {
     ClientMessage c(Commands::RemixApi_Present);
     c.send_data((uint32_t) sizeof(s_hwnd64), &s_hwnd64);
+    c.send_data(hasCapturedScene ? 1u : 0u);
   }
+  // One compositor owns the window once Remix is active. Waiting for the server
+  // also bounds queued capture frames and reports failures before suppressing
+  // the native swapchain presentation.
+  if (DeviceBridge::waitForCommand(Commands::RemixApi_Present,
+      GlobalOptions::getCommandTimeout()) != Result::Success) {
+    g_runtimeFailed.store(true, std::memory_order_release);
+    logf("capture", "Remix presentation stopped responding; restoring native presentation.");
+    return false;
+  }
+  const auto response = DeviceBridge::pop_front();
+  const bool rayTraced = DeviceBridge::get_data() != 0;
+  if (response.pHandle != REMIXAPI_ERROR_CODE_SUCCESS) {
+    g_runtimeFailed.store(true, std::memory_order_release);
+    logf("capture", "Remix presentation failed with code %u; restoring native presentation.", (unsigned) response.pHandle);
+    return false;
+  }
+  if (g_frameIndex.load(std::memory_order_relaxed) <= 2)
+    logf("capture", "Remix frame presented and acknowledged by the x64 server.");
+  return hasCapturedScene && rayTraced;
 }
 
 bool IsStreamingEnabled() {
-  return dx11_bridge_client::EnsureServer();
+  return g_runtimeStarted.load(std::memory_order_acquire)
+      && !g_runtimeFailed.load(std::memory_order_acquire)
+      && dx11_bridge_client::EnsureServer();
 }
 
 } // namespace dx11_capture

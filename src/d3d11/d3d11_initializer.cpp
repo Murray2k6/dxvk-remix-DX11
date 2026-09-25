@@ -83,7 +83,11 @@ namespace dxvk {
         // covers ordinary level geometry. The cap keeps a pathological buffer
         // from doubling its own footprint in system memory; anything larger
         // simply keeps the old behaviour.
-        if (desc.BindFlags & D3D11_BIND_INDEX_BUFFER) {
+        // DEFAULT/DYNAMIC buffers may change through CPU updates, copies or
+        // GPU writes. A creation-time shadow is authoritative only for an
+        // immutable buffer; stale maxima can undersize the BLAS vertex range.
+        if ((desc.BindFlags & D3D11_BIND_INDEX_BUFFER)
+         && desc.Usage == D3D11_USAGE_IMMUTABLE) {
           constexpr size_t kMaxIndexShadowBytes = 32ull << 20;
           if (desc.ByteWidth > 0 && desc.ByteWidth <= kMaxIndexShadowBytes)
             pBuffer->SetIndexShadow(pInitialData->pSysMem, desc.ByteWidth);

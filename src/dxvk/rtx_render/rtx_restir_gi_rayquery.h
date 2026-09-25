@@ -21,6 +21,9 @@
 */
 #pragma once
 
+#include <algorithm>
+#include <cmath>
+
 #include "../dxvk_format.h"
 #include "../dxvk_include.h"
 
@@ -65,9 +68,12 @@ namespace dxvk {
 
     int getTemporalHistoryLength(float frameTimeMs) {
       if (useAdaptiveTemporalHistory()) {
-        return static_cast<int>(std::max(temporalAdaptiveHistoryLengthMs() / frameTimeMs, 20.0f));
+        // A paused or first frame can have a zero/non-finite duration. Keep the
+        // packed reservoir history bounded and avoid float-to-int overflow.
+        const float safeFrameTimeMs = std::isfinite(frameTimeMs) && frameTimeMs > 0.0f ? frameTimeMs : 16.666667f;
+        return static_cast<int>(std::clamp(temporalAdaptiveHistoryLengthMs() / safeFrameTimeMs, 20.0f, 500.0f));
       } else {
-        return temporalFixedHistoryLength();
+        return std::clamp(temporalFixedHistoryLength(), 1, 500);
       }
     }
 

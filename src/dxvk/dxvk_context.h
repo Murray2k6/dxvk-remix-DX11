@@ -609,6 +609,10 @@ namespace dxvk {
             uint32_t          x,
             uint32_t          y,
             uint32_t          z);
+
+    // A missing asynchronous pipeline skips work. Compositors must not
+    // present that partial frame or promote its output to temporal history.
+    uint64_t failedDispatchCount() const { return m_failedDispatchCount; }
     
     /**
      * \brief Indirect dispatch call
@@ -1277,7 +1281,9 @@ namespace dxvk {
     DxvkBarrierSet          m_execAcquires;
     DxvkBarrierSet          m_execBarriers;
     DxvkBarrierSet          m_gfxBarriers;
+    DxvkBarrierSet          m_renderPassTransitions;
     DxvkBarrierControlFlags m_barrierControl;
+    DxvkRenderPassBarrier   m_activeRenderPassBarrier;
     
     DxvkGpuQueryManager     m_queryManager;
     DxvkStagingBuffer       m_staging;
@@ -1286,6 +1292,7 @@ namespace dxvk {
 
     VkPipeline m_gpActivePipeline = VK_NULL_HANDLE;
     VkPipeline m_cpActivePipeline = VK_NULL_HANDLE;
+    uint64_t m_failedDispatchCount = 0;
     VkPipeline m_rpActivePipeline = VK_NULL_HANDLE;
 
     VkDescriptorSet m_gpSet = VK_NULL_HANDLE;

@@ -127,6 +127,7 @@ namespace dxvk {
         TEXTURE2D(RTXDI_REUSE_BINDING_SUBSURFACE_DIFFUSION_PROFILE_DATA_INPUT)
         TEXTURE2D(RTXDI_REUSE_BINDING_SHARED_FLAGS_INPUT)
         TEXTURE2D(RTXDI_REUSE_BINDING_BEST_LIGHTS_INPUT)
+        TEXTURE2D(RTXDI_REUSE_BINDING_PREVIOUS_REPROJECTION_CONFIDENCE_INPUT)
         
         // Inputs / Outputs
         RW_STRUCTURED_BUFFER(RTXDI_REUSE_BINDING_RTXDI_RESERVOIR_INPUT_OUTPUT)
@@ -325,7 +326,10 @@ namespace dxvk {
     }
   }
 
-  void DxvkRtxdiRayQuery::setRaytraceArgs(Resources::RaytracingOutput& rtOutput) const {
+  void DxvkRtxdiRayQuery::setRaytraceArgs(Resources::RaytracingOutput& rtOutput, bool resetHistory) {
+    const uint32_t frameIdx = rtOutput.m_raytraceArgs.frameIdx;
+    m_previousFrameValid = RtxOptions::useRTXDI() && !resetHistory && m_hasDispatched
+      && m_lastDispatchFrame == frameIdx - 1;
     // ToDo should pass the rayTrace args directly like in the other cases...
     // ToDo add a struct for RTXDI within raytraceArgs and retain same names for options & refs in code. These diffs make it much more hard to look for ref in code...
     rtOutput.m_raytraceArgs.enableRtxdiCrossPortalLight = enableCrossPortalLight() && useRtxdiPortalShaderVariants();
@@ -336,7 +340,7 @@ namespace dxvk {
     rtOutput.m_raytraceArgs.enableRtxdiStealBoundaryPixelSamplesWhenOutsideOfScreen = stealBoundaryPixelSamplesWhenOutsideOfScreen();
     rtOutput.m_raytraceArgs.enableRtxdiSpatialReuse = enableSpatialReuse();
     rtOutput.m_raytraceArgs.enableRtxdiTemporalBiasCorrection = enableTemporalBiasCorrection();
-    rtOutput.m_raytraceArgs.enableRtxdiTemporalReuse = enableTemporalReuse();
+    rtOutput.m_raytraceArgs.enableRtxdiTemporalReuse = enableTemporalReuse() && m_previousFrameValid;
     rtOutput.m_raytraceArgs.enableRtxdiDiscardInvisibleSamples = enableDiscardInvisibleSamples();
     rtOutput.m_raytraceArgs.enableRtxdiDiscardEnlargedPixels= enableDiscardEnlargedPixels();
     rtOutput.m_raytraceArgs.rtxdiDisocclusionSamples = disocclusionSamples();
@@ -346,7 +350,7 @@ namespace dxvk {
 
     // Note: best light sampling uses data written into the RtxdiBestLights texture by the confidence pass on the previous frame.
     // We need to make sure that the data is there and valid: light indices from more than one frame ago are not mappable to the current frame.
-    const bool isRtxdiBestLightsValid = rtOutput.m_rtxdiBestLights.matchesWriteFrameIdx(rtOutput.m_raytraceArgs.frameIdx - 1);
+    const bool isRtxdiBestLightsValid = m_previousFrameValid && rtOutput.m_rtxdiBestLights.matchesWriteFrameIdx(frameIdx - 1);
 
     rtOutput.m_raytraceArgs.enableRtxdiBestLightSampling = enableBestLightSampling() && isRtxdiBestLightsValid;
     // Note: initialSamples is not written here, it's used in LightManager::setRaytraceArgs
@@ -389,12 +393,14 @@ namespace dxvk {
 
   void DxvkRtxdiRayQuery::dispatch(RtxContext* ctx, const Resources::RaytracingOutput& rtOutput) {
     ScopedGpuProfileZone(ctx, "RTXDI");
+    m_hasDispatched = false;
 
     if (!RtxOptions::useRTXDI()) {
       return;
     }
 
     const uint32_t frameIdx = ctx->getDevice()->getCurrentFrameId();
+    const uint64_t failures = ctx->failedDispatchCount();
 
     const auto& numRaysExtent = rtOutput.m_compositeOutputExtent;
     VkExtent3D workgroups = util::computeBlockCount(numRaysExtent, VkExtent3D{ 16, 8, 1 });
@@ -434,7 +440,8 @@ namespace dxvk {
 
       // Outputs
 
-      ctx->bindResourceView(RTXDI_REUSE_BINDING_REPROJECTION_CONFIDENCE_OUTPUT, rtOutput.m_reprojectionConfidence.view, nullptr);
+      ctx->bindResourceView(RTXDI_REUSE_BINDING_REPROJECTION_CONFIDENCE_OUTPUT, rtOutput.getCurrentReprojectionConfidence().view, nullptr);
+      ctx->bindResourceView(RTXDI_REUSE_BINDING_PREVIOUS_REPROJECTION_CONFIDENCE_INPUT, rtOutput.getPreviousReprojectionConfidence().view, nullptr);
       ctx->bindResourceView(RTXDI_REUSE_BINDING_BSDF_FACTOR_OUTPUT, rtOutput.m_bsdfFactor.view, nullptr);
       ctx->bindResourceView(RTXDI_REUSE_BINDING_TEMPORAL_POSITION_OUTPUT, rtOutput.m_primaryRtxdiTemporalPosition.view(Resources::AccessType::Write), nullptr);
 
@@ -443,12 +450,16 @@ namespace dxvk {
         ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, getRtxdiInitialSamplingShader(usePortalShaderVariants));
         ctx->dispatch(workgroups.width, workgroups.height, workgroups.depth);
       }
+      if (ctx->failedDispatchCount() != failures)
+        return;
 
       {
         ScopedGpuProfileZone(ctx, "RTXDI Temporal Reuse");
         ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, getRtxdiTemporalReuseShader(usePortalShaderVariants));
         ctx->dispatch(workgroups.width, workgroups.height, workgroups.depth);
       }
+      if (ctx->failedDispatchCount() != failures)
+        return;
     }
 
     {
@@ -482,7 +493,7 @@ namespace dxvk {
 
       // Outputs
 
-      ctx->bindResourceView(RTXDI_REUSE_BINDING_REPROJECTION_CONFIDENCE_OUTPUT, rtOutput.m_reprojectionConfidence.view, nullptr);
+      ctx->bindResourceView(RTXDI_REUSE_BINDING_REPROJECTION_CONFIDENCE_OUTPUT, rtOutput.getCurrentReprojectionConfidence().view, nullptr);
       ctx->bindResourceView(RTXDI_REUSE_BINDING_BSDF_FACTOR_OUTPUT, rtOutput.m_bsdfFactor.view, nullptr);
       ctx->bindResourceView(RTXDI_REUSE_BINDING_TEMPORAL_POSITION_OUTPUT, rtOutput.m_primaryRtxdiTemporalPosition.view(Resources::AccessType::Write), nullptr);
       ctx->bindResourceView(RTXDI_REUSE_BINDING_BEST_LIGHTS_INPUT, rtOutput.m_rtxdiBestLights.view(Resources::AccessType::Read, rtOutput.m_raytraceArgs.enableRtxdiBestLightSampling), nullptr);
@@ -491,6 +502,10 @@ namespace dxvk {
         usePortalShaderVariants,
         useRtxdiSpatialBsdfDetailShaderVariant(rtOutput)));
       ctx->dispatch(workgroups.width, workgroups.height, workgroups.depth);
+    }
+    if (ctx->failedDispatchCount() == failures) {
+      m_lastDispatchFrame = frameIdx;
+      m_hasDispatched = true;
     }
   }
 
@@ -529,7 +544,7 @@ namespace dxvk {
       ctx->bindResourceView(RTXDI_COMPUTE_GRADIENTS_BINDING_TEMPORAL_POSITION_INPUT, rtOutput.m_primaryRtxdiTemporalPosition.view(Resources::AccessType::Read), nullptr);
       ctx->bindResourceView(RTXDI_COMPUTE_GRADIENTS_BINDING_CURRENT_ILLUMINANCE_INPUT, rtOutput.getCurrentRtxdiIlluminance().view(Resources::AccessType::Read), nullptr);
 
-      const bool isPreviousIlluminanceValid = rtOutput.getPreviousRtxdiIlluminance().matchesWriteFrameIdx(frameIdx - 1);
+      const bool isPreviousIlluminanceValid = m_previousFrameValid && rtOutput.getPreviousRtxdiIlluminance().matchesWriteFrameIdx(frameIdx - 1);
       ctx->bindResourceView(RTXDI_COMPUTE_GRADIENTS_BINDING_PREVIOUS_ILLUMINANCE_INPUT, rtOutput.getPreviousRtxdiIlluminance().view(Resources::AccessType::Read, isPreviousIlluminanceValid), nullptr);
 
       ctx->bindResourceView(RTXDI_COMPUTE_GRADIENTS_BINDING_HIT_DISTANCE_INPUT, rtOutput.m_primaryHitDistance.view, nullptr);
@@ -606,7 +621,7 @@ namespace dxvk {
       ctx->bindResourceView(RTXDI_COMPUTE_CONFIDENCE_BINDING_MVEC_INPUT, rtOutput.m_primaryScreenSpaceMotionVector.view, nullptr);
       ctx->bindResourceView(RTXDI_COMPUTE_CONFIDENCE_BINDING_HIT_DISTANCE_INPUT, rtOutput.m_primaryHitDistance.view, nullptr);
 
-      const bool isPreviousConfidenceValid = rtOutput.getPreviousRtxdiConfidence().matchesWriteFrameIdx(frameIdx - 1);
+      const bool isPreviousConfidenceValid = m_previousFrameValid && rtOutput.getPreviousRtxdiConfidence().matchesWriteFrameIdx(frameIdx - 1);
       ctx->bindResourceView(RTXDI_COMPUTE_CONFIDENCE_BINDING_PREVIOUS_CONFIDENCE_INPUT, rtOutput.getPreviousRtxdiConfidence().view(Resources::AccessType::Read, isPreviousConfidenceValid), nullptr);
       
       // Outputs

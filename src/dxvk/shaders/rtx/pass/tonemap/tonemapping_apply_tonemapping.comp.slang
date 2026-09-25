@@ -27,7 +27,7 @@
 [[vk::binding(TONEMAPPING_APPLY_BLUE_NOISE_TEXTURE_INPUT)]]
 Texture2DArray BlueNoise;
 
-[[vk::binding(TONEMAPPING_APPLY_TONEMAPPING_COLOR_INPUT)]]
+layout(rgba16f, binding = TONEMAPPING_APPLY_TONEMAPPING_COLOR_INPUT)
 RWTexture2D<float4> InColorBuffer;
 
 [[vk::binding(TONEMAPPING_APPLY_TONEMAPPING_TONE_CURVE_INPUT)]]
@@ -36,7 +36,7 @@ Sampler1D<float> InToneCurve;
 [[vk::binding(TONEMAPPING_APPLY_TONEMAPPING_EXPOSURE_INPUT)]]
 RWTexture1D<float> InExposure;
 
-[[vk::binding(TONEMAPPING_APPLY_TONEMAPPING_COLOR_OUTPUT)]]
+layout(rgba16f, binding = TONEMAPPING_APPLY_TONEMAPPING_COLOR_OUTPUT)
 RWTexture2D<float4> OutColorBuffer;
 
 layout(push_constant)

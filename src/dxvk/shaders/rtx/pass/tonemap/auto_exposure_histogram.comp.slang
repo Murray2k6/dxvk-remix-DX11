@@ -24,7 +24,7 @@
 layout(binding = AUTO_EXPOSURE_HISTOGRAM_INPUT_OUTPUT)
 RWTexture1D<uint> OutHistogram;
 
-layout(binding = AUTO_EXPOSURE_COLOR_INPUT)
+layout(rgba16f, binding = AUTO_EXPOSURE_COLOR_INPUT)
 RWTexture2D<float4> InColorBuffer;
 
 layout(push_constant)

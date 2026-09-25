@@ -141,7 +141,7 @@ void volume_restir_pass(ivec3 threadIndex)
   const uvec3 froxelDimensions = uvec3(volumeArgs.restirFroxelGridDimensions, volumeArgs.restirFroxelDepthSlices);
   const uint froxelVolume = threadIndex.x / froxelDimensions.x;
 
-  if (any(threadIndex.yz >= froxelDimensions.yz) || froxelVolume > volumeArgs.numActiveFroxelVolumes)
+  if (any(threadIndex.yz >= froxelDimensions.yz) || froxelVolume >= volumeArgs.numActiveFroxelVolumes)
   {
     return;
   }
@@ -287,7 +287,7 @@ void volume_restir_pass(ivec3 threadIndex)
 
   // Note: The previous froxel coordinate/index are only valid if the Froxel UVW coordinate is valid (meaning successful reprojection).
   bool previousVolumeExists, reprojectionValid;
-  VolumeLookup previousFroxelLookup = froxelCoordinateToPrev(volumeArgs, volumeArgs.restirFroxelDepthSlices, cb.teleportationPortalIndex, froxelCoordinate, froxelVolume, previousVolumeExists, reprojectionValid);
+  VolumeLookup previousFroxelLookup = froxelCoordinateToPrev(volumeArgs, volumeArgs.restirFroxelDepthSlices, cb.teleportationPortalIndex, froxelCoordinate, froxelVolume, previousVolumeExists, reprojectionValid, true);
   
   uvec3 previousFroxelIndex = froxelCoordinateToFroxelIndex(previousFroxelLookup.coordinate);
   
@@ -306,7 +306,7 @@ void volume_restir_pass(ivec3 threadIndex)
   // Note: Left uninitialized as it will be written to in all paths when reprojecting existing temporal reservoirs.
   VolumeReSTIR_Reservoir oldVolumeReservoir = VolumeReSTIR_Reservoir::createEmpty();
 
-  if (previousVolumeExists && reprojectionValid)
+  if (volumeArgs.enableVolumeTemporalResampling && previousVolumeExists && reprojectionValid)
   {
     // Read previous volume reservoir
 

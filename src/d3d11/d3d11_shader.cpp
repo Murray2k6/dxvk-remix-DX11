@@ -1834,6 +1834,11 @@ namespace dxvk {
 
   D3D11ShaderModuleSet:: D3D11ShaderModuleSet() { }
   D3D11ShaderModuleSet::~D3D11ShaderModuleSet() { }
+
+  void D3D11ShaderModuleSet::Clear() {
+    std::unique_lock<dxvk::mutex> lock(m_mutex);
+    m_modules.clear();
+  }
   
   
   HRESULT D3D11ShaderModuleSet::GetShaderModule(

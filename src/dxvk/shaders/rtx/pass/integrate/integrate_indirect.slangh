@@ -69,6 +69,17 @@ bool nrcCombinedToGbufferPixelCoordinate(
 // Returns false if the thread should terminate
 bool initPixelCoordinateOnLaunch(inout uvec2 gbufferPixelCoordinate, out bool isNrcUpdate)
 {
+#if SHARC_UPDATE
+  // A different sample in every stride-sized tile each frame. Check launch
+  // dimensions before remapping so partial edge tiles never duplicate writes.
+  const uint stride = sharcArgs.updateStride;
+  const uint2 updateResolution = (cb.camera.resolution + stride - 1) / stride;
+  if (any(gbufferPixelCoordinate >= updateResolution)) {
+    isNrcUpdate = false;
+    return false;
+  }
+  gbufferPixelCoordinate = sharcUpdatePixelCoordinate(gbufferPixelCoordinate);
+#endif
   if (!nrcCombinedToGbufferPixelCoordinate(
       gbufferPixelCoordinate,
       gbufferPixelCoordinate,
@@ -118,7 +129,9 @@ void integrate_indirect_pass(uvec2 threadIndex)
       return;
     }
 
+#if !SHARC_UPDATE
     IndirectRadianceHitDistance[gbufferPixelCoordinate] = vec4(vec3(0), kEmptyPixelHitDistance);
+#endif
 
     return;
   }

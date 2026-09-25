@@ -31,8 +31,7 @@ $ScriptRoot = if ($PSScriptRoot) {
 
 . (Join-Path $ScriptRoot 'build_common.ps1')
 
-# Build a single DX11 runtime configuration directly, for example:
-# powershell -ExecutionPolicy Bypass -File .\build_dxvk.ps1 -Architecture x86 -BuildFlavour release -BuildSubDir _Comp32Release -Backend ninja -EnableTracy false
-# powershell -ExecutionPolicy Bypass -File .\build_dxvk.ps1 -Architecture x64 -BuildFlavour debugoptimized -BuildSubDir _Comp64DebugOptimized -Backend ninja -EnableTracy false
+# x64 selects a runtime configuration. x86 builds the complete matching bridge
+# package, using the architecture-specific build directories of the all driver.
 
 PerformBuild @args

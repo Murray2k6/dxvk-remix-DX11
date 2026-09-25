@@ -126,9 +126,14 @@ namespace bridge_util {
     }
     Config& config = get();
     if (app == Config::App::Server) {
-      const auto parentPid = getParentPID();
-      const std::string parentExeName = getProcessName(parentPid);
-      config.merge(getAppDefaultConfig(parentExeName.c_str()));
+      char gameExe[32768] = {};
+      const DWORD length = GetEnvironmentVariableA("DXVK_REMIX_REAL_GAME_EXE", gameExe, sizeof(gameExe));
+      if (length > 0 && length < sizeof(gameExe)) {
+        config.merge(getAppDefaultConfig(gameExe));
+      } else {
+        const std::string parentExeName = getProcessName(getParentPID());
+        config.merge(getAppDefaultConfig(parentExeName.c_str()));
+      }
     } else {
       config.merge(getAppDefaultConfig());
     }

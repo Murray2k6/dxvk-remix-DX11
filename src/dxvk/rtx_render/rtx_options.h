@@ -176,6 +176,7 @@ namespace dxvk {
     ReSTIRGI = 1,            // Importance Sampled + ReSTIR GI integrations
     NeuralRadianceCache = 2, // Implements a live trained neural network to provide a world space radiance cache and allow the pathtracer to terminate paths earlier into the cache.
   
+    SpatialHashRadianceCache = 3, // NVIDIA SHARC world-space radiance cache.
     Count
   };
 
@@ -658,7 +659,8 @@ namespace dxvk {
                    "2: RTX Neural Radiance Cache (NRC). NRC is an AI based world space radiance cache. It is live trained by the path tracer\n"
                    "   and allows paths to terminate early by looking up the cached value and saving performance.\n"
                    "   NRC supports infinite bounces and often provides results closer to that of reference than ReSTIR GI\n"
-                   "   while improving performance in scenarios where ray paths have 2 or more bounces on average.\n",
+                   "   while improving performance in scenarios where ray paths have 2 or more bounces on average.\n"
+                   "3: SHARC. Sparse full-path updates populate a world-space radiance cache, allowing rough indirect hits to terminate early.\n",
                    args.environment = "RTX_INTEGRATE_INDIRECT_MODE",
                    args.flags = RtxOptionFlags::UserSetting);
     // DX11: default to TAAU, not DLSS. TAA-Upscaling is vendor-agnostic (works on NVIDIA,
@@ -1450,10 +1452,9 @@ namespace dxvk {
 
     RTX_OPTION("rtx", SkyMode, skyMode, SkyMode::SkyboxRasterization,
                "Sky rendering mode. SkyboxRasterization uses traditional skybox rasterization, PhysicalAtmosphere uses Hillaire atmospheric scattering.");
-    RTX_OPTION("rtx", bool, skyAutoPhysicalAtmosphereFallback, true,
-               "Whether the DX11 runtime may switch rtx.skyMode from SkyboxRasterization to PhysicalAtmosphere (Numos) on its own.\n"
-               "DX11_V319: this promotion used to be unconditional, so Numos always replaced the game's sky regardless of rtx.skyMode and there was no setting to stop it. It also only changed an internal variable, leaving rtx.skyMode still reporting SkyboxRasterization - so the game-sky suppression and the Numos-gated night sky/cloud features stayed switched off while Numos was actually being drawn, and the game's own sky was composited alongside it.\n"
-               "It defaults ON because rasterized skybox mode genuinely cannot work here: the sky cubemap has no usable per-face reprojection, its faces stay at the clear value, and the result is a black box around the camera. Set to False to keep Numos out of the way and take the rasterized path as-is, or set rtx.skyMode=1 to choose Numos explicitly rather than by fallback.");
+    RTX_OPTION("rtx", bool, skyAutoPhysicalAtmosphereFallback, false,
+               "Use the physical atmosphere when the requested rasterized sky cannot be reprojected to a cubemap. "
+               "Disabled by default so SkyboxRasterization preserves the game sky. Set skyMode=PhysicalAtmosphere to select Numos explicitly.");
 
     // Atmosphere parameters
     RTX_OPTION("rtx.atmosphere", float, sunSize, 0.545f, "Size of sun disc in degrees.");

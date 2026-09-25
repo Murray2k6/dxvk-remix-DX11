@@ -337,6 +337,10 @@ private:
   uint32_t m_fogStartInMediumMaterialIndex_inCache = kInvalidMaterialCacheIndex;
   uint32_t m_externalStartInMediumMaterialIndex_inCache = kInvalidMaterialCacheIndex;
   uint32_t m_startInMediumMaterialIndex_inCache = kInvalidMaterialCacheIndex;
+  // Material-cache identity and GPU surface slot from the last successful
+  // surface-material upload; retained across the per-frame medium reset.
+  uint32_t m_uploadedStartInMediumMaterialIndex_inCache = kInvalidMaterialCacheIndex;
+  uint32_t m_uploadedStartInMediumMaterialIndex = SURFACE_INDEX_INVALID;
 
   // TODO: Move the following resources and getters to RtResources class
   Rc<DxvkBuffer> m_surfaceMaterialBuffer;

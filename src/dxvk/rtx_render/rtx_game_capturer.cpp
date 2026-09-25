@@ -134,6 +134,12 @@ namespace dxvk {
   }
 
   GameCapturer::~GameCapturer() {
+    onDestroy();
+  }
+
+  void GameCapturer::onDestroy() {
+    if (m_exportThread.joinable())
+      m_exportThread.join();
   }
 
   void GameCapturer::step(const Rc<DxvkContext> ctx, const HWND hwnd) {
@@ -145,7 +151,7 @@ namespace dxvk {
       capture(ctx, GlobalTime::get().deltaTimeMs());
     }
     if (m_state.has<State::BeginExport>()) {
-      exportUsd(ctx);
+      exportUsd();
     }
   }
 
@@ -1126,15 +1132,18 @@ namespace dxvk {
     pMesh->meshSync.cond.notify_all();
   }
 
-  void GameCapturer::exportUsd(const Rc<DxvkContext> ctx) {
+  void GameCapturer::exportUsd() {
     assert(m_state.has<State::BeginExport>());
     assert(!m_state.has<State::PreppingExport>());
     assert(!m_state.has<State::Exporting>());
-    static auto exportThreadTask = [this](const Rc<DxvkContext> ctx,
-                                          std::unique_ptr<Capture> pCap,
+    // The previous completed export may still own a joinable thread. Never
+    // retain a process-wide callback bound to an earlier device's capturer.
+    onDestroy();
+    auto exportThreadTask = [this](std::unique_ptr<Capture> pCap,
                                           State* pState,
                                           CompletedCapture* complete,
                                           const float framesPerSecond) {
+      try {
       Capture& cap = *pCap;
       const auto numTexExportsInProgress = m_exporter.getNumExportsInFlights();
       constexpr float kTimePerTexExport = 0.0050f; // Liberally decided by inspection, derived from timed out tests
@@ -1167,16 +1176,33 @@ namespace dxvk {
       complete->stagePath = cap.instance.stagePath;
       pState->set<State::Exporting, false>();
       pState->set<State::Complete, true>();
+      } catch (const std::exception& error) {
+        Logger::err(str::format("[GameCapturer] USD export failed: ", error.what()));
+        pState->set<State::PreppingExport, false>();
+        pState->set<State::Exporting, false>();
+        pState->set<State::Failed, true>();
+      } catch (...) {
+        Logger::err("[GameCapturer] USD export failed with an unknown exception");
+        pState->set<State::PreppingExport, false>();
+        pState->set<State::Exporting, false>();
+        pState->set<State::Failed, true>();
+      }
     };
 
     m_state.set<State::PreppingExport, true>();
     m_state.set<State::BeginExport, false>();
-    std::thread(exportThreadTask,
-                ctx,
+    try {
+      m_exportThread = std::thread(exportThreadTask,
                 std::move(m_pCap),
                 &m_state,
                 &m_completeCapture,
-                static_cast<float>(m_options.fps)).detach();
+                static_cast<float>(m_options.fps));
+    } catch (const std::exception& error) {
+      m_state.set<State::PreppingExport, false>();
+      m_state.set<State::Exporting, false>();
+      m_state.set<State::Failed, true>();
+      Logger::err(str::format("[GameCapturer] Could not start USD export: ", error.what()));
+    }
   }
 
   lss::Export GameCapturer::prepExport(const Capture& cap,

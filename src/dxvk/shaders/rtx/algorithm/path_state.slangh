@@ -26,6 +26,16 @@
 #include "rtx/algorithm/resolve_expanded.slangh"
 #include "rtx/external/NRC.slangh"
 
+#ifndef SHARC_UPDATE
+#define SHARC_UPDATE 0
+#endif
+#ifndef SHARC_QUERY
+#define SHARC_QUERY 0
+#endif
+#if SHARC_UPDATE || SHARC_QUERY
+#include "rtx/algorithm/sharc/sharc.slangh"
+#endif
+
 // RNG state is not carried via PathState from RayGen to Hit shader, 
 // but instead it is reconstructed using following explicit constants.
 // Hit shaders reuse the RNG state within its scope
@@ -49,6 +59,12 @@ static const float kThroughputClampedDivisionMaximum = 65000.0f;
 // Path state to be passed to functions (or the CHS) handling a path vertex.
 struct PathState : IBasePayloadState
 {
+#if SHARC_UPDATE
+  // Update-only compute shaders carry a single full-radiance sample. These
+  // fields never enlarge the ray tracing pipeline's payload.
+  SharcHitData sharcHit;
+  bool sharcHasHit;
+#endif
   // Note: These ray properties are passed into the function with the state of the
   // ray being cast as an input, and then set to the new state of the sampled ray
   // (if applicable) as an output.
@@ -262,7 +278,11 @@ struct PathState : IBasePayloadState
   {
     get 
     {
+#if SHARC_UPDATE
+      return u16vec2(sharcUpdatePixelCoordinate(getDispatchRaysIndex().xy));
+#else
       return getDispatchRaysIndex().xy;
+#endif
     }
   }
 

@@ -57,6 +57,10 @@ float getSurfaceIlluminance(
 [numthreads(16, 8, 1)]
 void main(uint2 GlobalIndex : SV_DispatchThreadID)
 {
+  const uint2 gradientResolution = (cb.camera.resolution + RTXDI_GRAD_FACTOR - 1) / RTXDI_GRAD_FACTOR;
+  if (any(GlobalIndex >= gradientResolution))
+    return;
+
   // This shader runs one thread per image stratum, i.e. a square of pixels
   // (RTXDI_GRAD_FACTOR x RTXDI_GRAD_FACTOR) in size. One pixel is selected to
   // produce a gradient.
@@ -192,7 +196,8 @@ void main(uint2 GlobalIndex : SV_DispatchThreadID)
   const float normalizedGradient = saturate(gradient.x / (gradient.y + push.darknessBias));
   
   // Store the output
-  const float referenceHitDistance = PrimaryHitDistance[selectedPixelPos];
+  const int2 referencePixel = clamp(selectedPixelPos, int2(0), int2(cb.camera.resolution) - 1);
+  const float referenceHitDistance = PrimaryHitDistance[referencePixel];
   RtxdiGradients[uint3(GlobalIndex, 0)] = float2(normalizedGradient, referenceHitDistance);
 
   // Debug output
@@ -204,7 +209,8 @@ void main(uint2 GlobalIndex : SV_DispatchThreadID)
     {
       int2 srcPixelPos = GlobalIndex * RTXDI_GRAD_FACTOR + int2(xx, yy);
       
-      storeInDebugView(srcPixelPos, normalizedGradient.xxx);
+      if (all(srcPixelPos < int2(cb.camera.resolution)))
+        storeInDebugView(srcPixelPos, normalizedGradient.xxx);
     }
   }
   else if (cb.debugView == DEBUG_VIEW_NAN)

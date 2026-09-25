@@ -361,6 +361,11 @@ namespace dxvk {
         // Capture task lambda
         future = m_tasks[taskId].capture<F, R>(std::forward<F>(f));
 
+        // Publish the count before the queue entry: a running worker may pop
+        // the task immediately, and a sleeping worker tests this count after
+        // waking. Publishing it after notify can underflow or lose a wakeup.
+        ++m_numTasks;
+
         // Place task into queue
         m_workerTasks[thread]->push(std::move(taskId));
 
@@ -374,8 +379,6 @@ namespace dxvk {
             m_condOnAdd.notify_all();
           }
         }
-
-        ++m_numTasks;
       }
 
       return future;

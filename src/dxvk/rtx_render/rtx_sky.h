@@ -147,11 +147,15 @@ dxvk::RtxContext::TryHandleSkyResult dxvk::RtxContext::tryHandleSky(const DrawPa
 
   // Skip all sky geometry when using physical atmosphere mode
   if (originalParams && originalDrawCallState && originalDrawCallState->cameraType == CameraType::Sky &&
-      RtxOptions::skyMode() == SkyMode::PhysicalAtmosphere) {
+      getEffectiveSkyMode() == SkyMode::PhysicalAtmosphere) {
     return TryHandleSkyResult::SkipSubmit;
   }
 
   if (originalParams && originalDrawCallState && originalDrawCallState->cameraType == CameraType::Sky) {
+
+    if (m_state.om.renderTargets.color[0].view == nullptr) {
+      return TryHandleSkyResult::Default;
+    }
 
     // Initialize the sky render targets
     {

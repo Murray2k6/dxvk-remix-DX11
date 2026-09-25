@@ -107,7 +107,7 @@ void integrateVolume(
   // Note: Default to 1.0 when reprojection fails to always favor new data coming in.
   float historyAgeWeight = 1.0f;
 
-  if (previousVolumeExists && reprojectionValid && volumeArgs.maxAccumulationFrames > 0)
+  if (previousVolumeExists && reprojectionValid && !volumeArgs.resetHistory && volumeArgs.maxAccumulationFrames > 0)
   {
     // Read previous history and radiance
 

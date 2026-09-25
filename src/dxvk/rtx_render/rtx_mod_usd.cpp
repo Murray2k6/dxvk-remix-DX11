@@ -72,6 +72,9 @@
 #include "rtx_lights_data.h"
 #include <filesystem>
 #include <algorithm>
+#include <exception>
+#include <mutex>
+#include <thread>
 
 namespace fs = std::filesystem;
 
@@ -86,6 +89,11 @@ public:
     : m_owner{owner}
     , m_usdChangeWatchdog([this] { return this->haveFilesChanged(); }, "usd-mod-watchdog")
   {}
+
+  ~Impl() {
+    m_usdChangeWatchdog.stop();
+    stopReplacementThreads();
+  }
 
   void load(const Rc<DxvkContext>& context);
   void unload();
@@ -136,9 +144,17 @@ private:
   Watchdog<1000> m_usdChangeWatchdog;
 
   void addReplacementsSync(dxvk::Rc<dxvk::DxvkCommandList> cmdList, XXH64_hash_t hash, std::vector<AssetReplacement>& replacementVec);
-  std::unordered_map<dxvk::DxvkCommandList*, std::thread> m_cmdListSyncThreads;
-  // Asset replacement vector and hash to add when command list execution is complete
-  std::unordered_map<dxvk::DxvkCommandList*, std::unordered_map<XXH64_hash_t, std::vector<AssetReplacement>>> m_meshReplacementsToAdd;
+  void stopReplacementThreads();
+  struct ReplacementBatch {
+    Rc<sync::Fence> signal = new sync::Fence(0);
+    std::thread worker;
+    std::unordered_map<XXH64_hash_t, std::vector<AssetReplacement>> replacements;
+  };
+  // The loading thread owns the map; workers access their stable batch under
+  // this mutex. Shutdown cancels unpublished replacements before waking them.
+  std::mutex m_replacementMutex;
+  bool m_stoppingReplacements = false;
+  std::unordered_map<DxvkCommandList*, std::unique_ptr<ReplacementBatch>> m_replacementBatches;
 };
 
 // context and member variable arguments to pass down to anonymous functions (to avoid having USD in the header)
@@ -1052,6 +1068,7 @@ void UsdMod::Impl::processReplacementRecursive(Args& args, const pxr::UsdPrim& p
 void UsdMod::Impl::load(const Rc<DxvkContext>& context) {
   ScopedCpuProfileZone();
   if (m_owner.state().progressState == ProgressState::Unloaded) {
+    m_stoppingReplacements = false;
     processUSD(context);
 
     m_usdChangeWatchdog.start();
@@ -1061,6 +1078,7 @@ void UsdMod::Impl::load(const Rc<DxvkContext>& context) {
 void UsdMod::Impl::unload() {
   if (m_owner.state().progressState == ProgressState::Loaded) {
     m_usdChangeWatchdog.stop();
+    stopReplacementThreads();
 
     m_owner.m_replacements->clear();
     AssetDataManager::get().clearSearchPaths();
@@ -1452,34 +1470,61 @@ Categorizer UsdMod::Impl::processCategoryFlags(const pxr::UsdPrim& prim) {
   return categoryFlags;
 }
 
-void UsdMod::Impl::addReplacementsSync(dxvk::Rc<dxvk::DxvkCommandList> cmdList, XXH64_hash_t hash, std::vector<AssetReplacement>& replacementVec) {
-  m_meshReplacementsToAdd[cmdList.ptr()][hash] = std::move(replacementVec);
+void UsdMod::Impl::stopReplacementThreads() {
+  {
+    std::lock_guard lock(m_replacementMutex);
+    m_stoppingReplacements = true;
+  }
+  // A load may be cancelled before its command list is submitted. Waking the
+  // CPU fence cancels publication; it does not claim GPU upload completion.
+  // The command list retains the resources required by submitted transfers.
+  for (auto& [commandList, batch] : m_replacementBatches) {
+    if (batch)
+      batch->signal->signal(1);
+  }
+  for (auto& [commandList, batch] : m_replacementBatches) {
+    if (batch && batch->worker.joinable())
+      batch->worker.join();
+  }
+  m_replacementBatches.clear();
+}
 
-  // If the sync thread for this command list hasn't been created then create it now
-  if (!m_cmdListSyncThreads[cmdList.ptr()].joinable()) {
-    m_cmdListSyncThreads[cmdList.ptr()] = std::thread([this, cmdList]() {
-      // Base on Vulkan Document: https://docs.vulkan.org/spec/latest/chapters/synchronization.html#synchronization-fences
-      // Host access to each member of pFences must be externally synchronized
-      // So, we must wait for the VkFence synchronization finished in queue submission thread. If we do synchronize here, it will cause VkFence multiple thread error.
-      {
-        constexpr uint64_t initialSignalValue = 0;
-        constexpr uint64_t waitSignalValue = 1;
-        Rc<sync::Fence> replacementSyncSignal = new sync::Fence(initialSignalValue);
-
-        cmdList->queueSignal(replacementSyncSignal, waitSignalValue);
-        // Note: May be possible that the command list's signal tracker can be reset before this wait call or before the signal is actually signaled, which may cause this
-        // wait to never complete. Unsure if this happens in practice, but previously a bug existed where a ref-counted pointer to the replacement signal wasn't used
-        // which resulted in a crash due to the object being freed before getting to this wait call, and the only way it would've been freed is if the command list's signal
-        // tracker was reset. it is possible that most/all the times this reset happens the signal has been properly signaled though and this may not be a concern, but
-        // something to watch out for regardless.
-        replacementSyncSignal->wait(waitSignalValue);
+void UsdMod::Impl::addReplacementsSync(Rc<DxvkCommandList> cmdList, XXH64_hash_t hash, std::vector<AssetReplacement>& replacementVec) {
+  auto& batch = m_replacementBatches[cmdList.ptr()];
+  // Command lists can be recycled. A completed, still-joinable worker must
+  // not suppress replacements from the next submission.
+  if (batch) {
+    {
+      std::lock_guard lock(m_replacementMutex);
+      if (batch->signal->value() == 0) {
+        batch->replacements[hash] = std::move(replacementVec);
+        return;
       }
-
-      // Add the replacements vector to the collection of replacements for this hash
-      for (auto it : m_meshReplacementsToAdd[cmdList.ptr()]) {
-        m_owner.m_replacements->set<AssetReplacement::eMesh>(it.first, std::move(it.second));
+    }
+    if (batch->worker.joinable())
+      batch->worker.join();
+    batch.reset();
+  }
+  if (!batch) {
+    batch = std::make_unique<ReplacementBatch>();
+    batch->replacements[hash] = std::move(replacementVec);
+    // Register while the context still owns the recording list. Registration
+    // inside the worker could miss submission/completion entirely.
+    cmdList->queueSignal(batch->signal, 1);
+    batch->worker = std::thread([this, pending = batch.get(), cmdList]() {
+      pending->signal->wait(1);
+      std::lock_guard lock(m_replacementMutex);
+      if (m_stoppingReplacements)
+        return;
+      try {
+        for (auto& [replacementHash, replacements] : pending->replacements)
+          m_owner.m_replacements->set<AssetReplacement::eMesh>(replacementHash, std::move(replacements));
+        pending->replacements.clear();
+      } catch (const std::exception& error) {
+        Logger::err(str::format("USD replacement publication failed: ", error.what()));
+      } catch (...) {
+        Logger::err("USD replacement publication failed with an unknown exception");
       }
-      m_meshReplacementsToAdd[cmdList.ptr()].clear();
     });
   }
 }

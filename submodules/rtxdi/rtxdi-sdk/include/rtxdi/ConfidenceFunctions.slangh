@@ -56,10 +56,10 @@ void RTXDI_FilterGradients(
       continue;
 
     int2 pos = gradientPos + int2(xx, yy) * filterStep;
-    float2 c = RtxdiGradients[int3(pos, inputBufferIndex)];
 
     if (all(pos >= 0) && all(pos < int2(gradientImageSize)))
     {
+      float2 c = RtxdiGradients[int3(pos, inputBufferIndex)];
       // Triangular filter kernel produces a smooth result after a few iterations
       float w = (xx == 0 ? 1.0 : 0.5) * (yy == 0 ? 1.0 : 0.5);
 
@@ -114,6 +114,9 @@ float RTXDI_ConvertGradientsToConfidence(
   {
     // Load the source sample
     const int2 gradientPos = int2(gradientBasePixel.x + xx, gradientBasePixel.y + yy);
+    const int2 gradientResolution = (cparams.resolution + RTXDI_GRAD_FACTOR - 1) / RTXDI_GRAD_FACTOR;
+    if (any(gradientPos < 0) || any(gradientPos >= gradientResolution))
+      continue;
     const float2 c = RtxdiGradients[int3(gradientPos.xy, cparams.inputBufferIndex)];
 
     // Compute the geometric weight
@@ -144,7 +147,7 @@ float RTXDI_ConvertGradientsToConfidence(
   if (bilateralWeightSum > 0)
     gradient /= bilateralWeightSum;
   else
-    gradient = fallbackGradient / interpolationWeightSum;
+    gradient = interpolationWeightSum > 0 ? fallbackGradient / interpolationWeightSum : 0;
 
   gradient = max(gradient, 0);
 

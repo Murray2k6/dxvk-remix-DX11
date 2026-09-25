@@ -48,4 +48,12 @@ namespace ServerOptions {
       bridge_util::Config::getOption<uint32_t>("server.shutdownRetries", 50);
     return shutdownRetries;
   }
+  inline uint32_t getDx11ShutdownTimeout() {
+    static const uint32_t timeout =
+      bridge_util::Config::getOption<uint32_t>("server.dx11ShutdownTimeout", 60000);
+    // Runtime shutdown drains shaders, asset uploads and the GPU. Give it a
+    // separate grace period from the legacy command-loop watchdog, with a
+    // finite upper bound even for an invalid user configuration.
+    return timeout < 1000 ? 1000 : (timeout > 300000 ? 300000 : timeout);
+  }
 }

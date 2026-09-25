@@ -1,5 +1,11 @@
 # NVIDIA RTX Remix Bridge
 
+For this DX11 branch, use the root `build.bat` and the
+[DX11 build and deployment guide](../documentation/DX11_BUILD_AND_DEPLOYMENT.md).
+The root driver builds the current x86 capture client, x86 startup helper and x64
+server as a matching package. The upstream launcher/build instructions below
+describe the older bridge workflow, not the active DX11 package.
+
 This folder contains the NVIDIA RTX Remix Bridge client and server components.  These are required for enabling a 32-bit game to interact with the 64-bit Remix Runtime dll.
 
 > **NOTE:** To experience the full feature set of NVIDIA RTX Remix, binaries compiled from this folder need to be combined with the binaries from the top level folder of `dxvk-remix` [repo on GitHub](https://github.com/NVIDIAGameWorks/dxvk-remix/). For additional details and explanation see below!

@@ -115,6 +115,17 @@
 #include <rtx_shaders/integrate_indirect_miss_nrc_wboit.h>
 #include <rtx_shaders/integrate_indirect_miss_nrc_neeCache_wboit.h>
 
+#include <rtx_shaders/integrate_indirect_sharc_update.h>
+#include <rtx_shaders/integrate_indirect_sharc_update_wboit.h>
+#include <rtx_shaders/integrate_indirect_sharc_update_neeCache.h>
+#include <rtx_shaders/integrate_indirect_sharc_update_neeCache_wboit.h>
+#include <rtx_shaders/integrate_indirect_sharc_query.h>
+#include <rtx_shaders/integrate_indirect_sharc_query_wboit.h>
+#include <rtx_shaders/integrate_indirect_sharc_query_neeCache.h>
+#include <rtx_shaders/integrate_indirect_sharc_query_neeCache_wboit.h>
+#include <rtx_shaders/sharc_resolve.h>
+#include "../shaders/rtx/algorithm/sharc/sharc_args.h"
+
 #include <rtx_shaders/integrate_nee.h>
 #include <rtx_shaders/visualize_nee.h>
 
@@ -126,11 +137,27 @@ namespace dxvk {
 
   // Defined within an unnamed namespace to ensure unique definition across binary
   namespace {
+    class SharcResolveShader : public ManagedShader {
+      SHADER_SOURCE(SharcResolveShader, VK_SHADER_STAGE_COMPUTE_BIT, sharc_resolve)
+      PUSH_CONSTANTS(SharcArgs)
+      BEGIN_PARAMETER()
+        CONSTANT_BUFFER(BINDING_CONSTANTS)
+        RW_STRUCTURED_BUFFER(SHARC_BINDING_HASH_ENTRIES)
+        RW_STRUCTURED_BUFFER(SHARC_BINDING_ACCUMULATION)
+        RW_STRUCTURED_BUFFER(SHARC_BINDING_RESOLVED)
+        RW_STRUCTURED_BUFFER(SHARC_BINDING_LOCKS)
+      END_PARAMETER()
+    };
     class IntegrateIndirectRayGenShader : public ManagedShader {
     public:
       BINDLESS_ENABLED()
+      PUSH_CONSTANTS(SharcArgs)
 
       BEGIN_PARAMETER()
+        RW_STRUCTURED_BUFFER(SHARC_BINDING_HASH_ENTRIES)
+        RW_STRUCTURED_BUFFER(SHARC_BINDING_ACCUMULATION)
+        RW_STRUCTURED_BUFFER(SHARC_BINDING_RESOLVED)
+        RW_STRUCTURED_BUFFER(SHARC_BINDING_LOCKS)
         COMMON_RAYTRACING_BINDINGS
 
         SAMPLER(INTEGRATE_INDIRECT_BINDING_LINEAR_WRAP_SAMPLER)
@@ -311,6 +338,13 @@ namespace dxvk {
   void DxvkPathtracerIntegrateIndirect::prewarmShaders(DxvkPipelineManager& pipelineManager) const {
     ScopedCpuProfileZoneN("Indirect Integrate Shader Prewarming");
 
+    if (RtxOptions::integrateIndirectMode() == IntegrateIndirectMode::SpatialHashRadianceCache) {
+      getSharcComputeShader(true, NeeCachePass::enable(), RtxOptions::wboitEnabled());
+      getSharcComputeShader(false, NeeCachePass::enable(), RtxOptions::wboitEnabled());
+      SharcResolveShader::getShader();
+      return;
+    }
+
     const bool isNrcSupported = NeuralRadianceCache::checkIsSupported(device());
     const bool isOpacityMicromapSupported = OpacityMicromapManager::checkIsOpacityMicromapSupported(*m_device);
     const bool isShaderExecutionReorderingSupported = 
@@ -385,6 +419,9 @@ namespace dxvk {
         break;
       case IntegrateIndirectMode::ReSTIRGI:
         Logger::info("[RTX] Integrate Indirect Mode: ReSTIR GI - activated");
+        break;
+      case IntegrateIndirectMode::SpatialHashRadianceCache:
+        Logger::info("[RTX] Integrate Indirect Mode: SHARC - activated");
         break;
       case IntegrateIndirectMode::NeuralRadianceCache:
         Logger::info("[RTX] Integrate Indirect Mode: Neural Radiance Cache - activated");
@@ -496,6 +533,12 @@ namespace dxvk {
     const bool neeCacheEnabled = NeeCachePass::enable();
     const bool wboitEnabled = RtxOptions::wboitEnabled();
 
+    if (RtxOptions::integrateIndirectMode() == IntegrateIndirectMode::SpatialHashRadianceCache && rtOutput.m_raytraceArgs.enableSecondaryBounces) {
+      dispatchSharc(ctx, rtOutput, neeCacheEnabled, wboitEnabled);
+      return;
+    }
+    releaseSharcResources();
+
     // Trace indirect ray
     {
       ScopedGpuProfileZone(ctx, "Integrate Indirect Raytracing");
@@ -519,6 +562,118 @@ namespace dxvk {
         break;
       }
     }
+  }
+
+  void DxvkPathtracerIntegrateIndirect::releaseSharcResources() {
+    m_sharcHashEntries = nullptr;
+    m_sharcAccumulation = nullptr;
+    m_sharcResolved = nullptr;
+    m_sharcLocks = nullptr;
+    m_sharcCapacity = 0;
+    m_resetSharcHistory = true;
+  }
+
+  void DxvkPathtracerIntegrateIndirect::dispatchSharc(
+    RtxContext* ctx, const Resources::RaytracingOutput& rtOutput, bool neeCacheEnabled, bool wboitEnabled) {
+    // A fixed 44 MiB budget, independent of display resolution (8+16+16+4
+    // bytes per entry). SDK probing is bounded even if the cache becomes full.
+    constexpr uint32_t capacity = 1u << 20;
+    const uint32_t frameIdx = ctx->getDevice()->getCurrentFrameId();
+    SharcArgs args = {};
+    args.capacity = capacity;
+    args.updateStride = 5;
+    args.accumulationFrames = 16;
+    args.staleFrames = 32;
+    // Cache positions are converted to meters so the finest grid level has
+    // the same physical size across games with different world units.
+    args.sceneScale = 64.0f;
+    args.minRoughness = 0.6f;
+    args.worldToMeters = 1.0f / std::max(RtxOptions::getMeterToWorldUnitScale(), 0.0001f);
+
+    if (m_sharcCapacity != capacity) {
+      const auto createCacheBuffer = [&](uint32_t stride, const char* name) {
+        DxvkBufferCreateInfo info;
+        info.size = VkDeviceSize(capacity) * stride;
+        info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        info.stages = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT;
+        info.access = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+        return ctx->getDevice()->createBuffer(info, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, DxvkMemoryStats::Category::RTXBuffer, name);
+      };
+      m_sharcHashEntries = createCacheBuffer(8, "SHARC Hash Entries");
+      m_sharcAccumulation = createCacheBuffer(16, "SHARC Accumulation");
+      m_sharcResolved = createCacheBuffer(16, "SHARC Resolved Radiance");
+      m_sharcLocks = createCacheBuffer(4, "SHARC Hash Locks");
+      m_sharcCapacity = capacity;
+      m_resetSharcHistory = true;
+    }
+    if (m_resetSharcHistory || m_sharcLastFrame + 1 != frameIdx || m_sharcSceneScale != RtxOptions::sceneScale()
+        || ctx->getSceneManager().getCamera().isCameraCut()) {
+      for (const auto& buffer : {m_sharcHashEntries, m_sharcAccumulation, m_sharcResolved, m_sharcLocks})
+        ctx->clearBuffer(buffer, 0, buffer->info().size, 0);
+      m_resetSharcHistory = false;
+    }
+    m_sharcLastFrame = frameIdx;
+    m_sharcSceneScale = RtxOptions::sceneScale();
+    ctx->bindResourceBuffer(SHARC_BINDING_HASH_ENTRIES, DxvkBufferSlice(m_sharcHashEntries));
+    ctx->bindResourceBuffer(SHARC_BINDING_ACCUMULATION, DxvkBufferSlice(m_sharcAccumulation));
+    ctx->bindResourceBuffer(SHARC_BINDING_RESOLVED, DxvkBufferSlice(m_sharcResolved));
+    ctx->bindResourceBuffer(SHARC_BINDING_LOCKS, DxvkBufferSlice(m_sharcLocks));
+    ctx->pushConstants(0, sizeof(args), &args);
+    Rc<DxvkShader> updateShader = getSharcComputeShader(true, neeCacheEnabled, wboitEnabled);
+    Rc<DxvkShader> queryShader = getSharcComputeShader(false, neeCacheEnabled, wboitEnabled);
+    const uint64_t failedDispatches = ctx->failedDispatchCount();
+
+    // All cache bindings are tracked as shader read/write resources. DXVK
+    // therefore emits the compute hazards between update, resolve and query.
+    const VkExtent3D& rayDims = rtOutput.m_compositeOutputExtent;
+    const VkExtent3D updateDims = util::computeBlockCount(rayDims, VkExtent3D {args.updateStride, args.updateStride, 1});
+    const VkExtent3D updateGroups = util::computeBlockCount(updateDims, VkExtent3D {16, 8, 1});
+    {
+      ScopedGpuProfileZone(ctx, "SHARC Sparse Full-Path Update");
+      ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, updateShader);
+      ctx->dispatch(updateGroups.width, updateGroups.height, updateGroups.depth);
+    }
+    if (ctx->failedDispatchCount() != failedDispatches) {
+      m_resetSharcHistory = true;
+      return;
+    }
+    {
+      ScopedGpuProfileZone(ctx, "SHARC Resolve");
+      ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, SharcResolveShader::getShader());
+      ctx->dispatch((capacity + 255) / 256, 1, 1);
+    }
+    if (ctx->failedDispatchCount() != failedDispatches) {
+      m_resetSharcHistory = true;
+      return;
+    }
+    {
+      ScopedGpuProfileZone(ctx, "SHARC Query");
+      const VkExtent3D groups = util::computeBlockCount(rayDims, VkExtent3D {16, 8, 1});
+      ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, queryShader);
+      ctx->dispatch(groups.width, groups.height, groups.depth);
+    }
+    m_resetSharcHistory |= ctx->failedDispatchCount() != failedDispatches;
+  }
+
+  Rc<DxvkShader> DxvkPathtracerIntegrateIndirect::getSharcComputeShader(bool update, bool neeCacheEnabled, bool wboitEnabled) const {
+    if (wboitEnabled) {
+      if (neeCacheEnabled) {
+        return update
+          ? GET_SHADER_VARIANT(VK_SHADER_STAGE_COMPUTE_BIT, IntegrateIndirectRayGenShader, integrate_indirect_sharc_update_neeCache_wboit)
+          : GET_SHADER_VARIANT(VK_SHADER_STAGE_COMPUTE_BIT, IntegrateIndirectRayGenShader, integrate_indirect_sharc_query_neeCache_wboit);
+      }
+      return update
+        ? GET_SHADER_VARIANT(VK_SHADER_STAGE_COMPUTE_BIT, IntegrateIndirectRayGenShader, integrate_indirect_sharc_update_wboit)
+        : GET_SHADER_VARIANT(VK_SHADER_STAGE_COMPUTE_BIT, IntegrateIndirectRayGenShader, integrate_indirect_sharc_query_wboit);
+    }
+    if (neeCacheEnabled) {
+      return update
+        ? GET_SHADER_VARIANT(VK_SHADER_STAGE_COMPUTE_BIT, IntegrateIndirectRayGenShader, integrate_indirect_sharc_update_neeCache)
+        : GET_SHADER_VARIANT(VK_SHADER_STAGE_COMPUTE_BIT, IntegrateIndirectRayGenShader, integrate_indirect_sharc_query_neeCache);
+    }
+    return update
+      ? GET_SHADER_VARIANT(VK_SHADER_STAGE_COMPUTE_BIT, IntegrateIndirectRayGenShader, integrate_indirect_sharc_update)
+      : GET_SHADER_VARIANT(VK_SHADER_STAGE_COMPUTE_BIT, IntegrateIndirectRayGenShader, integrate_indirect_sharc_query);
   }
 
   void DxvkPathtracerIntegrateIndirect::dispatchNEE(RtxContext* ctx, const Resources::RaytracingOutput& rtOutput) {

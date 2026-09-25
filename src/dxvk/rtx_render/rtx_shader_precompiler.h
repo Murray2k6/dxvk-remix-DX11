@@ -23,11 +23,13 @@
 
 #include <atomic>
 #include <cstdint>
+#include <exception>
 #include <functional>
 #include <mutex>
 
 #include "../../util/thread.h"
 #include "../../util/util_env.h"
+#include "../../util/log/log.h"
 
 namespace dxvk {
 
@@ -71,7 +73,7 @@ namespace dxvk {
     }
 
     static bool busy() {
-      return s_phase.load(std::memory_order_acquire) != Phase::Idle;
+      return s_activeOwner.load(std::memory_order_acquire) != nullptr;
     }
 
     static bool cancelRequested() {
@@ -104,22 +106,21 @@ namespace dxvk {
       s_runnerOwner.store(owner, std::memory_order_release);
     }
 
-    // Clears the runner and blocks until any in-flight job has observed the
-    // cancel request and finished, so the owner can be destroyed safely.
+    // Registration can move to a new device while the old device's job runs.
+    // Wait for the active owner independently of the current registration.
     static void clearRunner(void* owner) {
-      if (s_runnerOwner.load(std::memory_order_acquire) != owner)
-        return;
-      {
-        std::lock_guard<dxvk::mutex> lock(mutex());
-        if (s_runnerOwner.load(std::memory_order_acquire) != owner)
-          return;
+      if (!owner) return;
+      std::unique_lock<dxvk::mutex> lock(mutex());
+      if (s_runnerOwner.load(std::memory_order_relaxed) == owner) {
         s_runner = nullptr;
         s_runnerOwner.store(nullptr, std::memory_order_release);
       }
-      s_cancelRequested.store(true, std::memory_order_release);
-      while (busy())
-        ::Sleep(10);
-      s_cancelRequested.store(false, std::memory_order_release);
+      if (s_activeOwner.load(std::memory_order_relaxed) == owner) {
+        s_cancelRequested.store(true, std::memory_order_release);
+        completed().wait(lock, [owner] {
+          return s_activeOwner.load(std::memory_order_relaxed) != owner;
+        });
+      }
     }
 
     // --- UI side ---
@@ -129,37 +130,76 @@ namespace dxvk {
     // marker) before compiling. Returns false when no runner is registered
     // or a job is already running.
     static bool start(bool fullRescan) {
-      std::function<void(bool)> runner;
-      {
-        std::lock_guard<dxvk::mutex> lock(mutex());
-        if (s_runner == nullptr)
-          return false;
-        Phase expected = Phase::Idle;
-        if (!s_phase.compare_exchange_strong(expected,
-              fullRescan ? Phase::Scanning : Phase::Compiling,
-              std::memory_order_acq_rel))
-          return false;
-        runner = s_runner;
-      }
+      std::lock_guard<dxvk::mutex> lock(mutex());
+      const auto owner = s_runnerOwner.load(std::memory_order_relaxed);
+      if (!s_runner || !owner || s_activeOwner.load(std::memory_order_relaxed))
+        return false;
 
-      dxvk::thread worker([runner = std::move(runner), fullRescan] {
-        env::setThreadName("rtx-precompiler");
-        runner(fullRescan);
-        s_phase.store(Phase::Idle, std::memory_order_release);
-      });
-      worker.detach();
-      return true;
+      bool claimedActiveSlot = false;
+      try {
+        // Copy before claiming the active slot: a throwing callable copy must
+        // not leave a phantom job that a device destructor waits for forever.
+        auto runner = s_runner;
+        (void) completed();
+        s_cancelRequested.store(false, std::memory_order_release);
+        s_activeOwner.store(owner, std::memory_order_release);
+        s_phase.store(fullRescan ? Phase::Scanning : Phase::Compiling,
+          std::memory_order_release);
+        claimedActiveSlot = true;
+        dxvk::thread worker([runner = std::move(runner), fullRescan]() mutable {
+          JobCompletion completion { runner };
+          try {
+            env::setThreadName("rtx-precompiler");
+            runner(fullRescan);
+          } catch (const std::exception& error) {
+            Logger::warn(std::string("Shader precompiler failed: ") + error.what());
+          } catch (...) {
+            Logger::warn("Shader precompiler failed with an unknown exception");
+          }
+        });
+        worker.detach();
+        return true;
+      } catch (...) {
+        // Also release the active slot when thread creation fails.
+        if (claimedActiveSlot)
+          finishJobLocked();
+        return false;
+      }
     }
 
   private:
+    struct JobCompletion {
+      std::function<void(bool)>& runner;
+      ~JobCompletion() {
+        // This also runs when the callback or exception logging throws.
+        // Destroy captures before signaling the owner may be destroyed.
+        runner = nullptr;
+        std::lock_guard<dxvk::mutex> lock(mutex());
+        finishJobLocked();
+      }
+    };
+
     static dxvk::mutex& mutex() {
       // Leaked deliberately: the detached worker may outlive static dtors.
       static dxvk::mutex* s_mutex = new dxvk::mutex();
       return *s_mutex;
     }
 
+    static dxvk::condition_variable& completed() {
+      static auto* condition = new dxvk::condition_variable();
+      return *condition;
+    }
+
+    static void finishJobLocked() {
+      s_cancelRequested.store(false, std::memory_order_release);
+      s_phase.store(Phase::Idle, std::memory_order_release);
+      s_activeOwner.store(nullptr, std::memory_order_release);
+      completed().notify_all();
+    }
+
     inline static std::function<void(bool)> s_runner;               // guarded by mutex()
     inline static std::atomic<void*> s_runnerOwner { nullptr };
+    inline static std::atomic<void*> s_activeOwner { nullptr };     // writes guarded by mutex()
     inline static std::atomic<Phase> s_phase { Phase::Idle };
     inline static std::atomic<bool> s_cancelRequested { false };
     inline static std::atomic<uint32_t> s_scanFilesExamined { 0u };

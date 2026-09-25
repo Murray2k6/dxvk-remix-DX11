@@ -147,6 +147,8 @@ std::unordered_map<uint32_t, void*> gMapRemixApi;
 // Global state
 bool gbBridgeRunning = true;
 HANDLE hWait;
+std::atomic<bool> gClientExited { false };
+std::atomic<bool> gServerShutdownComplete { false };
 
 namespace {
 template<typename SerializableT>
@@ -320,7 +322,7 @@ static HRESULT CreateDx11DeviceAndSwapChain(const DXGI_SWAP_CHAIN_DESC& scDesc,
 void ProcessDeviceCommandQueue() {
   // Loop until the client sends terminate instruction
   bool done = false;
-  while (!done && DeviceBridge::waitForCommand() == Result::Success) {
+  while (!done && DeviceBridge::waitForCommand(Commands::Bridge_Any, 0, &gClientExited) == Result::Success) {
     ZoneScopedN("Process Command");
 #ifdef LOG_SERVER_COMMAND_TIME
     // Take a snapshot of the current tick count for profiling purposes
@@ -790,11 +792,13 @@ void ProcessDeviceCommandQueue() {
           memcpy(&hwnd64, ptr, sizeof(uint64_t));
         }
         static bool s_startupDone = false;
+        remixapi_ErrorCode status = s_startupDone
+          ? REMIXAPI_ERROR_CODE_SUCCESS : REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
         if (!s_startupDone && hwnd64 != 0 && remixapi::g_remix_initialized && remixapi::g_remix.Startup) {
           remixapi_StartupInfo info = {};
           info.sType = REMIXAPI_STRUCT_TYPE_STARTUP_INFO;
           info.hwnd = reinterpret_cast<remixapi_HWND>(static_cast<uintptr_t>(hwnd64));
-          const remixapi_ErrorCode status = remixapi::g_remix.Startup(&info);
+          status = remixapi::g_remix.Startup(&info);
           if (status == REMIXAPI_ERROR_CODE_SUCCESS) {
             s_startupDone = true;
             Logger::info("[RemixApi_Startup] Remix runtime started on the game window (cross-process HWND).");
@@ -806,6 +810,9 @@ void ProcessDeviceCommandQueue() {
             }
           }
         }
+        // The client may stream and cache resources only after the runtime has
+        // a registered device. Library initialization alone does not create it.
+        ServerMessage { Commands::RemixApi_Startup, static_cast<uintptr_t>(status) };
         break;
       }
 
@@ -831,20 +838,35 @@ void ProcessDeviceCommandQueue() {
 
       case RemixApi_Present:
       {
+        remixapi_ErrorCode status = REMIXAPI_ERROR_CODE_NOT_INITIALIZED;
+        uint32_t rayTraced = 0;
         void* ptr = nullptr;
         const uint32_t size = DeviceBridge::getReaderChannel().data->pull(&ptr);
         uint64_t hwnd64 = 0;
         if (ptr != nullptr && size >= sizeof(uint64_t)) {
           memcpy(&hwnd64, ptr, sizeof(uint64_t));
         }
+        const BOOL allowTakeover = DeviceBridge::get_data() != 0 ? TRUE : FALSE;
         if (remixapi::g_remix_initialized && remixapi::g_remix.Present) {
           remixapi_PresentInfo info = {};
           info.sType = REMIXAPI_STRUCT_TYPE_PRESENT_INFO;
           info.hwndOverride = reinterpret_cast<remixapi_HWND>(static_cast<uintptr_t>(hwnd64));
-          if (remixapi::g_remix.Present(&info) != REMIXAPI_ERROR_CODE_SUCCESS) {
+          status = remixapi::g_remix.Present(&info);
+          if (status == REMIXAPI_ERROR_CODE_SUCCESS) {
+            using WasRayTraced = BOOL (WINAPI*)(BOOL);
+            const auto wasRayTraced = remixapi::g_remix_dll
+              ? reinterpret_cast<WasRayTraced>(GetProcAddress(remixapi::g_remix_dll, "remixapi_dxvk_WasLastPresentRayTraced"))
+              : nullptr;
+            rayTraced = wasRayTraced && wasRayTraced(allowTakeover) ? 1u : 0u;
+          }
+          if (status != REMIXAPI_ERROR_CODE_SUCCESS) {
             static bool s_warnedPresent = false;
             if (!s_warnedPresent) { s_warnedPresent = true; Logger::err("[RemixApi_Present] remixapi Present failed!"); }
           }
+        }
+        {
+          ServerMessage response(Commands::RemixApi_Present, static_cast<uintptr_t>(status));
+          response.send_data(rayTraced);
         }
         break;
       }
@@ -1033,10 +1055,23 @@ bool InitializeD3D() {
 }
 
 void CALLBACK OnClientExited(void* context, BOOLEAN isTimeout) {
-  // DX11_V219_SERVER_REAL_GAME_TARGET_AND_IGNORE_EXIT_CALLBACK
   wchar_t dx11Mode[64] = {};
   if (GetEnvironmentVariableW(L"DX11_BRIDGE_MODE", dx11Mode, _countof(dx11Mode)) > 0) {
-    Logger::warn("DX11_V219_SERVER_REAL_GAME_TARGET_AND_IGNORE_EXIT_CALLBACK: ignoring legacy client-exit callback in DX11 bridge mode; server stays alive and waits for IPC/command shutdown.");
+    // Bridge_Syn contains the real game's process handle, duplicated into this
+    // process by the launcher. Game DLL detach cannot safely send IPC while
+    // holding the loader lock; this callback owns process-lifetime shutdown.
+    Logger::info("The DX11 game process exited; stopping the bridge server.");
+    gClientExited.store(true, std::memory_order_release);
+    const auto shutdownStart = GetTickCount64();
+    const auto shutdownTimeout = ServerOptions::getDx11ShutdownTimeout();
+    while (!gServerShutdownComplete.load(std::memory_order_acquire)
+        && GetTickCount64() - shutdownStart < shutdownTimeout) {
+      Sleep(100);
+    }
+    if (!gServerShutdownComplete.load(std::memory_order_acquire)) {
+      Logger::err("DX11 bridge shutdown exceeded the configured timeout; terminating the server.");
+      TerminateProcess(GetCurrentProcess(), 124);
+    }
     return;
   }
   Logger::err("The client process has unexpectedly exited, shutting down server as well!");
@@ -1470,7 +1505,7 @@ gTimeStart = std::chrono::high_resolution_clock::now();
       remixapi::g_remix_initialized = true;
     }
 
-    if (!remixapi::g_remix.Startup || !remixapi::g_remix.Present ||
+    if (!remixapi::g_remix.Startup || !remixapi::g_remix.Shutdown || !remixapi::g_remix.Present ||
         !remixapi::g_remix.SetupCamera || !remixapi::g_remix.CreateMaterial ||
         !remixapi::g_remix.CreateMesh || !remixapi::g_remix.DrawInstance) {
       Dx11BridgeBootLogV229("FATAL: Remix API function table is incomplete.");
@@ -1519,8 +1554,25 @@ gTimeStart = std::chrono::high_resolution_clock::now();
   });
   // Process device commands
   ProcessDeviceCommandQueue();
+  if (gClientExited.load(std::memory_order_acquire)) gbBridgeRunning = false;
   bSignalDone.store(true);
   moduleCmdProcessingThread.join();
+
+  int shutdownExitCode = 0;
+  if (dx11BridgeMode && remixapi::g_remix_initialized) {
+    // Both command queues are stopped. Release the API-owned D3D11 device
+    // while its DLL and dependencies are alive, not during process teardown.
+    const auto shutdownStart = GetTickCount64();
+    const auto status = remixapi::g_remix.Shutdown();
+    remixapi::g_remix_initialized = false;
+    if (status == REMIXAPI_ERROR_CODE_SUCCESS) {
+      Logger::info(format_string("DX11 Remix API Shutdown completed successfully. Duration: %llu ms.",
+        static_cast<unsigned long long>(GetTickCount64() - shutdownStart)));
+    } else {
+      Logger::err(format_string("DX11 Remix API Shutdown failed with status %d.", static_cast<int>(status)));
+      shutdownExitCode = 1;
+    }
+  }
 
   if (!dumpLeakedObjects()) {
     bridge_util::Logger::debug("No leaked objects dicovered at Direct3D module eviction.");
@@ -1537,6 +1589,7 @@ gTimeStart = std::chrono::high_resolution_clock::now();
   }
 
   // Clean up client exit callback handler
+  gServerShutdownComplete.store(true, std::memory_order_release);
   if (hWait) {
     // According to MSDN docs INVALID_HANDLE_VALUE means the function
     // waits for all callback functions to complete before returning.
@@ -1544,7 +1597,8 @@ gTimeStart = std::chrono::high_resolution_clock::now();
     hWait = NULL;
   }
 
-  Logger::info("Shutdown cleanup successful, exiting now!");
+  if (shutdownExitCode == 0)
+    Logger::info("Shutdown cleanup successful, exiting now!");
 
   const auto timeEnd = std::chrono::high_resolution_clock::now();
   std::stringstream uptimeSS;
@@ -1557,5 +1611,5 @@ gTimeStart = std::chrono::high_resolution_clock::now();
   {
     ServerMessage { Commands::Bridge_Ack };
   }
-  return 0;
+  return shutdownExitCode;
 }

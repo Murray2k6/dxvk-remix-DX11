@@ -399,6 +399,9 @@ namespace dxvk {
     
     D3D11ShaderModuleSet();
     ~D3D11ShaderModuleSet();
+
+    // Retire device-owned constant buffers before recreating the Vulkan device.
+    void Clear();
     
     HRESULT GetShaderModule(
             D3D11Device*        pDevice,

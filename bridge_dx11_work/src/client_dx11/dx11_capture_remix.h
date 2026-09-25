@@ -22,12 +22,12 @@
 #pragma once
 
 // DX11_V226_CAPTURE_TO_REMIX
-// Full translation layer: turns captured in-game DX11 geometry into Remix scene
+// Capture translation layer: turns supported in-game DX11 geometry into Remix scene
 // API commands (RemixApi_CreateMaterial / RemixApi_CreateMesh / RemixApi_DrawInstance
 // / RemixApi camera) and streams them over the bridge IPC to the x64 server, which
 // replays them into the .trex Remix runtime.
 //
-// This is a real capture engine, not a sampler:
+// Supported ordinary Draw/DrawIndexed capture:
 //  * Vertices are decoded from the actual bound D3D11 input layout - per-element
 //    semantic, DXGI format and byte offset across all bound vertex-buffer slots
 //    (position, normal, tangent, texcoord, color).
@@ -93,6 +93,10 @@ namespace dx11_capture {
   void CaptureDraw(ID3D11DeviceContext* context, uint32_t vertexCount,
                    uint32_t startVertexLocation);
 
+  // Preserve the native frame when a draw cannot be represented by this
+  // capture path. Unknown GPU/command-list counts are conservatively nonzero.
+  void RecordUncapturedDraw(uint32_t primitiveElements, uint32_t instances);
+
   // Frame boundary (hooked Present). DX11_V265_BRIDGE_PRESENT_CAMERA: sends
   // RemixApi_Startup (once, with the game window HWND from the swapchain),
   // RemixApi_SetupCamera (per frame, from the camera scanned out of the bound
@@ -100,7 +104,10 @@ namespace dx11_capture {
   // the game HWND as override so Remix presents INTO the game window instead
   // of a secondary one). Without this pump the server never starts the Remix
   // runtime and nothing path-traced reaches the screen for x86 bridge games.
-  void OnPresent(IDXGISwapChain* swapChain);
+  // Returns true only after the server produced this frame's ray-traced output
+  // from captured geometry and a recovered world camera.
+  // The caller then suppresses native presentation into the same window.
+  bool OnPresent(IDXGISwapChain* swapChain);
 
   // True once the bridge IPC handshake is up and streaming is enabled.
   bool IsStreamingEnabled();

@@ -644,7 +644,7 @@ extern "C" {
       // whose COM interface hands over dxgi.dll's ALREADY-CREATED instance -
       // one Vulkan instance in the whole process, no concurrent driver entry.
       do {
-        HMODULE dxgiModule = ::GetModuleHandleW(L"dxgi.dll");
+        HMODULE dxgiModule = loadSiblingDxgi();
         if (dxgiModule == nullptr)
           break;
 
@@ -672,7 +672,7 @@ extern "C" {
         if (FAILED(createFactory1(__uuidof(IDXGIFactory1), reinterpret_cast<void**>(&remixFactory))))
           break;
 
-        for (UINT i = 0; dxvkInstance == nullptr; i++) {
+        for (UINT i = 0; dxvkAdapter == nullptr; i++) {
           Com<IDXGIAdapter1> candidate;
           if (remixFactory->EnumAdapters1(i, &candidate) != S_OK)
             break;

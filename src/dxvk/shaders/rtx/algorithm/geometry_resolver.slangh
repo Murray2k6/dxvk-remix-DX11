@@ -1892,18 +1892,22 @@ void geometryResolverVertex(
     else if (cb.skyMode == 1)
     {
       // Physical atmosphere mode
-      skyRadiance = cb.atmosphereArgs.useSkyViewLut != 0
-        ? sampleSkyViewLutForRay(
-            normalize(cb.isZUp != 0 ? vec3(ray.direction.x, ray.direction.z, ray.direction.y) : ray.direction),
-            AtmosphereSkyViewLut, AtmosphereSkyViewSampler)
-        : evalSkyRadiance(ray.direction, cb.atmosphereArgs,
-                          uint2(0, 0), cb.frameIdx, cb.isZUp != 0);
+      skyRadiance = evalSkyRadiance(ray.direction, cb.atmosphereArgs,
+        geometryResolverState.pixelCoordinate, cb.frameIdx, cb.isZUp != 0,
+        false, vec2(0.0f), cb.camera.resolution,
+        !geometryResolverState.directionAltered && geometryResolverState.portalSpace == PORTAL_SPACE_NONE);
     }
 #endif
     else
     {
-      // Skybox rasterization mode
-      skyRadiance = cb.skyBrightness * SkyProbe.SampleLevel(ray.direction, 0);
+      // A camera ray can use the game's rasterized sky directly. DX11 sky
+      // shaders do not consume the legacy cubemap reprojection constants, so
+      // using the probe here discarded an otherwise valid sky matte.
+      const bool useSkyMatte = !geometryResolverState.directionAltered &&
+        geometryResolverState.portalSpace == PORTAL_SPACE_NONE;
+      skyRadiance = cb.skyBrightness * (useSkyMatte
+        ? SkyMatte.SampleLevel(cameraPixelCoordinateToScreenUV(cb.camera, geometryResolverState.pixelCoordinate), 0)
+        : SkyProbe.SampleLevel(ray.direction, 0));
     }
 
     geometryResolverState.radiance += skyRadiance * vec3(geometryResolverState.attenuation);
@@ -2547,12 +2551,8 @@ void geometryPSRResolverVertex(
     else if (cb.skyMode == 1)
     {
       // Physical atmosphere mode.
-      vec3 skyRadiance = cb.atmosphereArgs.useSkyViewLut != 0
-        ? sampleSkyViewLutForRay(
-            normalize(cb.isZUp != 0 ? vec3(ray.direction.x, ray.direction.z, ray.direction.y) : ray.direction),
-            AtmosphereSkyViewLut, AtmosphereSkyViewSampler)
-        : evalSkyRadiance(ray.direction, cb.atmosphereArgs,
-                          uint2(0, 0), cb.frameIdx, cb.isZUp != 0);
+      vec3 skyRadiance = evalSkyRadiance(ray.direction, cb.atmosphereArgs,
+        uint2(0, 0), cb.frameIdx, cb.isZUp != 0);
       emissiveRadiance += skyRadiance * radianceAttenuation;
     }
 #endif

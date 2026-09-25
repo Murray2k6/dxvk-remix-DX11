@@ -28,11 +28,13 @@
 #include "../../util/util_string.h"
 #include "../../util/util_global_time.h"
 #include "../../util/util_env.h"
+#include "../../spirv/spirv_nrd_image_format.h"
 #include <Shlwapi.h>
 #include <filesystem>
 #include <vector>
 #include <algorithm>
 #include <string>
+#include <string_view>
 
 namespace nrd {
   using pfnCreateInstance = Result (NRD_CALL *)(const InstanceCreationDesc& instanceCreationDesc, Instance*& instance);
@@ -180,6 +182,18 @@ namespace nrd {
 }
 
 namespace dxvk {
+
+  static bool isNativeNrdClear(const nrd::PipelineDesc& pipeline) {
+    const std::string_view name = pipeline.shaderFileName ? pipeline.shaderFileName : "";
+    // These NRD passes only store zero. Their SPIR-V declares RGBA32 images,
+    // which cannot legally clear the R8/R16/RGBA16 textures in NRD's pools.
+    // A transfer clear encodes zero using the actual image format instead.
+    return (name == "Clear_Float.cs" || name == "Clear_Uint.cs")
+      && !pipeline.hasConstantData
+      && pipeline.resourceRangesNum == 1
+      && pipeline.resourceRanges[0].descriptorType == nrd::DescriptorType::STORAGE_TEXTURE
+      && pipeline.resourceRanges[0].descriptorsNum == 1;
+  }
   static void* NrdAllocate(void* userArg, size_t size, size_t alignment) {
     return malloc(size);
   }
@@ -533,6 +547,13 @@ namespace dxvk {
       const nrd::PipelineDesc& nrdPipelineDesc = instanceDesc.pipelines[i];
       const nrd::ComputeShaderDesc& nrdComputeShader = nrdPipelineDesc.computeShaderSPIRV;
 
+      if (isNativeNrdClear(nrdPipelineDesc)) {
+        // Keep NRD's pipeline indices stable; native clears need no pipeline
+        // or descriptor allocation.
+        m_computePipelines.emplace_back();
+        continue;
+      }
+
       // Start with static samplers bind infos
       std::vector<VkDescriptorSetLayoutBinding> bindInfo(samplersBindInfo.begin(), samplersBindInfo.end());
       uint32_t cbBindInfoIndex = ComputePipeline::kInvalidIndex;
@@ -626,12 +647,23 @@ namespace dxvk {
     const nrd::PipelineDesc& nrdPipelineDesc,
     const VkPipelineLayout& pipelineLayout) {
 
+    // The packaged SDK infers RGBA32/R32 storage formats from HLSL float
+    // declarations, while its dispatches bind half/normalized pool textures.
+    // Apply DXC's formatless-storage semantics without changing pool precision.
+    const NrdStorageImageCode shaderCode = normalizeNrdStorageImageFormats(
+      nrdCS.bytecode, static_cast<size_t>(nrdCS.size));
+    const auto& features = device()->features().core.features;
+    if ((shaderCode.requiresRead && !features.shaderStorageImageReadWithoutFormat)
+        || (shaderCode.requiresWrite && !features.shaderStorageImageWriteWithoutFormat))
+      throw DxvkError(str::format("NRD pipeline ", nrdPipelineDesc.shaderFileName,
+        " requires unsupported formatless storage-image access"));
+
     VkShaderModuleCreateInfo shaderInfo;
     shaderInfo.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
     shaderInfo.pNext = nullptr;
     shaderInfo.flags = 0;
-    shaderInfo.codeSize = nrdCS.size;
-    shaderInfo.pCode = (const uint32_t*)nrdCS.bytecode;
+    shaderInfo.codeSize = shaderCode.code.size() * sizeof(uint32_t);
+    shaderInfo.pCode = shaderCode.code.data();
 
     VkShaderModule shaderModule = VK_NULL_HANDLE;
     VK_THROW_IF_FAILED(m_vkd->vkCreateShaderModule(m_vkd->device(), &shaderInfo, nullptr, &shaderModule));
@@ -793,6 +825,37 @@ namespace dxvk {
 
         ScopedGpuProfileZoneDynamicZ(ctx, dispatchDesc.name);
 
+        if (isNativeNrdClear(pipelineDesc)) {
+          if (dispatchDesc.resourcesNum != 1 || dispatchDesc.constantBufferDataSize != 0
+              || dispatchDesc.resources[0].descriptorType != nrd::DescriptorType::STORAGE_TEXTURE)
+            throw DxvkError("NRD clear dispatch has an unexpected resource signature");
+
+          const Resources::Resource* texture = getTexture(dispatchDesc.resources[0], inputs, outputs);
+          const auto& image = texture->image;
+          const auto& info = image->info();
+          if (!(info.usage & VK_IMAGE_USAGE_TRANSFER_DST_BIT))
+            throw DxvkError("NRD clear destination is missing transfer usage");
+
+          const VkImageSubresourceRange subresources = texture->view->imageSubresources();
+          const VkImageLayout clearLayout = image->pickLayout(VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+          const VkPipelineStageFlags shaderStages = info.stages | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+          const VkAccessFlags shaderAccess = info.access | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+          barriers.accessImage(image, subresources,
+            info.layout, shaderStages, shaderAccess,
+            clearLayout, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+          barriers.recordCommands(ctx->getCommandList());
+
+          const VkClearColorValue zero = {};
+          ctx->getCommandList()->cmdClearColorImage(image->handle(), clearLayout, &zero, 1, &subresources);
+          ctx->getCommandList()->trackResource<DxvkAccess::Write>(image);
+
+          barriers.accessImage(image, subresources,
+            clearLayout, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+            info.layout, shaderStages, shaderAccess);
+          barriers.recordCommands(ctx->getCommandList());
+          continue;
+        }
+
         VkDescriptorSet descriptorSet = ctx->allocateDescriptorSet(computePipeline.descriptorSetLayout, "NRD descriptor set");
 
         std::vector<VkWriteDescriptorSet> descriptorWriteSets;
@@ -843,7 +906,6 @@ namespace dxvk {
         // Gather needed resource infos for the pipeline
         for (size_t i = 0; i < dispatchDesc.resourcesNum; i++) {
 
-          const nrd::ResourceRangeDesc& descRange = pipelineDesc.resourceRanges[i];
           const VkDescriptorSetLayoutBinding& binding = computePipeline.bindings[computePipeline.resourcesStartIndex + i];
           assert(binding.descriptorCount == 1);
 

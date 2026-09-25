@@ -1,5 +1,6 @@
 
 import argparse
+import json
 import multiprocessing
 import os
 import re
@@ -33,27 +34,33 @@ parser.add_argument('-force', action='store_true', dest='force')
 parser.add_argument('-parallel', action='store_true', dest='parallel')
 parser.add_argument('-binary', action='store_true', dest='binary')
 parser.add_argument('-debug', action='store_true', dest='debug')
+parser.add_argument('-dx11', action='store_true', help='Exclude legacy API entry points and enable DX11 shader defines')
 args = parser.parse_args()
 
 # Set to True to generate Slang repro file when compiling shaders
 generateSlangRepro = False
 
-includePaths = ' '.join([f'-I{path}' for path in args.includes])
+includePaths = [f'-I{os.path.abspath(path)}' for path in args.includes]
+args.input = os.path.abspath(args.input)
+args.output = os.path.abspath(args.output)
 slangDll = os.path.join(os.path.dirname(args.slangc), 'slang.dll')
 
-tools = [args.glslang, args.slangc, slangDll, __file__]
+script_dir = os.path.dirname(os.path.realpath(__file__))
+tools = [args.glslang, args.slangc, slangDll, args.spirvval, __file__,
+         os.path.join(script_dir, 'compile_shaders.py'),
+         os.path.join(script_dir, 'shader_xxd.py'), depfile.__file__]
 newestTool = max([os.path.getmtime(x) for x in tools])
 
 # Note: -Os (Optimize Size) used here as while one might typically expect optimizing for size to comprimise speed optimizations,
 # the glslang optimizer actually just enables more optimizations when this option is specified, meaning it is probably good to enable
 # always (assuming that data wouldn't help the actual driver compiler at least, and we've observed it to make a slight speedup overall):
 # https://github.com/KhronosGroup/glslang/blob/master/SPIRV/SpvTools.cpp#L213
-glslangFlags = '--quiet --target-env vulkan1.2 -Os'
+glslangFlags = ['--quiet', '--target-env', 'vulkan1.2', '-Os']
 
 # Note: Debug is used for Debug and DebugOptimized currently, so it does not disable optimizations persay
 # (as otherwise -Od should be passed and be mutually exclusive with -Os), just means to generate debug info.
 if args.debug:
-    glslangFlags += ' -g'
+    glslangFlags += ['-g']
 
 os.makedirs(args.output, exist_ok = True)
 
@@ -65,13 +72,35 @@ def printFromThread(what):
 
 
 class Task:
-    outputs = []
-    inputs = []
-    commands = []
-    customName = None
+    def __init__(self):
+        self.outputs = []
+        self.inputs = []
+        self.commands = []
+        self.customName = None
+        self.commandFile = None
+        self.depFile = None
+        self.destFile = None
+        self.inputFile = None
+
+    def readDependencies(self):
+        try:
+            with open(self.depFile, 'r', encoding='utf-8') as file:
+                dependencies = depfile.parse(file.readlines(), self.destFile)
+        except (OSError, UnicodeError):
+            dependencies = []
+        # The source itself is required even for compilers emitting an empty or
+        # malformed depfile; changing variant declarations must also rebuild.
+        return list(dict.fromkeys([self.inputFile] + dependencies))
 
     def needsBuild(self):
         if args.force:
+            return True
+
+        try:
+            with open(self.commandFile, 'r', encoding='utf-8') as file:
+                if json.load(file) != self.commands:
+                    return True
+        except (OSError, ValueError):
             return True
 
         mostRecentInput = None
@@ -107,17 +136,21 @@ class Task:
     def build(self):
         allCommandOutputs = ''
         commandName = ''
+        # Failed/interrupted builds must never become an incremental cache hit,
+        # even if the compiler already replaced the SPIR-V or its depfile.
+        if os.path.exists(self.commandFile):
+            os.remove(self.commandFile)
 
         for command in self.commands:
             #print(command)
             timeStart = time.time()
 
-            process = subprocess.Popen(command, shell = True, stdout = subprocess.PIPE, stderr = subprocess.PIPE)
+            process = subprocess.Popen(command, stdout = subprocess.PIPE, stderr = subprocess.PIPE)
             out, err = process.communicate()
 
             duration = time.time() - timeStart
 
-            commandName = os.path.basename(command.split(' ')[0])
+            commandName = os.path.basename(command[0])
             printFromThread(f'[{duration:5.2f}s] {commandName}: {self.getName()}')
 
             combinedOutput = (out + err).decode("utf-8").strip()
@@ -131,6 +164,9 @@ class Task:
                 exitCode = ctypes.c_long(process.returncode).value
                 return (exitCode, allCommandOutputs, commandName)
 
+        self.inputs = self.readDependencies()
+        with open(self.commandFile, 'w', encoding='utf-8') as file:
+            json.dump(self.commands, file, indent=2)
         return (0, allCommandOutputs, commandName)
 
 
@@ -190,11 +226,11 @@ def getShaderName(inputFile):
 
 def createBasicTask(inputFile, destFile, targetName, depFile):
     task = Task()
-    try:
-        lines = open(depFile, 'r').readlines()
-        task.inputs = depfile.parse(lines, targetName)
-    except:
-        task.inputs = []
+    task.inputFile = inputFile
+    task.depFile = depFile
+    task.destFile = targetName
+    task.commandFile = depFile + '.commands.json'
+    task.inputs = task.readDependencies()
     task.outputs = [destFile, depFile]
     return task
 
@@ -204,10 +240,10 @@ def createGlslangTask(inputFile):
     destFile = os.path.join(args.output, shaderName + destExtension)
     depFile = os.path.join(args.output, shaderName + ".d")
     task = createBasicTask(inputFile, destFile, destFile, depFile)
-    variableName = '' if args.binary else f'--vn {shaderName}'
+    variableName = [] if args.binary else ['--vn', shaderName]
 
-    command = f'{args.glslang} {glslangFlags} {includePaths} -V {variableName} -o {destFile} ' \
-            + f'--depfile {depFile} {inputFile}'
+    command = [args.glslang] + glslangFlags + includePaths + ['-V'] + variableName \
+            + ['-o', destFile, '--depfile', depFile, inputFile]
     task.commands = [command]
     return task
 
@@ -218,7 +254,9 @@ def createSlangTask(inputFile, variantSpec):
     inputName, inputType = os.path.splitext(getShaderName(inputFile))
     variantName, variantType = os.path.splitext(variantSpec[0])
 
-    variantDefines = ' '.join([f'-D{x}' for x in variantSpec[1:]])
+    variantDefines = [f'-D{x}' for x in variantSpec[1:]]
+    if args.dx11:
+        variantDefines += ['-DDXVK_REMIX_DX11_SHADER_MODE=1', '-DRTX_REMIX_DX11=1']
     destFile = os.path.join(args.output, variantName + ".spv")
     headerFile = os.path.join(args.output, variantName + ".h")
     depFile = os.path.join(args.output, variantName + ".d")
@@ -229,34 +267,35 @@ def createSlangTask(inputFile, variantSpec):
     if variantName != inputName:
         task.customName = f'{os.path.basename(inputFile)} ({variantName})'
 
-    command1 = f'{args.slangc} -entry main -target spirv -zero-initialize -emit-spirv-directly -verbose-paths {includePaths} ' \
-            + f'-depfile {depFile} {inputFile} -D__SLANG__ {variantDefines} ' \
-            + f'-matrix-layout-column-major ' \
-            + f'-Wno-30081 '
+    command1 = [args.slangc, '-entry', 'main', '-target', 'spirv', '-zero-initialize',
+                '-emit-spirv-directly', '-verbose-paths'] + includePaths \
+            + ['-depfile', depFile, inputFile, '-D__SLANG__'] + variantDefines \
+            + ['-matrix-layout-column-major', '-Wno-30081']
 
     # Add SER capability only for variants that use Shader Execution Reordering
     if 'RT_SHADER_EXECUTION_REORDERING' in variantSpec:
-        command1 += f'-capability spvShaderInvocationReorderNV '
+        command1 += ['-capability', 'spvShaderInvocationReorderNV']
 
     # Force scalar block layout in shaders - buffers are required to be aligned as such by Neural Radiance Cache
-    command1 += f'-fvk-use-scalar-layout '
+    command1 += ['-fvk-use-scalar-layout']
 
     if generateSlangRepro:
       reproFile = os.path.join(args.output, variantName + ".slangRepro")
-      command1 += f'-dump-repro {reproFile}'
+      command1 += ['-dump-repro', reproFile]
 
-    command1 += f'-o {destFile}'
+    command1 += ['-o', destFile]
+    validationCommand = [args.spirvval, '--scalar-block-layout', destFile]
 
     # -binary switch just writes the SPV binary
     if args.binary:
-        task.commands = [command1]
+        task.commands = [command1, validationCommand]
     else:
         # Command to convert SPV into c array header
-        script_dir = os.path.dirname(os.path.realpath(__file__))
         shader_xxd = os.path.join(script_dir, 'shader_xxd.py')
-        command2 = f'"{sys.executable}" {shader_xxd} -i {destFile} -o {headerFile}'
+        command2 = [sys.executable, shader_xxd, '-i', destFile, '-o', headerFile]
 
-        task.commands = [command1, command2]
+        task.outputs.append(headerFile)
+        task.commands = [command1, validationCommand, command2]
 
     return task
 
@@ -598,12 +637,75 @@ def parseShaderVariants(inputFile):
         return []
     return result
 
+def isLegacyApiPath(path):
+    parts = path.replace('\\', '/').lower().split('/')
+    return any(part in ('d3d9', 'dx9') or part.startswith(('d3d9_', 'dx9_'))
+               or '_d3d9' in part or '_dx9' in part for part in parts)
+
+
+def isSlangEntryPoint(path):
+    # Shared .slang modules remain available to #include/import, but are not
+    # independent compiler inputs. Entry points declare a stage in their file
+    # name or describe their generated stages with variant directives.
+    if os.path.splitext(getShaderName(path))[1] in shaderTypeSuffixes:
+        return True
+    with open(path, 'r', encoding='utf-8') as source:
+        return any(line.startswith('//!variant') for line in source)
+
+
+def escapeDepfilePath(path):
+    return (path.replace('\\', '/').replace('$', '$$').replace(' ', '\\ ')
+            .replace('#', '\\#').replace(':', '\\:'))
+
+
+def writeBuildMetadata(allTasks):
+    if args.binary:
+        return
+
+    stamp = os.path.join(os.path.dirname(args.output), '_built_shaders.txt')
+    dependencies = set(tools)
+    outputs = []
+    for task in allTasks:
+        dependencies.update(task.readDependencies())
+        outputs.extend(task.outputs)
+
+    # Actual compiler-discovered transitive inputs include SDK headers outside
+    # the source directory. Ninja must invoke this script when those change.
+    dependencyFile = os.path.join(os.path.dirname(args.output), '_built_shaders.d')
+    with open(dependencyFile, 'w', encoding='utf-8') as file:
+        # Ninja records this custom target relative to its build directory.
+        file.write(escapeDepfilePath(os.path.relpath(stamp)) + ': ' + ' '.join(
+            escapeDepfilePath(os.path.abspath(path)) for path in sorted(dependencies)) + '\n')
+    with open(stamp, 'w', encoding='utf-8') as file:
+        file.write('DX11 RTX shader build manifest\n')
+        file.write(f'Source={args.input}\nShaderCount={len(allTasks)}\n')
+        for path in sorted(outputs):
+            file.write(f'{os.path.basename(path)}\t{os.path.getsize(path)}\n')
+
+
 tasks = []
+allTasks = []
+outputOwners = {}
+
+
+def addTask(task):
+    for output in task.outputs:
+        owner = outputOwners.get(output)
+        if owner is not None:
+            raise ValueError(f'Duplicate shader output {output}: {owner} and {task.inputFile}')
+        outputOwners[output] = task.inputFile
+    allTasks.append(task)
+    if task.needsBuild():
+        tasks.append(task)
 
 for root, dirs, files in os.walk(args.input):
-    for name in files:
+    dirs[:] = sorted(directory for directory in dirs
+                     if not args.dx11 or not isLegacyApiPath(os.path.join(root, directory)))
+    for name in sorted(files):
         task = None
         inputFile = os.path.join(root, name)
+        if args.dx11 and isLegacyApiPath(inputFile):
+            continue
         if name.endswith(".comp") \
         or name.endswith(".vert") \
         or name.endswith(".geom") \
@@ -614,10 +716,11 @@ for root, dirs, files in os.walk(args.input):
         or name.endswith(".rmiss") \
         or name.endswith(".rint"):
             task = createGlslangTask(inputFile)
-            if task.needsBuild():
-                tasks.append(task)
+            addTask(task)
 
         elif name.endswith(".slang"):
+            if not isSlangEntryPoint(inputFile):
+                continue
             variants = parseShaderVariants(inputFile)
 
             if len(variants) == 0:
@@ -627,8 +730,13 @@ for root, dirs, files in os.walk(args.input):
             # Create tasks for each variant
             for variantSpec in variants:
                 task = createSlangTask(inputFile, variantSpec)
-                if task.needsBuild():
-                    tasks.append(task)
+                addTask(task)
+
+if not allTasks:
+    print(f'No shader entry points found in {args.input}', file=sys.stderr)
+    sys.exit(2)
+
+print(f'Shader build: {len(tasks)} of {len(allTasks)} variants require compilation.', flush=True)
 
 if len(tasks):
     threads = []
@@ -643,3 +751,5 @@ if len(tasks):
 
 if terminate:
     sys.exit(1)
+
+writeBuildMetadata(allTasks)

@@ -20,10 +20,8 @@
 # DEALINGS IN THE SOFTWARE.
 #############################################################################
 
-detours_include_path = include_directories('../../../submodules/Detours/src')
-
 launcher_src = files([
-  'launcher.cpp'
+  'dx11_launcher.cpp'
 ])
 
 lib_shlwapi = bridge_compiler.find_library('shlwapi')
@@ -36,8 +34,9 @@ endif
 
 launcher_exe = executable(launcher_name, launcher_src,
 build_by_default    : (cpu_family == 'x86') ? true : false,
-dependencies        : [ lib_shlwapi, util_dep ],
-include_directories : [ detours_include_path, util_include_path ])
+dependencies        : [ lib_shlwapi ],
+link_args           : ['shell32.lib'],
+win_subsystem       : 'windows')
 
 
 if cpu_family == 'x86'

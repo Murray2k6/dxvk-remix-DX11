@@ -71,8 +71,8 @@ namespace dxvk {
   /**
    * \brief Render pass barrier
    * 
-   * External subpass dependency that is to be
-   * executed after a render pass has completed.
+   * Memory barrier recorded immediately after the render pass. Keeping this
+   * outside the render-pass object preserves compatibility between variants.
    */
   struct DxvkRenderPassBarrier {
     VkPipelineStageFlags  srcStages = 0;

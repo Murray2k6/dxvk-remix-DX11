@@ -89,10 +89,17 @@ using PFN_DrawIndexed = void (STDMETHODCALLTYPE *)(ID3D11DeviceContext*, UINT, U
 using PFN_Draw = void (STDMETHODCALLTYPE *)(ID3D11DeviceContext*, UINT, UINT);
 using PFN_DrawIndexedInstanced = void (STDMETHODCALLTYPE *)(ID3D11DeviceContext*, UINT, UINT, UINT, INT, UINT);
 using PFN_DrawInstanced = void (STDMETHODCALLTYPE *)(ID3D11DeviceContext*, UINT, UINT, UINT, UINT);
+using PFN_DrawAuto = void (STDMETHODCALLTYPE *)(ID3D11DeviceContext*);
+using PFN_DrawIndirect = void (STDMETHODCALLTYPE *)(ID3D11DeviceContext*, ID3D11Buffer*, UINT);
+using PFN_ExecuteCommandList = void (STDMETHODCALLTYPE *)(ID3D11DeviceContext*, ID3D11CommandList*, BOOL);
 static PFN_DrawIndexed oDrawIndexed = nullptr;
 static PFN_Draw oDraw = nullptr;
 static PFN_DrawIndexedInstanced oDrawIndexedInstanced = nullptr;
 static PFN_DrawInstanced oDrawInstanced = nullptr;
+static PFN_DrawAuto oDrawAuto = nullptr;
+static PFN_DrawIndirect oDrawIndexedInstancedIndirect = nullptr;
+static PFN_DrawIndirect oDrawInstancedIndirect = nullptr;
+static PFN_ExecuteCommandList oExecuteCommandList = nullptr;
 
 // ID3D11Device slots.
 using PFN_CreateBuffer = HRESULT (STDMETHODCALLTYPE *)(ID3D11Device*, const D3D11_BUFFER_DESC*, const D3D11_SUBRESOURCE_DATA*, ID3D11Buffer**);
@@ -135,7 +142,7 @@ static void V219NotifyResource(const char* what) {
 }
 
 static HRESULT STDMETHODCALLTYPE HSwapPresent(IDXGISwapChain* self, UINT syncInterval, UINT flags) {
-  if (!gV219InsideHook) {
+  if (!gV219InsideHook && !(flags & DXGI_PRESENT_TEST)) {
     gV219InsideHook = true;
     LONG n = InterlockedIncrement(&gV219PresentCount);
     if (n <= 8 || (n % 60) == 0) {
@@ -143,18 +150,18 @@ static HRESULT STDMETHODCALLTYPE HSwapPresent(IDXGISwapChain* self, UINT syncInt
       sprintf_s(msg, sizeof(msg), "DX11_V219_REAL_D3D11_CLIENT_CAPTURE_LAYER: captured IDXGISwapChain::Present count=%ld in game process.", n);
       V219Log("capture", msg);
     }
-    dx11_bridge_client::EnsureServer();
     // DX11_V265_BRIDGE_PRESENT_CAMERA: frame boundary - send Startup (once,
     // game HWND), SetupCamera and Present to the server so the Remix runtime
     // attaches to and presents INTO the game window every frame.
-    dx11_capture::OnPresent(self);
+    const bool presented = dx11_capture::OnPresent(self);
     gV219InsideHook = false;
+    if (presented) return S_OK;
   }
   return oSwapPresent ? oSwapPresent(self, syncInterval, flags) : DXGI_ERROR_DEVICE_REMOVED;
 }
 
 static HRESULT STDMETHODCALLTYPE HSwapPresent1(IDXGISwapChain1* self, UINT syncInterval, UINT flags, const DXGI_PRESENT_PARAMETERS* parameters) {
-  if (!gV219InsideHook) {
+  if (!gV219InsideHook && !(flags & DXGI_PRESENT_TEST)) {
     gV219InsideHook = true;
     LONG n = InterlockedIncrement(&gV219PresentCount);
     if (n <= 8 || (n % 60) == 0) {
@@ -162,9 +169,9 @@ static HRESULT STDMETHODCALLTYPE HSwapPresent1(IDXGISwapChain1* self, UINT syncI
       sprintf_s(msg, sizeof(msg), "DX11_V229: captured IDXGISwapChain1::Present1 count=%ld in game process.", n);
       V219Log("capture", msg);
     }
-    dx11_bridge_client::EnsureServer();
-    dx11_capture::OnPresent(self);
+    const bool presented = dx11_capture::OnPresent(self);
     gV219InsideHook = false;
+    if (presented) return S_OK;
   }
   return oSwapPresent1 ? oSwapPresent1(self, syncInterval, flags, parameters) : DXGI_ERROR_DEVICE_REMOVED;
 }
@@ -188,11 +195,37 @@ static void STDMETHODCALLTYPE HDraw(ID3D11DeviceContext* self, UINT vertexCount,
 static void STDMETHODCALLTYPE HDrawIndexedInstanced(ID3D11DeviceContext* self, UINT indexCountPerInstance, UINT instanceCount, UINT startIndexLocation, INT baseVertexLocation, UINT startInstanceLocation) {
   V219NotifyDraw("ID3D11DeviceContext::DrawIndexedInstanced");
   if (oDrawIndexedInstanced) oDrawIndexedInstanced(self, indexCountPerInstance, instanceCount, startIndexLocation, baseVertexLocation, startInstanceLocation);
+  dx11_capture::RecordUncapturedDraw(indexCountPerInstance, instanceCount);
 }
 
 static void STDMETHODCALLTYPE HDrawInstanced(ID3D11DeviceContext* self, UINT vertexCountPerInstance, UINT instanceCount, UINT startVertexLocation, UINT startInstanceLocation) {
   V219NotifyDraw("ID3D11DeviceContext::DrawInstanced");
   if (oDrawInstanced) oDrawInstanced(self, vertexCountPerInstance, instanceCount, startVertexLocation, startInstanceLocation);
+  dx11_capture::RecordUncapturedDraw(vertexCountPerInstance, instanceCount);
+}
+
+static void STDMETHODCALLTYPE HDrawAuto(ID3D11DeviceContext* self) {
+  if (oDrawAuto) oDrawAuto(self);
+  // The count lives in stream-output state, not in the CPU buffer snapshot.
+  dx11_capture::RecordUncapturedDraw(1, 1);
+}
+
+static void STDMETHODCALLTYPE HDrawIndexedInstancedIndirect(ID3D11DeviceContext* self, ID3D11Buffer* args, UINT offset) {
+  if (oDrawIndexedInstancedIndirect) oDrawIndexedInstancedIndirect(self, args, offset);
+  // GPU writes can change the arguments after our last CPU snapshot. Unknown
+  // counts must retain native output even when that snapshot happened to be zero.
+  if (args) dx11_capture::RecordUncapturedDraw(1, 1);
+}
+
+static void STDMETHODCALLTYPE HDrawInstancedIndirect(ID3D11DeviceContext* self, ID3D11Buffer* args, UINT offset) {
+  if (oDrawInstancedIndirect) oDrawInstancedIndirect(self, args, offset);
+  if (args) dx11_capture::RecordUncapturedDraw(1, 1);
+}
+
+static void STDMETHODCALLTYPE HExecuteCommandList(ID3D11DeviceContext* self, ID3D11CommandList* commands, BOOL restoreState) {
+  if (oExecuteCommandList) oExecuteCommandList(self, commands, restoreState);
+  // Deferred command-list contents are opaque to the immediate capture path.
+  if (commands) dx11_capture::RecordUncapturedDraw(1, 1);
 }
 
 static HRESULT STDMETHODCALLTYPE HCreateBuffer(ID3D11Device* self, const D3D11_BUFFER_DESC* desc, const D3D11_SUBRESOURCE_DATA* data, ID3D11Buffer** out) {
@@ -308,7 +341,11 @@ static void V219InstallCapture(ID3D11Device* device, ID3D11DeviceContext* contex
     V219HookVTable(context, 15, reinterpret_cast<void*>(&HUnmap), &oUnmap, "ID3D11DeviceContext::Unmap");
     V219HookVTable(context, 20, reinterpret_cast<void*>(&HDrawIndexedInstanced), &oDrawIndexedInstanced, "ID3D11DeviceContext::DrawIndexedInstanced");
     V219HookVTable(context, 21, reinterpret_cast<void*>(&HDrawInstanced), &oDrawInstanced, "ID3D11DeviceContext::DrawInstanced");
+    V219HookVTable(context, 38, reinterpret_cast<void*>(&HDrawAuto), &oDrawAuto, "ID3D11DeviceContext::DrawAuto");
+    V219HookVTable(context, 39, reinterpret_cast<void*>(&HDrawIndexedInstancedIndirect), &oDrawIndexedInstancedIndirect, "ID3D11DeviceContext::DrawIndexedInstancedIndirect");
+    V219HookVTable(context, 40, reinterpret_cast<void*>(&HDrawInstancedIndirect), &oDrawInstancedIndirect, "ID3D11DeviceContext::DrawInstancedIndirect");
     V219HookVTable(context, 48, reinterpret_cast<void*>(&HUpdateSubresource), &oUpdateSubresource, "ID3D11DeviceContext::UpdateSubresource");
+    V219HookVTable(context, 58, reinterpret_cast<void*>(&HExecuteCommandList), &oExecuteCommandList, "ID3D11DeviceContext::ExecuteCommandList");
   }
 
   if (localContext) {
@@ -330,17 +367,10 @@ BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, LPVOID reserved) {
   if (reason == DLL_PROCESS_ATTACH) {
     DisableThreadLibraryCalls(hinst);
     dx11_bridge_client::SetModule(hinst);
-    dx11_bridge_client::Attach();
-    V219Log("d3d11", "DX11_V219_REAL_D3D11_CLIENT_CAPTURE_LAYER: game loaded root d3d11.dll client capture layer.");
   }
 
-  if (reason == DLL_PROCESS_DETACH) {
-    if (reserved != nullptr) {
-      dx11_bridge_client::Detach();
-    } else {
-      V219Log("d3d11", "DX11_V219_REAL_D3D11_CLIENT_CAPTURE_LAYER: ignoring runtime detach; bridge remains owned until process exit.");
-    }
-  }
+  // IPC startup and shutdown can wait for other threads/processes, so neither
+  // may run under the loader lock. The server monitors the game process handle.
   return TRUE;
 }
 

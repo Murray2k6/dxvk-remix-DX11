@@ -62,6 +62,16 @@ void main(int2 thread_id : SV_DispatchThreadID)
 
   ReSTIRGI_Reservoir spatialReservoir = RAB_LoadGIReservoir(thread_id, ReSTIRGI_GetSpatialInputPage());
 
+  // The output page and last-frame GBuffer are still required when reuse is
+  // disabled. Copy the reservoir before launching any neighbor visibility rays.
+  if (!cb.enableReSTIRGISpatialReuse)
+  {
+    RAB_StoreGIReservoir(spatialReservoir, thread_id, ReSTIRGI_GetSpatialOutputPage());
+    if (cb.debugView == DEBUG_VIEW_RESTIR_GI_SPATIAL_REUSE)
+      storeInDebugView(thread_id, spatialReservoir.radiance * spatialReservoir.avgWeight);
+    return;
+  }
+
   ReSTIRGI_SpatialResamplingParameters sparams = {};
   sparams.fastHistoryLength = cb.temporalHistoryLength;
   sparams.frameIndex = cb.frameIdx;
@@ -89,9 +99,5 @@ void main(int2 thread_id : SV_DispatchThreadID)
     accumulateInDebugViewAnd(thread_id, isValid);
   }
 
-  if (!cb.enableReSTIRGISpatialReuse)
-  {
-    resultReservoir = RAB_LoadGIReservoir(thread_id, ReSTIRGI_GetSpatialInputPage());
-  }
   RAB_StoreGIReservoir(resultReservoir, thread_id, ReSTIRGI_GetSpatialOutputPage());
 }

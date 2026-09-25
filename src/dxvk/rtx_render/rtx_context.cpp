@@ -29,6 +29,7 @@
 #include "rtx_shader_manager.h"
 #include "dxvk_adapter.h"
 #include "rtx_context.h"
+#include "rtx_fork_hooks.h"
 // DX11_V225: complete type for the fixed-function-equivalent VS constant block.
 #include "perf_debug.h"
 #include "../../d3d11/d3d11_fixed_function.h"
@@ -317,6 +318,7 @@ namespace dxvk {
   }
 
   void RtxContext::resetScreenResolution(const VkExtent3D& upscaleExtent) {
+    m_resetHistory = true;
     // Calculate extents based on if DLSS is enabled or not
     const VkExtent3D downscaleExtent = setDownscaleExtent(upscaleExtent);
 
@@ -432,12 +434,6 @@ namespace dxvk {
 
     const RtCamera& mainCamera = getSceneManager().getCamera();
 
-    // Call onFrameBegin callbacks for RtxPases
-    // Note: this needs to be called after resetScreenResolution() call in a frame
-    // since an RtxPass may alias some of its resources with the ones created in createRaytracingOutput()
-    getResourceManager().onFrameBegin(this, getCommonObjects()->getTextureManager(), getSceneManager(), downscaledExtent,
-                                      upscaledExtent, m_resetHistory, mainCamera.isCameraCut());
-
     // Force history reset on integrate indirect mode change to discard incompatible history 
     if (RtxOptions::integrateIndirectMode() != m_prevIntegrateIndirectMode) {
       m_resetHistory = true;
@@ -448,6 +444,14 @@ namespace dxvk {
         m_common->metaNeuralRadianceCache().isResettingHistory()) {
       m_resetHistory = true;
     }
+
+    if (m_resetHistory || mainCamera.isCameraCut())
+      m_common->metaPathtracerIntegrateIndirect().resetSharcHistory();
+
+    // Passes must see a mode change before they validate temporal reservoirs.
+    // Resources must also have been resized before any pass aliases them.
+    getResourceManager().onFrameBegin(this, getCommonObjects()->getTextureManager(), getSceneManager(), downscaledExtent,
+                                      upscaledExtent, m_resetHistory, mainCamera.isCameraCut());
 
     // Release resources when switching upscalers
     m_currentUpscaler = getCurrentFrameUpscaler();
@@ -477,6 +481,10 @@ namespace dxvk {
     }
 
     getSceneManager().onFrameEnd(this, rayTracedThisFrame);
+    m_frameLastFinalized = m_device->getCurrentFrameId();
+    // Raster-only frames do not advance the ray-traced histories. Reusing
+    // them when tracing resumes would mix incompatible camera/scene frames.
+    m_resetHistory |= !rayTracedThisFrame;
   }
 
   // Hooked into D3D11 presentImage (same place HUD rendering is)
@@ -601,11 +609,6 @@ namespace dxvk {
       }
     }
 
-    // Update frame counter only after actual rendering
-    if (isCameraValid) {
-      m_frameLastInjected = m_device->getCurrentFrameId();
-    }
-
     if (RtxOptions::upscalerType() == UpscalerType::DLSS && !common->metaDLSS().supportsDLSS()) {
       RtxOptions::upscalerType.setDeferred(UpscalerType::TAAU);
     }
@@ -642,12 +645,15 @@ namespace dxvk {
 
     bool raytracedThisFrame = false;
 
+    if (targetImage == nullptr && m_state.om.renderTargets.color[0].view != nullptr)
+      targetImage = m_state.om.renderTargets.color[0].view->image();
+    const bool isTargetValid = targetImage != nullptr
+      && targetImage->info().extent.width != 0
+      && targetImage->info().extent.height != 0;
+
     // Note: Only engage ray tracing when it is enabled, the camera is valid and when no shaders are currently being compiled asynchronously (as
     // trying to render before shaders are done compiling will cause Remix to block).
-    if (isRaytracingEnabled && isCameraValid && !asyncShaderCompilationActive) {
-      if (targetImage == nullptr) {
-        targetImage = m_state.om.renderTargets.color[0].view->image();  
-      }
+    if (isRaytracingEnabled && isCameraValid && isTargetValid && !asyncShaderCompilationActive) {
 
       const bool captureTestScreenshot = (m_screenshotFrameEnabled && m_device->getCurrentFrameId() == m_screenshotFrameNum);
       const bool captureScreenImage = s_triggerScreenshot || (captureTestScreenshot && !s_capturePrePresentTestScreenshot);
@@ -675,6 +681,7 @@ namespace dxvk {
         takeScreenshot("orgImage", targetImage);
       }
 
+      const uint64_t failedDispatchesBefore = failedDispatchCount();
       RtxParticleSystemManager& particles = m_device->getCommon()->metaParticleSystem();
       particles.submitDrawState(this);
 
@@ -700,7 +707,13 @@ namespace dxvk {
       getSceneManager().prepareSceneData(this, m_execBarriers);
       
       // If we really don't have any RT to do, just bail early (could be UI/menus rendering)
-      if (getSceneManager().getSurfaceBuffer() != nullptr) {
+      if (failedDispatchCount() == failedDispatchesBefore
+       && getSceneManager().getInstanceManager().getActiveCount() > 0
+       && getSceneManager().getAccelManager().getSurfaceCount() > 0
+       && getSceneManager().getSurfaceBuffer() != nullptr) {
+        // A camera alone is not an injection. An early call without a target
+        // or scene must not suppress a later valid target in the same frame.
+        m_frameLastInjected = currentFrameId;
 
         VkExtent3D downscaledExtent = onInjectRtxFrameBegin(targetImage->info().extent);
 
@@ -734,173 +747,181 @@ namespace dxvk {
         dispatchVolumetrics(rtOutput);
         
         // Path Tracing
-        dispatchPathTracing(rtOutput);
+        if (failedDispatchCount() == failedDispatchesBefore)
+          dispatchPathTracing(rtOutput);
 
-        if (logRaytracerFrame) {
-          Logger::info(str::format(
-            "[Remix-RayTracer] frame=", currentFrameId,
-            " pathTraceDone albedo=", describeRaytracerImage(rtOutput.m_primaryAlbedo.image),
-            " normal=", describeRaytracerImage(rtOutput.m_primaryWorldShadingNormal.image),
-            " linearZ=", describeRaytracerImage(rtOutput.m_primaryLinearViewZ.image),
-            " directDiffuse=", describeRaytracerImage(rtOutput.m_primaryDirectDiffuseRadiance.image(Resources::AccessType::Read)),
-            " directSpecular=", describeRaytracerImage(rtOutput.m_primaryDirectSpecularRadiance.image(Resources::AccessType::Read))));
-        }
+        // Do not feed incomplete GBuffer/radiance data into denoisers or
+        // radiance-cache training when an asynchronous RT pipeline is absent.
+        if (failedDispatchCount() == failedDispatchesBefore) {
 
-        // Neural Radiance Cache
-        m_common->metaNeuralRadianceCache().dispatchTrainingAndResolve(*this, rtOutput);
-
-        // RTXDI confidence
-        m_common->metaRtxdiRayQuery().dispatchConfidence(this, rtOutput);
-
-        // ReSTIR GI
-        m_common->metaReSTIRGIRayQuery().dispatch(this, rtOutput);
-        
-        if (captureScreenImage && captureDebugImage) {
-          takeScreenshot("baseReflectivity", rtOutput.m_primaryBaseReflectivity.image(Resources::AccessType::Read));
-          takeScreenshot("sharedSubsurfaceData", rtOutput.m_sharedSubsurfaceData.image);
-          takeScreenshot("sharedSubsurfaceDiffusionProfileData", rtOutput.m_sharedSubsurfaceDiffusionProfileData.image);
-        }
-
-        // Demodulation
-        dispatchDemodulate(rtOutput);
-
-        if (logRaytracerFrame) {
-          Logger::info(str::format(
-            "[Remix-RayTracer] frame=", currentFrameId,
-            " demodulateDone diffuse=", describeRaytracerImage(rtOutput.m_primaryDirectDiffuseRadiance.image(Resources::AccessType::Read)),
-            " specular=", describeRaytracerImage(rtOutput.m_primaryDirectSpecularRadiance.image(Resources::AccessType::Read))));
-        }
-
-        // Note: Primary direct diffuse/specular radiance textures noisy and in a demodulated state after demodulation step.
-        if (captureScreenImage && captureDebugImage) {
-          takeScreenshot("noisyDiffuse", rtOutput.m_primaryDirectDiffuseRadiance.image(Resources::AccessType::Read));
-          takeScreenshot("noisySpecular", rtOutput.m_primaryDirectSpecularRadiance.image(Resources::AccessType::Read));
-        }
-
-        // Denoising
-        dispatchDenoise(rtOutput);
-
-        if (logRaytracerFrame) {
-          Logger::info(str::format(
-            "[Remix-RayTracer] frame=", currentFrameId,
-            " denoiseDone enabled=", RtxOptions::useDenoiser(),
-            " referenceMode=", RtxOptions::useDenoiserReferenceMode(),
-            " diffuse=", describeRaytracerImage(rtOutput.m_primaryDirectDiffuseRadiance.image(Resources::AccessType::Read)),
-            " specular=", describeRaytracerImage(rtOutput.m_primaryDirectSpecularRadiance.image(Resources::AccessType::Read))));
-        }
-
-        // Note: Primary direct diffuse/specular radiance textures denoised but in a still demodulated state after denoising step.
-        if (captureScreenImage && captureDebugImage) {
-          takeScreenshot("denoisedDiffuse", rtOutput.m_primaryDirectDiffuseRadiance.image(Resources::AccessType::Read));
-          takeScreenshot("denoisedSpecular", rtOutput.m_primaryDirectSpecularRadiance.image(Resources::AccessType::Read));
-        }
-
-        // Composition
-        dispatchComposite(rtOutput);
-
-        if (logRaytracerFrame) {
-          Logger::info(str::format(
-            "[Remix-RayTracer] frame=", currentFrameId,
-            " compositeDone image=", describeRaytracerImage(rtOutput.m_compositeOutput.resource(Resources::AccessType::Read).image),
-            " extent=", rtOutput.m_compositeOutputExtent.width, "x", rtOutput.m_compositeOutputExtent.height));
-        }
-
-        // Post composite Debug View that may overwrite Composite output
-        dispatchReplaceCompositeWithDebugView(rtOutput);
-        
-        if (captureScreenImage && captureDebugImage) {
-          takeScreenshot("rtxImagePostComposite", rtOutput.m_compositeOutput.resource(Resources::AccessType::Read).image);
-        }
-
-        getCommonObjects()->getTextureManager().copySamplerFeedbackToHost(this);
-        dispatchObjectPicking(rtOutput, downscaledExtent, targetImage->info().extent);
-
-        // Upscaling if DLSS/NIS enabled, or the Composition Pass will do upscaling
-        if (m_currentUpscaler == InternalUpscaler::DLSS) {
-          // xxxnsubtil: the DLSS indicator reads our exposure texture even with DLSS autoexposure on
-          // make sure it has been created, otherwise we run into trouble on the first frame
-          m_common->metaAutoExposure().createResources(this);
-          dispatchDLSS(rtOutput);
-        } else if (m_currentUpscaler == InternalUpscaler::DLSS_RR) {
-          m_common->metaAutoExposure().createResources(this);
-          dispatchRayReconstruction(rtOutput);
-        } else if (m_currentUpscaler == InternalUpscaler::XeSS) {
-          m_common->metaAutoExposure().createResources(this);
-          dispatchXeSS(rtOutput);
-        } else if (m_currentUpscaler == InternalUpscaler::NIS) {
-          dispatchNIS(rtOutput);
-        } else if (m_currentUpscaler == InternalUpscaler::TAAU){
-          dispatchTemporalAA(rtOutput);
-        } else {
-          copyImage(
-            rtOutput.m_finalOutput.resource(Resources::AccessType::Write).image,
-            { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
-            { 0, 0, 0 },
-            rtOutput.m_compositeOutput.image(Resources::AccessType::Read),
-            { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
-            { 0, 0, 0 },
-            rtOutput.m_compositeOutputExtent);
-        }
-        m_previousUpscaler = m_currentUpscaler;
-
-        RtxDustParticles& dust = m_common->metaDustParticles();
-        dust.simulateAndDraw(this, m_state, rtOutput);
-
-        dispatchBloom(rtOutput);
-        dispatchPostFx(rtOutput);
-
-        // Tone mapping
-        // WAR for TREX-553 - disable sRGB conversion as NVTT implicitly applies it during dds->png
-        // conversion for 16bit float formats
-        const bool performSRGBConversion = !captureScreenImage && g_allowSrgbConversionForOutput;
-        dispatchToneMapping(rtOutput, performSRGBConversion);
-
-        if (captureScreenImage) {
-          if (m_common->metaDebugView().debugViewIdx() == DEBUG_VIEW_DISABLED) {
-            takeScreenshot("rtxImagePostTonemapping", rtOutput.m_finalOutput.resource(Resources::AccessType::Read).image);
+          if (logRaytracerFrame) {
+            Logger::info(str::format(
+              "[Remix-RayTracer] frame=", currentFrameId,
+              " pathTraceDone albedo=", describeRaytracerImage(rtOutput.m_primaryAlbedo.image),
+              " normal=", describeRaytracerImage(rtOutput.m_primaryWorldShadingNormal.image),
+              " linearZ=", describeRaytracerImage(rtOutput.m_primaryLinearViewZ.image),
+              " directDiffuse=", describeRaytracerImage(rtOutput.m_primaryDirectDiffuseRadiance.image(Resources::AccessType::Read)),
+              " directSpecular=", describeRaytracerImage(rtOutput.m_primaryDirectSpecularRadiance.image(Resources::AccessType::Read))));
           }
+
+          // Neural Radiance Cache
+          m_common->metaNeuralRadianceCache().dispatchTrainingAndResolve(*this, rtOutput);
+
+          // RTXDI confidence
+          m_common->metaRtxdiRayQuery().dispatchConfidence(this, rtOutput);
+
+          // ReSTIR GI
+          m_common->metaReSTIRGIRayQuery().dispatch(this, rtOutput);
+        
+          if (captureScreenImage && captureDebugImage) {
+            takeScreenshot("baseReflectivity", rtOutput.m_primaryBaseReflectivity.image(Resources::AccessType::Read));
+            takeScreenshot("sharedSubsurfaceData", rtOutput.m_sharedSubsurfaceData.image);
+            takeScreenshot("sharedSubsurfaceDiffusionProfileData", rtOutput.m_sharedSubsurfaceDiffusionProfileData.image);
+          }
+
+          // Demodulation
+          dispatchDemodulate(rtOutput);
+
+          if (logRaytracerFrame) {
+            Logger::info(str::format(
+              "[Remix-RayTracer] frame=", currentFrameId,
+              " demodulateDone diffuse=", describeRaytracerImage(rtOutput.m_primaryDirectDiffuseRadiance.image(Resources::AccessType::Read)),
+              " specular=", describeRaytracerImage(rtOutput.m_primaryDirectSpecularRadiance.image(Resources::AccessType::Read))));
+          }
+
+          // Note: Primary direct diffuse/specular radiance textures noisy and in a demodulated state after demodulation step.
+          if (captureScreenImage && captureDebugImage) {
+            takeScreenshot("noisyDiffuse", rtOutput.m_primaryDirectDiffuseRadiance.image(Resources::AccessType::Read));
+            takeScreenshot("noisySpecular", rtOutput.m_primaryDirectSpecularRadiance.image(Resources::AccessType::Read));
+          }
+
+          // Denoising
+          dispatchDenoise(rtOutput);
+
+          if (logRaytracerFrame) {
+            Logger::info(str::format(
+              "[Remix-RayTracer] frame=", currentFrameId,
+              " denoiseDone enabled=", RtxOptions::useDenoiser(),
+              " referenceMode=", RtxOptions::useDenoiserReferenceMode(),
+              " diffuse=", describeRaytracerImage(rtOutput.m_primaryDirectDiffuseRadiance.image(Resources::AccessType::Read)),
+              " specular=", describeRaytracerImage(rtOutput.m_primaryDirectSpecularRadiance.image(Resources::AccessType::Read))));
+          }
+
+          // Note: Primary direct diffuse/specular radiance textures denoised but in a still demodulated state after denoising step.
+          if (captureScreenImage && captureDebugImage) {
+            takeScreenshot("denoisedDiffuse", rtOutput.m_primaryDirectDiffuseRadiance.image(Resources::AccessType::Read));
+            takeScreenshot("denoisedSpecular", rtOutput.m_primaryDirectSpecularRadiance.image(Resources::AccessType::Read));
+          }
+
+          // Composition
+          dispatchComposite(rtOutput);
+
+          if (logRaytracerFrame) {
+            Logger::info(str::format(
+              "[Remix-RayTracer] frame=", currentFrameId,
+              " compositeDone image=", describeRaytracerImage(rtOutput.m_compositeOutput.resource(Resources::AccessType::Read).image),
+              " extent=", rtOutput.m_compositeOutputExtent.width, "x", rtOutput.m_compositeOutputExtent.height));
+          }
+
+          // Post composite Debug View that may overwrite Composite output
+          dispatchReplaceCompositeWithDebugView(rtOutput);
+        
+          if (captureScreenImage && captureDebugImage) {
+            takeScreenshot("rtxImagePostComposite", rtOutput.m_compositeOutput.resource(Resources::AccessType::Read).image);
+          }
+
+          getCommonObjects()->getTextureManager().copySamplerFeedbackToHost(this);
+          dispatchObjectPicking(rtOutput, downscaledExtent, targetImage->info().extent);
+
+          // Upscaling if DLSS/NIS enabled, or the Composition Pass will do upscaling
+          if (m_currentUpscaler == InternalUpscaler::DLSS) {
+            // xxxnsubtil: the DLSS indicator reads our exposure texture even with DLSS autoexposure on
+            // make sure it has been created, otherwise we run into trouble on the first frame
+            m_common->metaAutoExposure().createResources(this);
+            dispatchDLSS(rtOutput);
+          } else if (m_currentUpscaler == InternalUpscaler::DLSS_RR) {
+            m_common->metaAutoExposure().createResources(this);
+            dispatchRayReconstruction(rtOutput);
+          } else if (m_currentUpscaler == InternalUpscaler::XeSS) {
+            m_common->metaAutoExposure().createResources(this);
+            dispatchXeSS(rtOutput);
+          } else if (m_currentUpscaler == InternalUpscaler::NIS) {
+            dispatchNIS(rtOutput);
+          } else if (m_currentUpscaler == InternalUpscaler::TAAU){
+            dispatchTemporalAA(rtOutput);
+          } else {
+            copyImage(
+              rtOutput.m_finalOutput.resource(Resources::AccessType::Write).image,
+              { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+              { 0, 0, 0 },
+              rtOutput.m_compositeOutput.image(Resources::AccessType::Read),
+              { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+              { 0, 0, 0 },
+              rtOutput.m_compositeOutputExtent);
+          }
+          m_previousUpscaler = m_currentUpscaler;
+
+          RtxDustParticles& dust = m_common->metaDustParticles();
+          dust.simulateAndDraw(this, m_state, rtOutput);
+
+          dispatchBloom(rtOutput);
+          dispatchPostFx(rtOutput);
+
+          // Tone mapping
+          // WAR for TREX-553 - disable sRGB conversion as NVTT implicitly applies it during dds->png
+          // conversion for 16bit float formats
+          const bool performSRGBConversion = !captureScreenImage && g_allowSrgbConversionForOutput;
+          dispatchToneMapping(rtOutput, performSRGBConversion);
+
+          if (captureScreenImage) {
+            if (m_common->metaDebugView().debugViewIdx() == DEBUG_VIEW_DISABLED) {
+              takeScreenshot("rtxImagePostTonemapping", rtOutput.m_finalOutput.resource(Resources::AccessType::Read).image);
+            }
           
-          if (captureDebugImage) {
-            takeScreenshot("albedo", rtOutput.m_primaryAlbedo.image);
-            takeScreenshot("worldNormals", rtOutput.m_primaryWorldShadingNormal.image);
-            takeScreenshot("worldMotion", rtOutput.m_primaryVirtualMotionVector.image(Resources::AccessType::Read));
-            takeScreenshot("linearZ", rtOutput.m_primaryLinearViewZ.image);
+            if (captureDebugImage) {
+              takeScreenshot("albedo", rtOutput.m_primaryAlbedo.image);
+              takeScreenshot("worldNormals", rtOutput.m_primaryWorldShadingNormal.image);
+              takeScreenshot("worldMotion", rtOutput.m_primaryVirtualMotionVector.image(Resources::AccessType::Read));
+              takeScreenshot("linearZ", rtOutput.m_primaryLinearViewZ.image);
+            }
+          }
+
+          // Set up output src
+          Rc<DxvkImage> srcImage = rtOutput.m_finalOutput.resource(Resources::AccessType::Read).image;
+
+          // Debug view
+          dispatchDebugView(srcImage, rtOutput, captureScreenImage);
+
+          if (logRaytracerFrame) {
+            Logger::info(str::format(
+              "[Remix-RayTracer] frame=", currentFrameId,
+              " final image=", describeRaytracerImage(srcImage),
+              " upscaler=", static_cast<uint32_t>(m_currentUpscaler),
+              " debugView=", m_common->metaDebugView().getDebugViewIndex(),
+              " captureDebug=", captureDebugImage));
+          }
+
+          // First-use asynchronous pipelines can be discovered after the frame's
+          // initial compilation check. Their dispatch was skipped, so preserve
+          // the game's raster output until every pass has actually run.
+          raytracedThisFrame = failedDispatchCount() == failedDispatchesBefore;
+          if (raytracedThisFrame) {
+            dispatchDLFG();
+            ScopedGpuProfileZone(this, "Blit to Game");
+          
+            // Note: the resolution between srcImage and dstImage always matches
+            // so we can use the same blit with nearest neighbor filtering
+            assert(srcImage->info().extent == targetImage->info().extent);
+            blitImageHelper(this, srcImage, targetImage, VkFilter::VK_FILTER_NEAREST);
+          } else if (logRaytracerFrame) {
+            Logger::info("[Remix-RayTracer] Preserving raster output: a required GPU pipeline was unavailable.");
+          }
+
+          // Log stats when an image is taken
+          if (captureScreenImage) {
+            getSceneManager().logStatistics();
           }
         }
-
-        // Set up output src
-        Rc<DxvkImage> srcImage = rtOutput.m_finalOutput.resource(Resources::AccessType::Read).image;
-
-        // Debug view
-        dispatchDebugView(srcImage, rtOutput, captureScreenImage);
-
-        if (logRaytracerFrame) {
-          Logger::info(str::format(
-            "[Remix-RayTracer] frame=", currentFrameId,
-            " final image=", describeRaytracerImage(srcImage),
-            " upscaler=", static_cast<uint32_t>(m_currentUpscaler),
-            " debugView=", m_common->metaDebugView().getDebugViewIndex(),
-            " captureDebug=", captureDebugImage));
-        }
-
-        dispatchDLFG();
-
-        // Blit to the game target
-        {
-          ScopedGpuProfileZone(this, "Blit to Game");
-          
-          // Note: the resolution between srcImage and dstImage always matches
-          // so we can use the same blit with nearest neighbor filtering
-          assert(srcImage->info().extent == targetImage->info().extent);
-          blitImageHelper(this, srcImage, targetImage, VkFilter::VK_FILTER_NEAREST);
-        }
-
-        // Log stats when an image is taken
-        if (captureScreenImage) {
-          getSceneManager().logStatistics();
-        }
-
-        raytracedThisFrame = true;
       } else if (logRaytracerFrame) {
         Logger::warn(str::format(
           "[Remix-RayTracer] frame=", currentFrameId,
@@ -929,6 +950,10 @@ namespace dxvk {
       }
     }
 
+    if (raytracedThisFrame) {
+      ++m_completedRaytracedFrameCount;
+      m_resetHistory = false;
+    }
     onInjectRtxFrameEnd(raytracedThisFrame);
 
     // apply changes to RtxOptions after the frame has ended
@@ -937,7 +962,6 @@ namespace dxvk {
     // Update stats
     updateMetrics(gpuIdleTimeMilliseconds);
 
-    m_resetHistory = false;
   }
 
 void RtxContext::endFrame(std::uint64_t cachedReflexFrameId, Rc<DxvkImage> targetImage, bool callInjectRtx) {
@@ -955,7 +979,8 @@ void RtxContext::endFrame(std::uint64_t cachedReflexFrameId, Rc<DxvkImage> targe
         
         PerfDebug_EndFeature(FEATURE_RAYTRACING);
       }
-    } else if (m_frameLastInjected != m_device->getCurrentFrameId()) {
+    }
+    if (m_frameLastFinalized != m_device->getCurrentFrameId()) {
       // A raster pass-through frame still submitted candidate geometry to the
       // Remix scene before its UI/loading classification was known. It must
       // therefore finalize the non-rendered RT frame as well. Without this,
@@ -974,6 +999,7 @@ void RtxContext::endFrame(std::uint64_t cachedReflexFrameId, Rc<DxvkImage> targe
           " transientBuffers=", transientBufferCount));
       }
       onInjectRtxFrameEnd(false);
+      RtxOptionManager::applyPendingValues(m_device.ptr(), /* forceOnChange */ false);
     }
 
     // End the performance debug frame timer and write to log
@@ -1359,7 +1385,9 @@ void RtxContext::endFrame(std::uint64_t cachedReflexFrameId, Rc<DxvkImage> targe
       static_cast<uint16_t>(RtxOptions::SubsurfaceScattering::diffusionProfileDebugPixelPosition().y) };
 
     auto& restirGI = m_common->metaReSTIRGIRayQuery();
-    ReSTIRGISampleStealing restirGISampleStealingMode = restirGI.useSampleStealing();
+    const bool resetTemporalHistory = m_resetHistory || getSceneManager().getCamera().isCameraCut();
+    ReSTIRGISampleStealing restirGISampleStealingMode = resetTemporalHistory
+      ? ReSTIRGISampleStealing::None : restirGI.useSampleStealing();
     // Stealing pixels requires indirect light stored in separated buffers instead of combined with direct light,
     // steal samples if separated denoiser is disabled.
     if (restirGISampleStealingMode == ReSTIRGISampleStealing::StealPixel 
@@ -1367,7 +1395,7 @@ void RtxContext::endFrame(std::uint64_t cachedReflexFrameId, Rc<DxvkImage> targe
       restirGISampleStealingMode = ReSTIRGISampleStealing::StealSample;
     }
     constants.enableReSTIRGI = restirGI.isActive();
-    constants.enableReSTIRGITemporalReuse = restirGI.useTemporalReuse();
+    constants.enableReSTIRGITemporalReuse = restirGI.useTemporalReuse() && !resetTemporalHistory;
     constants.enableReSTIRGISpatialReuse = restirGI.useSpatialReuse();
     constants.reSTIRGIMISMode = (uint32_t)restirGI.misMode();
     constants.enableReSTIRGIFinalVisibility = restirGI.useFinalVisibility();
@@ -1487,7 +1515,7 @@ void RtxContext::endFrame(std::uint64_t cachedReflexFrameId, Rc<DxvkImage> targe
     // Bitwise and used rather than modulus as well for slightly better performance.
     constants.timeSinceStartSeconds = (static_cast<uint32_t>(GlobalTime::get().absoluteTimeMs()) & ((1U << 24U) - 1U)) / 1000.f;
 
-    m_common->metaRtxdiRayQuery().setRaytraceArgs(rtOutput);
+    m_common->metaRtxdiRayQuery().setRaytraceArgs(rtOutput, resetTemporalHistory);
     getSceneManager().getLightManager().setRaytraceArgs(
       constants,
       m_common->metaRtxdiRayQuery().initialSampleCount(),
@@ -1500,80 +1528,7 @@ void RtxContext::endFrame(std::uint64_t cachedReflexFrameId, Rc<DxvkImage> targe
 
     constants.skyBrightness = RtxOptions::skyBrightness();
 
-    // DX11_V307_NO_DEGENERATE_SKY_PROBE: SkyboxRasterization makes every
-    // g-buffer/indirect miss sample the SkyProbe cubemap by ray direction. That
-    // cubemap cannot be rasterized correctly on the DX11 runtime - aiming each
-    // of the six faces requires injecting customWorldToProjection into the
-    // game's own DXBC vertex shader, which Remix does not author. All six faces
-    // therefore receive the same view-projected sky, five of them fall outside
-    // their face's clip volume and stay at the clear value, and the player ends
-    // up sitting inside a black box.
-    //
-    // Fall back to the physical atmosphere, which is the only sky path here that
-    // returns correct radiance for an arbitrary direction. This deliberately
-    // overrides rtx.skyMode because the requested value is unimplementable on
-    // this runtime; it is reported once so the override is not silent.
-    SkyMode currentSkyMode = RtxOptions::skyMode();
-
-    // Detect the condition structurally rather than waiting for the first sky
-    // draw to trip the flag: both state constant buffers are null exactly when
-    // hasVertexStateCB would be false in rasterizeToSkyProbe (for either shader
-    // type), and setConstantBuffers has no caller in this fork, so this is
-    // already true on frame 0. Waiting for the flag would leave one frame
-    // rendering the broken mode.
-    const bool skyProbeUnusable = m_skyProbeReprojectionUnavailable
-      || (m_rtState.vertexCaptureCB == nullptr && m_rtState.vsFixedFunctionCB == nullptr);
-
-    if (skyProbeUnusable && currentSkyMode == SkyMode::SkyboxRasterization) {
-      currentSkyMode = SkyMode::PhysicalAtmosphere;
-      ONCE(Logger::warn(
-        "[RTX Sky] rtx.skyMode=SkyboxRasterization cannot be honoured on the DX11 runtime "
-        "(the sky cubemap has no usable per-face reprojection). Using PhysicalAtmosphere "
-        "instead - rasterized skybox mode would render a black box around the camera."));
-    }
-
-    constants.skyMode = static_cast<uint32_t>(currentSkyMode);
-
-    // Detect sky mode changes and clear rasterized sky targets when switching to physical atmosphere.
-    if (currentSkyMode != m_lastSkyMode) {
-      if (currentSkyMode == SkyMode::PhysicalAtmosphere) {
-        auto skyProbe = getResourceManager().getSkyProbe(this, m_skyColorFormat);
-        auto skyMatte = getResourceManager().getSkyMatte(this, m_skyRtColorFormat);
-
-        VkClearValue clearValue = {};
-        clearValue.color.float32[0] = 0.0f;
-        clearValue.color.float32[1] = 0.0f;
-        clearValue.color.float32[2] = 0.0f;
-        clearValue.color.float32[3] = 0.0f;
-
-        if (skyProbe.view != nullptr) {
-          DxvkContext::clearRenderTarget(skyProbe.view, VK_IMAGE_ASPECT_COLOR_BIT, clearValue);
-        }
-
-        if (skyMatte.view != nullptr) {
-          DxvkContext::clearRenderTarget(skyMatte.view, VK_IMAGE_ASPECT_COLOR_BIT, clearValue);
-        }
-      }
-
-      m_lastSkyMode = currentSkyMode;
-    }
-
-    // Update atmosphere parameters and LUTs in physical atmosphere mode.
-    // Note: keyed off currentSkyMode, not RtxOptions::skyMode(), so the DX11
-    // fallback above actually brings the atmosphere up. Reading the option here
-    // would publish skyMode=PhysicalAtmosphere to the shader while leaving
-    // m_atmosphere null and atmosphereArgs unwritten - the miss path would take
-    // the atmosphere branch with no LUTs behind it and the sky would go black a
-    // different way.
-    if (currentSkyMode == SkyMode::PhysicalAtmosphere) {
-      if (!m_atmosphere) {
-        m_atmosphere = std::make_unique<RtxAtmosphere>(m_device.ptr());
-      }
-
-      m_atmosphere->initialize(this);
-      m_atmosphere->computeLuts(this);
-      constants.atmosphereArgs = m_atmosphere->getAtmosphereArgs();
-    }
+    fork_hooks::updateAtmosphereConstants(*this, constants);
 
     constants.isLastCompositeOutputValid = restirGI.isActive() && restirGI.getLastCompositeOutput().matchesWriteFrameIdx(frameIdx - 1);
     constants.isZUp = RtxOptions::zUp();
@@ -1659,28 +1614,7 @@ void RtxContext::endFrame(std::uint64_t cachedReflexFrameId, Rc<DxvkImage> targe
     bindResourceSampler(BINDING_VALUE_NOISE_SAMPLER, linearSampler);
     bindResourceBuffer(BINDING_SAMPLER_READBACK_BUFFER, DxvkBufferSlice(samplerFeedbackBuffer, 0, samplerFeedbackBuffer.ptr() ? samplerFeedbackBuffer->info().size : 0));
 
-    // Atmosphere LUTs are declared in common bindings and must always be bound.
-    if (!m_atmosphere) {
-      m_atmosphere = std::make_unique<RtxAtmosphere>(m_device.ptr());
-    }
-
-    m_atmosphere->initialize(this);
-
-    auto transmittanceLut = m_atmosphere->getTransmittanceLut();
-    auto multiscatteringLut = m_atmosphere->getMultiscatteringLut();
-    auto skyViewLut = m_atmosphere->getSkyViewLut();
-
-    if (transmittanceLut.isValid()) {
-      bindResourceView(BINDING_ATMOSPHERE_TRANSMITTANCE_LUT, transmittanceLut.view, nullptr);
-    }
-
-    if (multiscatteringLut.isValid()) {
-      bindResourceView(BINDING_ATMOSPHERE_MULTISCATTERING_LUT, multiscatteringLut.view, nullptr);
-    }
-
-    if (skyViewLut.isValid()) {
-      bindResourceView(BINDING_ATMOSPHERE_SKY_VIEW_LUT, skyViewLut.view, nullptr);
-    }
+    fork_hooks::bindAtmosphereLuts(*this);
   }
 
   void RtxContext::bindResourceView(const uint32_t slot, const Rc<DxvkImageView>& imageView, const Rc<DxvkBufferView>& bufferView)
@@ -1790,9 +1724,12 @@ void RtxContext::endFrame(std::uint64_t cachedReflexFrameId, Rc<DxvkImage> targe
 
   void RtxContext::dispatchIntegrate(const Resources::RaytracingOutput& rtOutput) {
     ScopedGpuProfileZone(this, "Integrate Raytracing");
+    const uint64_t failures = failedDispatchCount();
 
     // Integrate direct
     m_common->metaPathtracerIntegrateDirect().dispatch(this, rtOutput);
+    if (failedDispatchCount() != failures)
+      return;
 
     // RTXDI Gradient pass
     m_common->metaRtxdiRayQuery().dispatchGradient(this, rtOutput);
@@ -1804,18 +1741,25 @@ void RtxContext::endFrame(std::uint64_t cachedReflexFrameId, Rc<DxvkImage> targe
       
       m_common->metaPathtracerIntegrateIndirect().dispatch(this, rtOutput);
     }
+    if (failedDispatchCount() != failures)
+      return;
 
     // Integrate indirect - NEE Cache pass
     m_common->metaPathtracerIntegrateIndirect().dispatchNEE(this, rtOutput);
   }
 
   void RtxContext::dispatchPathTracing(const Resources::RaytracingOutput& rtOutput) {
+    const uint64_t failures = failedDispatchCount();
 
     // Gbuffer Raytracing
     m_common->metaPathtracerGbuffer().dispatch(this, rtOutput);
+    if (failedDispatchCount() != failures)
+      return;
 
     // RTXDI
     m_common->metaRtxdiRayQuery().dispatch(this, rtOutput);
+    if (failedDispatchCount() != failures)
+      return;
 
     // NEE Cache
     dispatchNeeCache(rtOutput);
@@ -2548,6 +2492,15 @@ void RtxContext::endFrame(std::uint64_t cachedReflexFrameId, Rc<DxvkImage> targe
     return *static_cast<D3D11SharedPS*>(slice.mapPtr);
   }
 
+  SkyMode RtxContext::getEffectiveSkyMode() const {
+    const SkyMode requestedMode = RtxOptions::skyMode();
+    const bool probeUnavailable = m_skyProbeReprojectionUnavailable ||
+      (m_rtState.vertexCaptureCB == nullptr && m_rtState.vsFixedFunctionCB == nullptr);
+    return requestedMode == SkyMode::SkyboxRasterization &&
+           RtxOptions::skyAutoPhysicalAtmosphereFallback() && probeUnavailable
+      ? SkyMode::PhysicalAtmosphere : requestedMode;
+  }
+
   void RtxContext::rasterizeToSkyMatte(const DrawParameters& params, const DrawCallState& drawCallState) {
     ScopedGpuProfileZone(this, "rasterizeToSkyMatte");
 
@@ -2732,34 +2685,11 @@ void RtxContext::endFrame(std::uint64_t cachedReflexFrameId, Rc<DxvkImage> targe
         prevCB.fixedFunction = *static_cast<D3D11FixedFunctionVS*>(m_rtState.vsFixedFunctionCB->mapPtr(0));
       }
     } else {
-      // DX11_V307_NO_DEGENERATE_SKY_PROBE: do not rasterize the cube at all.
-      //
-      // The loop below binds each of the 6 cube faces in turn and re-draws the
-      // sky geometry, relying on customWorldToProjection to aim the draw at that
-      // face. That injection needs m_rtState.vertexCaptureCB, which does not
-      // exist in this fork (RtxContext::setConstantBuffers has no caller), and
-      // it cannot be made to exist for DXBC titles: the reprojection has to
-      // happen inside the game's own compiled vertex shader, which Remix does
-      // not author. D3D11SpecConstantId::CustomVertexTransformEnabled is set
-      // below but appears nowhere in src/d3d11 or the shaders, so it is inert.
-      //
-      // Running the loop anyway wrote the SAME view-projected sky into all six
-      // faces. Five of the six directions fall outside their face's clip volume
-      // and keep the clear value, so the resulting cubemap is a mostly-black box
-      // centred on the camera - and because SkyProbe is sampled by direction on
-      // every g-buffer/indirect miss, the player sits inside that black box.
-      // It also cost six extra full sky-dome draws per sky draw per frame for a
-      // result that was never usable.
-      //
-      // Skip it and let the sky come from the physical atmosphere instead (see
-      // updateAtmosphereConstants, which forces PhysicalAtmosphere once this
-      // flag is set). Leave the probe cleared rather than filled with garbage.
+      // Without a transform consumed by the game shader, six replays would
+      // write the same view to every face. Keep the camera-visible sky matte;
+      // the optional physical fallback is selected by getEffectiveSkyMode().
       m_skyProbeReprojectionUnavailable = true;
-      ONCE(Logger::warn(
-        "[RTX Sky] Sky probe per-face reprojection is unavailable on the DX11 runtime "
-        "(no vertex-capture constant buffer, and DXBC vertex shaders cannot be reprojected). "
-        "Skipping skybox-cubemap rasterization and switching the sky to the physical "
-        "atmosphere model; rasterized skybox mode would render a black box around the camera."));
+      ONCE(Logger::info("[RTX Sky] Cubemap reprojection is unavailable for this vertex shader; using the rasterized sky matte for camera rays."));
       return;
     }
 
@@ -2965,7 +2895,7 @@ void RtxContext::endFrame(std::uint64_t cachedReflexFrameId, Rc<DxvkImage> targe
 
   void RtxContext::rasterizeSky(const DrawParameters& params, const DrawCallState& drawCallState) {
     // Skip rasterized sky rendering when physical atmosphere mode is active.
-    if (RtxOptions::skyMode() == SkyMode::PhysicalAtmosphere) {
+    if (getEffectiveSkyMode() == SkyMode::PhysicalAtmosphere) {
       return;
     }
 

@@ -393,7 +393,9 @@ namespace dxvk {
     // locations in dxvk environment. Hold a lock.
     std::lock_guard<dxvk::mutex> _(m_flushMutex);
 
-    if (m_sizeInFlight == 0) {
+    // A synchronous drain must also finish a previous asynchronous flush,
+    // even if no new requests have been enqueued since it was submitted.
+    if (m_sizeInFlight == 0 && async) {
       return true;
     }
 

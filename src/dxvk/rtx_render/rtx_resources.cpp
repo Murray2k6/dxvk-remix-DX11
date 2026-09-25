@@ -1112,7 +1112,8 @@ namespace dxvk {
 
     // RTXDI Data
     m_raytracingOutput.m_gbufferLast = createImageResource(ctx, "rtxdi gbuffer last", m_downscaledExtent, VK_FORMAT_R32G32_SFLOAT);
-    m_raytracingOutput.m_reprojectionConfidence = createImageResource(ctx, "rtxdi reprojection confidence", m_downscaledExtent, VK_FORMAT_R16_SFLOAT);
+    m_raytracingOutput.m_reprojectionConfidence[0] = createImageResource(ctx, "rtxdi reprojection confidence 0", m_downscaledExtent, VK_FORMAT_R16_SFLOAT);
+    m_raytracingOutput.m_reprojectionConfidence[1] = createImageResource(ctx, "rtxdi reprojection confidence 1", m_downscaledExtent, VK_FORMAT_R16_SFLOAT);
     m_raytracingOutput.m_rtxdiConfidence[0] = AliasedResource(ctx, m_downscaledExtent, VK_FORMAT_R16_SFLOAT, "RTXDI Confidence 0");
     m_raytracingOutput.m_rtxdiConfidence[1] = AliasedResource(ctx, m_downscaledExtent, VK_FORMAT_R16_SFLOAT, "RTXDI Confidence 1");
 
@@ -1123,11 +1124,11 @@ namespace dxvk {
     // RTXDI Best Lights - using the same downscaling factor as Gradients
     m_raytracingOutput.m_rtxdiBestLights = AliasedResource(ctx, rtxDiGradientExtents, VK_FORMAT_R16G16_UINT, "RTXDI Best Lights");
 
-    int numReservoirBuffer = 3;
-    int reservoirSize = sizeof(RTXDI_PackedReservoir);
-    int renderWidthBlocks = (m_downscaledExtent.width + RTXDI_RESERVOIR_BLOCK_SIZE - 1) / RTXDI_RESERVOIR_BLOCK_SIZE;
-    int renderHeightBlocks = (m_downscaledExtent.height + RTXDI_RESERVOIR_BLOCK_SIZE - 1) / RTXDI_RESERVOIR_BLOCK_SIZE;
-    int reservoirBufferPixels = renderWidthBlocks * renderHeightBlocks * RTXDI_RESERVOIR_BLOCK_SIZE * RTXDI_RESERVOIR_BLOCK_SIZE;
+    constexpr VkDeviceSize numReservoirBuffer = 3;
+    constexpr VkDeviceSize reservoirSize = sizeof(RTXDI_PackedReservoir);
+    const VkDeviceSize renderWidthBlocks = (VkDeviceSize(m_downscaledExtent.width) + RTXDI_RESERVOIR_BLOCK_SIZE - 1) / RTXDI_RESERVOIR_BLOCK_SIZE;
+    const VkDeviceSize renderHeightBlocks = (VkDeviceSize(m_downscaledExtent.height) + RTXDI_RESERVOIR_BLOCK_SIZE - 1) / RTXDI_RESERVOIR_BLOCK_SIZE;
+    const VkDeviceSize reservoirBufferPixels = renderWidthBlocks * renderHeightBlocks * RTXDI_RESERVOIR_BLOCK_SIZE * RTXDI_RESERVOIR_BLOCK_SIZE;
     DxvkBufferCreateInfo rtxdiBufferInfo;
     rtxdiBufferInfo.usage = VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
     rtxdiBufferInfo.stages = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;

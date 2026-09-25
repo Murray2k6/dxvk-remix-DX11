@@ -1,10 +1,13 @@
 #pragma once
 
-#include "../dxvk/dxvk_device.h"
+#include "../util/util_flags.h"
+#include "../util/rc/util_rc_ptr.h"
+#include <vulkan/vulkan.h>
 
 namespace dxvk {
 
   struct D3D11Options;
+  class DxvkDevice;
 
   enum class DxbcFloatControlFlag : uint32_t {
     DenormFlushToZero32,

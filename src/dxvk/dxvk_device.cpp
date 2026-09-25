@@ -583,6 +583,18 @@ namespace dxvk {
 
   void DxvkObjects::onDestroy() {
     getRtxInitializer().onDestroy();
+    getTextureManager().stopAsync();
+
+    // No frontend or asset worker can schedule more work now. Join the
+    // pipeline workers before destroying their deferred-operation finalizer,
+    // then drain GPU submissions before releasing resources that break
+    // CommonDeviceObject's references back to this device.
+    pipelineManager().stopWorkerThreads();
+    DxvkRaytracingPipeline::releaseFinalizer();
+    m_device->waitForIdle();
+    m_exporter.get().onDestroy();
+    m_capturer->onDestroy();
+    getTextureManager().onDestroy();
 
     metaGeometryUtils().onDestroy();
     getSceneManager().onDestroy();

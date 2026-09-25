@@ -81,7 +81,7 @@ namespace dxvk {
     if (m_renderTargets.depth.view != nullptr)
       result.depthView = m_renderTargets.depth.view->cookie();
 
-    if (result.renderPass)
+    if (m_renderPass)
       result.renderPass = m_renderPass->getDefaultHandle();
 
     return result;

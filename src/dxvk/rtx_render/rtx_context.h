@@ -90,6 +90,9 @@ namespace dxvk {
 
     float getGpuIdleTimeSinceLastCall();
 
+    // Keep the user's sky selection intact; automatic fallback is opt-in.
+    SkyMode getEffectiveSkyMode() const;
+
     /**
       * \brief Reset screen resolution, and resize all screen
       *        buffers to specified resolution if required.
@@ -109,6 +112,7 @@ namespace dxvk {
       */
     void injectRTX(std::uint64_t cachedReflexFrameId, Rc<DxvkImage> targetImage = nullptr);
     void endFrame(std::uint64_t cachedReflexFrameId, Rc<DxvkImage> targetImage = nullptr, bool callInjectRtx = true);
+    uint64_t completedRaytracedFrameCount() const { return m_completedRaytracedFrameCount; }
 
     void onPresent(Rc<DxvkImage> targetImage = nullptr);
 
@@ -246,21 +250,22 @@ namespace dxvk {
     InternalUpscaler m_previousUpscaler = InternalUpscaler::None;
 
     uint32_t m_frameLastInjected = kInvalidFrameIndex;
+    uint64_t m_completedRaytracedFrameCount = 0;
+    uint32_t m_frameLastFinalized = kInvalidFrameIndex;
     bool m_captureStateForRTX = true;
 
     Rc<DxvkImage> m_skyProbeImage;
     Rc<DxvkImageView> m_skyProbeCubePlanes[6];
     VkFormat m_skyColorFormat = VK_FORMAT_B10G11R11_UFLOAT_PACK32;
     VkFormat m_skyRtColorFormat = VK_FORMAT_B10G11R11_UFLOAT_PACK32;
-    VkClearValue m_skyClearValue;
+    VkClearValue m_skyClearValue = {};
     bool m_skyClearDirty = false;
     SkyMode m_lastSkyMode = SkyMode::SkyboxRasterization;
 
     // Set when rasterizeToSkyProbe finds it cannot aim the six cube-face draws
     // (no vertex-capture constant buffer; DXBC vertex shaders cannot be
-    // reprojected by Remix). While true, SkyboxRasterization can only produce a
-    // black cubemap wrapped around the camera, so the sky is served by the
-    // physical atmosphere instead. See DX11_V307_NO_DEGENERATE_SKY_PROBE.
+    // reprojected by Remix). Primary rays use the rasterized sky matte in this
+    // case; the physical atmosphere fallback remains an explicit option.
     bool m_skyProbeReprojectionUnavailable = false;
 
     std::unique_ptr<RtxAtmosphere> m_atmosphere;

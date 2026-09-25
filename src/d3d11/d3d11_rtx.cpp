@@ -15,6 +15,7 @@
 #include "d3d11_rasterizer.h"
 #include "../../include/remix/emulator_draw_abi.h"
 #include "d3d11_camera_resolver.h"
+#include "d3d11_rtx_index_range.h"
 
 #include "../dxvk/imgui/dxvk_imgui.h"
 #include "../dxvk/rtx_render/rtx_context.h"
@@ -8249,7 +8250,9 @@ namespace dxvk {
     // Count only complete position elements. The old length/stride division
     // ignored the semantic byte offset and could advertise one extra vertex;
     // an index to that element then made the BLAS read past the buffer slice.
-    const uint32_t positionBytes = positionElementBytes(posBuffer.vertexFormat());
+    // The authenticated GS path below decodes packed uint16 XY separately.
+    const uint32_t positionBytes = pcsx2PostTransformDraw
+      ? 4u : positionElementBytes(posBuffer.vertexFormat());
     const VkDeviceSize positionOffset = posBuffer.offsetFromSlice();
     const VkDeviceSize positionLength = posBuffer.length();
     const VkDeviceSize positionReadable = positionLength > positionOffset
@@ -8316,57 +8319,35 @@ namespace dxvk {
       static constexpr uint32_t kMaxIndexScan = 4u << 20; // cap submit-thread work
       if (idxScan && scanCount > 0 && scanCount <= kMaxIndexScan) {
         const bool primitiveRestart = vkTopology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP;
-        bool invalidIndex = false;
-        if (idxBuffer.indexType() == VK_INDEX_TYPE_UINT32) {
-          const uint32_t* ip = static_cast<const uint32_t*>(idxScan);
-          for (uint32_t i = 0; i < scanCount; ++i) {
-            const uint32_t index = ip[i];
-            if (primitiveRestart && index == UINT32_MAX)
-              continue;
-            if (index >= maxVBVertices) {
-              invalidIndex = true;
-              break;
-            }
-            maxIndexPlusOne = std::max(maxIndexPlusOne, index + 1u);
-          }
-        } else {
-          const uint16_t* ip = static_cast<const uint16_t*>(idxScan);
-          for (uint32_t i = 0; i < scanCount; ++i) {
-            const uint32_t index = ip[i];
-            if (primitiveRestart && index == UINT16_MAX)
-              continue;
-            if (index >= maxVBVertices) {
-              invalidIndex = true;
-              break;
-            }
-            maxIndexPlusOne = std::max(maxIndexPlusOne, index + 1u);
-          }
-        }
-        if (invalidIndex || maxIndexPlusOne == 0) {
+        const auto range = idxBuffer.indexType() == VK_INDEX_TYPE_UINT32
+          ? rtx::scanIndexRange<uint32_t>(idxScan, scanCount, maxVBVertices, primitiveRestart)
+          : rtx::scanIndexRange<uint16_t>(idxScan, scanCount, maxVBVertices, primitiveRestart);
+        if (!range.valid) {
           ++m_submitRejectStats.indexRangeRejected;
           return;
         }
+        maxIndexPlusOne = range.vertexCount;
       }
       if (maxIndexPlusOne > 0) {
         // Exact maximum known - size the vertex range to it.
         indexRangeExact = true;
         drawVertexCount = std::min(maxIndexPlusOne, maxVBVertices);
       } else {
-        // Index data not CPU-readable (or draw too large to scan). Index values
-        // may reference ANY vertex in the remaining buffer: many engines bake
-        // absolute offsets into the indices instead of using BaseVertexLocation,
-        // so clamping to the index count would leave indices pointing past the
-        // vertex range Remix copies - out-of-bounds fetches that render as
-        // exploded triangle spikes. Cover the whole remaining buffer, bounded to
-        // keep the interleave allocation sane; beyond that the draw cannot be
-        // made safe, so drop it rather than corrupt the scene.
+        // Cover the index type's entire addressable range, bounded by the
+        // remaining vertex slice. Shared 128 MiB buffers are common; rejecting
+        // them by allocation size discarded valid 16-bit draws before compact
+        // GPU capture could run, and copying them wasted millions of vertices.
+        const bool primitiveRestart = vkTopology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP;
+        const uint32_t addressableVertices = idxBuffer.indexType() == VK_INDEX_TYPE_UINT32
+          ? rtx::addressableVertexCount<uint32_t>(maxVBVertices, primitiveRestart)
+          : rtx::addressableVertexCount<uint16_t>(maxVBVertices, primitiveRestart);
         static constexpr uint32_t kMaxUnknownRangeVertices = 4u << 20;
-        if (maxVBVertices > kMaxUnknownRangeVertices) {
+        if (addressableVertices > kMaxUnknownRangeVertices) {
           ++m_submitRejectStats.vertexRangeRejected;
           return;
         }
         usedWholeVertexBufferFallback = true;
-        drawVertexCount = maxVBVertices;
+        drawVertexCount = addressableVertices;
       }
       hashCount = std::min(drawVertexCount, count);
     }

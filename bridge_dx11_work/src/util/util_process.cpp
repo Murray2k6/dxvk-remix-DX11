@@ -49,8 +49,8 @@ namespace bridge_util {
       lpCommandLine, // command line
       NULL,          // process security attributes
       NULL,          // primary thread security attributes
-      TRUE,          // handles are inherited
-      HIGH_PRIORITY_CLASS,             // creation flags
+      FALSE,         // bridge duplicates only the handles the server needs
+      CREATE_NO_WINDOW,                // creation flags
       NULL,          // use parent's environment
       NULL,          // use parent's current directory
       &siStartInfo,  // STARTUPINFO pointer
@@ -92,6 +92,7 @@ namespace bridge_util {
       free(lpCommandLine);
       return INVALID_HANDLE_VALUE;
     } else {
+      free(lpCommandLine);
       processMainThreadId = GetThreadId(piProcInfo.hThread);
       CloseHandle(piProcInfo.hThread);
       return piProcInfo.hProcess;
@@ -100,7 +101,7 @@ namespace bridge_util {
 
   void Process::releaseChildProcess() {
     // Ensure this process is around until the child process terminates
-    if (INVALID_HANDLE_VALUE != hProcess) {
+    if (hProcess && INVALID_HANDLE_VALUE != hProcess) {
       UnregisterExitCallback();
 
       // Give the child process 3 seconds to terminate on its own before we kill it
@@ -111,14 +112,12 @@ namespace bridge_util {
       CloseHandle(hProcess);
     }
     // Also close the duplicate client process handle that we created for the server
-    if (INVALID_HANDLE_VALUE != hDuplicate) {
-      CloseHandle(hDuplicate);
-    }
+    // hDuplicate belongs to the child process handle table, not this process.
   }
 
   bool Process::RegisterExitCallback(ProcessExitCallback callback) {
     // If no callback was passed in or one is already registered then bail out
-    if (!callback || exitCallback) {
+    if (!isValid() || !callback || exitCallback) {
       return false;
     }
 

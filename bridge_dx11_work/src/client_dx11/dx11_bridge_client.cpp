@@ -42,6 +42,8 @@ static bool gAttached = false;
 static std::string gRemixFolder;
 static Process* gpServer = nullptr;
 static bool gBridgeLaunchAttemptedV219 = false;
+static std::atomic<bool> gBridgeReady { false };
+static std::atomic<bool> gServerExited { false };
 static NamedSemaphore* gpPresent = nullptr;
 static std::chrono::steady_clock::time_point gTimeStart;
 
@@ -515,10 +517,8 @@ static uintptr_t DuplicateCurrentGameProcessHandleIntoServerV219(DWORD serverPid
 
 
 static void PrepareRemixServerRuntimeEnvironmentV219(const std::string& gameRoot, const std::string& trexRoot) {
-  AddDllDirectoryCompatV219(trexRoot);
-  AddDllDirectoryCompatV219(gameRoot);
-
-  PrependEnvPathV219("PATH", trexRoot + ";" + gameRoot);
+  // The launcher configures DLL search paths in the x64 child. Adding .trex to
+  // the x86 game's search path can make middleware load incompatible x64 DLLs.
   SetEnvironmentVariableA("DXVK_REMIX_GAME_DIR", gameRoot.c_str());
   SetEnvironmentVariableA("DXVK_REMIX_TREX_DIR", trexRoot.c_str());
   SetEnvironmentVariableA("DXVK_REMIX_BRIDGE_SERVER_HOSTS_RUNTIME", "1");
@@ -601,7 +601,6 @@ static void EnsureLauncherClientBridgeStarterV219(const std::string& gameRoot) {
 }
 void SetModule(HMODULE moduleHandle) {
   gModule = moduleHandle;
-  if (gRemixFolder.empty() && moduleHandle) gRemixFolder = GetFolderFromModule(moduleHandle);
 }
 
 HMODULE LoadSystemDll(const char* dllName) {
@@ -619,16 +618,11 @@ HMODULE LoadSystemDll(const char* dllName) {
 }
 
 static void OnServerExited(Process const*) {
-  // DX11_V219_D3D11_CLIENT_LIFETIME
-  // Do not permanently disable the bridge client if the server host reloads/exits.
-  // Keep the D3D11 client alive so the next D3D11 device call can reconnect.
-  BridgeState::setServerState(BridgeState::ProcessState::Exited);
-  if (gpServer) {
-    delete gpServer;
-    gpServer = nullptr;
-  }
-  gbBridgeRunning = true;
-  LogLine("bridge", "DX11_V219 bridge/launcher exited; keeping D3D11 client alive but not auto-opening another bridge in this same game process.");
+  // Never destroy Process from its own wait callback: its destructor waits for
+  // this callback to finish. The render thread observes this failure on its next
+  // EnsureServer call and stops sending commands to the dead IPC reader.
+  gBridgeReady.store(false, std::memory_order_release);
+  gServerExited.store(true, std::memory_order_release);
 }
 
 bool Attach() {
@@ -641,6 +635,15 @@ bool Attach() {
 
   if (!AcquireProcessBridgeClientOwnership()) {
     gAttached = false;
+    return false;
+  }
+
+  // Capture replaces COM vtable entries for the lifetime of the process. Keep
+  // their implementation mapped even if middleware releases its DLL reference.
+  HMODULE pinned = nullptr;
+  if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
+      reinterpret_cast<LPCSTR>(&Attach), &pinned)) {
+    ReleaseProcessBridgeClientOwnership();
     return false;
   }
 
@@ -669,10 +672,10 @@ bool Attach() {
 
 bool EnsureServer() {
   std::lock_guard<std::mutex> lock(gServerMutex);
-  if (gpServer) return true;
+  if (gBridgeReady.load(std::memory_order_acquire)
+      && !gServerExited.load(std::memory_order_acquire)) return true;
   if (gBridgeLaunchAttemptedV219) {
-    LogLine("bridge", "DX11_V219 bridge launch was already attempted in this game process; not opening another launcher/bridge.");
-    return true;
+    return false;
   }
   if (!Attach()) return false;
   if (!gThisDllOwnsBridgeClient) return false;
@@ -708,8 +711,10 @@ bool EnsureServer() {
   std::stringstream cmdSS;
   cmdSS << '"' << launcherPath << '"';
   cmdSS << " --dx11-launch-bridge";
-  cmdSS << " --game-root " << '"' << gRemixFolder << '"';
-  cmdSS << " --trex-root " << '"' << trexRoot << '"';
+  // Double the trailing backslash before the closing quote. Otherwise Windows
+  // command-line parsing escapes the quote and consumes the following switches.
+  cmdSS << " --game-root " << '"' << gRemixFolder << "\\\"";
+  cmdSS << " --trex-root " << '"' << trexRoot << "\\\"";
   cmdSS << " --guid " << sharedGuidV219;
   cmdSS << " --version " << BRIDGE_VERSION;
   cmdSS << " --game-cmd-file " << '"' << gameCmdFileV219 << '"';
@@ -785,12 +790,16 @@ bool EnsureServer() {
 
   BridgeState::setClientState(BridgeState::ProcessState::Running);
   BridgeState::setServerState(BridgeState::ProcessState::Running);
+  // The launcher remains alive until the actual x64 server exits.
+  if (!IsProcessStillRunningV219(gpServer->GetProcessHandle())) return false;
+  gBridgeReady.store(true, std::memory_order_release);
   LogLine("bridge", "DX11 bridge client/server handshake completed.");
   return true;
 }
 
 void Detach() {
   std::lock_guard<std::mutex> lock(gServerMutex);
+  gBridgeReady.store(false, std::memory_order_release);
   if (gAttached) {
     BridgeState::setClientState(BridgeState::ProcessState::DoneProcessing);
     if (gpServer) {

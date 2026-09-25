@@ -42,7 +42,7 @@ namespace dxvk {
     void dispatchConfidence(RtxContext* ctx, const Resources::RaytracingOutput& rtOutput);
 
     void showImguiSettings();
-    void setRaytraceArgs(Resources::RaytracingOutput& rtOutput) const;
+    void setRaytraceArgs(Resources::RaytracingOutput& rtOutput, bool resetHistory);
     bool getEnableDenoiserConfidence(RtxContext& ctx) const;
     // Returns true if denoiser gradient calculation is enabled and actually consumed downstream
     // (NRD primary denoiser or ReSTIR GI lighting validation).
@@ -83,5 +83,11 @@ namespace dxvk {
     RTX_OPTION("rtx.di", float, confidenceGradientScale, 6.f, "");
     RTX_OPTION("rtx.di", float, minimumConfidence, 0.1f, "");
     RTX_OPTION("rtx.di", float, confidenceHitDistanceSensitivity, 300.0f, "");
+
+  private:
+    // Aliased G-buffer ownership alone cannot prove that DI ran last frame.
+    uint32_t m_lastDispatchFrame = 0;
+    bool m_hasDispatched = false;
+    bool m_previousFrameValid = false;
   };
 }

@@ -72,6 +72,10 @@ build.bat
 
 The orchestrator (`build_dxvk_all_ninja.ps1`) builds the x64 runtime, compiles the RTX shaders, builds the x86 bridge client and x64 bridge server, and stages everything into `_output/` with the complete satellite payload. `package_release.ps1` zips a release layout.
 
+See [DX11 build and deployment details](documentation/DX11_BUILD_AND_DEPLOYMENT.md)
+for the active source paths, required architecture layout, initialization checks
+and current x86 capture limitations.
+
 ## Troubleshooting
 
 The runtime writes logs next to the game executable, built to make failures diagnosable from a single file:

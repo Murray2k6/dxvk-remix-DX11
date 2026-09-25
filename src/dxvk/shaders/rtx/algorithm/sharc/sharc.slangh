@@ -1,0 +1,56 @@
+#pragma once
+
+// This software contains source code provided by NVIDIA Corporation.
+#include "rtx/algorithm/sharc/sharc_args.h"
+
+#ifndef SHARC_UPDATE
+#define SHARC_UPDATE 0
+#endif
+#ifndef SHARC_QUERY
+#define SHARC_QUERY 0
+#endif
+#define SHARC_ENABLE_RESPONSIVE_LIGHTING 0
+#define SHARC_ENABLE_GLSL 0
+#define SHARC_MATERIAL_DEMODULATION 1
+
+// Use the SDK's bounded 32-bit lock fallback on devices without atomic int64.
+#define HASH_GRID_ENABLE_64_BIT_ATOMICS 0
+// Update paths trace a complete radiance sample, rather than feeding estimates
+// from the cache back into itself. One sample is submitted per sparse path.
+#define SHARC_ENABLE_CACHE_RESAMPLING 0
+#define SHARC_PROPAGATION_DEPTH 1
+#define SHARC_SAMPLE_NUM_THRESHOLD 3
+#define SHARC_MAX_SAMPLES_PER_FRAME 64
+#include "rtx/algorithm/sharc/sdk/SharcCommon.h"
+
+[[vk::push_constant]] ConstantBuffer<SharcArgs> sharcArgs;
+
+layout(binding = SHARC_BINDING_HASH_ENTRIES)
+RWStructuredBuffer<uint64_t> SharcHashEntries;
+layout(binding = SHARC_BINDING_ACCUMULATION)
+RWStructuredBuffer<SharcAccumulationData> SharcAccumulation;
+layout(binding = SHARC_BINDING_RESOLVED)
+RWStructuredBuffer<SharcPackedData> SharcResolved;
+layout(binding = SHARC_BINDING_LOCKS)
+RWStructuredBuffer<uint> SharcLocks;
+
+uint2 sharcUpdatePixelCoordinate(uint2 launchCoordinate) {
+  uint stride = sharcArgs.updateStride;
+  uint offset = cb.frameIdx % (stride * stride);
+  return launchCoordinate * stride + uint2(offset % stride, offset / stride);
+}
+
+SharcParameters makeSharcParameters() {
+  SharcParameters parameters;
+  parameters.hashGridParameters.cameraPosition = cameraGetWorldPosition(cb.camera) * sharcArgs.worldToMeters;
+  parameters.hashGridParameters.logarithmBase = SHARC_GRID_LOGARITHM_BASE;
+  parameters.hashGridParameters.sceneScale = sharcArgs.sceneScale;
+  parameters.hashGridParameters.levelBias = SHARC_GRID_LEVEL_BIAS;
+  parameters.hashGridData.capacity = sharcArgs.capacity;
+  parameters.hashGridData.hashEntriesBuffer = SharcHashEntries;
+  parameters.hashGridData.lockBuffer = SharcLocks;
+  parameters.radianceScale = 1000.0f;
+  parameters.accumulationBuffer = SharcAccumulation;
+  parameters.resolvedBuffer = SharcResolved;
+  return parameters;
+}

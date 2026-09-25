@@ -17,6 +17,7 @@ static HMODULE gSystemDxgi = nullptr;
 static PFN_CreateDXGIFactory pCreateDXGIFactory = nullptr;
 static PFN_CreateDXGIFactory1 pCreateDXGIFactory1 = nullptr;
 static PFN_CreateDXGIFactory2 pCreateDXGIFactory2 = nullptr;
+static INIT_ONCE gSystemDxgiOnce = INIT_ONCE_STATIC_INIT;
 
 using PFN_FactoryCreateSwapChain = HRESULT (STDMETHODCALLTYPE *)(IDXGIFactory*, IUnknown*, DXGI_SWAP_CHAIN_DESC*, IDXGISwapChain**);
 using PFN_Factory2CreateSwapChainForHwnd = HRESULT (STDMETHODCALLTYPE *)(IDXGIFactory2*, IUnknown*, HWND, const DXGI_SWAP_CHAIN_DESC1*, const DXGI_SWAP_CHAIN_FULLSCREEN_DESC*, IDXGIOutput*, IDXGISwapChain1**);
@@ -38,13 +39,17 @@ static void DLog(const char* text) {
   dx11_bridge_client::LogLine("dxgi", text);
 }
 
-static HMODULE LoadSystemDxgiV229() {
-  if (gSystemDxgi) return gSystemDxgi;
+static BOOL CALLBACK InitializeSystemDxgi(PINIT_ONCE, PVOID, PVOID*) {
   gSystemDxgi = dx11_bridge_client::LoadSystemDll("dxgi.dll");
-  if (!gSystemDxgi) return nullptr;
+  if (!gSystemDxgi) return FALSE;
   pCreateDXGIFactory = reinterpret_cast<PFN_CreateDXGIFactory>(GetProcAddress(gSystemDxgi, "CreateDXGIFactory"));
   pCreateDXGIFactory1 = reinterpret_cast<PFN_CreateDXGIFactory1>(GetProcAddress(gSystemDxgi, "CreateDXGIFactory1"));
   pCreateDXGIFactory2 = reinterpret_cast<PFN_CreateDXGIFactory2>(GetProcAddress(gSystemDxgi, "CreateDXGIFactory2"));
+  return TRUE;
+}
+
+static HMODULE LoadSystemDxgiV229() {
+  InitOnceExecuteOnce(&gSystemDxgiOnce, InitializeSystemDxgi, nullptr, nullptr);
   return gSystemDxgi;
 }
 
@@ -155,7 +160,8 @@ static void OnSwapChainCreatedV229(const char* path, IDXGISwapChain* swapChain) 
   char msg[320] = {};
   sprintf_s(msg, sizeof(msg), "DX11_V229: %s returned a swapchain; starting bridge and installing presentation capture.", path);
   DLog(msg);
-  dx11_bridge_client::EnsureServer();
+  // Only d3d11 owns the IPC queues. A second client in dxgi would acquire the
+  // process owner before device creation and leave d3d11 unable to stream draws.
   TryInstallD3D11SwapChainHookV229(swapChain);
 }
 
@@ -193,6 +199,11 @@ static HRESULT STDMETHODCALLTYPE HFactoryMediaCreateSwapChainForCompositionSurfa
 
 static void InstallFactoryHooksV229(void* factory) {
   if (!factory) return;
+  // Factory vtables belong to the system DLL and outlive the caller's LoadLibrary
+  // reference. Keep our hook destinations valid until the process exits.
+  HMODULE pinnedModule = nullptr;
+  if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
+      reinterpret_cast<LPCWSTR>(&InstallFactoryHooksV229), &pinnedModule)) return;
   IUnknown* unknown = reinterpret_cast<IUnknown*>(factory);
 
   IDXGIFactory* factory0 = nullptr;
@@ -220,9 +231,7 @@ BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, LPVOID reserved) {
   if (reason == DLL_PROCESS_ATTACH) {
     DisableThreadLibraryCalls(hinst);
     dx11_bridge_client::SetModule(hinst);
-    DLog("DX11_V229: game loaded root dxgi.dll with complete, interface-safe swapchain capture.");
   }
-  if (reason == DLL_PROCESS_DETACH && reserved != nullptr) dx11_bridge_client::Detach();
   return TRUE;
 }
 
@@ -248,4 +257,29 @@ extern "C" HRESULT WINAPI CreateDXGIFactory2(UINT flags, REFIID riid, void** ppF
   HRESULT hr = pCreateDXGIFactory2(flags, riid, ppFactory);
   if (SUCCEEDED(hr) && ppFactory && *ppFactory) InstallFactoryHooksV229(*ppFactory);
   return hr;
+}
+
+extern "C" HRESULT WINAPI DXGIDeclareAdapterRemovalSupport() {
+  using Proc = HRESULT (WINAPI*)();
+  const HMODULE module = LoadSystemDxgiV229();
+  const auto proc = module ? reinterpret_cast<Proc>(GetProcAddress(module, "DXGIDeclareAdapterRemovalSupport")) : nullptr;
+  return proc ? proc() : DXGI_ERROR_UNSUPPORTED;
+}
+
+extern "C" HRESULT WINAPI DXGIGetDebugInterface(REFIID riid, void** ppDebug) {
+  if (!ppDebug) return E_INVALIDARG;
+  *ppDebug = nullptr;
+  using Proc = HRESULT (WINAPI*)(REFIID, void**);
+  const HMODULE module = LoadSystemDxgiV229();
+  const auto proc = module ? reinterpret_cast<Proc>(GetProcAddress(module, "DXGIGetDebugInterface")) : nullptr;
+  return proc ? proc(riid, ppDebug) : E_NOINTERFACE;
+}
+
+extern "C" HRESULT WINAPI DXGIGetDebugInterface1(UINT flags, REFIID riid, void** ppDebug) {
+  if (!ppDebug) return E_INVALIDARG;
+  *ppDebug = nullptr;
+  using Proc = HRESULT (WINAPI*)(UINT, REFIID, void**);
+  const HMODULE module = LoadSystemDxgiV229();
+  const auto proc = module ? reinterpret_cast<Proc>(GetProcAddress(module, "DXGIGetDebugInterface1")) : nullptr;
+  return proc ? proc(flags, riid, ppDebug) : E_NOINTERFACE;
 }

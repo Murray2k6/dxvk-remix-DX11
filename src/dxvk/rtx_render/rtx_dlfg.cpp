@@ -1135,7 +1135,12 @@ namespace dxvk {
       throw DxvkError("DxvkDLFGTimestampQueryPool: vkCreateQueryPool failed");
     }
 
-    m_device->vkd()->vkResetQueryPool(m_device->handle(), m_queryPool, 0, numQueries);
+    if (m_device->features().vulkan12Features.hostQueryReset) {
+      m_device->vkd()->vkResetQueryPool(m_device->handle(), m_queryPool, 0, numQueries);
+    }
+    // Without host query reset, writeTimestamp resets each query on the GPU
+    // before writing it. The pacer waits for that command list's fence before
+    // reading the result, so no initial host reset is needed.
   }
 
   DxvkDLFGTimestampQueryPool::~DxvkDLFGTimestampQueryPool() {

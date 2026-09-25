@@ -85,12 +85,20 @@ void main(int2 threadIndex : SV_DispatchThreadID)
 
   if (!RAB_IsSurfaceValid(surface))
   {
+    RAB_StoreReservoir(RTXDI_EmptyReservoir(), pixelCoordinate, RTXDI_GetSpatialOutputPage());
+    BSDFFactor[pixelCoordinate] = vec2(1);
     return;
   }
 
   RAB_RandomSamplerState rtxdiRNG = RAB_InitRandomSampler(pixelCoordinate, cb.frameIdx, 3);
   
   RTXDI_Reservoir reservoir = RAB_LoadReservoir(pixelCoordinate, RTXDI_GetSpatialInputPage());
+  RTXDI_Reservoir result = reservoir;
+
+  // This pass still publishes the final reservoir, G-buffer, and BSDF factor
+  // when reuse is disabled. Only the neighborhood work is optional.
+  if (cb.enableRtxdiSpatialReuse)
+  {
 
   // Calculate the average reprojection confidence in the neighborhood to reject individual pixels that failed to reproject
   const int filterRadius = 1;
@@ -99,7 +107,8 @@ void main(int2 threadIndex : SV_DispatchThreadID)
   for (int xx = -filterRadius; xx <= filterRadius; ++xx)
   for (int yy = -filterRadius; yy <= filterRadius; ++yy)
   {
-    sumConfidence += ReprojectionConfidence[pixelCoordinate + int2(xx, yy)].r;
+    const int2 neighbor = clamp(pixelCoordinate + int2(xx, yy), int2(0), int2(cb.camera.resolution) - 1);
+    sumConfidence += ReprojectionConfidence[neighbor].r;
   }
 
   const float historyLength = sumConfidence * (float(kReprojectionConfidenceHistoryLength) / float(filterArea));
@@ -110,7 +119,7 @@ void main(int2 threadIndex : SV_DispatchThreadID)
     : cb.rtxdiSpatialSamples;
 
   RTXDI_SpatialResamplingParameters sparams;
-  sparams.numSamples = cb.enableRtxdiSpatialReuse ? clamp(numSpatialSamples, 1, 16) : 0;
+  sparams.numSamples = clamp(numSpatialSamples, 1, 16);
   sparams.sourceBufferIndex = RTXDI_GetSpatialInputPage();
   sparams.biasCorrectionMode = cb.enableRtxdiRayTracedBiasCorrection
     ? RTXDI_BIAS_CORRECTION_RAY_TRACED
@@ -120,12 +129,13 @@ void main(int2 threadIndex : SV_DispatchThreadID)
   sparams.depthThreshold = 0.1;
   sparams.screenResolution = cb.camera.resolution;
 
-  RTXDI_Reservoir result = RTXDI_SpatialResampling(
+  result = RTXDI_SpatialResampling(
     pixelCoordinate,
     surface,
     reservoir,
     rtxdiRNG,
     sparams);
+  }
 
   RAB_StoreReservoir(result, pixelCoordinate, RTXDI_GetSpatialOutputPage());
 

@@ -21,7 +21,7 @@
 */
 #include "rtx/pass/tonemap/tonemapping.slangh"
 
-layout(rgba32f, binding = TONEMAPPING_HISTOGRAM_COLOR_INPUT)
+layout(rgba16f, binding = TONEMAPPING_HISTOGRAM_COLOR_INPUT)
 RWTexture2D<float4> InColorBuffer; 
 
 layout(r32f, binding = TONEMAPPING_HISTOGRAM_EXPOSURE_INPUT)

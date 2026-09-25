@@ -312,18 +312,19 @@ namespace dxvk {
 
     const Resources::RaytracingOutput& rtOutput = ctx->getCommonObjects()->getResources().getRaytracingOutput();
 
-    int numReservoirBuffer = 3;
-    int reservoirSize = sizeof(ReSTIRGI_PackedReservoir);
-    int renderWidthBlocks = (downscaledExtent.width + RTXDI_RESERVOIR_BLOCK_SIZE - 1) / RTXDI_RESERVOIR_BLOCK_SIZE;
-    int renderHeightBlocks = (downscaledExtent.height + RTXDI_RESERVOIR_BLOCK_SIZE - 1) / RTXDI_RESERVOIR_BLOCK_SIZE;
-    int reservoirBufferPixels = renderWidthBlocks * renderHeightBlocks * RTXDI_RESERVOIR_BLOCK_SIZE * RTXDI_RESERVOIR_BLOCK_SIZE;
+    constexpr uint32_t numReservoirBuffer = 3;
+    constexpr VkDeviceSize reservoirSize = sizeof(ReSTIRGI_PackedReservoir);
+    const uint32_t renderWidthBlocks = (downscaledExtent.width + RTXDI_RESERVOIR_BLOCK_SIZE - 1) / RTXDI_RESERVOIR_BLOCK_SIZE;
+    const uint32_t renderHeightBlocks = (downscaledExtent.height + RTXDI_RESERVOIR_BLOCK_SIZE - 1) / RTXDI_RESERVOIR_BLOCK_SIZE;
+    const VkDeviceSize reservoirBufferPixels = VkDeviceSize(renderWidthBlocks) * renderHeightBlocks * RTXDI_RESERVOIR_BLOCK_SIZE * RTXDI_RESERVOIR_BLOCK_SIZE;
 
     DxvkBufferCreateInfo bufferInfo;
-    bufferInfo.usage = VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
-    bufferInfo.stages = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
-    bufferInfo.access = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    bufferInfo.usage = VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    bufferInfo.stages = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR | VK_PIPELINE_STAGE_TRANSFER_BIT;
+    bufferInfo.access = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
     bufferInfo.size = reservoirBufferPixels * numReservoirBuffer * reservoirSize;
     m_restirGIReservoirBuffer = ctx->getDevice()->createBuffer(bufferInfo, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, DxvkMemoryStats::Category::RTXBuffer, "Restir GI Reservoir Buffer");
+    ctx->clearBuffer(m_restirGIReservoirBuffer, 0, bufferInfo.size, 0);
 
     m_restirGIRadiance = Resources::AliasedResource(rtOutput.m_compositeOutput, ctx, downscaledExtent, VK_FORMAT_R16G16B16A16_SFLOAT, "ReSTIR GI Radiance");
     m_restirGIHitGeometry = Resources::createImageResource(ctx, "ReSTIR GI Hit Geometry", downscaledExtent, VK_FORMAT_R32G32B32A32_SFLOAT);

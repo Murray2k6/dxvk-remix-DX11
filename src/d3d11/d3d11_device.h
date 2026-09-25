@@ -2,6 +2,7 @@
 
 #include <filesystem>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <vector>
 
@@ -443,7 +444,7 @@ namespace dxvk {
     
     DxvkCsChunkPool                 m_csChunkPool;
     
-    D3D11Initializer*               m_initializer = nullptr;
+    std::unique_ptr<D3D11Initializer> m_initializer;
     Com<D3D11ImmediateContext, false> m_context;
 
     D3D11StateObjectSet<D3D11BlendState>        m_bsStateObjects;
@@ -841,11 +842,29 @@ namespace dxvk {
 
   private:
 
+    // Owns one frontend's share of the Vulkan device. Declared before all
+    // frontend members so their contexts and resources retire first, including
+    // when construction of a later member throws.
+    class SharedDeviceLease {
+    public:
+      SharedDeviceLease(const Rc<DxvkInstance>& instance,
+                        const Rc<DxvkAdapter>& adapter,
+                        D3D_FEATURE_LEVEL featureLevel);
+      ~SharedDeviceLease();
+      SharedDeviceLease(const SharedDeviceLease&) = delete;
+      SharedDeviceLease& operator=(const SharedDeviceLease&) = delete;
+
+      Rc<DxvkDevice> device() const { return m_device; }
+
+    private:
+      Rc<DxvkDevice> m_device;
+    };
+
     Com<IDXGIAdapter>   m_dxgiAdapter;
 
     Rc<DxvkInstance>    m_dxvkInstance;
     Rc<DxvkAdapter>     m_dxvkAdapter;
-    Rc<DxvkDevice>      m_dxvkDevice;
+    SharedDeviceLease  m_sharedDevice;
 
     D3D11Device         m_d3d11Device;
     D3D11DeviceExt      m_d3d11DeviceExt;
@@ -856,9 +875,6 @@ namespace dxvk {
     WineDXGISwapChainFactory m_wineFactory;
     
     uint32_t m_frameLatency = DefaultFrameLatency;
-
-    Rc<DxvkDevice> CreateDevice(D3D_FEATURE_LEVEL FeatureLevel);
-    void ReleaseSharedDevice();
 
   };
   
