@@ -455,7 +455,7 @@ namespace dxvk {
 
     // DX11_V292_PRECOMPILER_WIDGET: on-demand precompile job driven by the
     // Remix developer menu (optionally re-scans the game's own data files,
-    // then compiles every cached shader). Runs on a background thread.
+    // then preloads a bounded set with observed pipeline state). Background only.
     void RunShaderPrecompileJob(bool fullRescan);
 
     void LoadGameShaderCacheFiles(

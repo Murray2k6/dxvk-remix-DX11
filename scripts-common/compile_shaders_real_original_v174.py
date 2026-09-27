@@ -740,7 +740,13 @@ print(f'Shader build: {len(tasks)} of {len(allTasks)} variants require compilati
 
 if len(tasks):
     threads = []
-    threadCount = multiprocessing.cpu_count() if args.parallel else 1
+    # Ninja already has C++ jobs in flight. Slang itself uses substantial RAM;
+    # starting one process per logical CPU oversubscribes both resources.
+    try:
+        requestedWorkers = int(os.environ.get('DXVK_SHADER_COMPILER_JOBS', '4'))
+    except ValueError:
+        requestedWorkers = 4
+    threadCount = min(max(1, requestedWorkers), 16, multiprocessing.cpu_count(), len(tasks)) if args.parallel else 1
     for i in range(threadCount):
         thread = threading.Thread(target = runTasks, args = (tasks,))
         thread.start()

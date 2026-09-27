@@ -84,10 +84,8 @@ namespace dxvk {
       default:
         break;
     }
-    // DX11_V266_DENOISER_STRENGTH: the DX11 capture's path-traced signal is
-    // noisier than native Remix (approximate cameras, absent per-object
-    // motion vectors), so lean on the same measures Unreal's path tracer
-    // uses: heavier temporal accumulation and hard firefly suppression.
+    // Optional extra smoothing for captures that benefit from longer history.
+    // Keep the selected preset unchanged when the override is disabled.
     if (RtxOptions::dx11StrongerDenoising()) {
       reblurSettings.maxAccumulatedFrameNum = 48;
       reblurSettings.maxFastAccumulatedFrameNum = 3;
@@ -194,13 +192,8 @@ namespace dxvk {
         break;
     }
 
-    // DX11_V266_DENOISER_STRENGTH: the DX11 capture's path-traced signal is
-    // noisier than native Remix (approximate cameras, absent per-object
-    // motion vectors), so under-resolves with the stock tuning. Apply the
-    // same measures Unreal's path tracer leans on: substantially longer
-    // temporal accumulation, forced firefly suppression, and one extra
-    // a-trous iteration (each iteration doubles the spatial filter
-    // footprint) with stronger luminance smoothing on the indirect signal.
+    // This opt-in override adds temporal smoothing and another spatial pass.
+    // Its quality/performance tradeoff depends on the game's captured motion.
     if (RtxOptions::dx11StrongerDenoising()) {
       relaxSettings.enableAntiFirefly = true;
       if (type == dxvk::DenoiserType::DirectLight) {
@@ -300,6 +293,26 @@ namespace dxvk {
 
     m_relaxInternalBlurRadius.diffusePrepassBlurRadius = m_relaxSettings.diffusePrepassBlurRadius;
     m_relaxInternalBlurRadius.specularPrepassBlurRadius = m_relaxSettings.specularPrepassBlurRadius;
+    m_configuredDenoiser = m_denoiserDesc.denoiser;
+  }
+
+  void NrdSettings::updateDenoiserMode() {
+    const auto configured = m_type == DenoiserType::Reference ? nrd::Denoiser::REFERENCE
+      : m_type == DenoiserType::IndirectLight ? denoiserIndirectMode() : denoiserMode();
+    if (configured == m_configuredDenoiser)
+      return;
+    m_configuredDenoiser = configured;
+    switch (configured) {
+    case nrd::Denoiser::REFERENCE:
+    case nrd::Denoiser::REBLUR_DIFFUSE_SPECULAR:
+    case nrd::Denoiser::RELAX_DIFFUSE_SPECULAR:
+      m_denoiserDesc.denoiser = configured;
+      m_resetHistory = true;
+      break;
+    default:
+      Logger::err("NRD: unsupported denoiser mode; keeping the current denoiser");
+      break;
+    }
   }
 
   void NrdSettings::showImguiSettings() {

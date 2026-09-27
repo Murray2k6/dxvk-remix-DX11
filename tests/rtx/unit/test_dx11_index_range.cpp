@@ -39,6 +39,22 @@ int main() {
   check(!scanIndexRange<uint32_t>(&restart, 1u, UINT32_MAX, false).valid,
         "unrepresentable maximum vertex count must be rejected");
 
+  const std::array<uint16_t, 3> distant = { 50000, 50002, 50001 };
+  auto span = captureVertexSpan<uint16_t>(distant.data(), 3u, -49000);
+  check(span.first == 1000u && span.count == 3u,
+        "indexed capture must hash actual source vertices, including signed base");
+  check(captureVertexSpan<uint16_t>(distant.data(), 3u, -50001).count == 0,
+        "negative effective index cannot be reused");
+  check(captureVertexSpan<uint32_t>(&restart, 1u, 1).count == 0,
+        "effective index addition must not wrap");
+  check(captureVertexSpan<uint32_t>(nullptr, 3u, 0).count == 0,
+        "unreadable indices require GPU replay");
+  check(captureInstanceElementCount(0u, 0u) == 0u
+        && captureInstanceElementCount(17u, 0u) == 1u
+        && captureInstanceElementCount(17u, 4u) == 5u
+        && captureInstanceElementCount(UINT32_MAX, 1u) == UINT32_MAX,
+        "instance input coverage must honor zero and non-unit step rates");
+
   // Compare real production scanning with an independent reference over
   // unaligned byte buffers and randomized capacities, including tiny slices.
   std::mt19937 rng(0x5060u);
@@ -62,6 +78,22 @@ int main() {
     check(range.valid == expectedValid, "randomized bounds validation disagrees");
     if (range.valid)
       check(range.vertexCount == expectedCount, "randomized maximum disagrees");
+
+    const int32_t base = int32_t(rng() % 131073u) - 65536;
+    int64_t minimum = INT64_MAX;
+    int64_t maximum = INT64_MIN;
+    for (uint32_t i = 0; i < count; ++i) {
+      uint16_t index;
+      std::memcpy(&index, bytes.data() + 1u + i * sizeof(index), sizeof(index));
+      minimum = std::min(minimum, int64_t(index) + base);
+      maximum = std::max(maximum, int64_t(index) + base);
+    }
+    span = captureVertexSpan<uint16_t>(bytes.data() + 1u, count, base);
+    if (minimum < 0)
+      check(span.count == 0, "negative source address escaped capture validation");
+    else
+      check(span.first == uint64_t(minimum) && span.count == uint64_t(maximum - minimum + 1),
+            "randomized unaligned capture source coverage disagrees");
   }
   std::cout << "DX11 index range: edge cases and 10000 randomized cases passed\n";
 }

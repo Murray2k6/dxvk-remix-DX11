@@ -388,9 +388,27 @@ namespace dxvk {
     return active;
   }
 
+  struct DxvkSharedInstanceState {
+    dxvk::mutex mutex;
+    DxvkInstance* instance = nullptr;
+  };
+
+  uint32_t DxvkInstance::decRef() {
+    if (!m_sharedState)
+      return RcObject::decRef();
+
+    // DxvkInstance pointers cross the dxgi/d3d11 DLL boundary. Use the cache
+    // belonging to the creating DLL, rather than this call site's local static.
+    // Taking the same lock as getOrCreate prevents resurrection from count zero.
+    std::lock_guard<dxvk::mutex> lock(m_sharedState->mutex);
+    const uint32_t refs = RcObject::decRef();
+    if (!refs && m_sharedState->instance == this)
+      m_sharedState->instance = nullptr;
+    return refs;
+  }
+
   Rc<DxvkInstance> DxvkInstance::getOrCreateSharedInstance() {
-    static dxvk::mutex s_sharedInstanceMutex;
-    static Rc<DxvkInstance> s_sharedInstance;
+    static DxvkSharedInstanceState shared;
 
     static const bool s_shareDisabled =
       env::getEnvVar("DXVK_REMIX_SHARED_INSTANCE") == "0";
@@ -399,14 +417,17 @@ namespace dxvk {
       return new DxvkInstance();
     }
 
-    std::lock_guard<dxvk::mutex> lock(s_sharedInstanceMutex);
-    if (s_sharedInstance == nullptr) {
+    std::lock_guard<dxvk::mutex> lock(shared.mutex);
+    if (shared.instance == nullptr) {
       RemixCrossDllInstanceLock crossDllLock;
-      s_sharedInstance = new DxvkInstance();
+      shared.instance = new DxvkInstance();
+      shared.instance->m_sharedState = &shared;
     } else {
-      Logger::info("[Remix-DX11][init] reusing shared Vulkan instance");
+      Logger::debug("[Remix-DX11][init] reusing live shared Vulkan instance");
     }
-    return s_sharedInstance;
+    // Construct the caller's strong reference while still holding the cache
+    // lock. The registry itself owns no reference and has no Vulkan destructor.
+    return shared.instance;
   }
 
   DxvkInstance::DxvkInstance() {
@@ -465,7 +486,8 @@ namespace dxvk {
     // NV-DXVK start: RTXIO
 #ifdef WITH_RTXIO
     if (RtxIo::enabled()) {
-      m_extProviders.push_back(&RtxIoExtensionProvider::s_instance);
+      m_rtxIoExtensionProvider = std::make_unique<RtxIoExtensionProvider>();
+      m_extProviders.push_back(m_rtxIoExtensionProvider.get());
     }
 #endif
     // NV-DXVK end
@@ -553,11 +575,19 @@ namespace dxvk {
   
   
   DxvkInstance::~DxvkInstance() {
+    RemixCrossDllInstanceLock crossDllLock;
     // NV-DXVK start: use EXT_debug_utils
     if (m_debugUtilsMessenger != nullptr) {
       m_vki->vkDestroyDebugUtilsMessengerEXT(m_vki->instance(), m_debugUtilsMessenger, NULL);
     }
     // NV-DXVK end
+    // Complete driver teardown under the same cross-DLL serialization used for
+    // creation, before member destructors run after this guard leaves scope.
+    m_extProviders.clear();
+    m_rtxIoExtensionProvider.reset();
+    m_adapters.clear();
+    m_vki = nullptr;
+    m_vkl = nullptr;
   }
   
   

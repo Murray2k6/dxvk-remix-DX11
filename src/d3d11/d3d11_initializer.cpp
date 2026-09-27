@@ -284,40 +284,10 @@ namespace dxvk {
     std::lock_guard<dxvk::mutex> lock(dynamicSlotMutex());
     std::vector<bool>& pool = dynamicSlotPools()[descriptorHash];
 
-    // DX11_V319_STREAMING_POOL_COLLAPSES_TO_ONE_IDENTITY: once a descriptor has
-    // grown past a handful of simultaneous slots it is a STREAMING POOL, not a
-    // small set of dedicated buffers, and the per-slot ordinal stops being an
-    // identity.
-    //
-    // A game holding two or three live buffers for one UI element gets a stable
-    // hash per buffer, which is what the ordinal is for. A streaming pool works
-    // the other way round: one logical texture is cycled through whichever pool
-    // entry is free, so the slot a texture lands in varies frame to frame, the
-    // hash changes underneath the material, and the result is flickering plus
-    // texture tags that refuse to stick.
-    //
-    // Pool size is the structural signal for that, and it is measured from the
-    // game's own behaviour rather than assumed from which engine is running -
-    // any engine that streams through a rotating pool is handled, and none has
-    // to be recognised by name. Past the threshold every texture sharing the
-    // descriptor collapses to ordinal 0, i.e. one identity for the whole
-    // rotation: one tag covers it, at the cost of unrelated same-descriptor
-    // textures sharing that tag. That is the right trade for a pool whose
-    // members are interchangeable by construction.
-    constexpr size_t kRotationPoolSlotThreshold = 4;
-    if (pool.size() >= kRotationPoolSlotThreshold) {
-      static uint32_t sPoolCollapseLogCount = 0;
-      if (sPoolCollapseLogCount < 8u) {
-        ++sPoolCollapseLogCount;
-        Logger::info(str::format(
-          "[D3D11] dynamic-texture descriptor 0x", std::hex, descriptorHash, std::dec,
-          " reached ", pool.size(), " simultaneous slots; treating it as a streaming pool and "
-          "collapsing it to a single stable identity (per-slot hashes on a rotating pool change "
-          "underneath the material, which shows up as flicker and as tags that do not stick)."));
-      }
-      return 0u;
-    }
-
+    // Equal descriptors do not prove equal content. In particular, unrelated
+    // material textures often share dimensions/format. Every live resource
+    // needs its own slot; aliasing all resources after the fourth to slot zero
+    // propagated sky/ignore tags and let one destructor free another's slot.
     for (size_t slot = 0; slot < pool.size(); ++slot) {
       if (!pool[slot]) {
         pool[slot] = true;
@@ -331,8 +301,14 @@ namespace dxvk {
   void D3D11Initializer::ReleaseDynamicTextureSlot(uint64_t descriptorHash, uint32_t ordinal) {
     std::lock_guard<dxvk::mutex> lock(dynamicSlotMutex());
     auto pools = dynamicSlotPools().find(descriptorHash);
-    if (pools != dynamicSlotPools().end() && ordinal < pools->second.size())
+    if (pools != dynamicSlotPools().end() && ordinal < pools->second.size()) {
       pools->second[ordinal] = false;
+      // No live resource can retain an ordinal in the trimmed suffix.
+      while (!pools->second.empty() && !pools->second.back())
+        pools->second.pop_back();
+      if (pools->second.empty())
+        dynamicSlotPools().erase(pools);
+    }
   }
   // NV-DXVK end
 

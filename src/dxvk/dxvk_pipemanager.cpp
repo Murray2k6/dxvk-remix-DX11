@@ -158,6 +158,10 @@ namespace dxvk {
     if (m_stateCache != nullptr)
       m_stateCache->setRemixCompileConcurrency(maxConcurrent);
   }
+
+  bool DxvkPipelineManager::hasPipelineForShader(const DxvkShaderKey& key) {
+    return m_stateCache != nullptr && m_stateCache->hasPipelineForShader(key);
+  }
 // NV-DXVK end
 
 

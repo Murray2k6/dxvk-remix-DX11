@@ -1,6 +1,7 @@
 #include "dxgi_factory.h"
 #include "dxgi_swapchain.h"
 #include "dxgi_swapchain_dispatcher.h"
+#include "dxgi_native.h"
 
 namespace dxvk {
 
@@ -18,6 +19,20 @@ namespace dxvk {
   
   DxgiFactory::~DxgiFactory() {
     
+  }
+
+  HRESULT DxgiFactory::getNativeFactory(Com<IDXGIFactory2>& factory) {
+    std::lock_guard<std::mutex> lock(m_nativeMutex);
+    if (m_nativeFactory == nullptr) {
+      Com<IDXGIFactory2> created;
+      HRESULT hr = createSystemDxgiFactory(m_flags, "CreateDXGIFactory2",
+        __uuidof(IDXGIFactory2), reinterpret_cast<void**>(&created));
+      if (FAILED(hr))
+        return hr;
+      m_nativeFactory = std::move(created);
+    }
+    factory = m_nativeFactory;
+    return S_OK;
   }
   
   
@@ -61,8 +76,8 @@ namespace dxvk {
   
   
   BOOL STDMETHODCALLTYPE DxgiFactory::IsWindowedStereoEnabled() {
-    // We don't support Stereo 3D at the moment
-    return FALSE;
+    Com<IDXGIFactory2> factory;
+    return SUCCEEDED(getNativeFactory(factory)) && factory->IsWindowedStereoEnabled();
   }
   
   
@@ -74,8 +89,9 @@ namespace dxvk {
     if (ppAdapter == nullptr)
       return DXGI_ERROR_INVALID_CALL;
     
-    Logger::err("DXGI: CreateSoftwareAdapter: Software adapters not supported");
-    return DXGI_ERROR_UNSUPPORTED;
+    Com<IDXGIFactory2> factory;
+    const HRESULT hr = getNativeFactory(factory);
+    return FAILED(hr) ? hr : factory->CreateSoftwareAdapter(Module, ppAdapter);
   }
   
   
@@ -147,8 +163,34 @@ namespace dxvk {
       return hr;
     }
     
-    Logger::err("DXGI: CreateSwapChainForHwnd: Unsupported device type");
-    return DXGI_ERROR_UNSUPPORTED;
+    // Native D3D12 command queues and native D3D11 devices do not implement
+    // Remix's private swapchain factory. Keep their presentation on Windows
+    // DXGI; this branch does not translate their rendering into Remix RTX.
+    Com<IDXGIFactory2> nativeFactory;
+    HRESULT hr = getNativeFactory(nativeFactory);
+    if (FAILED(hr))
+      return hr;
+    Com<IDXGIOutput> nativeOutput;
+    hr = getSystemDxgiOutput(nativeFactory.ptr(), pRestrictToOutput, nativeOutput);
+    if (FAILED(hr))
+      return hr;
+    hr = nativeFactory->CreateSwapChainForHwnd(pDevice, hWnd, pDesc,
+      pFullscreenDesc, nativeOutput.ptr(), ppSwapChain);
+    if (SUCCEEDED(hr)) {
+      // Windows applies these flags to swapchains already owned by the factory.
+      // A request saved before its first native swapchain must be applied now;
+      // applying it during factory construction silently leaves monitoring on.
+      std::lock_guard<std::mutex> lock(m_nativeMutex);
+      if (m_hasWindowAssociation && (!m_associatedWindow || m_associatedWindow == hWnd)) {
+        const HRESULT associationResult = nativeFactory->MakeWindowAssociation(m_associatedWindow, m_windowAssociationFlags);
+        if (FAILED(associationResult)) {
+          (*ppSwapChain)->Release();
+          *ppSwapChain = nullptr;
+          return associationResult;
+        }
+      }
+    }
+    return hr;
   }
   
   
@@ -160,8 +202,15 @@ namespace dxvk {
           IDXGISwapChain1**     ppSwapChain) {
     InitReturnPtr(ppSwapChain);
     
-    Logger::err("DxgiFactory::CreateSwapChainForCoreWindow: Not implemented");
-    return E_NOTIMPL;
+    if (!pDevice || !pWindow || !pDesc || !ppSwapChain)
+      return DXGI_ERROR_INVALID_CALL;
+    Com<IDXGIFactory2> factory;
+    HRESULT hr = getNativeFactory(factory);
+    if (FAILED(hr))
+      return hr;
+    Com<IDXGIOutput> output;
+    hr = getSystemDxgiOutput(factory.ptr(), pRestrictToOutput, output);
+    return FAILED(hr) ? hr : factory->CreateSwapChainForCoreWindow(pDevice, pWindow, pDesc, output.ptr(), ppSwapChain);
   }
   
   
@@ -172,8 +221,15 @@ namespace dxvk {
           IDXGISwapChain1**     ppSwapChain) {
     InitReturnPtr(ppSwapChain);
     
-    Logger::err("DxgiFactory::CreateSwapChainForComposition: Not implemented");
-    return E_NOTIMPL;
+    if (!pDevice || !pDesc || !ppSwapChain)
+      return DXGI_ERROR_INVALID_CALL;
+    Com<IDXGIFactory2> factory;
+    HRESULT hr = getNativeFactory(factory);
+    if (FAILED(hr))
+      return hr;
+    Com<IDXGIOutput> output;
+    hr = getSystemDxgiOutput(factory.ptr(), pRestrictToOutput, output);
+    return FAILED(hr) ? hr : factory->CreateSwapChainForComposition(pDevice, pDesc, output.ptr(), ppSwapChain);
   }
   
   
@@ -269,18 +325,13 @@ namespace dxvk {
           void**                ppvAdapter) {
     InitReturnPtr(ppvAdapter);
 
-    static bool s_errorShown = false;
-
-    if (!std::exchange(s_errorShown, true))
-      Logger::warn("DxgiFactory::EnumWarpAdapter: WARP not supported, returning first hardware adapter");
-
-    Com<IDXGIAdapter1> adapter;
-    HRESULT hr = EnumAdapters1(0, &adapter);
-
+    Com<IDXGIFactory2> factory;
+    HRESULT hr = getNativeFactory(factory);
     if (FAILED(hr))
       return hr;
-
-    return adapter->QueryInterface(riid, ppvAdapter);
+    Com<IDXGIFactory4> factory4;
+    hr = factory->QueryInterface(__uuidof(IDXGIFactory4), reinterpret_cast<void**>(&factory4));
+    return FAILED(hr) ? hr : factory4->EnumWarpAdapter(riid, ppvAdapter);
   }
 
 
@@ -288,6 +339,9 @@ namespace dxvk {
     if (pWindowHandle == nullptr)
       return DXGI_ERROR_INVALID_CALL;
     
+    std::lock_guard<std::mutex> lock(m_nativeMutex);
+    if (m_nativeFactory != nullptr)
+      return m_nativeFactory->GetWindowAssociation(pWindowHandle);
     *pWindowHandle = m_associatedWindow;
     return S_OK;
   }
@@ -296,20 +350,32 @@ namespace dxvk {
   HRESULT STDMETHODCALLTYPE DxgiFactory::GetSharedResourceAdapterLuid(
           HANDLE                hResource,
           LUID*                 pLuid) {
-    Logger::err("DxgiFactory::GetSharedResourceAdapterLuid: Not implemented");
-    return E_NOTIMPL;
+    Com<IDXGIFactory2> factory;
+    const HRESULT hr = getNativeFactory(factory);
+    return FAILED(hr) ? hr : factory->GetSharedResourceAdapterLuid(hResource, pLuid);
   }
   
   
   HRESULT STDMETHODCALLTYPE DxgiFactory::MakeWindowAssociation(HWND WindowHandle, UINT Flags) {
-    Logger::warn("DXGI: MakeWindowAssociation: Ignoring flags");
+    if ((Flags & ~(DXGI_MWA_NO_WINDOW_CHANGES | DXGI_MWA_NO_ALT_ENTER | DXGI_MWA_NO_PRINT_SCREEN))
+        || (!WindowHandle && Flags) || (WindowHandle && !IsWindow(WindowHandle)))
+      return DXGI_ERROR_INVALID_CALL;
+    std::lock_guard<std::mutex> lock(m_nativeMutex);
+    if (m_nativeFactory != nullptr) {
+      const HRESULT hr = m_nativeFactory->MakeWindowAssociation(WindowHandle, Flags);
+      if (FAILED(hr))
+        return hr;
+    }
     m_associatedWindow = WindowHandle;
+    m_windowAssociationFlags = Flags;
+    m_hasWindowAssociation = true;
     return S_OK;
   }
   
   
   BOOL STDMETHODCALLTYPE DxgiFactory::IsCurrent() {
-    return TRUE;
+    std::lock_guard<std::mutex> lock(m_nativeMutex);
+    return m_nativeFactory == nullptr || m_nativeFactory->IsCurrent();
   }
   
   
@@ -317,16 +383,18 @@ namespace dxvk {
           HWND                  WindowHandle,
           UINT                  wMsg,
           DWORD*                pdwCookie) {
-    Logger::err("DxgiFactory::RegisterOcclusionStatusWindow: Not implemented");
-    return E_NOTIMPL;
+    Com<IDXGIFactory2> factory;
+    const HRESULT hr = getNativeFactory(factory);
+    return FAILED(hr) ? hr : factory->RegisterOcclusionStatusWindow(WindowHandle, wMsg, pdwCookie);
   }
   
   
   HRESULT STDMETHODCALLTYPE DxgiFactory::RegisterStereoStatusEvent(
           HANDLE                hEvent,
           DWORD*                pdwCookie) {
-    Logger::err("DxgiFactory::RegisterStereoStatusEvent: Not implemented");
-    return E_NOTIMPL;
+    Com<IDXGIFactory2> factory;
+    const HRESULT hr = getNativeFactory(factory);
+    return FAILED(hr) ? hr : factory->RegisterStereoStatusEvent(hEvent, pdwCookie);
   }
   
   
@@ -334,28 +402,34 @@ namespace dxvk {
           HWND                  WindowHandle,
           UINT                  wMsg,
           DWORD*                pdwCookie) {
-    Logger::err("DxgiFactory::RegisterStereoStatusWindow: Not implemented");
-    return E_NOTIMPL;
+    Com<IDXGIFactory2> factory;
+    const HRESULT hr = getNativeFactory(factory);
+    return FAILED(hr) ? hr : factory->RegisterStereoStatusWindow(WindowHandle, wMsg, pdwCookie);
   }
   
 
   HRESULT STDMETHODCALLTYPE DxgiFactory::RegisterOcclusionStatusEvent(
           HANDLE                hEvent,
           DWORD*                pdwCookie) {
-    Logger::err("DxgiFactory::RegisterOcclusionStatusEvent: Not implemented");
-    return E_NOTIMPL;
+    Com<IDXGIFactory2> factory;
+    const HRESULT hr = getNativeFactory(factory);
+    return FAILED(hr) ? hr : factory->RegisterOcclusionStatusEvent(hEvent, pdwCookie);
   }
   
 
   void STDMETHODCALLTYPE DxgiFactory::UnregisterStereoStatus(
           DWORD                 dwCookie) {
-    Logger::err("DxgiFactory::UnregisterStereoStatus: Not implemented");
+    std::lock_guard<std::mutex> lock(m_nativeMutex);
+    if (m_nativeFactory != nullptr)
+      m_nativeFactory->UnregisterStereoStatus(dwCookie);
   }
   
   
   void STDMETHODCALLTYPE DxgiFactory::UnregisterOcclusionStatus(
           DWORD                 dwCookie) {
-    Logger::err("DxgiFactory::UnregisterOcclusionStatus: Not implemented");
+    std::lock_guard<std::mutex> lock(m_nativeMutex);
+    if (m_nativeFactory != nullptr)
+      m_nativeFactory->UnregisterOcclusionStatus(dwCookie);
   }
 
 
@@ -388,15 +462,25 @@ namespace dxvk {
   HRESULT STDMETHODCALLTYPE DxgiFactory::RegisterAdaptersChangedEvent(
           HANDLE                hEvent,
           DWORD*                pdwCookie) {
-    Logger::err("DxgiFactory: RegisterAdaptersChangedEvent: Stub");
-    return E_NOTIMPL;
+    Com<IDXGIFactory2> factory;
+    HRESULT hr = getNativeFactory(factory);
+    if (FAILED(hr))
+      return hr;
+    Com<IDXGIFactory7> factory7;
+    hr = factory->QueryInterface(__uuidof(IDXGIFactory7), reinterpret_cast<void**>(&factory7));
+    return FAILED(hr) ? hr : factory7->RegisterAdaptersChangedEvent(hEvent, pdwCookie);
   }
 
 
   HRESULT STDMETHODCALLTYPE DxgiFactory::UnregisterAdaptersChangedEvent(
           DWORD                 Cookie) {
-    Logger::err("DxgiFactory: UnregisterAdaptersChangedEvent: Stub");
-    return E_NOTIMPL;
+    Com<IDXGIFactory2> factory;
+    HRESULT hr = getNativeFactory(factory);
+    if (FAILED(hr))
+      return hr;
+    Com<IDXGIFactory7> factory7;
+    hr = factory->QueryInterface(__uuidof(IDXGIFactory7), reinterpret_cast<void**>(&factory7));
+    return FAILED(hr) ? hr : factory7->UnregisterAdaptersChangedEvent(Cookie);
   }
 
 

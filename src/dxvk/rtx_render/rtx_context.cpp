@@ -490,6 +490,7 @@ namespace dxvk {
   // Hooked into D3D11 presentImage (same place HUD rendering is)
   void RtxContext::injectRTX(std::uint64_t cachedReflexFrameId, Rc<DxvkImage> targetImage) {
     ScopedCpuProfileZone();
+    ScopedResourceState restoreClientResources(*this);
 #ifdef REMIX_DEVELOPMENT
     m_currentPassStage = RtxFramePassStage::FrameBegin;
 #endif
@@ -529,29 +530,12 @@ namespace dxvk {
     const auto isRaytracingEnabled = RtxOptions::enableRaytracing();
     const auto asyncShaderCompilationActive = RtxOptions::Shader::enableAsyncCompilation() && common->pipelineManager().remixShaderCompilationCount() > 0;
 
-    // Determine and set present throttle delay
-    // Note: This must be done before the early out returns below which is why some logic here is redundant (e.g. checking if ray tracing is supported again)
-    // just to ensure the present throttle delay is always being set properly.
-
     const auto requestedPresentThrottleDelay = RtxOptions::enablePresentThrottle() ? RtxOptions::presentThrottleDelay() : 0;
-    std::uint32_t requestedAsyncShaderCompilationDelay = 0U;
-
-    // Note: Only use the async shader compilation throttle delay when rendering which uses Remix shaders would actually take place. As such this delay is not
-    // needed when ray tracing is not supported or enabled as Remix shaders will not be used in that case.
-    if (m_rayTracingSupported && isRaytracingEnabled && asyncShaderCompilationActive) {
-      requestedAsyncShaderCompilationDelay = RtxOptions::Shader::asyncCompilationThrottleMilliseconds();
-    }
-
-    // Note: Determine the throttle delay to use based on the larger of the two requested delay values as the larger should satisfy the requests of both.
-    // A sum is also potentially a valid way of going about this, but a maximum makes more sense in that these delays aren't expected to stack but rather
-    // are just requests for some minimum amount of time to spend waiting per frame.
-    const auto computedPresentThrottleDelay = std::max(requestedPresentThrottleDelay, requestedAsyncShaderCompilationDelay);
-
-    m_device->setPresentThrottleDelay(computedPresentThrottleDelay);
 
     // Early out if ray tracing is not supported or if Remix has already been injected
 
     if (!m_rayTracingSupported) {
+      m_device->setPresentThrottleDelay(requestedPresentThrottleDelay);
       ONCE(Logger::info(str::format("[RTX-Compatibility-Info] Raytracing doesn't appear to be supported on this HW.")));
       return;
     }
@@ -560,11 +544,18 @@ namespace dxvk {
       return;
     }
 
+    // A second injection request in this frame must retain the first request's
+    // result. Otherwise begin with only the explicit presentation throttle;
+    // optional background prewarm work is not a reason to delay a ready frame.
+    m_device->setPresentThrottleDelay(requestedPresentThrottleDelay);
+
     const uint32_t currentFrameId = m_device->getCurrentFrameId();
-    const bool logRaytracerFrame =
-      m_lastRaytracerDiagnosticFrame == kInvalidFrameIndex ||
-      currentFrameId - m_lastRaytracerDiagnosticFrame >= 120u ||
-      s_triggerDebugScreenshot;
+    static const bool logRaytracerDiagnostics =
+      env::getEnvVar("DXVK_REMIX_RENDER_LOG") == "1";
+    const bool logRaytracerFrame = s_triggerDebugScreenshot ||
+      (logRaytracerDiagnostics &&
+       (m_lastRaytracerDiagnosticFrame == kInvalidFrameIndex ||
+        currentFrameId - m_lastRaytracerDiagnosticFrame >= 120u));
 
     if (logRaytracerFrame)
       m_lastRaytracerDiagnosticFrame = currentFrameId;
@@ -651,9 +642,11 @@ namespace dxvk {
       && targetImage->info().extent.width != 0
       && targetImage->info().extent.height != 0;
 
-    // Note: Only engage ray tracing when it is enabled, the camera is valid and when no shaders are currently being compiled asynchronously (as
-    // trying to render before shaders are done compiling will cause Remix to block).
-    if (isRaytracingEnabled && isCameraValid && isTargetValid && !asyncShaderCompilationActive) {
+    // The required dispatches determine readiness. Waiting for the entire
+    // prewarm queue also waits for unused variants and used to defer a ready
+    // ray-traced frame until unrelated multi-second driver compiles finished.
+    // Missing asynchronous pipelines leave native output intact below.
+    if (isRaytracingEnabled && isCameraValid && isTargetValid) {
 
       const bool captureTestScreenshot = (m_screenshotFrameEnabled && m_device->getCurrentFrameId() == m_screenshotFrameNum);
       const bool captureScreenImage = s_triggerScreenshot || (captureTestScreenshot && !s_capturePrePresentTestScreenshot);
@@ -930,12 +923,15 @@ namespace dxvk {
       }
 
       m_framesWithoutValidScene = 0;
+
+      if (RtxOptions::Shader::enableAsyncCompilation()
+       && failedDispatchCount() != failedDispatchesBefore) {
+        m_device->setPresentThrottleDelay(std::max(requestedPresentThrottleDelay,
+          RtxOptions::Shader::asyncCompilationThrottleMilliseconds()));
+      }
     } else {
-      // If raytracing is only disabled because we don't have shaders available, we don't want to clear the scene.
-      // This frequently happens for a single frame when a cached shader is being fetched, and causes the Logic 
-      // graph state to be reset - which is problematic since Logic graphs often trigger shader fetches.
-      // It might be safe to remove this clear entirely - it was added before we had any garbage collection
-      // in the scene manager, so it may not be needed anymore.
+      // Temporary absence of a presentation target must not discard a valid
+      // scene or restart its logic graphs and shader fetches.
       if (!isRaytracingEnabled || !isCameraValid) {
         m_framesWithoutValidScene++;
         // Some games may have invalid cameras for a brief period during camera cuts, but clearing the scene
@@ -951,6 +947,10 @@ namespace dxvk {
     }
 
     if (raytracedThisFrame) {
+      if (m_completedRaytracedFrameCount == 0 && logRaytracerDiagnostics) {
+        Logger::info(str::format("[Remix-RayTracer] first completed frame: pendingPipelines=",
+          common->pipelineManager().remixShaderCompilationCount()));
+      }
       ++m_completedRaytracedFrameCount;
       m_resetHistory = false;
     }
@@ -965,6 +965,7 @@ namespace dxvk {
   }
 
 void RtxContext::endFrame(std::uint64_t cachedReflexFrameId, Rc<DxvkImage> targetImage, bool callInjectRtx) {
+    ScopedResourceState restoreClientResources(*this);
 
     // Start the performance debug frame timer
     PerfDebug_BeginFrame();
@@ -1090,6 +1091,7 @@ void RtxContext::endFrame(std::uint64_t cachedReflexFrameId, Rc<DxvkImage> targe
 
   void RtxContext::commitGeometryToRT(const DrawParameters& params, DrawCallState& drawCallState){
     ScopedCpuProfileZone();
+    ScopedResourceState restoreClientResources(*this);
 
     RasterGeometry& geoData = drawCallState.geometryData;
     DrawCallTransforms& transformData = drawCallState.transformData;
@@ -1781,9 +1783,13 @@ void RtxContext::endFrame(std::uint64_t cachedReflexFrameId, Rc<DxvkImage> targe
 
   void RtxContext::dispatchDenoise(const Resources::RaytracingOutput& rtOutput) {
     auto& rayReconstruction = getCommonObjects()->metaRayReconstruction();
+    const bool separated = RtxOptions::denoiseDirectAndIndirectLightingSeparately();
 
     // Primary direct denoiser used for primary direct lighting when separated, otherwise a special combined direct+indirect denoiser is used when both direct and indirect signals are combined.
-    DxvkDenoise& denoiser0 = RtxOptions::denoiseDirectAndIndirectLightingSeparately() ? m_common->metaPrimaryDirectLightDenoiser() : m_common->metaPrimaryCombinedLightDenoiser();
+    DxvkDenoise& denoiser0 = separated ? m_common->metaPrimaryDirectLightDenoiser() : m_common->metaPrimaryCombinedLightDenoiser();
+    // The unselected primary signal owns a different history. Release it on
+    // mode changes instead of keeping both histories and pipeline sets resident.
+    (separated ? m_common->metaPrimaryCombinedLightDenoiser() : m_common->metaPrimaryDirectLightDenoiser()).releaseResources();
     DxvkDenoise& referenceDenoiserSecondLobe0 = m_common->metaReferenceDenoiserSecondLobe0();
     // Primary Indirect denoiser used for primary indirect lighting when separated.
     DxvkDenoise& denoiser1 = m_common->metaPrimaryIndirectLightDenoiser();
@@ -1835,8 +1841,10 @@ void RtxContext::endFrame(std::uint64_t cachedReflexFrameId, Rc<DxvkImage> targe
         denoiseInput.reference = denoiseInput.specular_hitT;
         denoiseOutput.reference = denoiseOutput.specular_hitT;
         secondLobeReferenceDenoiser.dispatch(this, m_execBarriers, rtOutput, denoiseInput, denoiseOutput);
-      } else
+      } else {
+        secondLobeReferenceDenoiser.releaseResources();
         denoiser.dispatch(this, m_execBarriers, rtOutput, denoiseInput, denoiseOutput);
+      }
     };
 
     const bool isSecondaryOnly = rayReconstruction.denoiseSecondarySignalWithExternalDenoiser();
@@ -1870,7 +1878,7 @@ void RtxContext::endFrame(std::uint64_t cachedReflexFrameId, Rc<DxvkImage> targe
     }
 
     // Primary Indirect light denoiser, if separate denoiser is used.
-    if (RtxOptions::denoiseDirectAndIndirectLightingSeparately() && !isSecondaryOnly)
+    if (separated && !isSecondaryOnly)
     {
       ScopedGpuProfileZone(this, "Primary Indirect Denoising");
 

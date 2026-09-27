@@ -22,6 +22,7 @@
 #include "dxvk_device.h"
 #include "dxvk_pipemanager.h"
 #include "dxvk_state_cache.h"
+#include "dxvk_compiler_policy.h"
 
 #include <filesystem>
 
@@ -224,15 +225,13 @@ namespace dxvk {
       }
     }
 
-    // Use half the available CPU cores for pipeline compilation
-    uint32_t numCpuCores = dxvk::thread::hardware_concurrency();
-    uint32_t numWorkers  = ((std::max(1u, numCpuCores) - 1) * 5) / 7;
-
-    if (numWorkers <  1) numWorkers =  1;
-    if (numWorkers > 32) numWorkers = 32;
-
-    if (device->config().numCompilerThreads > 0)
-      numWorkers = device->config().numCompilerThreads;
+    MEMORYSTATUSEX memory = {};
+    memory.dwLength = sizeof(memory);
+    const uint64_t availableMemory = GlobalMemoryStatusEx(&memory) ? memory.ullAvailPhys : 0;
+    const uint32_t cpuThreads = dxvk::thread::hardware_concurrency();
+    const uint32_t numWorkers = pipelineCompilerThreads(cpuThreads,
+      device->config().numCompilerThreads, availableMemory);
+    m_remixCompileConcurrencyLimit.store(remixCompilerThreads(cpuThreads, 0));
     
     Logger::info(str::format("DXVK: Using ", numWorkers, " compiler threads"));
     
@@ -343,7 +342,8 @@ namespace dxvk {
         workerLock = std::unique_lock<dxvk::mutex>(m_workerLock);
 
       // NV-DXVK start: do not compile same shader multiple times
-      if (m_workerItemsInFlight.count(item.hash()) == 0) {
+      if (!m_stopThreads.load() && m_workerItemsInFlight.count(item.hash()) == 0
+       && m_failedWorkerItems.count(item.hash()) == 0) {
         ++m_workerCompilationCount;
         if (item.isRemixShader) {
           ++m_workerCompilingRemixShaders;
@@ -407,7 +407,8 @@ namespace dxvk {
     std::unique_lock<dxvk::mutex> workerLock(m_workerLock);
 
     // Do not compile same shader multiple times
-    if (m_workerItemsInFlight.count(item.hash()) == 0) {
+    if (!m_stopThreads.load() && m_workerItemsInFlight.count(item.hash()) == 0
+     && m_failedWorkerItems.count(item.hash()) == 0) {
       assert(item.isRemixShader);
       ++m_workerCompilationCount;
       ++m_workerCompilingRemixShaders;
@@ -419,6 +420,11 @@ namespace dxvk {
     }
   }
   // NV-DXVK end
+
+  bool DxvkStateCache::hasPipelineForShader(const DxvkShaderKey& key) {
+    std::lock_guard<dxvk::mutex> lock(m_entryLock);
+    return m_pipelineMap.find(key) != m_pipelineMap.end();
+  }
 
   void DxvkStateCache::stopWorkerThreads() {
     { std::lock_guard<dxvk::mutex> workerLock(m_workerLock);
@@ -435,6 +441,16 @@ namespace dxvk {
       worker.join();
     
     m_writerThread.join();
+
+    // A retired device needs no speculative jobs. Release their shader refs
+    // after running jobs finish; never destroy resources under a driver call.
+    std::lock_guard<dxvk::mutex> lock(m_workerLock);
+    m_workerQueue = {};
+    m_workerQueueRemix = {};
+    m_workerItemsInFlight.clear();
+    m_workerCompilationCount.store(0);
+    m_workerCompilingRemixShaders.store(0);
+    m_workerBusy.store(0);
   }
 
 
@@ -1096,6 +1112,9 @@ namespace dxvk {
             m_workerBusy += 1;
         }
 
+        if (m_stopThreads.load())
+          break;
+
         if (!m_workerQueue.empty()) {
           item = m_workerQueue.front();
           m_workerQueue.pop();
@@ -1109,7 +1128,19 @@ namespace dxvk {
         }
       }
 
-      compilePipelines(item);
+      bool failed = false;
+      try {
+        compilePipelines(item);
+      } catch (const DxvkError& error) {
+        Logger::err(str::format("Pipeline compilation failed: ", error.message()));
+        failed = true;
+      } catch (const std::exception& error) {
+        Logger::err(str::format("Pipeline compilation failed: ", error.what()));
+        failed = true;
+      } catch (...) {
+        Logger::err("Pipeline compilation failed with an unknown exception.");
+        failed = true;
+      }
 
       --m_workerCompilationCount;
 
@@ -1123,13 +1154,16 @@ namespace dxvk {
       { std::unique_lock<dxvk::mutex> lock(m_workerLock);
         assert(m_workerItemsInFlight.count(item.hash()) == 1);
         m_workerItemsInFlight.erase(item.hash());
+        if (failed)
+          m_failedWorkerItems.insert(item.hash());
+
+        if (tookRemixSlot) {
+          m_remixCompilesActive -= 1;
+          m_workerCond.notify_all();
+        }
       }
       // NV-DXVK end
 
-      if (tookRemixSlot) {
-        m_remixCompilesActive -= 1;
-        m_workerCond.notify_all();
-      }
     }
   }
 
@@ -1139,7 +1173,7 @@ namespace dxvk {
 
     std::ofstream file;
 
-    while (!m_stopThreads.load()) {
+    while (true) {
       DxvkStateCacheEntry entry;
 
       { std::unique_lock<dxvk::mutex> lock(m_writerLock);

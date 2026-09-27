@@ -1,6 +1,7 @@
 #pragma once
 
 #include <vector>
+#include <mutex>
 
 #include "dxgi_adapter.h"
 #include "dxgi_monitor.h"
@@ -144,6 +145,7 @@ namespace dxvk {
     }
     
   private:
+    HRESULT getNativeFactory(Com<IDXGIFactory2>& factory);
     
     Rc<DxvkInstance> m_instance;
     DxgiMonitorInfo  m_monitorInfo;
@@ -151,6 +153,10 @@ namespace dxvk {
     UINT             m_flags;
     
     HWND m_associatedWindow = nullptr;
+    UINT m_windowAssociationFlags = 0;
+    bool m_hasWindowAssociation = false;
+    std::mutex m_nativeMutex;
+    Com<IDXGIFactory2> m_nativeFactory;
     
   };
   

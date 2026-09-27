@@ -56,6 +56,49 @@ namespace dxvk {
 
   }
 
+  DxvkContext::ScopedResourceState::ScopedResourceState(DxvkContext& context)
+  : m_context(context),
+    m_previous(context.m_resourceStateScope),
+    m_computeShader(context.m_state.cp.shaders.cs),
+    m_pushConstants(context.m_state.pc) {
+    m_savedSlots.clear();
+    context.m_resourceStateScope = this;
+  }
+
+  void DxvkContext::ScopedResourceState::preserve(uint32_t slot) {
+    if (!m_savedSlots.set(slot))
+      return;
+    SavedSlot saved { slot, m_context.m_rc[slot] };
+    if (m_inlineCount < m_inlineSlots.size())
+      m_inlineSlots[m_inlineCount++] = std::move(saved);
+    else
+      m_overflowSlots.push_back(std::move(saved));
+  }
+
+  DxvkContext::ScopedResourceState::~ScopedResourceState() {
+    assert(m_context.m_resourceStateScope == this);
+    m_context.m_resourceStateScope = m_previous;
+    const auto restore = [this](SavedSlot& saved) {
+      m_context.m_rc[saved.index] = std::move(saved.resource);
+      m_context.m_rcTracked.clr(saved.index);
+    };
+    for (uint32_t i = 0; i < m_inlineCount; ++i)
+      restore(m_inlineSlots[i]);
+    for (auto& saved : m_overflowSlots)
+      restore(saved);
+    if (m_inlineCount || !m_overflowSlots.empty()) {
+      m_context.m_flags.set(DxvkContextFlag::GpDirtyResources,
+        DxvkContextFlag::CpDirtyResources, DxvkContextFlag::RpDirtyResources);
+    }
+    if (m_context.m_state.cp.shaders.cs != m_computeShader)
+      m_context.bindShader(VK_SHADER_STAGE_COMPUTE_BIT, m_computeShader);
+    if (m_context.m_state.pc.constantBank != m_pushConstants.constantBank
+     || std::memcmp(m_context.m_state.pc.data, m_pushConstants.data, sizeof(m_pushConstants.data)) != 0) {
+      m_context.m_state.pc = m_pushConstants;
+      m_context.m_flags.set(DxvkContextFlag::DirtyPushConstants);
+    }
+  }
+
   // NV-DXVK start: DLFG integration
   bool DxvkContext::isDLFGEnabled() const {
     ScopedCpuProfileZone();
@@ -205,6 +248,7 @@ namespace dxvk {
     uint32_t              slot,
     const DxvkBufferSlice& buffer) {
     ScopedCpuProfileZone();
+    if (m_resourceStateScope) m_resourceStateScope->preserve(slot);
     bool needsUpdate = !m_rc[slot].bufferSlice.matchesBuffer(buffer);
 
     if (likely(needsUpdate))
@@ -234,6 +278,7 @@ namespace dxvk {
     const Rc<DxvkImageView>& imageView,
     const Rc<DxvkBufferView>& bufferView) {
     ScopedCpuProfileZone();
+    if (m_resourceStateScope) m_resourceStateScope->preserve(slot);
     m_rc[slot].imageView = imageView;
     m_rc[slot].bufferView = bufferView;
     m_rc[slot].bufferSlice = bufferView != nullptr
@@ -252,6 +297,7 @@ namespace dxvk {
     uint32_t              slot,
     const Rc<DxvkSampler>& sampler) {
     ScopedCpuProfileZone();
+    if (m_resourceStateScope) m_resourceStateScope->preserve(slot);
     m_rc[slot].sampler = sampler;
     m_rcTracked.clr(slot);
 
@@ -267,6 +313,7 @@ namespace dxvk {
     uint32_t              slot,
     const Rc<DxvkAccelStructure> accelStructure) {
     ScopedCpuProfileZone();
+    if (m_resourceStateScope) m_resourceStateScope->preserve(slot);
     m_rc[slot].accelStructure = accelStructure;
     m_rc[slot].tlas = accelStructure != nullptr
       ? accelStructure->getAccelStructure()
@@ -359,6 +406,10 @@ namespace dxvk {
     ScopedCpuProfileZone();
     if (!m_state.xfb.buffers[binding].matches(buffer)
       || !m_state.xfb.counters[binding].matches(counter)) {
+      // End feedback with the counters belonging to the active bindings.
+      // Replacing them first loses the byte count when an SO target is
+      // unbound and subsequently consumed by D3D11 DrawAuto.
+      this->pauseTransformFeedback();
       m_state.xfb.buffers[binding] = buffer;
       m_state.xfb.counters[binding] = counter;
 
@@ -1807,14 +1858,30 @@ namespace dxvk {
     uint32_t          counterDivisor,
     uint32_t          counterBias) {
     ScopedCpuProfileZone();
-    if (this->commitGraphicsState<false, false>()) {
-      auto physSlice = counterBuffer.getSliceHandle();
+    // Commit an active feedback session's byte count before checking its
+    // pending write. These are GPU barriers, never a host readback or wait.
+    this->pauseTransformFeedback();
+    const auto physSlice = counterBuffer.getSliceHandle();
+    if (m_gfxBarriers.isBufferDirty(physSlice, DxvkAccess::Read))
+      this->spillRenderPass(true);
+    if (m_execBarriers.isBufferDirty(physSlice, DxvkAccess::Read)) {
+      this->spillRenderPass(true);
+      m_execBarriers.recordCommands(m_cmd);
+    }
 
+    if (this->commitGraphicsState<false, false>()) {
       m_cmd->cmdDrawIndirectVertexCount(1, 0,
         physSlice.handle,
         physSlice.offset,
         counterBias,
         counterDivisor);
+
+      // DrawIndirectByteCount reads an indirect command, whereas the XFB
+      // counter-read access bit belongs to BeginTransformFeedback.
+      this->checkGfxBufferBarrier<true>(counterBuffer,
+        VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT,
+        VK_ACCESS_INDIRECT_COMMAND_READ_BIT);
+      m_cmd->trackResource<DxvkAccess::Read>(counterBuffer.buffer());
     }
 
     m_cmd->addStatCtr(DxvkStatCounter::CmdDrawCalls, 1);

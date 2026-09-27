@@ -123,9 +123,17 @@ static PFN_Map oMap = nullptr;
 static PFN_Unmap oUnmap = nullptr;
 static PFN_UpdateSubresource oUpdateSubresource = nullptr;
 
+static bool CaptureTraceEnabled() {
+  static const bool enabled = [] {
+    wchar_t value[8] = {};
+    return GetEnvironmentVariableW(L"DXVK_REMIX_BRIDGE_TRACE", value, 8) == 1 && value[0] == L'1';
+  }();
+  return enabled;
+}
+
 static void V219NotifyDraw(const char* what) {
   LONG n = InterlockedIncrement(&gV219DrawCount);
-  if (n <= 16 || (n % 500) == 0) {
+  if (n <= 16 || (CaptureTraceEnabled() && (n % 500) == 0)) {
     char msg[256] = {};
     sprintf_s(msg, sizeof(msg), "DX11_V219_REAL_D3D11_CLIENT_CAPTURE_LAYER: captured %s count=%ld in game process.", what, n);
     V219Log("capture", msg);
@@ -134,7 +142,7 @@ static void V219NotifyDraw(const char* what) {
 
 static void V219NotifyResource(const char* what) {
   LONG n = InterlockedIncrement(&gV219ResourceCount);
-  if (n <= 16 || (n % 250) == 0) {
+  if (n <= 16 || (CaptureTraceEnabled() && (n % 250) == 0)) {
     char msg[256] = {};
     sprintf_s(msg, sizeof(msg), "DX11_V219_REAL_D3D11_CLIENT_CAPTURE_LAYER: captured %s count=%ld in game process.", what, n);
     V219Log("capture", msg);
@@ -145,14 +153,13 @@ static HRESULT STDMETHODCALLTYPE HSwapPresent(IDXGISwapChain* self, UINT syncInt
   if (!gV219InsideHook && !(flags & DXGI_PRESENT_TEST)) {
     gV219InsideHook = true;
     LONG n = InterlockedIncrement(&gV219PresentCount);
-    if (n <= 8 || (n % 60) == 0) {
+    if (n <= 8 || (CaptureTraceEnabled() && (n % 60) == 0)) {
       char msg[256] = {};
       sprintf_s(msg, sizeof(msg), "DX11_V219_REAL_D3D11_CLIENT_CAPTURE_LAYER: captured IDXGISwapChain::Present count=%ld in game process.", n);
       V219Log("capture", msg);
     }
-    // DX11_V265_BRIDGE_PRESENT_CAMERA: frame boundary - send Startup (once,
-    // game HWND), SetupCamera and Present to the server so the Remix runtime
-    // attaches to and presents INTO the game window every frame.
+    // The server presents to its own child HWND. Keep native DXGI alive for
+    // incomplete captures and expose the child only after a completed RT frame.
     const bool presented = dx11_capture::OnPresent(self);
     gV219InsideHook = false;
     if (presented) return S_OK;
@@ -164,7 +171,7 @@ static HRESULT STDMETHODCALLTYPE HSwapPresent1(IDXGISwapChain1* self, UINT syncI
   if (!gV219InsideHook && !(flags & DXGI_PRESENT_TEST)) {
     gV219InsideHook = true;
     LONG n = InterlockedIncrement(&gV219PresentCount);
-    if (n <= 8 || (n % 60) == 0) {
+    if (n <= 8 || (CaptureTraceEnabled() && (n % 60) == 0)) {
       char msg[256] = {};
       sprintf_s(msg, sizeof(msg), "DX11_V229: captured IDXGISwapChain1::Present1 count=%ld in game process.", n);
       V219Log("capture", msg);

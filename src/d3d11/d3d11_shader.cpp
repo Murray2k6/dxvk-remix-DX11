@@ -1730,6 +1730,13 @@ namespace dxvk {
         Sha1Hash::compute(2, shaderKeyData)));
       state->shader = gs;
 
+      const std::string dumpPath = env::getEnvVar("DXVK_SHADER_DUMP_PATH");
+      if (!dumpPath.empty()) {
+        std::ofstream dump(std::filesystem::path(dumpPath) / (gs->getShaderKey().toString() + ".spv"),
+          std::ios::binary | std::ios::trunc);
+        gs->dump(dump);
+      }
+
       Logger::info(str::format(
         "[Remix-DX11] V280: texcoord capture GS built (semantic=",
         state->semanticName, state->semanticIndex, ")"));
@@ -1810,6 +1817,13 @@ namespace dxvk {
       gs->setShaderKey(DxvkShaderKey(VK_SHADER_STAGE_GEOMETRY_BIT,
         Sha1Hash::compute(2, shaderKeyData)));
       variant.shader = gs;
+
+      const std::string dumpPath = env::getEnvVar("DXVK_SHADER_DUMP_PATH");
+      if (!dumpPath.empty()) {
+        std::ofstream dump(std::filesystem::path(dumpPath) / (gs->getShaderKey().toString() + ".spv"),
+          std::ios::binary | std::ios::trunc);
+        gs->dump(dump);
+      }
 
       Logger::info(str::format(
         "[Remix-DX11] V290: post-VS position capture GS built (vs=",

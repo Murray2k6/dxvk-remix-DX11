@@ -48,6 +48,32 @@ namespace dxvk {
 
     virtual ~DxvkContext();
 
+    // Internal compute/RT work shares descriptor slots with the client API.
+    // Save only slots that are overwritten, with inline storage for the small
+    // geometry interleaver, and restore them when the injected work ends.
+    class ScopedResourceState {
+    public:
+      explicit ScopedResourceState(DxvkContext& context);
+      ~ScopedResourceState();
+      ScopedResourceState(const ScopedResourceState&) = delete;
+      ScopedResourceState& operator=(const ScopedResourceState&) = delete;
+    private:
+      friend class DxvkContext;
+      struct SavedSlot {
+        uint32_t index = 0;
+        DxvkShaderResourceSlot resource;
+      };
+      void preserve(uint32_t slot);
+      DxvkContext& m_context;
+      ScopedResourceState* m_previous;
+      Rc<DxvkShader> m_computeShader;
+      DxvkPushConstantState m_pushConstants;
+      DxvkBindingSet<MaxNumResourceSlots> m_savedSlots;
+      std::array<SavedSlot, 16> m_inlineSlots;
+      uint32_t m_inlineCount = 0;
+      std::vector<SavedSlot> m_overflowSlots;
+    };
+
     // NV-DXVK start: DLFG integration
     /**
      * \brief Returns true if DLFG is enabled
@@ -1305,6 +1331,7 @@ namespace dxvk {
     std::vector<DxvkDeferredClear> m_deferredClears;
     
     std::array<DxvkShaderResourceSlot, MaxNumResourceSlots>  m_rc;
+    ScopedResourceState* m_resourceStateScope = nullptr;
     std::array<DxvkGraphicsPipeline*, 4096> m_gpLookupCache = { };
     std::array<DxvkComputePipeline*,   256> m_cpLookupCache = { };
     std::unordered_map<size_t /*Hash*/, DxvkRaytracingPipeline*> m_rpLookupCache;

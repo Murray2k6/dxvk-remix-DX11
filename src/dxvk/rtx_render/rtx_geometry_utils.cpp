@@ -777,6 +777,12 @@ namespace dxvk {
   void RtxGeometryUtils::processGeometryBuffers(const InterleavedGeometryDescriptor& desc, RaytraceGeometry& output) {
     const DxvkBufferSlice targetSlice = DxvkBufferSlice(desc.buffer);
 
+    // A repack may remove attributes. Never retain a descriptor into the old
+    // allocation or old stride after the current layout stops producing it.
+    output.normalBuffer = RaytraceBuffer();
+    output.texcoordBuffer = RaytraceBuffer();
+    output.color0Buffer = RaytraceBuffer();
+
     output.positionBuffer = RaytraceBuffer(targetSlice, desc.positionOffset, desc.stride, VK_FORMAT_R32G32B32_SFLOAT);
 
     if (desc.hasNormals)
@@ -791,6 +797,10 @@ namespace dxvk {
 
   void RtxGeometryUtils::processGeometryBuffers(const RasterGeometry& input, RaytraceGeometry& output) {
     const DxvkBufferSlice slice = DxvkBufferSlice(output.historyBuffer[0]);
+
+    output.normalBuffer = RaytraceBuffer();
+    output.texcoordBuffer = RaytraceBuffer();
+    output.color0Buffer = RaytraceBuffer();
 
     output.positionBuffer = RaytraceBuffer(slice, input.positionBuffer.offsetFromSlice(), input.positionBuffer.stride(), input.positionBuffer.vertexFormat());
 
@@ -823,6 +833,20 @@ namespace dxvk {
     assert(stride <= kMaxInterleavedComponents * sizeof(float) && "Maximum number of interleaved components needs update.");
 
     return stride;
+  }
+
+  bool RtxGeometryUtils::matchesGeometryAttributes(const RasterGeometry& input, const RaytraceGeometry& output, bool forceNormals) {
+    const bool copyLayout = input.isVertexDataInterleaved() && input.areFormatsGpuFriendly()
+      && !forceNormals && !input.postVsPositionIsHomogeneousClip;
+    const bool normals = forceNormals || (input.normalBuffer.defined()
+      && (copyLayout || interleaver::formatConversionFloatSupported(input.normalBuffer.vertexFormat())));
+    const bool texcoord = input.texcoordBuffer.defined()
+      && (copyLayout || interleaver::formatConversionFloatSupported(input.texcoordBuffer.vertexFormat()));
+    const bool color = input.color0Buffer.defined()
+      && (copyLayout || interleaver::formatConversionUintSupported(input.color0Buffer.vertexFormat()));
+    return normals == output.normalBuffer.defined()
+        && texcoord == output.texcoordBuffer.defined()
+        && color == output.color0Buffer.defined();
   }
 
   void RtxGeometryUtils::cacheVertexDataOnGPU(const Rc<DxvkContext>& ctx, const RasterGeometry& input, RaytraceGeometry& output, bool forceNormals) {
@@ -987,19 +1011,19 @@ namespace dxvk {
     output.positionOffset = offset;
     offset += sizeof(float) * 3;
 
-    if (input.normalBuffer.defined() || forceNormals) {
+    if (hasNormals || forceNormals) {
       output.hasNormals = true;
       output.normalOffset = offset;
       offset += sizeof(float) * 3;
     }
 
-    if (input.texcoordBuffer.defined()) {
+    if (hasTexcoord) {
       output.hasTexcoord = true;
       output.texcoordOffset = offset;
       offset += sizeof(float) * 2;
     }
 
-    if (input.color0Buffer.defined()) {
+    if (hasColor0) {
       output.hasColor0 = true;
       output.color0Offset = offset;
       offset += sizeof(uint32_t);

@@ -9,3 +9,4 @@ EXPORTS
     D3D11On12CreateDevice @24
     remixapi_InitializeLibrary @25
     remixapi_dxvk_WasLastPresentRayTraced
+    remixapi_dxvk_GetCompletedRaytracedFrameCount

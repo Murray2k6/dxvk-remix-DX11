@@ -177,12 +177,21 @@ namespace dxvk {
       specData.set(getSpecId(i), state.sc.specConstants[i], 0u);
     
     VkSpecializationInfo specInfo = specData.getSpecInfo();
+
+    const int32_t rasterizedStream = m_shaders.gs != nullptr
+      ? m_shaders.gs->shaderOptions().rasterizedStream
+      : 0;
     
     auto vsm  = createShaderModule(m_shaders.vs,  state);
     auto tcsm = createShaderModule(m_shaders.tcs, state);
     auto tesm = createShaderModule(m_shaders.tes, state);
     auto gsm  = createShaderModule(m_shaders.gs,  state);
-    auto fsm  = createShaderModule(m_shaders.fs,  state);
+    // Stream-output-only capture has no fragment shader state. Vulkan forbids
+    // a fragment stage when rasterizer discard is enabled, even if D3D11 left
+    // its pixel shader bound during the original draw.
+    auto fsm = rasterizedStream >= 0
+      ? createShaderModule(m_shaders.fs, state)
+      : DxvkShaderModule();
 
     std::vector<VkPipelineShaderStageCreateInfo> stages;
     if (vsm)  stages.push_back(vsm.stageInfo(&specInfo));
@@ -224,10 +233,6 @@ namespace dxvk {
       }
     }
 
-    int32_t rasterizedStream = m_shaders.gs != nullptr
-      ? m_shaders.gs->shaderOptions().rasterizedStream
-      : 0;
-    
     // Compact vertex bindings so that we can more easily update vertex buffers
     std::array<VkVertexInputAttributeDescription, MaxNumVertexAttributes> viAttribs;
     std::array<VkVertexInputBindingDescription,   MaxNumVertexBindings>   viBindings;

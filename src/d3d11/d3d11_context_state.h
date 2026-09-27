@@ -14,9 +14,14 @@
 #include "d3d11_view_uav.h"
 
 namespace dxvk {
+
+  // Bound objects are owned by the context, which is itself owned by its
+  // device. Private references retain the objects without making a public
+  // child reference retain that same device and create an ownership cycle.
+  // API Get* methods still return ordinary public references through ref().
   
   struct D3D11ConstantBufferBinding {
-    Com<D3D11Buffer> buffer         = nullptr;
+    Com<D3D11Buffer, false> buffer  = nullptr;
     UINT             constantOffset = 0;
     UINT             constantCount  = 0;
     UINT             constantBound  = 0;
@@ -31,17 +36,17 @@ namespace dxvk {
     
   
   struct D3D11ShaderResourceBindings {
-    std::array<Com<D3D11ShaderResourceView>, D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT> views     = { };
+    std::array<Com<D3D11ShaderResourceView, false>, D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT> views = { };
     DxvkBindingSet<D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT>                           hazardous = { };
   };
     
     
   using D3D11UnorderedAccessBindings = std::array<
-    Com<D3D11UnorderedAccessView>, D3D11_1_UAV_SLOT_COUNT>;
+    Com<D3D11UnorderedAccessView, false>, D3D11_1_UAV_SLOT_COUNT>;
   
   
   struct D3D11ContextStateVS {
-    Com<D3D11VertexShader>        shader = nullptr;
+    Com<D3D11VertexShader, false> shader = nullptr;
     D3D11ConstantBufferBindings   constantBuffers = { };
     D3D11SamplerBindings          samplers        = { };
     D3D11ShaderResourceBindings   shaderResources = { };
@@ -49,7 +54,7 @@ namespace dxvk {
   
   
   struct D3D11ContextStateHS {
-    Com<D3D11HullShader>          shader = nullptr;
+    Com<D3D11HullShader, false>   shader = nullptr;
     D3D11ConstantBufferBindings   constantBuffers = { };
     D3D11SamplerBindings          samplers        = { };
     D3D11ShaderResourceBindings   shaderResources = { };
@@ -57,7 +62,7 @@ namespace dxvk {
   
   
   struct D3D11ContextStateDS {
-    Com<D3D11DomainShader>        shader = nullptr;
+    Com<D3D11DomainShader, false> shader = nullptr;
     D3D11ConstantBufferBindings   constantBuffers = { };
     D3D11SamplerBindings          samplers        = { };
     D3D11ShaderResourceBindings   shaderResources = { };
@@ -65,7 +70,7 @@ namespace dxvk {
   
   
   struct D3D11ContextStateGS {
-    Com<D3D11GeometryShader>      shader = nullptr;
+    Com<D3D11GeometryShader, false> shader = nullptr;
     D3D11ConstantBufferBindings   constantBuffers = { };
     D3D11SamplerBindings          samplers        = { };
     D3D11ShaderResourceBindings   shaderResources = { };
@@ -73,7 +78,7 @@ namespace dxvk {
   
   
   struct D3D11ContextStatePS {
-    Com<D3D11PixelShader>         shader = nullptr;
+    Com<D3D11PixelShader, false>  shader = nullptr;
     D3D11ConstantBufferBindings   constantBuffers = { };
     D3D11SamplerBindings          samplers        = { };
     D3D11ShaderResourceBindings   shaderResources = { };
@@ -82,7 +87,7 @@ namespace dxvk {
   
   
   struct D3D11ContextStateCS {
-    Com<D3D11ComputeShader>       shader = nullptr;
+    Com<D3D11ComputeShader, false> shader = nullptr;
     D3D11ConstantBufferBindings   constantBuffers = { };
     D3D11SamplerBindings          samplers        = { };
     D3D11ShaderResourceBindings   shaderResources = { };
@@ -93,27 +98,27 @@ namespace dxvk {
   
   
   struct D3D11VertexBufferBinding {
-    Com<D3D11Buffer> buffer = nullptr;
+    Com<D3D11Buffer, false> buffer = nullptr;
     UINT             offset = 0;
     UINT             stride = 0;
   };
   
   
   struct D3D11IndexBufferBinding {
-    Com<D3D11Buffer> buffer = nullptr;
+    Com<D3D11Buffer, false> buffer = nullptr;
     UINT             offset = 0;
     DXGI_FORMAT      format = DXGI_FORMAT_UNKNOWN;
   };
 
 
   struct D3D11ContextStateID {
-    Com<D3D11Buffer> argBuffer = nullptr;
-    Com<D3D11Buffer> cntBuffer = nullptr;
+    Com<D3D11Buffer, false> argBuffer = nullptr;
+    Com<D3D11Buffer, false> cntBuffer = nullptr;
   };
   
   
   struct D3D11ContextStateIA {
-    Com<D3D11InputLayout>    inputLayout       = nullptr;
+    Com<D3D11InputLayout, false> inputLayout   = nullptr;
     D3D11_PRIMITIVE_TOPOLOGY primitiveTopology = D3D11_PRIMITIVE_TOPOLOGY_UNDEFINED;
     
     std::array<D3D11VertexBufferBinding, D3D11_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT> vertexBuffers = { };
@@ -149,7 +154,7 @@ namespace dxvk {
 
 
   struct D3D11ContextSoTarget {
-    Com<D3D11Buffer> buffer = nullptr;
+    Com<D3D11Buffer, false> buffer = nullptr;
     UINT             offset = 0;
   };
   
@@ -160,7 +165,7 @@ namespace dxvk {
   
   
   struct D3D11ContextStatePR {
-    Com<D3D11Query> predicateObject = nullptr;
+    Com<D3D11Query, false> predicateObject = nullptr;
     BOOL            predicateValue  = FALSE;
   };
   

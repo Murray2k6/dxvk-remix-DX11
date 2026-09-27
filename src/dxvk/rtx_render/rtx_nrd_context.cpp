@@ -35,6 +35,7 @@
 #include <algorithm>
 #include <string>
 #include <string_view>
+#include <malloc.h>
 
 namespace nrd {
   using pfnCreateInstance = Result (NRD_CALL *)(const InstanceCreationDesc& instanceCreationDesc, Instance*& instance);
@@ -44,8 +45,8 @@ namespace nrd {
   using pfnSetCommonSettings = Result (NRD_CALL *)(Instance& instance, const CommonSettings& commonSettings);
   using pfnSetDenoiserSettings = Result (NRD_CALL *)(Instance& instance, Identifier identifier, const void* denoiserSettings);
   using pfnGetComputeDispatches = Result (NRD_CALL *)(Instance& instance, const Identifier* identifiers, uint32_t identifiersNum, const DispatchDesc*& dispatchDescs, uint32_t& dispatchDescsNum);
-  using pfnGetResourceTypeString = const char* (*)(ResourceType resourceType);
-  using pfnGetDenoiserString = const char* (*)(Denoiser denoiser);
+  using pfnGetResourceTypeString = const char* (NRD_CALL *)(ResourceType resourceType);
+  using pfnGetDenoiserString = const char* (NRD_CALL *)(Denoiser denoiser);
 
   struct DispatchNRD {
     pfnCreateInstance CreateInstance;
@@ -57,7 +58,17 @@ namespace nrd {
     pfnGetComputeDispatches GetComputeDispatches;
     pfnGetResourceTypeString GetResourceTypeString;
     pfnGetDenoiserString GetDenoiserString;
-  } dispatch;
+  };
+
+  struct Library {
+    HMODULE module = nullptr;
+    DispatchNRD dispatch = {};
+
+    ~Library() {
+      if (module)
+        FreeLibrary(module);
+    }
+  };
 
   // DX11_V270_NRD_ROBUST_LOAD: locate NRD.dll across every plausible layout.
   // The old loader only tried the runtime DLL's OWN directory; when the
@@ -120,11 +131,12 @@ namespace nrd {
     return NULL;
   }
 
-  HMODULE initialize() {
+  static void initialize(Library& library) {
     HMODULE hNRD = loadNrdLibrary();
     if (hNRD == NULL) {
-      return NULL;
+      return;
     }
+    DispatchNRD dispatch = {};
 
     // Resolve and VALIDATE every entry point. A null proc that the old code
     // called unchecked (GetLibraryDesc at minimum) was an access violation;
@@ -149,7 +161,7 @@ namespace nrd {
 
     if (!allProcs) {
       FreeLibrary(hNRD);
-      return NULL;
+      return;
     }
 
     const LibraryDesc& desc = dispatch.GetLibraryDesc();
@@ -163,7 +175,7 @@ namespace nrd {
         " but built against v", NRD_VERSION_MAJOR, ".", NRD_VERSION_MINOR, ".", NRD_VERSION_BUILD,
         " - denoiser disabled. Ship the matching NRD.dll."));
       FreeLibrary(hNRD);
-      return NULL;
+      return;
     }
     if (desc.versionBuild != NRD_VERSION_BUILD) {
       dxvk::Logger::warn(dxvk::str::format(
@@ -177,7 +189,23 @@ namespace nrd {
       "[Remix-DX11] NRD denoiser loaded: v",
       uint32_t(desc.versionMajor), ".", uint32_t(desc.versionMinor), ".", uint32_t(desc.versionBuild)));
 
-    return hNRD;
+    library.module = hNRD;
+    library.dispatch = dispatch;
+  }
+
+  static std::shared_ptr<Library> acquireLibrary() {
+    static std::mutex mutex;
+    static std::weak_ptr<Library> sharedLibrary;
+    std::lock_guard<std::mutex> lock(mutex);
+    auto library = sharedLibrary.lock();
+    if (!library) {
+      library = std::make_shared<Library>();
+      initialize(*library);
+      sharedLibrary = library;
+    }
+    // A failed load is also retained by the contexts. Do not probe the
+    // filesystem and repeat an identical error on every rendered frame.
+    return library;
   }
 }
 
@@ -195,15 +223,15 @@ namespace dxvk {
       && pipeline.resourceRanges[0].descriptorsNum == 1;
   }
   static void* NrdAllocate(void* userArg, size_t size, size_t alignment) {
-    return malloc(size);
+    return _aligned_malloc(size, alignment);
   }
 
   static void* NrdReallocate(void* userArg, void* memory, size_t size, size_t alignment) {
-    return realloc(memory, size);
+    return _aligned_realloc(memory, size, alignment);
   }
 
   static void NrdFree(void* userArg, void* memory) {
-    free(memory);
+    _aligned_free(memory);
   }
 
   static VkFormat TranslateFormat(nrd::Format format) {
@@ -239,9 +267,9 @@ namespace dxvk {
     case nrd::Format::R11_G11_B10_UFLOAT:
       return VK_FORMAT_B10G11R11_UFLOAT_PACK32;
     case nrd::Format::R10_G10_B10_A2_UNORM:
-      return VK_FORMAT_A2R10G10B10_UNORM_PACK32;
+      return VK_FORMAT_A2B10G10R10_UNORM_PACK32;
     case nrd::Format::R10_G10_B10_A2_UINT:
-      return VK_FORMAT_A2R10G10B10_UINT_PACK32;
+      return VK_FORMAT_A2B10G10R10_UINT_PACK32;
     default:
       assert(!"Unknown/Unsupported format.");
       return VK_FORMAT_UNDEFINED;
@@ -250,13 +278,14 @@ namespace dxvk {
 
   NRDContext::NRDContext(DxvkDevice* device, DenoiserType type)
     : CommonDeviceObject(device), m_vkd(device->vkd()), m_type(type) {
-    m_hNRD = nrd::initialize();
-
-    if (m_hNRD == NULL) {
-      return;
-    }
-
-    m_settings.initialize(nrd::dispatch.GetLibraryDesc(), device->instance()->config(), type);
+    // Settings and ray-tracing arguments are needed even when this signal
+    // never runs NRD. Loading the DLL and creating an SDK instance are deferred
+    // until the first dispatch; all active contexts share the same library.
+    nrd::LibraryDesc libraryDesc = {};
+    libraryDesc.versionMajor = NRD_VERSION_MAJOR;
+    libraryDesc.versionMinor = NRD_VERSION_MINOR;
+    libraryDesc.versionBuild = NRD_VERSION_BUILD;
+    m_settings.initialize(libraryDesc, device->instance()->config(), type);
     
     // Disable the replace direct specular HitT with indirect specular HitT if we are using combined denoiser.
     // Because in combined denoiser the direct and indirect signals are denoised together,
@@ -265,16 +294,11 @@ namespace dxvk {
   }
 
   NRDContext::~NRDContext() {
-    destroyResources();
-    destroyPipelines();
-
-    if (m_hNRD != NULL) {
-      FreeLibrary(m_hNRD);
-    }
+    release();
   }
 
   void NRDContext::onDestroy() {
-    m_cbData = nullptr;
+    release();
   }
 
   const char* NRDContext::getDenoiserName() const {
@@ -288,80 +312,78 @@ namespace dxvk {
     }
   }
 
+  static DxvkSamplerCreateInfo getSamplerInfo(const nrd::Sampler& nrdSampler);
+
   void NRDContext::prepareResources(
     Rc<DxvkContext> ctx,
     const Resources::RaytracingOutput& rtOutput) {
 
+    if (m_type != DenoiserType::Reference)
+      m_settings.updateDenoiserMode();
+
+    const auto extent = rtOutput.m_compositeOutputExtent;
+    if (!extent.width || !extent.height || extent.width > UINT16_MAX || extent.height > UINT16_MAX)
+      throw DxvkError("NRD render extent is outside the SDK's supported range");
+
+    // An NRD instance describes one algorithm, independently of resolution.
+    // Recreate it on algorithm changes, but retain its pipelines on a resize.
+    if (m_denoiser != m_settings.m_denoiserDesc.denoiser || !m_denoiserInstance) {
+      release();
+      m_denoiser = m_settings.m_denoiserDesc.denoiser;
+      // Identifiers are local to an SDK instance, which contains one denoiser.
+      m_settings.m_denoiserDesc.identifier = 0;
+      nrd::InstanceCreationDesc instanceCreationDesc = {};
+      instanceCreationDesc.allocationCallbacks.Allocate = NrdAllocate;
+      instanceCreationDesc.allocationCallbacks.Reallocate = NrdReallocate;
+      instanceCreationDesc.allocationCallbacks.Free = NrdFree;
+      instanceCreationDesc.denoisersNum = 1;
+      instanceCreationDesc.denoisers = &m_settings.m_denoiserDesc;
+      try {
+        THROW_IF_FALSE(m_library->dispatch.CreateInstance(instanceCreationDesc, m_denoiserInstance) == nrd::Result::SUCCESS);
+        const auto& instanceDesc = m_library->dispatch.GetInstanceDesc(*m_denoiserInstance);
+        m_computePipelines.resize(instanceDesc.pipelinesNum);
+        for (uint32_t i = 0; i < instanceDesc.samplersNum; ++i)
+          m_staticSamplers.emplace_back(device()->createSampler(getSamplerInfo(instanceDesc.samplers[i])));
+      } catch (...) {
+        release();
+        throw;
+      }
+      Logger::debug(str::format("[RTX] NRD: created ", getDenoiserName(), " instance (",
+        m_library->dispatch.GetDenoiserString(m_denoiser), "); pipelines compile on first use"));
+    }
+
+    if (m_resourceExtent.width != extent.width || m_resourceExtent.height != extent.height) {
+      destroyResources();
+      const auto width = static_cast<uint16_t>(extent.width);
+      const auto height = static_cast<uint16_t>(extent.height);
+      m_settings.m_commonSettings.resourceSizePrev[0] = width;
+      m_settings.m_commonSettings.resourceSizePrev[1] = height;
+      m_settings.m_commonSettings.resourceSize[0] = width;
+      m_settings.m_commonSettings.resourceSize[1] = height;
+      m_settings.m_commonSettings.rectSizePrev[0] = width;
+      m_settings.m_commonSettings.rectSizePrev[1] = height;
+      m_settings.m_commonSettings.rectSize[0] = width;
+      m_settings.m_commonSettings.rectSize[1] = height;
+      createResources(ctx, rtOutput);
+      m_resourceExtent = extent;
+      m_settings.m_resetHistory = true;
+    }
+
     if (!m_cbData) {
       m_cbData = std::make_unique<RtxStagingDataAlloc>(
-        device(),
-        "RtxStagingDataAlloc: NRD CB",
+        device(), "RtxStagingDataAlloc: NRD CB",
         (VkMemoryPropertyFlagBits) (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT),
         VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
     }
 
-    const uint16_t width = static_cast<uint16_t>(rtOutput.m_compositeOutputExtent.width);
-    const uint16_t height = static_cast<uint16_t>(rtOutput.m_compositeOutputExtent.height);
-
-    bool bCreateDenoiser = m_denoiser != m_settings.m_denoiserDesc.denoiser ||
-      m_settings.m_commonSettings.resourceSize[0] != width ||
-      m_settings.m_commonSettings.resourceSize[1] != height ||
-      (m_transientTex.size() == 0 && m_permanentTex.size() == 0);
-
-    if (bCreateDenoiser) {
-      Logger::debug(str::format("[RTX] NRD: initializing denoiser ", getDenoiserName()));
-
-      m_denoiser = m_settings.m_denoiserDesc.denoiser;
-
-      if (m_settings.m_denoiserDesc.identifier == UINT32_MAX) {
-        static uint32_t uniqueId = 0;
-        m_settings.m_denoiserDesc.identifier = uniqueId++;
-      }
-
-      // Destroy previous graphics state
-      {
-        ctx->getDevice()->waitForIdle();
-        destroyResources();
-        destroyPipelines();
-      }
-
-      // Initialize new graphics state
-      {
-        m_settings.m_commonSettings.resourceSizePrev[0] = width;
-        m_settings.m_commonSettings.resourceSizePrev[1] = height;
-        m_settings.m_commonSettings.resourceSize[0] = width;
-        m_settings.m_commonSettings.resourceSize[1] = height;
-        m_settings.m_commonSettings.rectSizePrev[0] = width;
-        m_settings.m_commonSettings.rectSizePrev[1] = height;
-        m_settings.m_commonSettings.rectSize[0] = width;
-        m_settings.m_commonSettings.rectSize[1] = height;
-
-        if (!m_denoiserInstance) {
-          nrd::InstanceCreationDesc instanceCreationDesc;
-          instanceCreationDesc.allocationCallbacks.Allocate = NrdAllocate;
-          instanceCreationDesc.allocationCallbacks.Reallocate = NrdReallocate;
-          instanceCreationDesc.allocationCallbacks.Free = NrdFree;
-          instanceCreationDesc.allocationCallbacks.userArg = nullptr; // ? ToDo
-          instanceCreationDesc.denoisersNum = 1;
-          instanceCreationDesc.denoisers = &m_settings.m_denoiserDesc;
-
-          THROW_IF_FALSE(nrd::dispatch.CreateInstance(instanceCreationDesc, m_denoiserInstance) == nrd::Result::SUCCESS);
-        }
-
-        createPipelines();
-
-        createResources(ctx, rtOutput);
-
-        m_settings.m_resetHistory = true;
-      }
-    }
-
     if (m_settings.m_commonSettings.enableValidation && !m_validationTex.isValid()) {
       m_validationTex = Resources::createImageResource(ctx, "nrd validation texture", rtOutput.m_compositeOutputExtent, VK_FORMAT_R32G32B32A32_SFLOAT);
+    } else if (!m_settings.m_commonSettings.enableValidation) {
+      m_validationTex.reset();
     }
   }
 
-  DxvkSamplerCreateInfo getSamplerInfo(const nrd::Sampler& nrdSampler) {
+  static DxvkSamplerCreateInfo getSamplerInfo(const nrd::Sampler& nrdSampler) {
 
     DxvkSamplerCreateInfo samplerInfo;
 
@@ -405,7 +427,7 @@ namespace dxvk {
   void NRDContext::createResources(
     Rc<DxvkContext> ctx,
     const Resources::RaytracingOutput& rtOutput) {
-    const nrd::InstanceDesc& instanceDesc = nrd::dispatch.GetInstanceDesc(*m_denoiserInstance);
+    const nrd::InstanceDesc& instanceDesc = m_library->dispatch.GetInstanceDesc(*m_denoiserInstance);
 
     DxvkImageCreateInfo desc;
     desc.type = VK_IMAGE_TYPE_2D;
@@ -431,8 +453,14 @@ namespace dxvk {
 
     const uint32_t textureCount = instanceDesc.permanentPoolSize + instanceDesc.transientPoolSize;
 
-    // Take a copy so we can pull from the bag without aliasing.
-    SharedTransientPool sharedPoolCopy = m_sharedTransientTex;
+    std::lock_guard<std::mutex> poolLock(m_sharedTransientMutex);
+    auto& sharedPool = m_sharedTransientTex[device()];
+    sharedPool.erase(std::remove_if(sharedPool.begin(), sharedPool.end(),
+      [](const auto& resource) { return resource.expired(); }), sharedPool.end());
+    // Each pool slot is used at most once by this context. Different slots of
+    // the same dimensions/format must not alias within a denoiser dispatch.
+    SharedTransientPool available = sharedPool;
+    uint32_t reusedTransientCount = 0;
 
     for (uint32_t i = 0; i < textureCount; i++) {
 
@@ -443,6 +471,15 @@ namespace dxvk {
         : instanceDesc.transientPool[i - instanceDesc.permanentPoolSize];
 
       viewInfo.format = desc.format = TranslateFormat(nrdTextureDesc.format);
+      VkFormatProperties3 formatFeatures = { VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_3 };
+      VkFormatProperties2 formatProperties = { VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2, &formatFeatures };
+      const auto adapter = device()->adapter();
+      adapter->vki()->vkGetPhysicalDeviceFormatProperties2(adapter->handle(), desc.format, &formatProperties);
+      constexpr VkFormatFeatureFlags2 required = VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_BIT
+        | VK_FORMAT_FEATURE_2_STORAGE_IMAGE_BIT | VK_FORMAT_FEATURE_2_STORAGE_WRITE_WITHOUT_FORMAT_BIT;
+      if ((formatFeatures.optimalTilingFeatures & required) != required)
+        throw DxvkError(str::format("NRD pool format ", desc.format,
+          " lacks sampled/storage/formatless-write support"));
       
       desc.extent = { 
         util::ceilDivide(m_settings.m_commonSettings.resourceSize[0], nrdTextureDesc.downsampleFactor),
@@ -459,25 +496,24 @@ namespace dxvk {
         m_permanentTex.emplace_back(std::move(resource));
       }
       else {
-        DxvkHashState result;
-        result.add(std::hash<size_t>()(desc.hash()));
-        result.add(std::hash<size_t>()(viewInfo.hash()));
-        const size_t imageHash = result;
-
-        // See if we can find an existing transient from the pool
-        auto transientResource = sharedPoolCopy.find(imageHash);
-
-        if (transientResource != sharedPoolCopy.end() && transientResource->second.lock()) {
-          // Cache in this instance
-          m_transientTex.emplace_back(transientResource->second.lock());
-
-          // Take one for this pass and remove it so it cannot be shared
-          sharedPoolCopy.erase(imageHash);
-        } else {
-          // If the weak_ptr is now dead, then remove it
-          if (transientResource != sharedPoolCopy.end() && !transientResource->second.lock()) {
-            m_sharedTransientTex.erase(imageHash);
+        std::shared_ptr<Resource> shared;
+        for (auto it = available.begin(); it != available.end(); ++it) {
+          auto candidate = it->lock();
+          if (!candidate)
+            continue;
+          // All other image/view properties are fixed for NRD pools above.
+          const auto& candidateInfo = candidate->image->info();
+          if (candidateInfo.format == desc.format && candidateInfo.extent.width == desc.extent.width
+              && candidateInfo.extent.height == desc.extent.height) {
+            shared = std::move(candidate);
+            available.erase(it);
+            break;
           }
+        }
+        if (shared) {
+          m_transientTex.emplace_back(std::move(shared));
+          ++reusedTransientCount;
+        } else {
           Resources::Resource resource;
           resource.image = device()->createImage(desc, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, DxvkMemoryStats::Category::RTXRenderTarget, "nrd transient tex");
           resource.view = device()->createImageView(resource.image, viewInfo);
@@ -488,48 +524,38 @@ namespace dxvk {
           m_transientTex.emplace_back(std::make_shared<Resource>(resource));
 
           // NOTE: Insert into the main pool (not copy)
-          m_sharedTransientTex[imageHash] = m_transientTex.back();
+          sharedPool.emplace_back(m_transientTex.back());
         }
       }
     }
+    Logger::debug(str::format("[RTX] NRD: ", getDenoiserName(), " resources ",
+      m_settings.m_commonSettings.resourceSize[0], "x", m_settings.m_commonSettings.resourceSize[1],
+      ", permanent=", m_permanentTex.size(), ", transient=", m_transientTex.size(),
+      ", reusedTransient=", reusedTransientCount));
   }
 
   Resources::Resource NRDContext::getValidationTexture() const {
     return m_validationTex;
   }
 
-  void NRDContext::createPipelines() {
+  NRDContext::ComputePipeline::~ComputePipeline() {
+    vkd->vkDestroyPipeline(vkd->device(), pipeline, nullptr);
+    vkd->vkDestroyPipelineLayout(vkd->device(), pipelineLayout, nullptr);
+    vkd->vkDestroyDescriptorSetLayout(vkd->device(), descriptorSetLayout, nullptr);
+  }
 
-    const nrd::InstanceDesc& instanceDesc = nrd::dispatch.GetInstanceDesc(*m_denoiserInstance);
+  void NRDContext::createPipeline(uint32_t index) {
 
-    const nrd::DescriptorPoolDesc& descriptorDesc = instanceDesc.descriptorPoolDesc;
-    const nrd::SPIRVBindingOffsets spirvOffsets = nrd::dispatch.GetLibraryDesc().spirvBindingOffsets;
+    const nrd::InstanceDesc& instanceDesc = m_library->dispatch.GetInstanceDesc(*m_denoiserInstance);
 
-    // Create constant buffer
-    // With NRD, using width + height + method, you receive a description of the pipelines
-    // to create. You receive a max constant buffer size across all pipelines.
-    // Only with a specific set of NRD settings, you get the dispatch descriptions
-    // which include per pipeline constant buffer size and texture pool assignments
-    DxvkBufferCreateInfo cbufferInfo;
-    cbufferInfo.usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-    cbufferInfo.stages = VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
-    cbufferInfo.access = VK_ACCESS_TRANSFER_WRITE_BIT;
-    cbufferInfo.size = instanceDesc.constantBufferMaxDataSize;
-
+    const nrd::SPIRVBindingOffsets spirvOffsets = m_library->dispatch.GetLibraryDesc().spirvBindingOffsets;
 
     // Create static sampler binding infos
     std::vector<VkDescriptorSetLayoutBinding> samplersBindInfo;
     {
       samplersBindInfo.resize(instanceDesc.samplersNum);
-      m_staticSamplers.resize(instanceDesc.samplersNum);
 
       for (uint32_t i = 0; i < instanceDesc.samplersNum; i++) {
-
-        DxvkSamplerCreateInfo samplerInfo;
-        samplerInfo = getSamplerInfo(instanceDesc.samplers[i]);
-
-        // Create sampler 
-        m_staticSamplers[i] = device()->createSampler(samplerInfo);
 
         // Bind info
         const uint32_t reg = static_cast<uint32_t>(instanceDesc.samplers[i]);
@@ -541,17 +567,17 @@ namespace dxvk {
       }
     }
 
-    // Create binding infos for all the pipelines
-    for (uint32_t i = 0; i < instanceDesc.pipelinesNum; i++) {
+    // Only compile permutations actually selected by GetComputeDispatches.
+    // ReLAX/ReBLUR list many variants that a given configuration never uses.
+    {
 
-      const nrd::PipelineDesc& nrdPipelineDesc = instanceDesc.pipelines[i];
+      const nrd::PipelineDesc& nrdPipelineDesc = instanceDesc.pipelines[index];
       const nrd::ComputeShaderDesc& nrdComputeShader = nrdPipelineDesc.computeShaderSPIRV;
 
       if (isNativeNrdClear(nrdPipelineDesc)) {
         // Keep NRD's pipeline indices stable; native clears need no pipeline
         // or descriptor allocation.
-        m_computePipelines.emplace_back();
-        continue;
+        return;
       }
 
       // Start with static samplers bind infos
@@ -599,30 +625,26 @@ namespace dxvk {
       }
 
       // Create descriptor set layout   
-      VkDescriptorSetLayout descriptorSetLayout;
+      Rc<ComputePipeline> computePipeline = new ComputePipeline(m_vkd);
       {
         VkDescriptorSetLayoutCreateInfo dsetInfo;
         dsetInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
         dsetInfo.pNext = nullptr;
         dsetInfo.flags = 0;
         dsetInfo.bindingCount = (uint32_t)bindInfo.size();
-        dsetInfo.pBindings = &bindInfo[0];
+        dsetInfo.pBindings = bindInfo.data();
 
-        VK_THROW_IF_FAILED(m_vkd->vkCreateDescriptorSetLayout(m_vkd->device(), &dsetInfo, nullptr, &descriptorSetLayout));
+        VK_THROW_IF_FAILED(m_vkd->vkCreateDescriptorSetLayout(m_vkd->device(), &dsetInfo, nullptr, &computePipeline->descriptorSetLayout));
       }
 
       // Create pipeline
-      VkPipelineLayout pipelineLayout = createPipelineLayout(descriptorSetLayout);
-      VkPipeline pipeline = createPipeline(nrdComputeShader, nrdPipelineDesc, pipelineLayout);
-
-      ComputePipeline computePipeline;
-      computePipeline.descriptorSetLayout = descriptorSetLayout;
-      computePipeline.pipelineLayout = pipelineLayout;
-      computePipeline.pipeline = pipeline;
-      computePipeline.constantBufferIndex = cbBindInfoIndex;
-      computePipeline.resourcesStartIndex = resourcesStartIndex;
-      computePipeline.bindings = std::move(bindInfo);
-      m_computePipelines.emplace_back(std::move(computePipeline));
+      computePipeline->pipelineLayout = createPipelineLayout(computePipeline->descriptorSetLayout);
+      computePipeline->pipeline = createPipeline(nrdComputeShader, nrdPipelineDesc, computePipeline->pipelineLayout);
+      computePipeline->constantBufferIndex = cbBindInfoIndex;
+      computePipeline->resourcesStartIndex = resourcesStartIndex;
+      computePipeline->bindings = std::move(bindInfo);
+      m_computePipelines[index] = std::move(computePipeline);
+      ++m_compiledPipelineCount;
     }
   }
 
@@ -687,12 +709,16 @@ namespace dxvk {
     pipeInfo.basePipelineIndex = -1;
 
     VkPipeline result = VK_NULL_HANDLE;
-    const VkResult status = m_vkd->vkCreateComputePipelines(m_vkd->device(), VK_NULL_HANDLE, 1, &pipeInfo, nullptr, &result);
+    const VkResult status = m_vkd->vkCreateComputePipelines(m_vkd->device(),
+      device()->getCommon()->pipelineManager().pipelineCache(), 1, &pipeInfo, nullptr, &result);
 
     m_vkd->vkDestroyShaderModule(m_vkd->device(), shaderModule, nullptr);
 
     if (status != VK_SUCCESS) {
-      throw DxvkError("Dxvk: Failed to create meta clear compute pipeline");
+      if (result)
+        m_vkd->vkDestroyPipeline(m_vkd->device(), result, nullptr);
+      throw DxvkError(str::format("NRD: Failed to create pipeline ", nrdPipelineDesc.shaderFileName,
+        " (Vulkan result ", status, ")"));
     }
 
     return result;
@@ -747,11 +773,16 @@ namespace dxvk {
     const Resources::RaytracingOutput& rtOutput,
     const DxvkDenoise::Input& inputs,
     const DxvkDenoise::Output& outputs) {
-    if (m_hNRD == NULL) {
+    if (!m_library)
+      m_library = nrd::acquireLibrary();
+    if (!m_library->module) {
       return;
     }
+    m_settings.m_libraryDesc = m_library->dispatch.GetLibraryDesc();
 
-    m_settings.m_resetHistory |= inputs.reset;
+    const uint32_t frameId = device()->getCurrentFrameId();
+    m_settings.m_resetHistory |= inputs.reset || m_lastDispatchFrame == UINT32_MAX
+      || frameId != m_lastDispatchFrame + 1;
 
     ScopedGpuProfileZone(ctx, "NRD");
     static_cast<RtxContext*>(ctx.ptr())->setFramePassStage(RtxFramePassStage::NRD);
@@ -810,18 +841,20 @@ namespace dxvk {
     };
 
     // Prepare and run dispatches
-    const nrd::InstanceDesc& instanceDesc = nrd::dispatch.GetInstanceDesc(*m_denoiserInstance);
+    const nrd::InstanceDesc& instanceDesc = m_library->dispatch.GetInstanceDesc(*m_denoiserInstance);
     {
       uint32_t dispatchDescNum = 0;
       const nrd::DispatchDesc* dispatchDescs = nullptr;
 
-      nrd::dispatch.GetComputeDispatches(*m_denoiserInstance, &m_settings.m_denoiserDesc.identifier, 1, dispatchDescs, dispatchDescNum);
+      THROW_IF_FALSE(m_library->dispatch.GetComputeDispatches(*m_denoiserInstance,
+        &m_settings.m_denoiserDesc.identifier, 1, dispatchDescs, dispatchDescNum) == nrd::Result::SUCCESS);
 
       for (uint32_t i = 0; i < dispatchDescNum; i++) {
 
         const nrd::DispatchDesc& dispatchDesc = dispatchDescs[i];
+        if (dispatchDesc.pipelineIndex >= m_computePipelines.size())
+          throw DxvkError("NRD dispatch references an invalid pipeline index");
         const nrd::PipelineDesc& pipelineDesc = instanceDesc.pipelines[dispatchDesc.pipelineIndex];
-        const ComputePipeline& computePipeline = m_computePipelines[dispatchDesc.pipelineIndex];
 
         ScopedGpuProfileZoneDynamicZ(ctx, dispatchDesc.name);
 
@@ -856,14 +889,23 @@ namespace dxvk {
           continue;
         }
 
+        if (m_computePipelines[dispatchDesc.pipelineIndex] == nullptr)
+          createPipeline(dispatchDesc.pipelineIndex);
+        const auto& pipelineResource = m_computePipelines[dispatchDesc.pipelineIndex];
+        const ComputePipeline& computePipeline = *pipelineResource;
+        ctx->getCommandList()->trackResource<DxvkAccess::None>(pipelineResource);
         VkDescriptorSet descriptorSet = ctx->allocateDescriptorSet(computePipeline.descriptorSetLayout, "NRD descriptor set");
 
-        std::vector<VkWriteDescriptorSet> descriptorWriteSets;
+        auto& descriptorWriteSets = m_descriptorWrites;
+        descriptorWriteSets.clear();
+        descriptorWriteSets.reserve(instanceDesc.samplersNum + dispatchDesc.resourcesNum + 1);
 
         // Variables referenced inside descriptorWriteSets must have the same lifetime, so preallocate
-        std::vector<VkDescriptorImageInfo> samplerDescs{ instanceDesc.samplersNum };
+        auto& samplerDescs = m_samplerDescriptors;
+        samplerDescs.resize(instanceDesc.samplersNum);
         VkDescriptorBufferInfo             cbDesc{};
-        std::vector<VkDescriptorImageInfo> imageDesc{ dispatchDesc.resourcesNum };
+        auto& imageDesc = m_resourceDescriptors;
+        imageDesc.resize(dispatchDesc.resourcesNum);
 
         // Static sampler descriptors
         for (size_t i = 0; i < instanceDesc.samplersNum; i++) {
@@ -981,6 +1023,7 @@ namespace dxvk {
     }
 
     m_settings.m_resetHistory = false;
+    m_lastDispatchFrame = frameId;
   }
 
   void NRDContext::updateNRDSettings(
@@ -1068,7 +1111,7 @@ namespace dxvk {
       commonSettings.isHistoryConfidenceAvailable = inputs.confidence != nullptr;
       commonSettings.isDisocclusionThresholdMixAvailable = inputs.disocclusionThresholdMix != nullptr;
 
-      THROW_IF_FALSE(nrd::dispatch.SetCommonSettings(*m_denoiserInstance, commonSettings) == nrd::Result::SUCCESS);
+      THROW_IF_FALSE(m_library->dispatch.SetCommonSettings(*m_denoiserInstance, commonSettings) == nrd::Result::SUCCESS);
     }
 
     // nrd::SetDenoiserSettings
@@ -1089,7 +1132,7 @@ namespace dxvk {
         assert("Invalid option");
       };
 
-      THROW_IF_FALSE(nrd::dispatch.SetDenoiserSettings(*m_denoiserInstance, m_settings.m_denoiserDesc.identifier, denoiserSettings) == nrd::Result::SUCCESS);
+      THROW_IF_FALSE(m_library->dispatch.SetDenoiserSettings(*m_denoiserInstance, m_settings.m_denoiserDesc.identifier, denoiserSettings) == nrd::Result::SUCCESS);
     }
   }
 
@@ -1117,17 +1160,22 @@ namespace dxvk {
   void NRDContext::destroyResources() {
     m_transientTex.clear();
     m_permanentTex.clear();
-    m_sharedTransientTex.clear();
     m_validationTex.reset();
+    m_resourceExtent = {};
+    std::lock_guard<std::mutex> lock(m_sharedTransientMutex);
+    auto pool = m_sharedTransientTex.find(device());
+    if (pool != m_sharedTransientTex.end()) {
+      auto& resources = pool->second;
+      resources.erase(std::remove_if(resources.begin(), resources.end(),
+        [](const auto& resource) { return resource.expired(); }), resources.end());
+      if (resources.empty())
+        m_sharedTransientTex.erase(pool);
+    }
   }
 
   void NRDContext::destroyPipelines() {
-    for (auto& pipeline : m_computePipelines) {
-      m_vkd->vkDestroyPipeline(m_vkd->device(), pipeline.pipeline, nullptr);
-      m_vkd->vkDestroyPipelineLayout(m_vkd->device(), pipeline.pipelineLayout, nullptr);
-      m_vkd->vkDestroyDescriptorSetLayout(m_vkd->device(), pipeline.descriptorSetLayout, nullptr);
-    }
-
+    // Recorded command lists retain the pipelines until GPU completion. A
+    // configuration change can safely drop our references without waiting idle.
     m_computePipelines.clear();
     m_staticSamplers.clear();
   }
@@ -1136,7 +1184,9 @@ namespace dxvk {
     m_settings.showImguiSettings();
   }
 
-  NrdArgs NRDContext::getNrdArgs() const {
+  NrdArgs NRDContext::getNrdArgs() {
+    if (m_type != DenoiserType::Reference)
+      m_settings.updateDenoiserMode();
     static_assert(nrd::CommonSettings{}.denoisingRange == 500000.0f, "NRD's default settings has changed, denoisingRange must be re-evaluated");
     constexpr float denoisingRangeLimit = nrd::CommonSettings{}.denoisingRange;
 
@@ -1162,7 +1212,9 @@ namespace dxvk {
     return args;
   }
 
-  bool NRDContext::isReferenceDenoiserEnabled() const {
+  bool NRDContext::isReferenceDenoiserEnabled() {
+    if (m_type != DenoiserType::Reference)
+      m_settings.updateDenoiserMode();
     return m_settings.m_denoiserDesc.denoiser == nrd::Denoiser::REFERENCE;
   }
 
@@ -1171,17 +1223,40 @@ namespace dxvk {
   }
 
   void NRDContext::setNrdSettings(const NrdSettings& refSettings) {
+    const auto commonSettings = m_settings.m_commonSettings;
+    const auto identifier = m_settings.m_denoiserDesc.identifier;
+    const bool resetHistory = m_settings.m_resetHistory || m_settings.m_type != refSettings.m_type;
     m_settings = refSettings;
+    // A second reference lobe copies user tuning, not the first lobe's
+    // independently accumulated camera and jitter bookkeeping. The other
+    // common fields include user tuning (validation, split screen, thresholds).
+    memcpy(m_settings.m_commonSettings.worldToViewMatrix, commonSettings.worldToViewMatrix,
+      sizeof(commonSettings.worldToViewMatrix));
+    memcpy(m_settings.m_commonSettings.viewToClipMatrix, commonSettings.viewToClipMatrix,
+      sizeof(commonSettings.viewToClipMatrix));
+    memcpy(m_settings.m_commonSettings.cameraJitter, commonSettings.cameraJitter,
+      sizeof(commonSettings.cameraJitter));
+    m_settings.m_denoiserDesc.identifier = identifier;
+    m_settings.m_resetHistory |= resetHistory;
   }
 
   void NRDContext::release() {
+    if (!m_denoiserInstance && !m_cbData && m_computePipelines.empty())
+      return;
+    if (m_denoiserInstance)
+      Logger::debug(str::format("[RTX] NRD: releasing ", getDenoiserName(), ", compiledPipelines=",
+        m_compiledPipelineCount, "/", m_computePipelines.size()));
     destroyResources();
     destroyPipelines();
     m_cbData = nullptr;
     
     if (m_denoiserInstance) {
-      nrd::dispatch.DestroyInstance(*m_denoiserInstance);
+      m_library->dispatch.DestroyInstance(*m_denoiserInstance);
       m_denoiserInstance = nullptr;
     }
+    m_denoiser = nrd::Denoiser::MAX_NUM;
+    m_lastDispatchFrame = UINT32_MAX;
+    m_settings.m_resetHistory = true;
+    m_compiledPipelineCount = 0;
   }
 } // namespace dxvk

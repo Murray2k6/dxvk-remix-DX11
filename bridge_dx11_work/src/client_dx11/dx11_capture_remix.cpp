@@ -40,6 +40,10 @@
 
 #include "dx11_capture_remix.h"
 #include "dx11_frame_capture_coverage.h"
+#include "dx11_presentation_window.h"
+#include "dx11_mesh_cache.h"
+#include "dx11_resource_lifetime.h"
+#include <algorithm>
 #include "dx11_bridge_client.h"
 
 #include "util_bridgecommand.h"
@@ -215,21 +219,25 @@ namespace {
   // Capture state.                                                        //
   // ===================================================================== //
 
-  std::recursive_mutex g_mutex;
+  // Native-resource tags can retire during another DLL's process teardown.
+  // Keep their metadata owners alive until process exit; every resource's
+  // actual data is erased by its tag during normal resource destruction.
+  std::recursive_mutex& g_mutex = *new std::recursive_mutex();
+  uint64_t g_nextContentVersion = 0; // Guarded by g_mutex; survives pointer reuse.
 
   struct CachedBuffer {
     std::vector<uint8_t> data;
     uint32_t bindFlags = 0;
-    uint64_t version = 1;     // bumped on every content change (Create/Unmap/UpdateSubresource)
+    uint64_t version = 0;     // unique on every Create/Unmap/UpdateSubresource
   };
-  std::unordered_map<ID3D11Buffer*, CachedBuffer> g_buffers;
+  auto& g_buffers = *new std::unordered_map<ID3D11Buffer*, CachedBuffer>();
 
   // Mesh dedup cache: geometry+material identity key -> already-created Remix mesh uid.
   // Lets repeated (static) draws skip the per-draw vertex decode + FNV hash + serialize +
   // IPC re-send entirely; only a fresh DrawInstance (carrying the current transform) is
   // emitted on a cache hit. This is THE bridge frame-rate fix: previously every draw
   // re-streamed its full mesh over the shared-memory bridge every frame.
-  std::unordered_map<uint64_t, uint32_t> g_meshCache;
+  MeshCache g_meshCache;
 
   inline uint64_t mixKey(uint64_t h, uint64_t v) {
     h ^= v + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);
@@ -237,7 +245,7 @@ namespace {
   }
 
   // Resource -> mapped CPU pointer (between Map and Unmap).
-  std::unordered_map<ID3D11Resource*, void*> g_mapped;
+  auto& g_mapped = *new std::unordered_map<ID3D11Resource*, void*>();
 
   struct InputElement {
     std::string semantic;
@@ -246,7 +254,11 @@ namespace {
     uint32_t inputSlot;
     uint32_t alignedByteOffset;
   };
-  std::unordered_map<ID3D11InputLayout*, std::vector<InputElement>> g_layouts;
+  struct CachedLayout {
+    std::vector<InputElement> elements;
+    uint64_t version = 0;
+  };
+  auto& g_layouts = *new std::unordered_map<ID3D11InputLayout*, CachedLayout>();
 
   struct VSReflect {
     bool hasWorld = false;     // an unambiguous object->world matrix was found
@@ -254,7 +266,7 @@ namespace {
     uint32_t byteOffset = 0;   // offset of the matrix inside that constant buffer
     bool columnMajor = true;   // HLSL default storage
   };
-  std::unordered_map<ID3D11VertexShader*, VSReflect> g_vsReflect;
+  auto& g_vsReflect = *new std::unordered_map<ID3D11VertexShader*, VSReflect>();
 
   // Material cache keyed by bound-texture identity hash.
   std::unordered_map<uint64_t, uint32_t> g_materials;
@@ -263,7 +275,7 @@ namespace {
   // identity hash, recorded at CreateTexture2D. Pointer address reuse after a
   // release self-heals because a new texture at the same address re-records
   // its entry at the only place a texture can come into existence.
-  std::unordered_map<ID3D11Resource*, uint64_t> g_textureHashes;
+  auto& g_textureHashes = *new std::unordered_map<ID3D11Resource*, uint64_t>();
 
   std::atomic<uint64_t> g_meshesStreamed { 0 };
   std::atomic<bool> g_runtimeStarted { false };
@@ -672,19 +684,22 @@ namespace {
                   uint32_t indexCount, uint32_t startIndex, int32_t baseVertex,
                   bool sequential, uint32_t seqStart, uint64_t geomKey) {
     if (indexCount < 3) return;
-    if (indexCount > 24'000'000u) return;
+    constexpr uint64_t maximumMeshBytes = 32ull << 20;
+    if (uint64_t(indexCount) * sizeof(uint32_t) > maximumMeshBytes) return;
 
     // Material identity is part of the mesh-cache key: the same geometry drawn with a
     // different bound texture must map to a distinct Remix mesh (the material is baked
     // onto the surface at CreateMesh time).
-    const uint32_t materialUid = ensureMaterial(boundTextureHash(ctx));
+    const uint64_t materialHash = boundTextureHash(ctx);
+    const uint32_t materialUid = ensureMaterial(materialHash);
+    const uint64_t frame = g_frameIndex.load(std::memory_order_relaxed);
     const uint64_t cacheKey = geomKey ? mixKey(geomKey, materialUid) : 0;
 
     uint32_t meshUid = 0;
     bool haveMesh = false;
     if (cacheKey) {
-      auto cit = g_meshCache.find(cacheKey);
-      if (cit != g_meshCache.end()) { meshUid = cit->second; haveMesh = true; }
+      meshUid = g_meshCache.find(cacheKey, frame);
+      haveMesh = meshUid != 0;
     }
 
     if (!haveMesh) {
@@ -736,33 +751,46 @@ namespace {
       }
     }
 
-    // Decode every vertex referenced by the position stream.
-    std::vector<remixapi_HardcodedVertex> verts(vertexCount);
+    // Shared vertex buffers can contain an entire level. Decode only the
+    // actual indexed span, and rebase its indices to the compact allocation.
+    const auto range = std::minmax_element(indices.begin(), indices.end());
+    const uint32_t firstVertex = *range.first;
+    const uint32_t capturedVertices = *range.second - firstVertex + 1u;
+    const uint64_t meshBytes = uint64_t(capturedVertices) * sizeof(remixapi_HardcodedVertex)
+      + uint64_t(indices.size()) * sizeof(uint32_t);
+    if (meshBytes > maximumMeshBytes || !g_meshCache.reserve(meshBytes, frame, [](uint32_t uid) {
+          ClientMessage destroy(Commands::RemixApi_DestroyMesh);
+          sendUid(destroy, uid);
+        }))
+      return; // Coverage accounting preserves native output for this frame.
+    for (auto& index : indices) index -= firstVertex;
+    std::vector<remixapi_HardcodedVertex> verts(capturedVertices);
     const StreamRef& nStream = (nrmE >= 0) ? streams[elems[nrmE].inputSlot % D3D11_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT] : StreamRef{};
     const StreamRef& tStream = (uvE  >= 0) ? streams[elems[uvE ].inputSlot % D3D11_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT] : StreamRef{};
     const StreamRef& cStream = (colE >= 0) ? streams[elems[colE].inputSlot % D3D11_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT] : StreamRef{};
 
-    for (uint32_t i = 0; i < vertexCount; ++i) {
-      remixapi_HardcodedVertex& hv = verts[i];
+    for (uint32_t v = 0; v < capturedVertices; ++v) {
+      const uint32_t i = firstVertex + v;
+      remixapi_HardcodedVertex& hv = verts[v];
       memset(&hv, 0, sizeof(hv));
 
       float p[4];
       decodeFormat(posStream.data + (size_t) i * posStream.stride + elemOffsets[posE], pe.format, p);
       hv.position[0] = p[0]; hv.position[1] = p[1]; hv.position[2] = p[2];
 
-      if (nrmE >= 0 && nStream.data && (size_t) i * nStream.stride + elemOffsets[nrmE] + formatByteSize(elems[nrmE].format) <= nStream.size) {
+      if (nrmE >= 0 && nStream.data && uint64_t(i) * nStream.stride + elemOffsets[nrmE] + formatByteSize(elems[nrmE].format) <= nStream.size) {
         float n[4];
         decodeFormat(nStream.data + (size_t) i * nStream.stride + elemOffsets[nrmE], elems[nrmE].format, n);
         hv.normal[0]=n[0]; hv.normal[1]=n[1]; hv.normal[2]=n[2];
       } else { hv.normal[0]=0.0f; hv.normal[1]=0.0f; hv.normal[2]=1.0f; }
 
-      if (uvE >= 0 && tStream.data && (size_t) i * tStream.stride + elemOffsets[uvE] + formatByteSize(elems[uvE].format) <= tStream.size) {
+      if (uvE >= 0 && tStream.data && uint64_t(i) * tStream.stride + elemOffsets[uvE] + formatByteSize(elems[uvE].format) <= tStream.size) {
         float t[4];
         decodeFormat(tStream.data + (size_t) i * tStream.stride + elemOffsets[uvE], elems[uvE].format, t);
         hv.texcoord[0]=t[0]; hv.texcoord[1]=t[1];
       }
 
-      if (colE >= 0 && cStream.data && (size_t) i * cStream.stride + elemOffsets[colE] + formatByteSize(elems[colE].format) <= cStream.size) {
+      if (colE >= 0 && cStream.data && uint64_t(i) * cStream.stride + elemOffsets[colE] + formatByteSize(elems[colE].format) <= cStream.size) {
         float c[4];
         decodeFormat(cStream.data + (size_t) i * cStream.stride + elemOffsets[colE], elems[colE].format, c);
         hv.color = packColorRGBA(c);
@@ -773,10 +801,15 @@ namespace {
 
     uint64_t hash = fnv1a(verts.data(), verts.size() * sizeof(remixapi_HardcodedVertex));
     hash = fnv1a(indices.data(), indices.size() * sizeof(uint32_t), hash);
-
-    // ---- CreateMesh ----
-    MeshHandle meshHandle;
-    {
+    hash = mixKey(hash, materialHash);
+    if (!hash) hash = 1; // Remix API reserves null handles.
+    const uint64_t resolvedKey = cacheKey ? cacheKey : hash;
+    meshUid = g_meshCache.find(resolvedKey, frame);
+    if (!meshUid) meshUid = g_meshCache.findContent(hash);
+    if (!meshUid) {
+      // ---- CreateMesh ----
+      MeshHandle meshHandle;
+      meshUid = meshHandle.uid;
       remixapi_MeshInfoSurfaceTriangles surf = {};
       surf.vertices_values = verts.data();
       surf.vertices_count = verts.size();
@@ -798,19 +831,14 @@ namespace {
       sendUid(c, meshHandle.uid);
     }
 
-      meshUid = meshHandle.uid;
-      if (cacheKey) {
-        // Bound to avoid unbounded growth from genuinely dynamic geometry (a fresh
-        // content-version produces a fresh key every frame). Clearing just forces those
-        // to be re-streamed; static geometry repopulates immediately.
-        if (g_meshCache.size() > 262144) g_meshCache.clear();
-        g_meshCache[cacheKey] = meshUid;
-      }
+      if (!g_meshCache.find(resolvedKey, frame))
+        g_meshCache.insert(resolvedKey, hash, meshUid, meshBytes, frame);
 
       const uint64_t n = ++g_meshesStreamed;
-      if (n <= 16 || (n % 2000) == 0) {
-        logf("capture", "DX11_V226_CAPTURE_TO_REMIX: streamed mesh #%llu (verts=%u, indices=%u) to Remix.",
-             (unsigned long long) n, vertexCount, indexCount);
+      if (n <= 16) {
+        logf("capture", "Streamed/cached mesh #%llu (verts=%u, indices=%u, residentMiB=%llu).",
+             (unsigned long long)n, capturedVertices, indexCount,
+             (unsigned long long)(g_meshCache.bytes() >> 20));
       }
     } // end if(!haveMesh): cache miss built+streamed a new mesh
 
@@ -846,12 +874,16 @@ void RecordBufferCreate(ID3D11Buffer* buffer, const void* pInitialData,
   if (!buffer || byteWidth == 0) return;
   if ((bindFlags & (D3D11_BIND_VERTEX_BUFFER | D3D11_BIND_INDEX_BUFFER | D3D11_BIND_CONSTANT_BUFFER)) == 0) return;
   std::lock_guard<std::recursive_mutex> lock(g_mutex);
+  if (!ResourceLifetime::attach<ID3D11Buffer, &RecordBufferRelease>(buffer)) {
+    RecordBufferRelease(buffer);
+    return;
+  }
   CachedBuffer& cb = g_buffers[buffer];
   cb.bindFlags = bindFlags;
   cb.data.resize(byteWidth);
   if (pInitialData) memcpy(cb.data.data(), pInitialData, byteWidth);
   else memset(cb.data.data(), 0, byteWidth);
-  ++cb.version;
+  cb.version = ++g_nextContentVersion;
 }
 
 void RecordBufferRelease(ID3D11Buffer* buffer) {
@@ -878,7 +910,7 @@ void RecordUnmap(ID3D11Resource* resource, uint32_t subresource) {
   auto it = g_buffers.find(reinterpret_cast<ID3D11Buffer*>(resource));
   if (it != g_buffers.end() && src && !it->second.data.empty()) {
     memcpy(it->second.data.data(), src, it->second.data.size());
-    ++it->second.version;
+    it->second.version = ++g_nextContentVersion;
   }
 }
 
@@ -889,13 +921,18 @@ void RecordUpdateSubresource(ID3D11Resource* resource, uint32_t dstSubresource,
   auto it = g_buffers.find(reinterpret_cast<ID3D11Buffer*>(resource));
   if (it != g_buffers.end() && !it->second.data.empty()) {
     memcpy(it->second.data.data(), pSrcData, it->second.data.size());
-    ++it->second.version;
+    it->second.version = ++g_nextContentVersion;
   }
 }
 
 void RecordInputLayoutCreate(ID3D11InputLayout* layout,
                              const D3D11_INPUT_ELEMENT_DESC* descs, uint32_t numElements) {
   if (!layout || !descs || numElements == 0) return;
+  std::lock_guard<std::recursive_mutex> lock(g_mutex);
+  if (!ResourceLifetime::attach<ID3D11InputLayout, &RecordInputLayoutRelease>(layout)) {
+    RecordInputLayoutRelease(layout);
+    return;
+  }
   std::vector<InputElement> elems;
   elems.reserve(numElements);
   for (uint32_t i = 0; i < numElements; ++i) {
@@ -907,8 +944,7 @@ void RecordInputLayoutCreate(ID3D11InputLayout* layout,
     e.alignedByteOffset = descs[i].AlignedByteOffset;
     elems.push_back(std::move(e));
   }
-  std::lock_guard<std::recursive_mutex> lock(g_mutex);
-  g_layouts[layout] = std::move(elems);
+  g_layouts[layout] = { std::move(elems), ++g_nextContentVersion };
 }
 
 void RecordInputLayoutRelease(ID3D11InputLayout* layout) {
@@ -925,6 +961,11 @@ void RecordTexture2DCreate(ID3D11Resource* texture, const void* pMip0Data,
   if (!texture) return;
   // Only textures the game can sample can become Remix materials.
   if ((bindFlags & D3D11_BIND_SHADER_RESOURCE) == 0) return;
+  std::lock_guard<std::recursive_mutex> lock(g_mutex);
+  if (!ResourceLifetime::attach<ID3D11Resource, &RecordTexture2DRelease>(texture)) {
+    RecordTexture2DRelease(texture);
+    return;
+  }
 
   uint64_t h = 0;
   if (pMip0Data && rowPitchBytes) {
@@ -945,7 +986,6 @@ void RecordTexture2DCreate(ID3D11Resource* texture, const void* pMip0Data,
   h = fnv1a(meta, sizeof(meta), h ? h : 1469598103934665603ull);
   if (h == 0) h = 1;
 
-  std::lock_guard<std::recursive_mutex> lock(g_mutex);
   g_textureHashes[texture] = h;
 }
 
@@ -956,6 +996,12 @@ void RecordTexture2DRelease(ID3D11Resource* texture) {
 }
 
 void RecordVertexShaderCreate(ID3D11VertexShader* shader, const void* bytecode, size_t length) {
+  if (!shader || !bytecode || !length) return;
+  std::lock_guard<std::recursive_mutex> lock(g_mutex);
+  if (!ResourceLifetime::attach<ID3D11VertexShader, &RecordVertexShaderRelease>(shader)) {
+    RecordVertexShaderRelease(shader);
+    return;
+  }
   reflectVertexShader(shader, bytecode, length);
 }
 
@@ -1004,7 +1050,7 @@ void CaptureDrawIndexed(ID3D11DeviceContext* context, uint32_t indexCount,
       // Cheap geometry-identity key (no byte hashing): bound buffer pointers + their
       // content-versions + offsets/strides + draw params. Stable frame-to-frame for
       // static geometry, so streamDraw can skip the decode/serialize/IPC re-send.
-      uint64_t geomKey = mixKey(0xC0FFEEull, reinterpret_cast<uintptr_t>(layout));
+      uint64_t geomKey = mixKey(0xC0FFEEull, lit->second.version);
       for (uint32_t s = 0; s < D3D11_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT; ++s) {
         if (!vbs[s]) continue;
         const CachedBuffer* vbc = findBuffer(vbs[s]);
@@ -1022,7 +1068,7 @@ void CaptureDrawIndexed(ID3D11DeviceContext* context, uint32_t indexCount,
       geomKey = mixKey(geomKey, ibc->version);
       geomKey = mixKey(geomKey, ((uint64_t) indexCount << 32) | startIndexLocation);
       geomKey = mixKey(geomKey, (uint64_t)(uint32_t) baseVertexLocation);
-      streamDraw(context, lit->second, streams,
+      streamDraw(context, lit->second.elements, streams,
                  ibc->data.data() + ibOffset, (uint32_t)(ibc->data.size() - ibOffset),
                  ibFormat == DXGI_FORMAT_R32_UINT,
                  indexCount, startIndexLocation, baseVertexLocation, false, 0, geomKey);
@@ -1058,7 +1104,7 @@ void CaptureDraw(ID3D11DeviceContext* context, uint32_t vertexCount,
       StreamRef streams[D3D11_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT] = {};
       // Cheap geometry-identity key (sequential/non-indexed variant; distinct seed so it
       // never collides with the indexed path).
-      uint64_t geomKey = mixKey(0xBEEFull, reinterpret_cast<uintptr_t>(layout));
+      uint64_t geomKey = mixKey(0xBEEFull, lit->second.version);
       for (uint32_t s = 0; s < D3D11_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT; ++s) {
         if (!vbs[s]) continue;
         const CachedBuffer* vbc = findBuffer(vbs[s]);
@@ -1072,7 +1118,7 @@ void CaptureDraw(ID3D11DeviceContext* context, uint32_t vertexCount,
         }
       }
       geomKey = mixKey(geomKey, ((uint64_t) vertexCount << 32) | startVertexLocation);
-      streamDraw(context, lit->second, streams, nullptr, 0, false,
+      streamDraw(context, lit->second.elements, streams, nullptr, 0, false,
                  vertexCount, 0, 0, true, startVertexLocation, geomKey);
     }
   }
@@ -1131,15 +1177,15 @@ static HWND ResolvePresentWindowV229(IDXGISwapChain* swapChain) {
   return best.hwnd;
 }
 
-// DX11_V265_BRIDGE_PRESENT_CAMERA: the per-frame pump that makes the server
-// actually render. Startup attaches the Remix runtime to the GAME window
-// (HWNDs are system-global, so the x64 server presents into the x86 game's
-// window - this is what makes the Remix output primary instead of a stray
-// secondary window), SetupCamera feeds the frame's captured camera, Present
-// kicks the path-traced frame with the game HWND as override.
+// The game retains its native DXGI swapchain. The server targets a separate
+// child HWND, exposed only after a complete captured frame is acknowledged.
 bool OnPresent(IDXGISwapChain* swapChain) {
+  auto& presentation = PresentationWindow::instance();
   if (g_runtimeFailed.load(std::memory_order_acquire)
-      || !dx11_bridge_client::EnsureServer()) return false;
+      || !dx11_bridge_client::EnsureServer()) {
+    presentation.setVisible(false);
+    return false;
+  }
 
   // Serialize first startup with the capture/cache state. Draws must not cache
   // material or mesh handles until the runtime has created its D3D11 device.
@@ -1152,8 +1198,12 @@ bool OnPresent(IDXGISwapChain* swapChain) {
   static uint64_t s_hwnd64 = 0;
   static bool s_startupSent = false;
   const HWND presentWindow = ResolvePresentWindowV229(swapChain);
-  if (!presentWindow) return false;
-  s_hwnd64 = (uint64_t)(uintptr_t) presentWindow;
+  const HWND remixWindow = presentation.ensure(presentWindow);
+  if (!remixWindow) {
+    presentation.setVisible(false);
+    return false;
+  }
+  s_hwnd64 = (uint64_t)(uintptr_t) remixWindow;
   if (!s_startupSent) {
       {
         ClientMessage c(Commands::RemixApi_Startup);
@@ -1161,19 +1211,22 @@ bool OnPresent(IDXGISwapChain* swapChain) {
       }
       if (DeviceBridge::waitForCommand(Commands::RemixApi_Startup,
           GlobalOptions::getStartupTimeout()) != Result::Success) {
-        logf("capture", "Remix runtime startup did not acknowledge the game window.");
+        logf("capture", "Remix runtime startup did not acknowledge the presentation window.");
         g_runtimeFailed.store(true, std::memory_order_release);
+        presentation.setVisible(false);
         return false;
       }
       const auto response = DeviceBridge::pop_front();
       if (response.pHandle != REMIXAPI_ERROR_CODE_SUCCESS) {
         logf("capture", "Remix runtime startup failed with code %u.", (unsigned) response.pHandle);
         g_runtimeFailed.store(true, std::memory_order_release);
+        presentation.setVisible(false);
         return false;
       }
       s_startupSent = true;
       g_runtimeStarted.store(true, std::memory_order_release);
-      logf("capture", "Remix runtime started (game hwnd=0x%llx)", (unsigned long long) s_hwnd64);
+      logf("capture", "Remix runtime started (game hwnd=0x%llx, presentation child=0x%llx)",
+        (unsigned long long)(uintptr_t)presentWindow, (unsigned long long)s_hwnd64);
   }
 
   {
@@ -1198,6 +1251,7 @@ bool OnPresent(IDXGISwapChain* swapChain) {
   if (DeviceBridge::waitForCommand(Commands::RemixApi_Present,
       GlobalOptions::getCommandTimeout()) != Result::Success) {
     g_runtimeFailed.store(true, std::memory_order_release);
+    presentation.setVisible(false);
     logf("capture", "Remix presentation stopped responding; restoring native presentation.");
     return false;
   }
@@ -1205,12 +1259,15 @@ bool OnPresent(IDXGISwapChain* swapChain) {
   const bool rayTraced = DeviceBridge::get_data() != 0;
   if (response.pHandle != REMIXAPI_ERROR_CODE_SUCCESS) {
     g_runtimeFailed.store(true, std::memory_order_release);
+    presentation.setVisible(false);
     logf("capture", "Remix presentation failed with code %u; restoring native presentation.", (unsigned) response.pHandle);
     return false;
   }
   if (g_frameIndex.load(std::memory_order_relaxed) <= 2)
     logf("capture", "Remix frame presented and acknowledged by the x64 server.");
-  return hasCapturedScene && rayTraced;
+  presentation.retirePrevious();
+  const bool takeOver = hasCapturedScene && rayTraced;
+  return presentation.setVisible(takeOver) && takeOver;
 }
 
 bool IsStreamingEnabled() {

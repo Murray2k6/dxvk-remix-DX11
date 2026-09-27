@@ -26,8 +26,10 @@
 #include "../dxvk/dxvk_buffer.h"
 #include "../util/util_matrix.h"
 #include "../util/util_threadpool.h"
+#include "../util/sync/sync_signal.h"
 
 #include <unordered_set>
+#include <memory>
 
 namespace dxvk {
 
@@ -36,6 +38,7 @@ namespace dxvk {
   class D3D11Rtx {
   public:
     explicit D3D11Rtx(D3D11DeviceContext* pContext);
+    ~D3D11Rtx();
 
     // DX11_V225: DX11 capture-layer options exposed in the RTX Remix "Game Setup"
     // menu. RTX_OPTION generates both the value accessor (e.g. useVertexCapture())
@@ -109,6 +112,8 @@ namespace dxvk {
     using GeometryProcessor = WorkerThreadPool<kMaxConcurrentDraws>;
 
     D3D11DeviceContext*                  m_context;
+    struct CameraTrackingState;
+    std::unique_ptr<CameraTrackingState> m_cameraTrackingState;
     std::unique_ptr<GeometryProcessor>   m_pGeometryWorkers;
     uint32_t                             m_drawCallID = 0;
 
@@ -177,23 +182,8 @@ namespace dxvk {
     // The confirmed location stores camera-to-world; invert on each re-read.
     bool                                 m_viewInverted = false;
 
-    // DX11_V309_CAMERA_RESOLVER (shadow mode, step 1 of the camera replacement).
-    // TryCapturePositionsViaStreamOut and SubmitDraw are separate functions, so
-    // the capture path's two pieces of evidence have to be carried across to the
-    // accept site where the comparison is made. These are READ-ONLY inputs to
-    // the shadow log and must never influence rendering - the whole point of
-    // step 1 is that behaviour is unchanged while the two opinions are compared.
-    bool                                 m_shadowCapturedPostTransform = false;
-    bool                                 m_shadowCaptureWorldAnchored = false;
     // Throttles late-session confirmation attempts to once per frame.
     uint32_t                             m_lastViewConfirmFrame = UINT32_MAX;
-
-    // Cached world matrix cbuffer location — reduces per-draw scanning.
-    // World matrices change every draw but often live at the same (stage, slot, offset).
-    // Smoothed camera position — exponential moving average dampens
-    // micro-jitter from floating-point rounding in cbuffer matrix extraction.
-    Vector3                              m_smoothedCamPos = Vector3(0.0f);
-    bool                                 m_hasPrevCamPos  = false;
 
     // Sole source of truth for resize transition detection. Only changes to
     // this extent trigger `m_resizeTransitionFramesRemaining` and
@@ -511,25 +501,12 @@ namespace dxvk {
     VkDeviceSize m_positionCaptureCacheBytes = 0;
     void SweepPositionCaptureCache(uint32_t currentFrame);
 
-    // DX11_V319_WORLD_ANCHOR_CAMERA: bounded, stall-free readback of a few
-    // vertices per mesh out of the post-VS capture buffers, feeding the
-    // camera-position solve for engines that render camera-relative.
-    //
-    // Those capture buffers are DEVICE_LOCAL and cannot be mapped at all, so
-    // the samples are copied into a small host-visible buffer by copyBuffer on
-    // the CS thread and read one frame later, when the copy has certainly
-    // retired. Two buffers ping-pong so the batch being read is never the batch
-    // being written. Reading the CURRENT frame's copies instead would mean
-    // blocking the render thread on the GPU - the ~100ms round trip the capture
-    // path already goes out of its way to avoid (DX11_V303).
-    //
-    // The resulting camera position therefore lags the game by two frames. That
-    // is deliberately not compensated: the camera and the geometry are anchored
-    // with the SAME position, so a constant lag is a constant offset of the
-    // whole scene, which is invisible. Only acceleration leaves a residual, and
-    // the next frame's solve absorbs it.
-    static constexpr uint32_t kCameraAnchorSampleVertices  = 4u;
-    static constexpr uint32_t kCameraAnchorSampleSlotBytes = 128u;
+    // Capture memory stays device-local. Camera estimators share a bounded
+    // host-visible readback ring; a command-list completion signal, not frame
+    // age or an unrecorded buffer's isInUse state, authorizes CPU access/reuse.
+    static constexpr uint32_t kCameraAnchorBatchCount      = 3u;
+    static constexpr uint32_t kCameraAnchorSampleVertices  = 8u;
+    static constexpr uint32_t kCameraAnchorSampleSlotBytes = 256u;
     static constexpr uint32_t kCameraAnchorMaxSampleMeshes = 48u;
     static constexpr float    kCameraAnchorMaxTranslationPerFrame = 2000.0f;
     struct CameraAnchorSampleRequest {
@@ -537,17 +514,28 @@ namespace dxvk {
       Matrix4  viewRotationToWorld;
       Matrix4  clipToPosition;
       bool     clipUsesWDepth = false;
+      bool     viewSpaceCamera = false;
       uint32_t vertexCount = 0;
       uint32_t stride = 0;
     };
-    Rc<DxvkBuffer>                         m_cameraAnchorStaging[2];
-    std::vector<CameraAnchorSampleRequest> m_cameraAnchorRequests[2];
-    uint32_t                               m_cameraAnchorWriteIndex = 0;
+    struct CameraAnchorSampleBatch {
+      Rc<DxvkBuffer> staging;
+      Rc<sync::Fence> completion;
+      std::vector<CameraAnchorSampleRequest> requests;
+      uint64_t sequence = 0;
+      uint32_t frame = ~0u;
+      bool sealed = false;
+    };
+    CameraAnchorSampleBatch                m_cameraAnchorBatches[kCameraAnchorBatchCount];
+    uint64_t                               m_cameraAnchorNextSequence = 0;
+    uint32_t                               m_cameraAnchorWriteIndex = kCameraAnchorBatchCount;
     uint32_t                               m_cameraAnchorLastConsumedFrame = ~0u;
     // Set per draw by ExtractTransforms: the game supplied a real view matrix
     // whose translation is exactly zero, i.e. it renders camera-relative.
     bool                                   m_cameraAnchorViewTranslationFree = false;
-    void QueueCameraAnchorSample(const PositionCaptureEntry& entry, uint64_t meshKey);
+    void QueueCameraAnchorSample(const PositionCaptureEntry& entry, uint64_t meshKey,
+                                 bool viewSpaceCamera = false);
+    void SealCameraAnchorSamples();
     void ConsumeCameraAnchorSamples();
 
     // DX11_V285_HELPER_BUFFER_POOL: host-visible helper buffers (dynamic

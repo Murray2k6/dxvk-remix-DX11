@@ -6,6 +6,7 @@ dxgi_src = [
   'dxgi_factory.cpp',
   'dxgi_format.cpp',
   'dxgi_main.cpp',
+  'dxgi_native.cpp',
   'dxgi_monitor.cpp',
   'dxgi_options.cpp',
   'dxgi_output.cpp',

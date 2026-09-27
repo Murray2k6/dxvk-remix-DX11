@@ -33,6 +33,7 @@
 #include "../dxvk/rtx_render/rtx_options.h"
 // DX11_V292_PRECOMPILER_WIDGET: dev-menu driven on-demand shader precompile
 #include "../dxvk/rtx_render/rtx_shader_precompiler.h"
+#include "../dxvk/dxvk_compiler_policy.h"
 
 namespace dxvk {
   
@@ -49,18 +50,8 @@ namespace dxvk {
       return modules;
     }
 
-    // DX11_V286_GAME_SHADER_SCAN: game-wide shader harvesting at boot.
-    // The .dxbc cache only knows shaders the game already created in an
-    // earlier session, so a first playthrough still compiles at first use -
-    // the mid-game stall that forces players to exit. This scanner reads the
-    // game's own data files once, extracts every embedded DXBC container
-    // (validated header, chunk table, and SHDR/SHEX program type), and stores
-    // each one in the regular d3d11-shaders cache under its canonical shader
-    // key. The boot preload that runs immediately afterwards then compiles
-    // the complete set game-wide before the game's menu is even shown. The
-    // scan is time-budgeted and resumable across launches
-    // (game-shader-scan.marker), and DXVK_GAME_SHADER_SCAN=0 disables it.
-
+    // Optional explicit archive scan. Raw DXBC extraction cannot discover
+    // graphics pipeline state; normal startup reuses only observed pipelines.
     // Launcher/helper processes load this d3d11.dll from the game folder too.
     // "*launcher*" exes are already forwarded wholesale to the system D3D11
     // (DX11_V279_LAUNCHER_BYPASS); this catches the remaining helper-style
@@ -136,6 +127,8 @@ namespace dxvk {
         std::memcpy(&value, blob + offset, sizeof(value));
         return value;
       };
+      if (std::memcmp(blob, "DXBC", 4) || readU32(0x14u) != 1u || readU32(0x18u) != blobSize)
+        return kInvalid;
       const uint32_t chunkCount = readU32(0x1Cu);
       if (chunkCount == 0u || chunkCount > 64u)
         return kInvalid;
@@ -248,13 +241,7 @@ namespace dxvk {
         uint64_t budgetOverrideMs = 0u,
         bool ignoreResumeMarker = false) {
       constexpr uintmax_t kMaximumFileSize = 2ull << 30;
-      // DX11_V298_COMPLETE_BOOT_SCAN: the shader cache is built from the
-      // game's data at init, BEFORE play. The old 45 s budget spread the
-      // harvest across many launches, so early sessions still hit un-cached
-      // shaders mid-game. Ten minutes covers even large titles on the first
-      // boot (Fallout 4: ~25 GB scanned in roughly 3 minutes); the resume
-      // marker makes every later launch skip the scan entirely.
-      uint64_t budgetMs = 800000u;
+      uint64_t budgetMs = 60000u;
       const std::string budgetOverride =
         env::getEnvVar("DXVK_GAME_SHADER_SCAN_BUDGET_MS");
       if (!budgetOverride.empty()) {
@@ -265,6 +252,7 @@ namespace dxvk {
       if (budgetOverrideMs != 0u)
         budgetMs = budgetOverrideMs;
 
+      const auto enumerationStart = std::chrono::steady_clock::now();
       // Deterministic, sorted candidate list so the resume marker can
       // continue an interrupted scan on the next launch.
       std::vector<std::filesystem::path> files;
@@ -275,6 +263,9 @@ namespace dxvk {
         walkError);
       const std::filesystem::recursive_directory_iterator end;
       while (!walkError && iterator != end) {
+        if (RtxShaderPrecompiler::cancelRequested()
+         || std::chrono::steady_clock::now() - enumerationStart >= std::chrono::milliseconds(budgetMs))
+          return 0u; // Incomplete enumeration must not write a completed marker.
         const std::filesystem::directory_entry& entry = *iterator;
         std::error_code entryError;
         if (entry.is_directory(entryError) && !entryError) {
@@ -450,8 +441,6 @@ namespace dxvk {
     m_dxbcOptions   (m_dxvkDevice, m_d3d11Options) {
     m_initializer = std::make_unique<D3D11Initializer>(this);
     m_context     = new D3D11ImmediateContext(this, m_dxvkDevice);
-    PrewarmCachedGameShaders();
-
     // DX11_V292_PRECOMPILER_WIDGET: expose the on-demand precompile job to
     // the Remix developer menu. Helper/launcher processes never register.
     if (env::getEnvVar("DXVK_GAME_SHADER_CACHE") != "0"
@@ -460,6 +449,7 @@ namespace dxvk {
       RtxShaderPrecompiler::setRunner(this, [this](bool fullRescan) {
         RunShaderPrecompileJob(fullRescan);
       });
+      PrewarmCachedGameShaders();
     }
   }
 
@@ -474,109 +464,14 @@ namespace dxvk {
 
 
   void D3D11Device::PrewarmCachedGameShaders() {
-    std::lock_guard<dxvk::mutex> prewarmLock(g_gameShaderPrewarmMutex);
-    if (g_gameShaderPrewarmComplete) {
-      if (prewarmLoggingEnabled()) {
-        Logger::info(
-          "[Remix-DX11][game-shader-cache] shared-device preload already complete; reusing cached modules for this D3D11 device.");
-      }
+    // Never scan a game's installation or compile its entire shader archive
+    // inside CreateDevice. Only previously used pipeline shaders are candidates
+    // for this bounded, low-priority job; first-use compilation remains intact.
+    std::lock_guard<dxvk::mutex> lock(g_gameShaderPrewarmMutex);
+    if (g_gameShaderPrewarmComplete)
       return;
-    }
-    g_gameShaderPrewarmComplete = true;
-
-    if (env::getEnvVar("DXVK_GAME_SHADER_CACHE") == "0") {
-      if (prewarmLoggingEnabled())
-        Logger::info("[Remix-DX11][game-shader-cache] disabled by DXVK_GAME_SHADER_CACHE=0.");
-      return;
-    }
-
-    // Prewarm belongs to the real game process, not to a launcher or helper
-    // that happens to create a D3D11 device from the same folder first.
-    if (isHelperOrLauncherProcess()
-     && env::getEnvVar("DXVK_REMIX_FORCE_CURRENT_PROCESS") != "1") {
-      if (prewarmLoggingEnabled()) {
-        Logger::info(str::format(
-          "[Remix-DX11][game-shader-cache] helper/launcher-style process '",
-          env::getExeName(),
-          "' detected; skipping shader scan and preload. The game process prewarms after launcher handoff (override: DXVK_REMIX_FORCE_CURRENT_PROCESS=1)."));
-      }
-      return;
-    }
-
-    constexpr uintmax_t kMaximumShaderSize = 8u << 20;
-    const std::filesystem::path cacheDirectory =
-      std::filesystem::path(env::getExePath()).parent_path()
-      / "rtx-remix" / "cache" / "d3d11-shaders";
-
-    // DX11_V286_GAME_SHADER_SCAN: harvest DXBC embedded in the game's own
-    // data files into the cache BEFORE enumerating it, so even the very
-    // first boot compiles the game's shaders game-wide during startup
-    // instead of stalling at each first use in gameplay.
-    // DX11_V298: the scan now runs inside the shared prewarm window (visible
-    // progress instead of a silent windowless stall) and completes on the
-    // first boot rather than resuming across many launches.
-    if (env::getEnvVar("DXVK_GAME_SHADER_SCAN") != "0") {
-      std::error_code scanDirectoryError;
-      std::filesystem::create_directories(cacheDirectory, scanDirectoryError);
-      if (!scanDirectoryError) {
-        m_dxvkDevice->getCommon()->getRtxInitializer().runBootShaderScanPhase(
-          [this, &cacheDirectory] {
-            scanGameDataForShaders(
-              std::filesystem::path(env::getExePath()).parent_path(),
-              cacheDirectory);
-          });
-      }
-    }
-
-    std::error_code error;
-    if (!std::filesystem::exists(cacheDirectory, error) || error)
-      return;
-
-    std::vector<std::filesystem::path> cacheFiles;
-    std::filesystem::directory_iterator iterator(cacheDirectory, error);
-    const std::filesystem::directory_iterator end;
-    while (!error && iterator != end) {
-      const auto& entry = *iterator;
-      std::error_code entryError;
-      if (entry.is_regular_file(entryError)
-       && !entryError
-       && entry.path().extension() == ".dxbc") {
-        const uintmax_t size = entry.file_size(entryError);
-        if (!entryError && size > 0u && size <= kMaximumShaderSize)
-          cacheFiles.push_back(entry.path());
-      }
-      iterator.increment(error);
-    }
-
-    if (error && prewarmLoggingEnabled()) {
-      Logger::warn(str::format(
-        "[Remix-DX11][game-shader-cache] could not enumerate '",
-        cacheDirectory.string(), "': ", error.message()));
-    }
-    if (cacheFiles.empty())
-      return;
-
-    std::sort(cacheFiles.begin(), cacheFiles.end());
-    uint32_t loadedShaders = 0u;
-    uint32_t rejectedShaders = 0u;
-
-    m_dxvkDevice->getCommon()->getRtxInitializer().prewarmCachedGameShaders(
-      static_cast<uint32_t>(cacheFiles.size()),
-      [this, &cacheFiles, &loadedShaders, &rejectedShaders](
-          const std::function<void(uint32_t)>& updateProgress) {
-        LoadGameShaderCacheFiles(
-          cacheFiles, updateProgress, loadedShaders, rejectedShaders);
-      });
-
-    RtxShaderPrecompiler::reportCacheCounts(
-      static_cast<uint32_t>(cacheFiles.size()), loadedShaders, rejectedShaders);
-    if (prewarmLoggingEnabled()) {
-      Logger::info(str::format(
-        "[Remix-DX11][game-shader-cache] executable='", env::getExeName(),
-        "' directory='", cacheDirectory.string(), "' discovered=",
-        cacheFiles.size(), " loaded=", loadedShaders,
-        " rejected=", rejectedShaders));
-    }
+    if (RtxShaderPrecompiler::start(env::getEnvVar("DXVK_GAME_SHADER_SCAN") == "1"))
+      g_gameShaderPrewarmComplete = true;
   }
 
 
@@ -587,45 +482,22 @@ namespace dxvk {
       uint32_t&                                 rejectedShaders) {
     constexpr uintmax_t kMaximumShaderSize = 8u << 20;
 
-    // DX11_V298_POISON_BLOB_QUARANTINE: the game-data scan harvests raw DXBC
-    // candidates; a malformed-but-header-plausible blob can wedge or crash
-    // the DXBC->SPIR-V compiler, which hangs the whole boot inside device
-    // creation (observed: CoD Advanced Warfare froze at "pre-init preload
-    // started"). Before each compile, record the file being processed; if a
-    // previous boot died mid-compile the marker still names the culprit -
-    // quarantine (delete) it and the boot self-heals. The marker is removed
-    // after every successful pass, so healthy boots leave nothing behind.
-    const std::filesystem::path quarantineMarker = !cacheFiles.empty()
-      ? cacheFiles.front().parent_path() / "compiling.marker"
-      : std::filesystem::path();
-    if (!quarantineMarker.empty()) {
-      std::ifstream marker(quarantineMarker);
-      std::string previousVictim;
-      if (marker && std::getline(marker, previousVictim) && !previousVictim.empty()) {
-        marker.close();
-        std::error_code quarantineError;
-        std::filesystem::remove(std::filesystem::path(previousVictim), quarantineError);
-        Logger::warn(str::format(
-          "[Remix-DX11][game-shader-cache] previous boot died while compiling '",
-          previousVictim, "'; quarantined that cache entry and continuing."));
-      }
-    }
-
+    ShaderPreloadBudget budget;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+    auto& pipelines = m_dxvkDevice->getCommon()->pipelineManager();
     for (size_t i = 0; i < cacheFiles.size(); ++i) {
-      if (RtxShaderPrecompiler::cancelRequested())
+      if (RtxShaderPrecompiler::cancelRequested() || std::chrono::steady_clock::now() >= deadline)
+        break;
+
+      // Back pressure limits queued driver work as well as loaded bytecode.
+      // Device retirement interrupts this wait through clearRunner().
+      while (pipelines.shaderCompilationCount() >= ShaderPreloadBudget::MaximumPendingPipelines
+          && !RtxShaderPrecompiler::cancelRequested() && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+      if (RtxShaderPrecompiler::cancelRequested() || std::chrono::steady_clock::now() >= deadline)
         break;
 
       const std::filesystem::path& path = cacheFiles[i];
-      if (!quarantineMarker.empty()) {
-        std::ofstream marker(quarantineMarker, std::ios::trunc);
-        marker << path.string() << '\n';
-        marker.flush();
-      }
-      std::error_code victimError;
-      if (!std::filesystem::exists(path, victimError) || victimError) {
-        updateProgress(static_cast<uint32_t>(cacheFiles.size() - i - 1u));
-        continue;
-      }
       VkShaderStageFlagBits stage = VK_SHADER_STAGE_FLAG_BITS_MAX_ENUM;
       const std::string filename = path.filename().string();
       if      (filename.rfind("VS_",  0) == 0) stage = VK_SHADER_STAGE_VERTEX_BIT;
@@ -652,7 +524,17 @@ namespace dxvk {
       if (!bytecode.empty()) {
         const DxvkShaderKey shaderKey(
           stage, Sha1Hash::compute(bytecode.data(), bytecode.size()));
-        if (path.stem().string() == shaderKey.toString()) {
+        if (path.stem().string() == shaderKey.toString()
+         && classifyDxbcBlob(reinterpret_cast<const uint8_t*>(bytecode.data()),
+                             static_cast<uint32_t>(bytecode.size())) == stage) {
+          // Harvested blobs have no graphics pipeline state. Loading all of
+          // them cannot precompile those pipelines and retains unused modules.
+          if (!pipelines.hasPipelineForShader(shaderKey)) {
+            updateProgress(static_cast<uint32_t>(cacheFiles.size() - i - 1u));
+            continue;
+          }
+          if (!budget.admit(bytecode.size()))
+            break;
           DxbcTessInfo tessInfo;
           tessInfo.maxTessFactor = float(m_d3d11Options.maxTessFactor);
           DxbcModuleInfo moduleInfo;
@@ -678,29 +560,17 @@ namespace dxvk {
             "[Remix-DX11][game-shader-cache] rejected invalid cache entry '",
             path.string(), "'."));
         }
-        std::error_code removeError;
-        std::filesystem::remove(path, removeError);
       }
 
       updateProgress(static_cast<uint32_t>(cacheFiles.size() - i - 1u));
     }
 
-    // Every entry compiled (or was rejected) without taking the boot down -
-    // clear the quarantine marker so the next launch does not delete a
-    // perfectly good cache entry.
-    if (!quarantineMarker.empty()) {
-      std::error_code markerCleanupError;
-      std::filesystem::remove(quarantineMarker, markerCleanupError);
-    }
+
   }
 
 
-  // DX11_V292_PRECOMPILER_WIDGET: dev-menu driven precompile. Mirrors the
-  // Fossilize / Steam shader pre-caching model on top of this runtime's own
-  // pieces: (optionally) harvest every DXBC container from the game's data
-  // files, then compile the complete cache; already-compiled shaders dedupe
-  // through the shared module set, and pipeline warmth accumulates in the
-  // DXVK state cache for every later launch.
+  // The explicit scan populates the DXBC disk cache. A bounded subset with
+  // observed pipeline state is then registered; unseen shaders load on demand.
   void D3D11Device::RunShaderPrecompileJob(bool fullRescan) {
     const std::filesystem::path cacheDirectory =
       std::filesystem::path(env::getExePath()).parent_path()
@@ -745,24 +615,28 @@ namespace dxvk {
 
     uint32_t loadedShaders = 0u;
     uint32_t rejectedShaders = 0u;
+    uint32_t examinedShaders = 0u;
     const uint32_t total = static_cast<uint32_t>(cacheFiles.size());
     RtxShaderPrecompiler::reportCacheCounts(total, 0u, 0u);
 
     LoadGameShaderCacheFiles(
       cacheFiles,
-      [total, &loadedShaders, &rejectedShaders](uint32_t) {
+      [total, &loadedShaders, &rejectedShaders, &examinedShaders](uint32_t remaining) {
+        examinedShaders = total - remaining;
         RtxShaderPrecompiler::reportCacheCounts(
-          total, loadedShaders, rejectedShaders);
+          total, loadedShaders, rejectedShaders, examinedShaders);
       },
       loadedShaders, rejectedShaders);
 
-    RtxShaderPrecompiler::reportCacheCounts(total, loadedShaders, rejectedShaders);
-    if (prewarmLoggingEnabled()) {
+    RtxShaderPrecompiler::reportCacheCounts(total, loadedShaders, rejectedShaders, examinedShaders);
+    if (total != 0u) {
       Logger::info(str::format(
         "[Remix-DX11][precompiler] job finished: fullRescan=", fullRescan ? 1 : 0,
         " cachedShaders=", total,
         " loaded=", loadedShaders,
         " rejected=", rejectedShaders,
+        " examined=", examinedShaders,
+        " (bounded preload; unused shaders remain on disk)",
         RtxShaderPrecompiler::cancelRequested() ? " (cancelled)" : ""));
     }
   }
@@ -1376,6 +1250,7 @@ namespace dxvk {
           semList.at(i).componentType = entry->componentType;
           semList.at(i).systemValue = entry->systemValue;
           semList.at(i).perInstance = pInputElementDescs[i].InputSlotClass == D3D11_INPUT_PER_INSTANCE_DATA;
+          semList.at(i).instanceStepRate = pInputElementDescs[i].InstanceDataStepRate;
         }
         
         // Create vertex input binding description. The
@@ -2658,8 +2533,9 @@ namespace dxvk {
     enabled.core.features.shaderStorageImageReadWithoutFormat     = supported.core.features.shaderStorageImageReadWithoutFormat;
     enabled.core.features.depthBounds                             = supported.core.features.depthBounds;
 
-    // PHASMOPHOBIA REMIX PORTING: shaderDrawParameters removed from Remix fork
-    // enabled.shaderDrawParameters.shaderDrawParameters             = VK_TRUE;
+    // DXBC vertex shaders use BaseVertex/BaseInstance and declare DrawParameters.
+    // The promoted Vulkan 1.1 feature must be required and enabled explicitly.
+    enabled.vulkan11Features.shaderDrawParameters                 = VK_TRUE;
 
     enabled.extMemoryPriority.memoryPriority                      = supported.extMemoryPriority.memoryPriority;
 

@@ -1,7 +1,9 @@
 #include "dxgi_factory.h"
 #include "dxgi_include.h"
+#include "dxgi_native.h"
 
 #include <delayimp.h>
+#include <d3dcommon.h>
 
 #include "../util/util_env.h"
 
@@ -93,50 +95,20 @@ namespace dxvk {
   
   Logger Logger::s_instance("dxgi.log");
 
-  // Intel Vulkan ICD (igvk64.dll/ControlLib.dll) calls CreateDXGIFactory1 from
-  // inside vkCreateInstance to enumerate adapters. That re-enters our dxgi.dll,
-  // creates another DxvkInstance, calls vkCreateInstance again → stack overflow.
-  // Guard: on reentrant calls forward to the real system dxgi.dll instead.
-  static HRESULT forwardToSystemDxgi(UINT Flags, const char* exportName, REFIID riid, void** ppFactory) {
-    wchar_t sysPath[MAX_PATH];
-    GetSystemDirectoryW(sysPath, MAX_PATH);
-    wcscat_s(sysPath, L"\\dxgi.dll");
-
-    HMODULE hSys = LoadLibraryExW(sysPath, nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
-    if (!hSys) return E_FAIL;
-
-    if (!std::strcmp(exportName, "CreateDXGIFactory2")) {
-      using PFN_CreateDXGIFactory2 = HRESULT(WINAPI*)(UINT, REFIID, void**);
-      auto fn = reinterpret_cast<PFN_CreateDXGIFactory2>(GetProcAddress(hSys, exportName));
-
-      if (!fn) {
-        FreeLibrary(hSys);
-        return E_FAIL;
-      }
-
-      return fn(Flags, riid, ppFactory);
-    }
-
-    using PFN_CreateDXGIFactory = HRESULT(WINAPI*)(REFIID, void**);
-    auto fn = reinterpret_cast<PFN_CreateDXGIFactory>(GetProcAddress(hSys, exportName));
-
-    if (!fn) {
-      FreeLibrary(hSys);
-      return E_FAIL;
-    }
-
-    return fn(riid, ppFactory);
-  }
-
   HRESULT createDxgiFactory(UINT Flags, const char* exportName, REFIID riid, void **ppFactory) {
+    if (!ppFactory)
+      return E_POINTER;
+    *ppFactory = nullptr;
     if (env::shouldBypassRemixForCurrentProcess()) {
       Logger::info(str::format("DXGI bypass for helper process: ", env::getExeName()));
-      return forwardToSystemDxgi(Flags, exportName, riid, ppFactory);
+      return createSystemDxgiFactory(Flags, exportName, riid, ppFactory);
     }
 
+    // Some Vulkan ICDs enumerate Windows adapters during vkCreateInstance.
+    // Reentrant factory creation must use Windows rather than recurse into Vulkan.
     static thread_local bool s_creating = false;
     if (s_creating)
-      return forwardToSystemDxgi(Flags, exportName, riid, ppFactory);
+      return createSystemDxgiFactory(Flags, exportName, riid, ppFactory);
 
     // DX11_V238_INTEROP_DXGI_PASSTHROUGH: the Intel D3D11/D3D12-interop present path needs a REAL DXGI
     // factory (the present runs on a real D3D12 device that bypasses the broken Intel Vulkan WSI).
@@ -145,9 +117,13 @@ namespace dxvk {
     // its own D3D12 device/swapchain creation), forward to the real system dxgi so the present device
     // gets real DXGI. The game's own DXGI calls (flag clear) still go through DXVK/Remix as normal.
     if (env::getEnvVar("DXVK_REMIX_DXGI_PASSTHROUGH") == "1")
-      return forwardToSystemDxgi(Flags, exportName, riid, ppFactory);
+      return createSystemDxgiFactory(Flags, exportName, riid, ppFactory);
 
     s_creating = true;
+    struct CreationGuard {
+      bool& creating;
+      ~CreationGuard() { creating = false; }
+    } guard { s_creating };
     HRESULT hr;
     try {
       Com<DxgiFactory> factory = new DxgiFactory(Flags);
@@ -156,14 +132,12 @@ namespace dxvk {
       Logger::err(e.message());
       hr = E_FAIL;
     }
-    s_creating = false;
     return hr;
   }
 }
 
 extern "C" {
   DLLEXPORT HRESULT __stdcall CreateDXGIFactory2(UINT Flags, REFIID riid, void **ppFactory) {
-    dxvk::Logger::info("CreateDXGIFactory2: Ignoring flags");
     return dxvk::createDxgiFactory(Flags, "CreateDXGIFactory2", riid, ppFactory);
   }
 
@@ -176,63 +150,68 @@ extern "C" {
   }
 
   DLLEXPORT HRESULT __stdcall DXGIDeclareAdapterRemovalSupport() {
-    static bool enabled = false;
-
-    if (std::exchange(enabled, true))
-      return 0x887a0036; // DXGI_ERROR_ALREADY_EXISTS;
-
-    dxvk::Logger::warn("DXGIDeclareAdapterRemovalSupport: Stub");
-    return S_OK;
+    using Function = HRESULT (WINAPI*)();
+    const auto function = reinterpret_cast<Function>(dxvk::getSystemDxgiProcAddress("DXGIDeclareAdapterRemovalSupport"));
+    return function ? function() : HRESULT_FROM_WIN32(ERROR_PROC_NOT_FOUND);
   }
 
   DLLEXPORT HRESULT __stdcall DXGIGetDebugInterface1(UINT Flags, REFIID riid, void **ppDebug) {
-    static bool errorShown = false;
-
-    if (!std::exchange(errorShown, true))
-      dxvk::Logger::warn("DXGIGetDebugInterface1: Stub");
-
-    return E_NOINTERFACE;
+    if (!ppDebug)
+      return E_POINTER;
+    *ppDebug = nullptr;
+    using Function = HRESULT (WINAPI*)(UINT, REFIID, void**);
+    const auto function = reinterpret_cast<Function>(dxvk::getSystemDxgiProcAddress("DXGIGetDebugInterface1"));
+    return function ? function(Flags, riid, ppDebug) : DXGI_ERROR_SDK_COMPONENT_MISSING;
   }
 
-  // DX11_V282_SYS_DLL_EXPORTS: the SYSTEM d3d11.dll and d3d10/d3d10_1.dll
-  // import these from "dxgi.dll" BY NAME. When the launcher bypass (V279)
-  // loads the system d3d11.dll into a process where OUR dxgi.dll is already
-  // resident, or any module loads system D3D10, the loader resolves those
-  // imports against us; missing names failed the load with
-  // STATUS_ENTRYPOINT_NOT_FOUND - games/launchers dying with no logs. Stubs
-  // satisfy the loader; D3D10 device creation through Remix's DXGI stays
-  // unsupported (E_NOTIMPL). x64 calling convention makes the exact
-  // signatures loader-irrelevant; these match the documented DDK shapes.
+  // Windows D3D10/11 imports these private entry points by name. Forward the
+  // native ABI, including all seven CreateDevice arguments, rather than merely
+  // satisfying the loader and failing device creation later.
   DLLEXPORT HRESULT __stdcall DXGID3D10CreateDevice(
-    HMODULE hModule, void* pFactory, void* pAdapter, UINT Flags, void* unknown, void** ppDevice) {
-    static bool warned = false;
-    if (!std::exchange(warned, true))
-      dxvk::Logger::warn("DXGID3D10CreateDevice: Stub (D3D10 devices unsupported)");
-    return E_NOTIMPL;
+    HMODULE hModule, IDXGIFactory* pFactory, IDXGIAdapter* pAdapter,
+    UINT Flags, const D3D_FEATURE_LEVEL* pFeatureLevels, UINT FeatureLevelCount, void** ppDevice) {
+    using Function = HRESULT (WINAPI*)(HMODULE, IDXGIFactory*, IDXGIAdapter*, UINT,
+      const D3D_FEATURE_LEVEL*, UINT, void**);
+    const auto function = reinterpret_cast<Function>(dxvk::getSystemDxgiProcAddress("DXGID3D10CreateDevice"));
+    if (!function)
+      return HRESULT_FROM_WIN32(ERROR_PROC_NOT_FOUND);
+    dxvk::Com<IDXGIVkMonitorInfo> proxy;
+    if (pFactory && SUCCEEDED(pFactory->QueryInterface(__uuidof(IDXGIVkMonitorInfo), reinterpret_cast<void**>(&proxy)))) {
+      dxvk::Com<IDXGIFactory3> proxyFlags;
+      pFactory->QueryInterface(__uuidof(IDXGIFactory3), reinterpret_cast<void**>(&proxyFlags));
+      dxvk::Com<IDXGIFactory1> nativeFactory;
+      HRESULT hr = dxvk::createSystemDxgiFactory(proxyFlags != nullptr ? proxyFlags->GetCreationFlags() : 0,
+        "CreateDXGIFactory2", __uuidof(IDXGIFactory1), reinterpret_cast<void**>(&nativeFactory));
+      if (FAILED(hr))
+        return hr;
+      dxvk::Com<IDXGIAdapter> nativeAdapter;
+      hr = dxvk::getSystemDxgiAdapter(nativeFactory.ptr(), pAdapter, nativeAdapter);
+      if (FAILED(hr))
+        return hr;
+      return function(hModule, nativeFactory.ptr(), nativeAdapter.ptr(), Flags, pFeatureLevels, FeatureLevelCount, ppDevice);
+    }
+    return function(hModule, pFactory, pAdapter, Flags, pFeatureLevels, FeatureLevelCount, ppDevice);
   }
 
   DLLEXPORT HRESULT __stdcall DXGID3D10CreateLayeredDevice(
     void* unknown0, void* unknown1, void* unknown2, void* unknown3, void* unknown4) {
-    static bool warned = false;
-    if (!std::exchange(warned, true))
-      dxvk::Logger::warn("DXGID3D10CreateLayeredDevice: Stub (D3D10 devices unsupported)");
-    return E_NOTIMPL;
+    using Function = HRESULT (WINAPI*)(void*, void*, void*, void*, void*);
+    const auto function = reinterpret_cast<Function>(dxvk::getSystemDxgiProcAddress("DXGID3D10CreateLayeredDevice"));
+    return function ? function(unknown0, unknown1, unknown2, unknown3, unknown4) : HRESULT_FROM_WIN32(ERROR_PROC_NOT_FOUND);
   }
 
   DLLEXPORT SIZE_T __stdcall DXGID3D10GetLayeredDeviceSize(
     const void* pLayers, UINT NumLayers) {
-    static bool warned = false;
-    if (!std::exchange(warned, true))
-      dxvk::Logger::warn("DXGID3D10GetLayeredDeviceSize: Stub (D3D10 devices unsupported)");
-    return 0;
+    using Function = SIZE_T (WINAPI*)(const void*, UINT);
+    const auto function = reinterpret_cast<Function>(dxvk::getSystemDxgiProcAddress("DXGID3D10GetLayeredDeviceSize"));
+    return function ? function(pLayers, NumLayers) : 0;
   }
 
   DLLEXPORT HRESULT __stdcall DXGID3D10RegisterLayers(
     const void* pLayers, UINT NumLayers) {
-    static bool warned = false;
-    if (!std::exchange(warned, true))
-      dxvk::Logger::warn("DXGID3D10RegisterLayers: Stub (D3D10 devices unsupported)");
-    return E_NOTIMPL;
+    using Function = HRESULT (WINAPI*)(const void*, UINT);
+    const auto function = reinterpret_cast<Function>(dxvk::getSystemDxgiProcAddress("DXGID3D10RegisterLayers"));
+    return function ? function(pLayers, NumLayers) : HRESULT_FROM_WIN32(ERROR_PROC_NOT_FOUND);
   }
 
 }

@@ -148,7 +148,7 @@ namespace dxvk {
         RW_STRUCTURED_BUFFER(SHARC_BINDING_LOCKS)
       END_PARAMETER()
     };
-    class IntegrateIndirectRayGenShader : public ManagedShader {
+    class IntegrateIndirectRayGenShader : public AsyncManagedShader {
     public:
       BINDLESS_ENABLED()
       PUSH_CONSTANTS(SharcArgs)

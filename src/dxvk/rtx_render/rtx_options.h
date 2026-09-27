@@ -336,7 +336,7 @@ namespace dxvk {
     RTX_OPTION("rtx", float, significanceCullingMinScreenFraction, 0.0003f, "Performance: minimum projected on-screen size (object world-size / camera distance, an angular fraction) below which significanceCulling drops an instance. 0.0003 is sub-pixel even at 4K; raise for more aggressive culling, lower (or 0) to keep everything.");
     RTX_OPTION("rtx", uint32_t, maxInstanceSubmissions, 100000u, "Performance: hard cap on the number of (non-culled) main-camera scene instances submitted to the path tracer per frame. Default 100000 effectively means no cap; lower it to bound worst-case instance counts in pathological scenes.");
     RTX_OPTION("rtx", bool, forceInjection, true, "DX11: forces Remix injection for draws even when normal heuristics would skip them. Default ON so games path-trace instead of falling back to rasterization whenever a real camera or a previous scene exists; camera-less pure-UI frames still pass through (injecting those would render black menus).");
-    RTX_OPTION("rtx", bool, dx11StrongerDenoising, true, "DX11: strengthen NRD denoising beyond the stock presets - longer temporal accumulation, forced firefly suppression, and wider spatial filtering (the same measures Unreal's path tracer leans on: heavy temporal history + variance-guided spatial reconstruction). The DX11 capture's signal is noisier than native Remix (approximate cameras, absent per-object motion), so the stock tuning under-resolves. Disable per game in rtx.conf if temporal ghosting is objectionable.");
+    RTX_OPTION("rtx", bool, dx11StrongerDenoising, false, "Apply heavier NRD tuning to DX11 captures: longer temporal history, anti-firefly filtering, and an additional ReLAX spatial-filter iteration. This costs GPU time and can increase ghosting. Disabled uses the selected NRD preset; enable per game only when the additional smoothing is useful.");
     RTX_OPTION("rtx", bool, useCBufferWorldMatrices, false, "DX11: derives world/view matrices from constant buffers when true.");
     RTX_OPTION("rtx", bool, enableUnrealTextureFixes, false, "DX11: applies generic albedo texture-selection reinforcement (boost strong-albedo mipmapped textures, demote scene/intermediate surfaces). Removed from the default path (it could promote the wrong texture to albedo); set true to re-enable per game.");
     RTX_OPTION("rtx", bool, enableSource2Fixes, false, "DX11: applies Source 2 engine specific fixes when true.");
@@ -459,19 +459,18 @@ namespace dxvk {
                "Gives sampled textures created without initial data (UI/font atlases, video surfaces, streaming pools) a stable identity derived from their descriptor and creation order, instead of hashing the content of whichever runtime upload happened to arrive first.\n"
                "First-upload hashing made such texture hashes differ between sessions - the first upload depends on which glyphs or frames the menu touched first - so UI texture tags and replacements silently stopped applying on the next run.\n"
                "Note: enabling or disabling this changes the hashes of these dynamic textures once, so existing tags on them need re-tagging; textures created with data (nearly all world materials) are unaffected.");
-    // DX11_V295_CAPTURE_BUDGET: per-frame post-VS capture budgets. Remix-native
-    // titles route their whole scene through capture (50-200 small draws per
-    // frame), so the caps default high; the byte cap bounds one frame's GPU
-    // copy work against TDR. Lower these per title if a device-lost occurs.
+    // Whole-frame admission budgets complement bounded GPU replay chunks.
+    // A flattened indexed triangle needs three captured vertices; 96 MiB
+    // admits over one million triangles at the maximum 24-byte capture stride.
+    // Cache memory is separately bounded, and an incomplete frame stays native.
     RTX_OPTION("rtx.dx11", int, captureMaxDrawsPerFrame, 128,
-               "Maximum post-VS position captures performed per frame. Draws past the cap keep their previous capture or stay on the raster layer until a later frame captures them.\n"
-               "DX11_V298: raised 64 -> 128 (with new=64, replay=64, 48 MiB). Fallout 4 pinned the old cold lane (new=32/32) during world streaming, so scenery popped in over many seconds. GPU pacing is bounded separately (8 draws / 64K vertices per queue submission) and capture memory is capped, so the wider lanes only shorten pop-in.");
+               "Maximum post-VS position captures performed per frame. If required geometry exceeds a capture budget, retain the complete native frame and retry on subsequent frames. Unchanged exact captures do not consume this budget.");
     RTX_OPTION("rtx.dx11", int, captureMaxNewBuffersPerFrame, 64,
                "Maximum NEW capture buffers allocated per frame (cold captures of meshes never seen before).");
     RTX_OPTION("rtx.dx11", int, captureMaxReplaysPerFrame, 64,
                "Maximum dynamic-mesh capture replays per frame (meshes whose vertex data changes every frame).");
-    RTX_OPTION("rtx.dx11", int, captureMaxMiBPerFrame, 48,
-               "Maximum bytes (MiB) of post-VS capture copied per frame. Bounds a single frame's GPU copy work so capture can never push one queue submission past the TDR limit.");
+    RTX_OPTION("rtx.dx11", int, captureMaxMiBPerFrame, 96,
+               "Maximum bytes (MiB) of post-VS capture written per frame. Large draws use bounded replay submissions; this separate limit bounds aggregate work. A budget refusal preserves the complete native frame instead of reusing stale geometry.");
     RTX_OPTION("rtx.dx11", bool, dynamicTextureHashUsesOrdinal, true,
                "Includes a same-descriptor slot ordinal in the stable dynamic-texture identity. Slots are recycled when a texture is destroyed, so a recreated UI atlas keeps its hash across recreation.\n"
                "Games that rotate several live buffers for one UI element get one stable hash per rotation slot - tag each slot once and the tags stick.\n"
@@ -521,20 +520,16 @@ namespace dxvk {
                  "When set to true shaders will be automatically recompiled when any shader file is updated (saved for instance) in addition to the usual manual recompilation trigger.\n"
                  "This option is mainly meant for development use and should not be set for user-facing operation.");
 
-      RTX_OPTION_ENV("rtx.shader", bool, prewarmAllVariants, true, "RTX_PREWARM_ALL_VARIANTS",
-                     "Prewarms every Remix shader variant in the injected game process after an external game launcher has handed off and before Remix completes game initialization. Only takes effect when rtx.initializer.asyncShaderPrewarming is true.\n"
-                     "Disable only to diagnose a driver compiler problem or reduce first-run compilation time; disabled variants compile asynchronously when first selected.");
+      RTX_OPTION_ENV("rtx.shader", bool, prewarmAllVariants, false, "RTX_PREWARM_ALL_VARIANTS",
+                     "Compile all supported Remix variants instead of only the configured path-tracing variants. This can consume substantial CPU time and memory; disabled variants compile asynchronously when selected.");
       RTX_OPTION_ENV("rtx.shader", bool, prewarmOnBoot, true, "DXVK_REMIX_PREWARM",
-                     "Registers the Remix path-tracing pipeline set with the asynchronous compiler during startup so required shaders are compiled before their first rendered use. Disable only when diagnosing a driver-specific compiler failure.");
-      RTX_OPTION("rtx.shader", bool, waitForPrewarmOnBoot, true,
-                 "Waits for boot shader prewarming to finish before Remix completes game initialization. The wait is bounded so a driver compiler failure cannot hang startup forever.\n"
-                 "DX11_V298: defaults ON - the game holds at the prewarm window and does not initialize past it until every Remix pipeline is compiled, so gameplay never overlaps compilation. The multi-minute cost the old OFF default avoided is now first-boot-only: compiled pipelines persist to rtx-remix/cache and later boots drain the wait in seconds.");
+                     "Register the configured path-tracing variants with the bounded asynchronous compiler during startup.");
+      RTX_OPTION("rtx.shader", bool, waitForPrewarmOnBoot, false,
+                 "Wait for selected boot shaders before game initialization. Disabled by default so the application can create its window and remain responsive while pipelines compile.");
       RTX_OPTION("rtx.shader", uint, maxBootPrewarmWaitSeconds, 45,
-                 "Longest the boot shader prewarm may hold the game before the remaining pipelines are handed to the background compiler and the game is allowed to start. Only applies to the boot wait; the shutdown drain always finishes.\n"
-                 "DX11_V319: with rtx.shader.prewarmAllVariants on there was previously NO total limit - only a 180s no-progress timeout - so a cold per-game pipeline cache blocked startup for as long as compilation kept making progress. Measured: Call of Duty Advanced Warfare 7m21s, Saints Row IV 8m02s, with no log output during the wait, which is indistinguishable from a hang and was reported as the game never loading.\n"
-                 "The handoff keeps the benefit: compiled pipelines still persist to rtx-remix/cache, so a later launch drains the wait in seconds. Raise it to favour compiling before play, or set to 0 for the old unbounded wait.");
+                 "Maximum boot wait when waitForPrewarmOnBoot is enabled. Remaining pipelines continue asynchronously; 0 hands off immediately. Shutdown discards unused queued prewarms and waits only for active driver work.");
       RTX_OPTION("rtx.shader", bool, showPrewarmDialog, true,
-                 "Shows a responsive native Please Wait window with live shader count while boot shader prewarming is running before the game can render Remix's in-game UI.");
+                 "Show shader prewarm progress while the configured pipeline set is being compiled.");
       RTX_OPTION_ENV("rtx.shader", bool, enableAsyncCompilation, true, "RTX_ENABLE_ASYNC_COMPILATION",
                  "When set to true shader compilation (especially that of prewarming) will be done asynchronously rather than blocking.\n"
                  "Typically shader prewarming with async finalization is done to attempt to compile all required shader variants before they are used, often by overlapping this work with a startup sequence (e.g. a game's loading screen). Often times however this prewarming takes longer than the time available, or an application may not have a startup sequence to begin with and immediately begin using Remix shaders.\n"
@@ -547,13 +542,10 @@ namespace dxvk {
       RTX_OPTION("rtx.shader", bool, enableAsyncCompilationUI, true,
                  "Enables a UI message when async shader compilation is in progress to indicate the current compilation progress. Only takes effect when rtx.shader.enableAsyncCompilation is true.\n"
                  "This should usually be enabled as providing information to the user about the current progress of compilation is useful. May be disabled however for automated testing purposes if the nondeterministic behavior of the UI's rendered text interferes with testing.");
-      RTX_OPTION("rtx.shader", std::uint32_t, asyncCompilationThrottleMilliseconds, 8,
-                 "Specifies a time in milliseconds to throttle each application frame when async shader compilation is in progress. Set to 0 to disable, and only takes effect when rtx.shader.enableAsyncCompilation is true.\n"
-                 "This generally should be set to a value low enough to not impact the application framerate significantly (especially if non-ray traced visuals are capable of being displayed by the application while loading, e.g. an intro video), but also high enough to get the desired shader compilation performance (especially relevant if the application is fairly heavy on the CPU during async shader compilation, or on CPUs with few hardware threads).\n"
-                 "DX11_V296: default lowered from 33 to 8. With rtx.shader.waitForPrewarmOnBoot off, the full pipeline set compiles in the background while the game is already playable; a 33ms tax on every frame capped games near 30 FPS for that whole multi-minute window - the reported post-prewarm lag. 8ms keeps the compiler fed without visibly dragging the frame rate.");
+      RTX_OPTION("rtx.shader", std::uint32_t, asyncCompilationThrottleMilliseconds, 0,
+                 "Optional frame delay while Remix pipelines compile. The default adds no delay; compiler concurrency is bounded independently.");
       RTX_OPTION("rtx.shader", std::uint32_t, backgroundCompilerConcurrency, 0,
-                 "Maximum number of Remix pipeline compiles allowed to run concurrently on the shader compiler workers once the game is running (0 = automatic: one quarter of the hardware threads, clamped to [1, 4]).\n"
-                 "Remix ray-tracing pipelines take seconds to minutes each to build and the GPU driver parallelizes each compile internally; letting every worker thread build one at once saturates the CPU and the driver's own compiler pool, which lags gameplay while the background prewarm runs. This cap only applies to Remix pipelines and only after initialization - boot-time blocking prewarm and the exit drain always run at full parallelism - and regular game pipelines are never held back by it.");
+                 "Maximum simultaneous Remix driver compilations, including boot prewarm. 0 selects one eighth of logical CPUs, clamped to 1-4; explicit values are capped at four. Overall compiler workers are also bounded by available memory.");
     } shader;
 
     struct RaytracedRenderTarget {
@@ -1288,27 +1280,15 @@ namespace dxvk {
                "frame markedly worse than anything reported so far is always logged regardless of the\n"
                "interval, so a genuine escalation is never throttled away. Set to 0 to report every frame.");
     RTX_OPTION("rtx", bool, logCameraObstruction, true,
-               "Logs any accepted draw whose bounding box, transformed into view space, encloses the eye.\n"
-               "Geometry that genuinely sits elsewhere in the world lands away from the view origin; anything\n"
-               "bracketing it on all three axes is pinned to the viewpoint and will fill the screen no matter\n"
-               "where the player looks. Each entry names the draw, its texture hash, whether it was captured\n"
-               "camera-relative, and both its object-space and view-space boxes, so the obstructing mesh can\n"
-               "be identified and tagged rather than guessed at.");
+               "Reports raw input bounds that enclose the eye at debug log level.\n"
+               "These bounds precede vertex-shader placement and do not prove an obstruction.");
     RTX_OPTION("rtx", uint, logCameraObstructionMaxEntries, 32,
-               "Caps how many camera-obstruction entries are logged per session, so a mesh submitted every\n"
-               "frame cannot flood the log. Raise it when several distinct meshes need identifying.");
+               "Maximum camera-bounds diagnostics per session.");
     RTX_OPTION("rtx", bool, dropCollapsedEyeGeometry, true,
-               "Drops geometry that has collapsed onto the viewpoint: its bounding box encloses the eye\n"
-               "AND both the object-to-world and world-to-view translations are zero, meaning the mesh\n"
-               "was never actually placed in the world. Such a mesh occludes the scene that renders\n"
-               "correctly behind it - the long-standing 'black box around the camera'.\n"
-               "\n"
-               "Enclosing the eye alone is NOT enough to cull: a room, cave or water volume you are\n"
-               "standing inside legitimately brackets the camera on all three axes. The zero-translation\n"
-               "test is what separates a collapsed mesh from an interior you are genuinely inside.\n"
-               "\n"
-               "This is a safety net. The real fix is submitting the draw in the correct coordinate\n"
-               "space (see rtx.dx11UseResolvedTransformSpace); when that works this never fires.");
+               "Require exact vertex-shader capture for ambiguous origin-centered or eye-enclosing\n"
+               "untextured quad bounds. If capture is unavailable, retain the native frame.\n"
+               "Verified captured geometry, including rooms around the camera, remains valid.\n"
+               "This protection operates independently of camera-obstruction logging.");
     RTX_OPTION("rtx", bool, dx11UseResolvedTransformSpace, true,
                "Let the DX11 camera resolver decide which coordinate space a draw's vertices are in,\n"
                "instead of the legacy cameraRelativeView flag (which is written from 13 separate sites,\n"

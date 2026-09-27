@@ -34,20 +34,7 @@ namespace dxvk {
   public:
     explicit RtxInitializer(DxvkDevice* device);
 
-    void onDestroy() override {
-      m_stopPrewarmMonitor.store(true);
-      if (m_prewarmMonitorThread.joinable()) {
-        m_prewarmMonitorThread.join();
-      }
-
-      if (m_asyncAssetLoadThread.joinable()) {
-        m_asyncAssetLoadThread.join();
-      }
-
-      // Asset loading can create pipelines and enqueue texture uploads.
-      // Finish the producer before draining either class of work.
-      waitForShaderPrewarm();
-    }
+    void onDestroy() override;
 
     void initialize();
     void release();
@@ -59,25 +46,13 @@ namespace dxvk {
     void waitForShaderPrewarm(bool showProgressDialog = false,
                               bool allowBackgroundHandoff = false);
 
-    using GameShaderRegistrar = std::function<void(
-      const std::function<void(uint32_t)>&)>;
-
-    void prewarmCachedGameShaders(
-      uint32_t cachedShaderCount,
-      const GameShaderRegistrar& registerShaders);
-
-    // DX11_V298_BOOT_SHADER_SCAN_PHASE: runs the boot-time game-data shader
-    // scan inside the shared prewarm window so building the cache from the
-    // game's data before play is visible instead of a silent stall.
-    void runBootShaderScanPhase(const std::function<void()>& scan);
-
     bool getWarmupComplete() const {
       return m_warmupComplete;
     }
 
   private:
-    bool m_warmupComplete = false;
-    bool m_assetsLoaded = false;
+    std::atomic<bool> m_warmupComplete { false };
+    std::atomic<bool> m_assetsLoaded { false };
 
     void loadAssets();
     bool startPrewarmShaders();

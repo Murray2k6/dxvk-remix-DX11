@@ -304,6 +304,14 @@ namespace dxvk::vk {
     std::vector<PresenterImage> m_images;
     std::vector<PresenterSync>  m_semaphores;
 
+    struct AcquireCompletion {
+      VkFence fence = VK_NULL_HANDLE;
+      bool acquired = false;
+      bool submitted = false;
+    };
+    std::vector<AcquireCompletion> m_acquireCompletions;
+    std::vector<uint32_t> m_imageAcquireSlots;
+
     uint32_t m_imageIndex = 0;
     uint32_t m_frameIndex = 0;
 
@@ -321,6 +329,10 @@ namespace dxvk::vk {
     bool m_gdiFallback = false;
 
     FpsLimiter m_fpsLimiter;
+
+    VkResult acquireImage(uint32_t slot, uint32_t& imageIndex);
+
+    VkResult trackAcquireConsumption(uint32_t imageIndex);
 
     VkResult getSupportedFormats(
             std::vector<VkSurfaceFormatKHR>& formats,

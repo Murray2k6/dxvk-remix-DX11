@@ -1828,6 +1828,27 @@ namespace {
 
 extern "C"
 {
+  // Native DXGI presentation does not pass through remixapi_Present. Query
+  // the supplied device directly so diagnostics can distinguish completed RT
+  // frames from successful raster presents without depending on API globals.
+  REMIXAPI uint64_t REMIXAPI_CALL remixapi_dxvk_GetCompletedRaytracedFrameCount(ID3D11Device* device) {
+    auto* remixDevice = dynamic_cast<dxvk::D3D11Device*>(device);
+    if (!remixDevice) return 0;
+    ID3D11DeviceContext* immediate = nullptr;
+    remixDevice->GetImmediateContext(&immediate);
+    if (!immediate) return 0;
+    std::unique_ptr<ID3D11DeviceContext, void(*)(ID3D11DeviceContext*)> ownedContext(
+      immediate, [](ID3D11DeviceContext* context) { context->Release(); });
+    auto* context = static_cast<dxvk::D3D11ImmediateContext*>(immediate);
+    uint64_t completed = 0;
+    std::lock_guard lock { s_mutex };
+    dxvk::RemixAPIPrivateAccessor::EmitCs(context, [&completed](dxvk::DxvkContext* ctx) {
+      completed = static_cast<dxvk::RtxContext*>(ctx)->completedRaytracedFrameCount();
+    });
+    context->SynchronizeCsThread(dxvk::DxvkCsThread::SynchronizeAll);
+    return completed;
+  }
+
   // Internal bridge contract, separate from the public Remix API table. A
   // successful DXGI Present may contain no RT output (menus, missing camera,
   // cold pipelines). Only suppress the native game frame after a complete blit

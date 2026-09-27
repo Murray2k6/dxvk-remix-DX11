@@ -27,8 +27,6 @@
 #include <rtxio/rtxioVulkan.h>
 
 namespace dxvk {
-  RtxIoExtensionProvider RtxIoExtensionProvider::s_instance;
-
   DxvkNameSet RtxIoExtensionProvider::getInstanceExtensions() {
     DxvkNameSet nameSet;
     uint32_t extensionCount;
@@ -110,13 +108,11 @@ namespace dxvk {
     return nameSet;
   }
 
-  bool RtxIoExtensionProvider::getDeviceFeatures(VkPhysicalDevice device,
+  bool RtxIoExtensionProvider::getDeviceFeatures(VkInstance instance, VkPhysicalDevice device,
                                                  DxvkDeviceFeatures& features) {
-    if (device == VK_NULL_HANDLE) {
+    if (instance == VK_NULL_HANDLE || device == VK_NULL_HANDLE) {
       return false;
     }
-
-    auto instance = const_cast<DxvkInstance*>(m_vkInstance)->handle();
 
     // Patch the dxvk structures to make them right
     features.vulkan12Features.sType =

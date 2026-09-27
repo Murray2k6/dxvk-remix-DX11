@@ -28,6 +28,7 @@
 #include "dxvk_pipemanager.h"
 #include "dxvk_spec_const.h"
 #include "dxvk_state_cache.h"
+#include "rtx_render/rtx_options.h"
 
 namespace dxvk {
   
@@ -61,6 +62,21 @@ namespace dxvk {
   
   VkPipeline DxvkComputePipeline::getPipelineHandle(
     const DxvkComputePipelineStateInfo& state) {
+    if (m_shaders.forceNoSpecConstants && m_shaders.cs->allowsAsyncCompilation()
+     && RtxOptions::Shader::enableAsyncCompilation()
+     && m_pipeMgr->hasAsyncCompiler()) {
+      // The compiler holds this lock across the driver call. Waiting for it
+      // on the render thread defeats asynchronous compilation entirely.
+      std::unique_lock<sync::Spinlock> lock(m_mutex, std::try_to_lock);
+      if (!lock.owns_lock())
+        return VK_NULL_HANDLE;
+      if (auto* instance = this->findInstance(state))
+        return instance->pipeline();
+      lock.unlock();
+      m_pipeMgr->registerShader(m_shaders.cs, true);
+      return VK_NULL_HANDLE;
+    }
+
     DxvkComputePipelineInstance* instance = nullptr;
 
     { std::lock_guard<sync::Spinlock> lock(m_mutex);

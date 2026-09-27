@@ -97,16 +97,11 @@ namespace dx11_capture {
   // capture path. Unknown GPU/command-list counts are conservatively nonzero.
   void RecordUncapturedDraw(uint32_t primitiveElements, uint32_t instances);
 
-  // Frame boundary (hooked Present). DX11_V265_BRIDGE_PRESENT_CAMERA: sends
-  // RemixApi_Startup (once, with the game window HWND from the swapchain),
-  // RemixApi_SetupCamera (per frame, from the camera scanned out of the bound
-  // VS constant buffers at draw time), and RemixApi_Present (per frame, with
-  // the game HWND as override so Remix presents INTO the game window instead
-  // of a secondary one). Without this pump the server never starts the Remix
-  // runtime and nothing path-traced reaches the screen for x86 bridge games.
+  // Frame boundary: start and present the server runtime on its independent
+  // child HWND, with the recovered camera and captured geometry for this frame.
   // Returns true only after the server produced this frame's ray-traced output
   // from captured geometry and a recovered world camera.
-  // The caller then suppresses native presentation into the same window.
+  // Otherwise the child stays hidden and the caller uses native presentation.
   bool OnPresent(IDXGISwapChain* swapChain);
 
   // True once the bridge IPC handshake is up and streaming is enabled.

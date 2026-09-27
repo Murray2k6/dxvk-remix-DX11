@@ -77,11 +77,13 @@ namespace dxvk {
     ~NrdSettings() = default;
 
     void initialize(const nrd::LibraryDesc& libraryDesc, const dxvk::Config& config, DenoiserType type);
+    void updateDenoiserMode();
     void showImguiSettings();
 
     void updateAdaptiveAccumulation(float frameTimeMs);
 
   private:
+    nrd::Denoiser m_configuredDenoiser = nrd::Denoiser::MAX_NUM;
     RTX_OPTION_ENV("rtx", nrd::Denoiser, denoiserMode, sDefaultDenoiser, "DXVK_DENOISER_NRD_MODE", "");
     RTX_OPTION_ENV("rtx", nrd::Denoiser, denoiserIndirectMode, sDefaultIndirectDenoiser, "DXVK_DENOISER_INDIRECT_NRD_MODE", "");
     RTX_OPTION("rtx.denoiser", float, maxDirectHitTContribution, -1.0f, "");

@@ -36,10 +36,9 @@ namespace dxvk {
   // DX11_V292_PRECOMPILER_WIDGET: bridge between the d3d11 layer (which owns
   // the game-file shader scanner and the DXBC cache preloader) and the Remix
   // developer menu, which renders a Shader Precompiler widget on top of it.
-  // This mirrors the Fossilize / Steam shader pre-caching model: everything
-  // the game has ever used - or that the scanner can harvest from the game's
-  // own files - is compiled up front, on demand, with visible progress,
-  // instead of stalling gameplay at each first use.
+  // The background job registers bounded cached DXBC that has a recorded
+  // pipeline state. Explicit scanning can harvest more bytecode for later
+  // use, but bytecode alone cannot describe an unseen graphics pipeline.
   class RtxShaderPrecompiler {
   public:
     enum class Phase : uint32_t {
@@ -57,6 +56,7 @@ namespace dxvk {
       uint32_t cachedShadersOnDisk;
       uint32_t loadedShaders;
       uint32_t rejectedShaders;
+      uint32_t examinedCachedShaders;
     };
 
     static Status status() {
@@ -69,6 +69,7 @@ namespace dxvk {
       result.cachedShadersOnDisk = s_cachedShadersOnDisk.load(std::memory_order_acquire);
       result.loadedShaders = s_loadedShaders.load(std::memory_order_acquire);
       result.rejectedShaders = s_rejectedShaders.load(std::memory_order_acquire);
+      result.examinedCachedShaders = s_examinedCachedShaders.load(std::memory_order_acquire);
       return result;
     }
 
@@ -92,10 +93,11 @@ namespace dxvk {
       s_scanNewShaders.store(newShaders, std::memory_order_release);
     }
 
-    static void reportCacheCounts(uint32_t onDisk, uint32_t loaded, uint32_t rejected) {
+    static void reportCacheCounts(uint32_t onDisk, uint32_t loaded, uint32_t rejected, uint32_t examined = 0) {
       s_cachedShadersOnDisk.store(onDisk, std::memory_order_release);
       s_loadedShaders.store(loaded, std::memory_order_release);
       s_rejectedShaders.store(rejected, std::memory_order_release);
+      s_examinedCachedShaders.store(examined, std::memory_order_release);
     }
 
     // --- runner registration (d3d11 device side) ---
@@ -157,6 +159,7 @@ namespace dxvk {
             Logger::warn("Shader precompiler failed with an unknown exception");
           }
         });
+        worker.set_priority(ThreadPriority::Lowest);
         worker.detach();
         return true;
       } catch (...) {
@@ -208,6 +211,7 @@ namespace dxvk {
     inline static std::atomic<uint32_t> s_cachedShadersOnDisk { 0u };
     inline static std::atomic<uint32_t> s_loadedShaders { 0u };
     inline static std::atomic<uint32_t> s_rejectedShaders { 0u };
+    inline static std::atomic<uint32_t> s_examinedCachedShaders { 0u };
   };
 
 } // namespace dxvk

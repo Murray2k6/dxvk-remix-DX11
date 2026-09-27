@@ -23,6 +23,7 @@ namespace dxvk {
     DxbcScalarType componentType = DxbcScalarType::Uint32;
     DxbcSystemValue systemValue = DxbcSystemValue::None;
     bool     perInstance; // true if D3D11_INPUT_PER_INSTANCE_DATA
+    uint32_t instanceStepRate = 0;
   };
 
   class D3D11InputLayout : public D3D11DeviceChild<ID3D11InputLayout> {

@@ -346,7 +346,7 @@ namespace dxvk {
     rtOutput.m_raytraceArgs.rtxdiDisocclusionSamples = disocclusionSamples();
     rtOutput.m_raytraceArgs.rtxdiDisocclusionFrames = float(disocclusionFrames());
     rtOutput.m_raytraceArgs.rtxdiSpatialSamples = spatialSamples();
-    rtOutput.m_raytraceArgs.rtxdiMaxHistoryLength = maxHistoryLength();
+    rtOutput.m_raytraceArgs.rtxdiMaxHistoryLength = std::min(maxHistoryLength(), 32u);
 
     // Note: best light sampling uses data written into the RtxdiBestLights texture by the confidence pass on the previous frame.
     // We need to make sure that the data is there and valid: light indices from more than one frame ago are not mappable to the current frame.
@@ -414,7 +414,7 @@ namespace dxvk {
       // Inputs
      
       // Note: Primary buffers bound as these exhibit coherency for RTXDI and denoising.
-     ctx->bindResourceView(RTXDI_REUSE_BINDING_WORLD_SHADING_NORMAL_INPUT, rtOutput.m_primaryWorldShadingNormal.view, nullptr);
+      ctx->bindResourceView(RTXDI_REUSE_BINDING_WORLD_SHADING_NORMAL_INPUT, rtOutput.m_primaryWorldShadingNormal.view, nullptr);
       ctx->bindResourceView(RTXDI_REUSE_BINDING_PERCEPTUAL_ROUGHNESS_INPUT, rtOutput.m_primaryPerceptualRoughness.view, nullptr);
       ctx->bindResourceView(RTXDI_REUSE_BINDING_HIT_DISTANCE_INPUT, rtOutput.m_primaryHitDistance.view, nullptr);
       ctx->bindResourceView(RTXDI_REUSE_BINDING_ALBEDO_INPUT, rtOutput.m_primaryAlbedo.view, nullptr);
@@ -511,7 +511,8 @@ namespace dxvk {
 
   void DxvkRtxdiRayQuery::dispatchGradient(RtxContext* ctx, const Resources::RaytracingOutput& rtOutput) {
 
-    if (!RtxOptions::useRTXDI()) {
+    if (!RtxOptions::useRTXDI() || !m_hasDispatched
+        || m_lastDispatchFrame != ctx->getDevice()->getCurrentFrameId()) {
       return;
     }
 
@@ -573,7 +574,8 @@ namespace dxvk {
 
   void DxvkRtxdiRayQuery::dispatchConfidence(RtxContext* ctx, const Resources::RaytracingOutput& rtOutput) {
     
-    if (!RtxOptions::useRTXDI() ||
+    if (!RtxOptions::useRTXDI() || !m_hasDispatched
+        || m_lastDispatchFrame != ctx->getDevice()->getCurrentFrameId() ||
         !getEnableDenoiserConfidence(*ctx)) {
       return;
     }
@@ -581,6 +583,10 @@ namespace dxvk {
     ScopedGpuProfileZone(ctx, "RTXDI Confidence");
 
     const uint32_t frameIdx = ctx->getDevice()->getCurrentFrameId(); 
+    const uint64_t failures = ctx->failedDispatchCount();
+    // Config files and the public API bypass the UI slider's range. Bound the
+    // work here as well, including the shader's 1 << passIndex filter step.
+    const uint32_t filterPasses = std::min(gradientFilterPasses(), 6u);
     VkExtent3D numThreads = rtOutput.m_compositeOutputExtent;
     VkExtent3D workgroups = util::computeBlockCount(numThreads, VkExtent3D { 16 * RTXDI_GRAD_FACTOR, 8 * RTXDI_GRAD_FACTOR, 1 });
 
@@ -601,11 +607,13 @@ namespace dxvk {
       args.gradientImageSize.y = rtOutput.m_rtxdiGradients.image->info().extent.height;
       args.hitDistanceSensitivity = gradientHitDistanceSensitivity();
 
-      for (uint32_t passIndex = 0; passIndex < gradientFilterPasses(); ++passIndex) {
+      for (uint32_t passIndex = 0; passIndex < filterPasses; ++passIndex) {
         args.passIndex = passIndex;
         ctx->pushConstants(0, sizeof(args), &args);
 
         ctx->dispatch(workgroups.width, workgroups.height, workgroups.depth);
+        if (ctx->failedDispatchCount() != failures)
+          return;
       }
     }
 
@@ -637,7 +645,7 @@ namespace dxvk {
       args.gradientPower = confidenceGradientPower();
       args.gradientScale = confidenceGradientScale();
       args.minimumConfidence = minimumConfidence();
-      args.inputBufferIndex = gradientFilterPasses() & 1;
+      args.inputBufferIndex = filterPasses & 1;
       args.hitDistanceSensitivity = gradientHitDistanceSensitivity();
       args.confidenceHitDistanceSensitivity = confidenceHitDistanceSensitivity();
       ctx->pushConstants(0, sizeof(args), &args);

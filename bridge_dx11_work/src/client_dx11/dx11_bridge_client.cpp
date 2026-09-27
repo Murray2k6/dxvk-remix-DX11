@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include "version.h"
 #include "dx11_bridge_client.h"
+#include "dx11_presentation_window.h"
 #include "config/config.h"
 #include "config/global_options.h"
 #include "log/log.h"
@@ -819,6 +820,7 @@ void Detach() {
   } else {
     ReleaseProcessBridgeClientOwnership();
   }
+  dx11_capture::PresentationWindow::instance().shutdown();
 }
 
 }

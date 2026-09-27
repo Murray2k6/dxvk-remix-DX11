@@ -22,11 +22,16 @@
 #pragma once
 
 #include <NRD.h>
+#include <memory>
+#include <mutex>
+#include <unordered_map>
 
 #include "dxvk_context.h"
 #include "rtx_denoise.h"
 #include "rtx_nrd_settings.h"
 #include "rtx_scene_manager.h"
+
+namespace nrd { struct Library; }
 
 namespace dxvk {
   class NRDContext : public CommonDeviceObject {
@@ -46,8 +51,8 @@ namespace dxvk {
       const DxvkDenoise::Output& outputs);
 
     void showImguiSettings();
-    NrdArgs getNrdArgs() const;
-    bool isReferenceDenoiserEnabled() const;
+    NrdArgs getNrdArgs();
+    bool isReferenceDenoiserEnabled();
 
     const NrdSettings& getNrdSettings() const;
     void setNrdSettings(const NrdSettings& refSettings);
@@ -58,15 +63,12 @@ namespace dxvk {
     const char* getDenoiserName() const;
 
   private:
-    void setSettingsOnInitialization(const DxvkDevice* device);
-    void updateRuntimeSettings(const DxvkDenoise::Input& inputs);
-
     void prepareResources(
       Rc<DxvkContext> ctx,
       const Resources::RaytracingOutput& rtOutput);
 
     void createResources(Rc<DxvkContext> ctx, const Resources::RaytracingOutput& rtOutput);
-    void createPipelines();
+    void createPipeline(uint32_t index);
 
     const Resources::Resource* getTexture(
       const nrd::ResourceDesc& resource,
@@ -83,10 +85,13 @@ namespace dxvk {
 
     void updateAdaptiveScaling(const VkExtent3D& renderSize);
     
-    struct ComputePipeline
+    struct ComputePipeline : public DxvkResource
     {
       static constexpr uint32_t kInvalidIndex = UINT32_MAX;
 
+      explicit ComputePipeline(const Rc<vk::DeviceFn>& vkd) : vkd(vkd) { }
+      ~ComputePipeline();
+      Rc<vk::DeviceFn> vkd;
       VkPipeline pipeline = VK_NULL_HANDLE;
       VkPipelineLayout pipelineLayout = VK_NULL_HANDLE;
       VkDescriptorSetLayout descriptorSetLayout = VK_NULL_HANDLE;
@@ -96,7 +101,6 @@ namespace dxvk {
       uint32_t constantBufferIndex = kInvalidIndex;
       uint32_t resourcesStartIndex = kInvalidIndex;
 
-      Rc<DxvkSampler> linearSampler;
     };
 
     VkPipelineLayout createPipelineLayout(VkDescriptorSetLayout dsetLayout);
@@ -111,8 +115,9 @@ namespace dxvk {
     // Settings
     NrdSettings m_settings;
     nrd::Denoiser m_denoiser = nrd::Denoiser::MAX_NUM;
-    bool m_resetResources = true;
     nrd::Instance* m_denoiserInstance = nullptr;
+    uint32_t m_lastDispatchFrame = UINT32_MAX;
+    VkExtent3D m_resourceExtent = {};
 
     // Resources
     using Resource = Resources::Resource;
@@ -120,15 +125,22 @@ namespace dxvk {
     std::vector<std::shared_ptr<Resource>> m_transientTex;
     Resource m_validationTex;
 
-    using SharedTransientPool = std::unordered_map<size_t, std::weak_ptr<Resource>>;
-    inline static SharedTransientPool m_sharedTransientTex; // share these between all NRD instances
+    // Only contexts on the same Vulkan device can share transient images.
+    // Keep every matching image, including duplicate formats within one pool.
+    using SharedTransientPool = std::vector<std::weak_ptr<Resource>>;
+    inline static std::unordered_map<DxvkDevice*, SharedTransientPool> m_sharedTransientTex;
+    inline static std::mutex m_sharedTransientMutex;
 
     std::vector<Rc<DxvkSampler>> m_staticSamplers;
 
     // Pipelines
-    std::vector<ComputePipeline> m_computePipelines;
+    std::vector<Rc<ComputePipeline>> m_computePipelines;
+    uint32_t m_compiledPipelineCount = 0;
+    std::vector<VkWriteDescriptorSet> m_descriptorWrites;
+    std::vector<VkDescriptorImageInfo> m_samplerDescriptors;
+    std::vector<VkDescriptorImageInfo> m_resourceDescriptors;
     std::unique_ptr<RtxStagingDataAlloc> m_cbData;
 
-    HMODULE m_hNRD;
+    std::shared_ptr<nrd::Library> m_library;
   };
 } // namespace dxvk

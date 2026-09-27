@@ -21,36 +21,9 @@
 */
 #pragma once
 
-// =============================================================================
-// DX11_V309_CAMERA_RESOLVER - STEP 1 of the camera replacement (SHADOW MODE).
-//
-// This header changes NO behaviour. It computes a second, independent opinion
-// about which coordinate space a draw's vertices are in, so the two answers can
-// be compared in the log before anything is switched over.
-//
-// WHY THIS EXISTS
-// ---------------
-// D3D11Rtx::ExtractTransforms is ~1900 lines containing 14 competing camera
-// recovery strategies, and DrawCallTransforms::cameraRelativeView is written at
-// 13 separate sites across both extraction and draw submission. The effective
-// rule is therefore "last writer wins", independent of how good each writer's
-// evidence was. Field logs show the failure directly: a frame logs
-//   [D3D11Rtx] Camera-relative identity view CONFIRMED from coherent camera block
-// while the draw that encloses the eye that same frame reports
-//   [cam-obstruction] ... cameraRelative=0 objToWorldT=[0,0,0] worldToViewT=[-0,-0,-0]
-// i.e. vertices that are in CAMERA space get submitted as if they were in WORLD
-// space with no translation, which pins that geometry to the eye.
-//
-// Two design faults produce that:
-//   1. A bool cannot express the four spaces a draw can actually be in, so
-//      "not camera-relative" silently means three different things.
-//   2. Every heuristic mutates shared state instead of proposing a candidate,
-//      so the outcome depends on evaluation order rather than on evidence.
-//
-// This resolver fixes both: an explicit space enum, and a single pure function
-// that ranks evidence and returns the best candidate plus the reason it won.
-// It has no side effects and holds no state, so it is safe to call anywhere.
-// =============================================================================
+// Resolves uncaptured input geometry from this draw's transform evidence.
+// Exact post-VS capture runs later and owns its camera/geometry pairing.
+// Never feed a previous draw's capture state into this admission decision.
 
 #include "../util/util_matrix.h"
 
@@ -92,15 +65,6 @@ namespace dxvk {
     Matrix4 worldToView;
     Matrix4 viewToProjection;
 
-    // The DX11 vertex-capture path recovered the rasterizer's own SV_Position
-    // for this draw, so the vertices are post-transform rather than raw mesh
-    // data. Which space they landed in then depends on worldAnchoredCapture.
-    bool capturedPostTransform = false;
-
-    // The post-transform capture was reconstructed back into a stable world
-    // space (rather than being left in the camera's own space).
-    bool worldAnchoredCapture = false;
-
     // A real view matrix has been positively confirmed for this frame.
     bool viewConfirmed = false;
 
@@ -139,19 +103,6 @@ namespace dxvk {
   inline ResolvedTransform resolveTransformSpace(const CameraEvidence& ev) {
     const bool identityObjectToWorld = isIdentityExact(ev.objectToWorld);
     const bool identityWorldToView   = isIdentityExact(ev.worldToView);
-
-    // 1. Post-transform capture that was explicitly re-anchored into world
-    //    space. The reconstruction is the strongest statement available: it
-    //    says outright which space the vertices were put back into.
-    if (ev.capturedPostTransform && ev.worldAnchoredCapture) {
-      return { TransformSpace::World, 95, "post-transform capture, world-anchored" };
-    }
-
-    // 2. Post-transform capture that was NOT re-anchored. The vertices are
-    //    still in the camera's space; only the projection remains to apply.
-    if (ev.capturedPostTransform && !ev.worldAnchoredCapture) {
-      return { TransformSpace::View, 90, "post-transform capture, not world-anchored" };
-    }
 
     // 3. The engine renders camera-relative: world space and camera space are
     //    the same thing, so the vertices are already in view space.

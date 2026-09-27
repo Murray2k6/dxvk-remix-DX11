@@ -144,6 +144,9 @@ namespace dxvk {
 // NV-DXVK start
     uint32_t remixShaderCompilationCount() const;
 
+    bool hasAsyncCompiler() const { return m_stateCache != nullptr; }
+    bool hasPipelineForShader(const DxvkShaderKey& key);
+
     // DX11_V296_BACKGROUND_COMPILE_CAP: caps concurrent Remix pipeline compiles
     // on the state-cache workers (0 = unlimited). See DxvkStateCache.
     void setRemixCompileConcurrency(uint32_t maxConcurrent);
@@ -159,6 +162,8 @@ namespace dxvk {
     // pipeline cache to disk so later launches reuse compiled pipelines.
     // Called when a prewarm phase drains and on device teardown.
     void savePipelineCache() const;
+
+    VkPipelineCache pipelineCache() const { return m_cache->handle(); }
 // NV-DXVK end
 
   private:

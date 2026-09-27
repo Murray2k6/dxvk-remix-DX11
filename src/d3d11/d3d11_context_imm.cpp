@@ -703,8 +703,8 @@ namespace dxvk {
     if (!pState)
       return;
     
-    Com<D3D11DeviceContextState> oldState = std::move(m_stateObject);
-    Com<D3D11DeviceContextState> newState = static_cast<D3D11DeviceContextState*>(pState);
+    Com<D3D11DeviceContextState, false> oldState = std::move(m_stateObject);
+    Com<D3D11DeviceContextState, false> newState = static_cast<D3D11DeviceContextState*>(pState);
 
     if (oldState == nullptr)
       oldState = new D3D11DeviceContextState(m_parent);

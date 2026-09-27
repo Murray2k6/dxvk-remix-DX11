@@ -109,6 +109,8 @@ namespace dxvk {
      */
     void registerRaytracingShaders(
       const DxvkRaytracingPipelineShaders& shaders);
+
+    bool hasPipelineForShader(const DxvkShaderKey& key);
     // NV-DXVK end
     
     /**
@@ -139,6 +141,7 @@ namespace dxvk {
     // presenting frames saturates the driver's own compiler pool and lags
     // gameplay. Regular game pipelines are never throttled by this.
     void setRemixCompileConcurrency(uint32_t maxConcurrent) {
+      std::lock_guard<dxvk::mutex> lock(m_workerLock);
       m_remixCompileConcurrencyLimit.store(maxConcurrent);
       m_workerCond.notify_all();
     }
@@ -203,6 +206,7 @@ namespace dxvk {
     // NV-DXVK end
     // NV-DXVK start: do not compile same shader multiple times
     std::unordered_set<size_t>        m_workerItemsInFlight;  // stores hashes for work items in the queue
+    std::unordered_set<size_t>        m_failedWorkerItems;
     // NV-DXVK end
     std::atomic<uint32_t>             m_workerBusy = { 0 };
     std::atomic<uint32_t>             m_workerCompilationCount = { 0 };

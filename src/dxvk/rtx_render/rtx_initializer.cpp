@@ -37,6 +37,7 @@
 #include "rtx_texture_manager.h"
 #include "rtx_io.h"
 #include "dxvk_raytracing.h"
+#include "dxvk_compiler_policy.h"
 #include "rtx_debug_view.h"
 
 namespace dxvk {
@@ -608,15 +609,11 @@ namespace dxvk {
     Logger::info("[Remix-DX11][init] applying pending RtxOptions...");
     RtxOptionManager::applyPendingValues(m_device, /* forceOnChange */ true);
 
-    // Kick off shader prewarming
-    //
-    // DX11_V319_VISIBLE_PREWARM_STEP: these two lines were behind
-    // DXVK_REMIX_PREWARM_LOG, so a boot that spent minutes here left NOTHING
-    // between "applying pending RtxOptions..." and "loading assets..." - the
-    // only evidence that Call of Duty Advanced Warfare and Saints Row IV were
-    // stuck in prewarm was a silent multi-minute gap between two timestamps.
-    // They fire once per boot, so they cost nothing and they name the step.
-    Logger::info("[Remix-DX11][init] starting shader prewarm...");
+    // Apply limits before any registration starts worker jobs, including an
+    // explicitly requested boot wait. Driver-internal parallelism is additional.
+    pCommon->pipelineManager().setRemixCompileConcurrency(remixCompilerThreads(
+      dxvk::thread::hardware_concurrency(), RtxOptions::Shader::backgroundCompilerConcurrency()));
+    Logger::info("[Remix-DX11][init] registering selected shader prewarm...");
     const bool prewarmStarted = startPrewarmShaders();
 
     if (prewarmStarted && RtxOptions::Shader::waitForPrewarmOnBoot()) {
@@ -655,28 +652,6 @@ namespace dxvk {
       waitForShaderPrewarm(false);
     }
 
-    // DX11_V296_BACKGROUND_COMPILE_CAP: from here on the game is running, so
-    // Remix pipeline compiles (background boot prewarm and any later first-use
-    // compile) are capped to a few concurrent builds. Uncapped, every compiler
-    // worker chewed on a multi-second ray-tracing pipeline at once and the
-    // driver's internal compiler pool saturated the CPU - the reported
-    // "lagging games after the prewarmer". Blocking boot prewarm above and the
-    // exit drain in waitForShaderPrewarm() run before/after this cap applies.
-    {
-      uint32_t concurrency = RtxOptions::Shader::backgroundCompilerConcurrency();
-      if (concurrency == 0u) {
-        const uint32_t cpuThreads = std::max(1u, dxvk::thread::hardware_concurrency());
-        concurrency = std::clamp(cpuThreads / 4u, 1u, 4u);
-      }
-      pCommon->pipelineManager().setRemixCompileConcurrency(concurrency);
-      if (prewarmLoggingEnabled()) {
-        Logger::info(str::format(
-          "[Remix-DX11][init] background Remix compile concurrency capped at ",
-          concurrency, " (rtx.shader.backgroundCompilerConcurrency=",
-          RtxOptions::Shader::backgroundCompilerConcurrency(), ", 0=auto)."));
-      }
-    }
-
     // DX11_V296_NONBLOCKING_PREWARM_WINDOW: when boot prewarm runs in the
     // background, the old blocking wait was the only code path that showed the
     // progress window - so V295's non-blocking default silently compiled ~300
@@ -690,12 +665,20 @@ namespace dxvk {
     Logger::info("[Remix-DX11][init] RtxInitializer::initialize() complete.");
   }
 
-  void RtxInitializer::release() {
-    if (asyncShaderFinalizing()) {
-      // Wait for all prewarming to complete 
-      waitForShaderPrewarm();
-    }
+  void RtxInitializer::onDestroy() {
+    m_stopPrewarmMonitor.store(true);
+    if (m_prewarmMonitorThread.joinable())
+      m_prewarmMonitorThread.join();
+    if (m_asyncAssetLoadThread.joinable())
+      m_asyncAssetLoadThread.join();
+    auto& pipelines = m_device->getCommon()->pipelineManager();
+    pipelines.stopWorkerThreads();
+    DxvkRaytracingPipeline::releaseFinalizer();
+    pipelines.savePipelineCache();
+    m_warmupComplete.store(true);
+  }
 
+  void RtxInitializer::release() {
     ShaderManager::destroyInstance();
 #ifdef WITH_RTXIO
     RtxIo::get().release();
@@ -718,36 +701,8 @@ namespace dxvk {
   }
 
   bool RtxInitializer::startPrewarmShaders() {
-    // If we want to run without shader prewarming, then pipelines will be built inline with other GPU work on first use (typically means
-    // long stutters whenever a yet to be compiled pipeline comes into use).
-    // DX11_V228_CROSS_VENDOR: bulk RT-pipeline shader prewarming crashes/deadlocks at LAUNCH across
-    // every GPU vendor in this DX11 fork - AMD: long-standing deadlock (original WAR below); Intel Arc
-    // (Battlemage B580) AND NVIDIA: launch crash inside startPrewarmShaders(), confirmed via the
-    // [Remix-DX11][init] markers (the init log stops right after "starting shader prewarm..." with no
-    // further step). Since all three IHVs fail here, disable prewarming unconditionally; the RT
-    // pipelines then compile inline on first use (minor first-use stutter, but the game boots and
-    // path tracing runs on any GPU). Re-evaluate per-vendor once the prewarm path is fixed.
-    // DX11_V245_NVIDIA_PREWARM: the earlier blanket disable lumped NVIDIA in with the
-    // vendors whose prewarm genuinely fails - AMD (long-standing deadlock) and Intel Arc
-    // (Battlemage launch crash). NVIDIA prewarms correctly, and it NEEDS prewarm: without
-    // it the large RGS ray-tracing pipelines (NVIDIA's default indirect-integrate path)
-    // compile INLINE on the first ray-traced frame, causing long stutters and a first-frame
-    // crash risk (matches the RTX 4060 / Minecraft crash that lands right at the first RT
-    // frame). So prewarm on NVIDIA and keep it disabled on AMD/Intel. Escape hatch:
-    // DXVK_REMIX_PREWARM = "0" forces off, "1" forces on, on any vendor.
-    // DX11_V275_NO_PREWARM_BY_DEFAULT: prewarm registration (below) can hang or
-    // crash SYNCHRONOUSLY at launch - the init log stops right after "starting
-    // shader prewarm" with no further step. This is the "game only stays in
-    // Task Manager and never boots" / launch-freeze report, and it has now been
-    // seen on all three vendors (AMD deadlock, Intel Arc crash, NVIDIA hang),
-    // not just AMD/Intel. Since V248 made the RT pipelines compile ASYNC +
-    // NON-BLOCKING on first use (they enqueue to the state-cache workers and
-    // the frame simply skips RT until each pipeline is ready - no inline stall,
-    // no first-frame crash, which V244 NRC-opt-in also addressed), prewarm is
-    // no longer needed to avoid first-frame stutter. Default it OFF on EVERY
-    // vendor so the game ALWAYS boots ("any game must work"); pipelines warm up
-    // in the background and RT engages once they are ready. Re-enable for
-    // benchmarking / prewarm testing with env DXVK_REMIX_PREWARM=1.
+    // Register configured path-tracing variants only. Other variants remain
+    // available through the same asynchronous first-use compiler.
     const bool doPrewarm = RtxOptions::Shader::prewarmOnBoot();
 
     if (!asyncShaderPrewarming() || !doPrewarm) {
@@ -815,10 +770,10 @@ namespace dxvk {
     pCommon->metaPathtracerIntegrateDirect().prewarmShaders(pCommon->pipelineManager());
     pCommon->metaPathtracerIntegrateIndirect().prewarmShaders(pCommon->pipelineManager());
 
-    pCommon->metaDebugView().prewarmShaders(pCommon->pipelineManager());
-
-    // Prewarm the rest of the pipelines that can be done automatically
-    AutoShaderPipelinePrewarmer::prewarmComputePipelines(pCommon->pipelineManager());
+    if (RtxOptions::Shader::prewarmAllVariants()) {
+      pCommon->metaDebugView().prewarmShaders(pCommon->pipelineManager());
+      AutoShaderPipelinePrewarmer::prewarmComputePipelines(pCommon->pipelineManager());
+    }
 
     if (prewarmLoggingEnabled()) {
       Logger::info(str::format(
@@ -841,11 +796,6 @@ namespace dxvk {
     if (m_warmupComplete) {
       return;
     }
-
-    // DX11_V296_BACKGROUND_COMPILE_CAP: this wait blocks the game (boot wait or
-    // exit drain), so restore full compile parallelism for its duration - the
-    // gameplay cap would otherwise stretch the drain out severalfold.
-    m_device->getCommon()->pipelineManager().setRemixCompileConcurrency(0u);
 
     // Full-variant prewarming can legitimately take several minutes on an empty
     // driver cache. A fixed total timeout released the game halfway through that
@@ -873,7 +823,7 @@ namespace dxvk {
     // to leave m_warmupComplete false and return.
     const uint64_t maxBootWaitMs =
       uint64_t(RtxOptions::Shader::maxBootPrewarmWaitSeconds()) * 1000ull;
-    const bool boundedBootWait = allowBackgroundHandoff && maxBootWaitMs != 0ull;
+    const bool boundedBootWait = allowBackgroundHandoff;
 
     const uint64_t startMs = ::GetTickCount64();
     uint64_t lastProgressMs = startMs;
@@ -960,7 +910,8 @@ namespace dxvk {
         totalElapsedMs));
     }
 
-    DxvkRaytracingPipeline::releaseFinalizer();
+    if (aborted)
+      return;
 
     // DX11_V298_PERSISTENT_PIPELINE_CACHE: everything the prewarm compiled is
     // now in the shared Vulkan pipeline cache - serialize it so the next
@@ -1036,7 +987,6 @@ namespace dxvk {
             "[Remix-DX11][init] background shader prewarm complete: pendingPipelines=0 elapsedMs=",
             totalElapsedMs));
         }
-        DxvkRaytracingPipeline::releaseFinalizer();
         // DX11_V298_PERSISTENT_PIPELINE_CACHE: persist the freshly compiled
         // pipelines for the next launch.
         m_device->getCommon()->pipelineManager().savePipelineCache();
@@ -1054,113 +1004,4 @@ namespace dxvk {
     });
   }
 
-  void RtxInitializer::runBootShaderScanPhase(const std::function<void()>& scan) {
-    if (!scan)
-      return;
-    // Building the cache from game data can take minutes on a first boot;
-    // keep the shared prewarm window up (with a scan label) for its duration
-    // so the user sees the work instead of a frozen, windowless launch.
-    ShaderPrewarmDialogPhase progressDialog(
-      RtxOptions::Shader::showPrewarmDialog(),
-      L"Building shader cache from game data (first launch only)...", 1u);
-    scan();
-  }
-
-  void RtxInitializer::prewarmCachedGameShaders(
-      uint32_t cachedShaderCount,
-      const GameShaderRegistrar& registerShaders) {
-    if (cachedShaderCount == 0u || !registerShaders)
-      return;
-
-    constexpr uint64_t kNoProgressTimeoutMs = 180000;
-    constexpr uint64_t kProgressLogIntervalMs = 5000;
-    const uint64_t startMs = ::GetTickCount64();
-    ShaderPrewarmDialogPhase progressDialog(
-      RtxOptions::Shader::showPrewarmDialog(),
-      L"Compiling cached game shaders...", cachedShaderCount);
-
-    if (prewarmLoggingEnabled()) {
-      Logger::info(str::format(
-        "[Remix-DX11][game-shader-cache] pre-init preload started: cachedShaders=",
-        cachedShaderCount));
-    }
-
-    registerShaders([&](uint32_t remainingShaders) {
-      progressDialog.update(remainingShaders);
-    });
-
-    // DX11_V298_GAME_SHADER_WAIT_SCOPE: this wait runs inside D3D11 device
-    // creation, before the game can even show its window. The old loop waited
-    // on the TOTAL compile count, which includes the multi-minute Remix
-    // ray-tracing pipeline prewarm running in the background - Fallout 4 sat
-    // windowless for ~6.5 minutes on an RTX 5060 because of it. Wait only on
-    // the GAME shader pipelines this preload actually registered; the Remix
-    // prewarm keeps compiling in the background after the game is up.
-    auto& pipelineManager = m_device->getCommon()->pipelineManager();
-    auto gamePendingPipelines = [&pipelineManager]() -> uint32_t {
-      const uint32_t total = pipelineManager.shaderCompilationCount();
-      const uint32_t remix = pipelineManager.remixShaderCompilationCount();
-      // The two counters decrement non-atomically with respect to each other;
-      // clamp the transient case where remix momentarily exceeds total.
-      return total > remix ? total - remix : 0u;
-    };
-
-    uint32_t pendingPipelines = gamePendingPipelines();
-    uint64_t lastProgressMs = ::GetTickCount64();
-    uint64_t lastProgressLogMs = lastProgressMs;
-    bool stalled = false;
-
-    progressDialog.update(pendingPipelines);
-
-    if (prewarmLoggingEnabled()) {
-      Logger::info(str::format(
-        "[Remix-DX11][game-shader-cache] cached shader registration complete; pendingPipelines=",
-        pendingPipelines));
-    }
-
-    while (pendingPipelines > 0u) {
-      const uint64_t nowMs = ::GetTickCount64();
-      const uint64_t elapsedMs = nowMs - startMs;
-      const uint32_t currentPending = gamePendingPipelines();
-      if (currentPending != pendingPipelines) {
-        pendingPipelines = currentPending;
-        lastProgressMs = nowMs;
-      }
-
-      progressDialog.update(pendingPipelines);
-
-      if (nowMs - lastProgressLogMs >= kProgressLogIntervalMs) {
-        if (prewarmLoggingEnabled()) {
-          Logger::info(str::format(
-            "[Remix-DX11][game-shader-cache] pipeline prewarm progress: pendingPipelines=",
-            pendingPipelines, " elapsedMs=", elapsedMs));
-        }
-        lastProgressLogMs = nowMs;
-      }
-
-      if (nowMs - lastProgressMs >= kNoProgressTimeoutMs) {
-        stalled = true;
-        break;
-      }
-      ::Sleep(10);
-    }
-
-    const uint64_t elapsedMs = ::GetTickCount64() - startMs;
-    if (prewarmLoggingEnabled()) {
-      if (stalled) {
-        Logger::err(str::format(
-          "[Remix-DX11][game-shader-cache] pipeline prewarm stopped after no progress for 180 seconds; remainingPipelines=",
-          pendingPipelines, " elapsedMs=", elapsedMs,
-          "; continuing launch so a driver compiler failure cannot hang the game."));
-      } else {
-        Logger::info(str::format(
-          "[Remix-DX11][game-shader-cache] pre-init preload complete: pendingPipelines=0 elapsedMs=",
-          elapsedMs));
-      }
-    }
-
-    // DX11_V298_PERSISTENT_PIPELINE_CACHE: persist the game pipelines this
-    // preload just compiled so the next launch loads them as binaries.
-    pipelineManager.savePipelineCache();
-  }
 }

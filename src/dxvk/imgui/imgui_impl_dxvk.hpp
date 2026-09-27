@@ -91,7 +91,10 @@ namespace ImGui_ImplDxvk {
   struct Backend {
     Data pub;
 
-    Rc<DxvkDevice> device;
+    // The device owns ImGUI, whose destructor destroys this backend. Owning
+    // the device here would keep that entire cycle alive after the last game
+    // device is released, once the overlay has rendered its first frame.
+    DxvkDevice* device = nullptr;
 
     // We do not hold a context permanently (caller passes the active DxvkContext each frame)
 
@@ -111,7 +114,7 @@ namespace ImGui_ImplDxvk {
   static Backend* g = nullptr;
 
   // Utility: (re)create a HOST_VISIBLE | HOST_COHERENT buffer of given size/usage, name is for debugging.
-  static Rc<DxvkBuffer> CreateHostBuffer(const Rc<DxvkDevice>& dev,
+  static Rc<DxvkBuffer> CreateHostBuffer(DxvkDevice* dev,
                                          VkDeviceSize size,
                                          VkBufferUsageFlags usage,
                                          const char* name) {
@@ -132,11 +135,14 @@ namespace ImGui_ImplDxvk {
       return;
     }
 
+    ImGuiIO& io = ImGui::GetIO();
+    io.BackendRendererUserData = nullptr;
+    io.BackendFlags &= ~ImGuiBackendFlags_RendererHasVtxOffset;
     delete g;
     g = nullptr;
   }
 
-  inline bool Init(const Rc<DxvkDevice>& device) {
+  inline bool Init(DxvkDevice* device) {
     // If a previous backend instance was not cleanly shut down (e.g. the game
     // recreated the D3D device during a resolution change before the old one
     // was fully released), tear it down before re-initializing.
@@ -182,7 +188,7 @@ namespace ImGui_ImplDxvk {
   }
 
   // Ensure our streaming buffers are large enough; recreate if needed.
-  static void EnsureBufferCapacity(FrameBuffers& fb, const Rc<DxvkDevice>& dev, size_t vtxBytes, size_t idxBytes) {
+  static void EnsureBufferCapacity(FrameBuffers& fb, DxvkDevice* dev, size_t vtxBytes, size_t idxBytes) {
     if (vtxBytes > fb.vbSize) {
       VkDeviceSize newSize = (vtxBytes + g->alignment - 1) & ~(g->alignment - 1);
       fb.vb = CreateHostBuffer(dev, newSize, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, "ImGuiVB");

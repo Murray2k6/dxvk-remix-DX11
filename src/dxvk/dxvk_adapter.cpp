@@ -425,8 +425,10 @@ namespace dxvk {
       // NV-DXVK start: Check against extension requirements for DXVK and Remix to run
       Logger::err("Unable to find all required Vulkan GPU extensions for device creation.");
 
-      // Note: Once macro used to ensure this message is only displayed to the user once when applications attempt to create multiple devices.
-      ONCE(messageBox("Your GPU driver doesn't support the required device extensions to run RTX Remix.\nSee the log file 'rtx-remix/logs/remix-dxvk.log' for which extensions are unsupported and try updating your driver.\nThe game will exit now.", "RTX Remix - Device Extension Error!", MB_OK));
+      // Device creation is also used to probe adapters and software devices.
+      // Return the error so the application can try another adapter. A modal
+      // dialog here stalled such probes (including PREY) before the game could
+      // select its ray-tracing-capable GPU, and incorrectly claimed it must exit.
       // NV-DXVK end
 
       // NV-DXVK start: Provide error code on exception
@@ -510,11 +512,7 @@ namespace dxvk {
     // NV-DXVK start: RTXIO
 #ifdef WITH_RTXIO
     if (RtxIo::enabled()) {
-      // Reset the extension provider to adapter's Vulkan instance first since client app
-      // may have probbed another Vulkan instance in the process and so latched it inside
-      // extension provider singleton.
-      RtxIoExtensionProvider::s_instance.initDeviceExtensions(instance.ptr());
-      if (!RtxIoExtensionProvider::s_instance.getDeviceFeatures(m_handle, enabledFeatures)) {
+      if (!RtxIoExtensionProvider::getDeviceFeatures(instance->handle(), m_handle, enabledFeatures)) {
         Logger::err("Physical device does not support features required to enable RTX IO.");
         // NV-DXVK start: Provide error code on exception
         throw DxvkErrorWithId(REMIXAPI_ERROR_CODE_HRESULT_NO_REQUIRED_GPU_FEATURES, "DxvkAdapter: Failed to create device, device does not support required RTX IO extensions (and RTX IO is enabled).");

@@ -52,6 +52,10 @@ namespace dxvk {
 
   namespace {
 
+    // Shared by ordinary and instanced capture admission. Individual replay
+    // submissions are smaller; this bounds the complete draw's allocation.
+    constexpr uint32_t kMaxPositionCaptureVerticesPerDraw = 2u << 20;
+
     bool isRenderDocAttached() {
       return ::GetModuleHandleW(L"renderdoc.dll") != nullptr;
     }
@@ -321,6 +325,10 @@ namespace dxvk {
       void beginFrame(uint32_t minimumSamplePoints, float maxTranslationPerFrame) {
         m_minimumSamplePoints = std::max(minimumSamplePoints, 9u);
         m_maxTranslationPerFrame = std::max(maxTranslationPerFrame, 1.0f);
+        // Delayed readback can skip frames. Preserve the previous sample set
+        // until another completed batch is available to solve against it.
+        if (m_current.empty())
+          return;
         solveAndAccumulate();
         m_previous = std::move(m_current);
         m_current.clear();
@@ -638,7 +646,6 @@ namespace dxvk {
     uint64_t s_emulatorCameraFrameId = ~0ull;
     std::optional<remix::emulator::CameraMetadataV1> s_emulatorPublishedCamera;
 
-    ViewSpaceCameraTracker s_pcViewSpaceCamera;
     // PC world units vary per engine; Skyrim units are ~1.4 cm so sprinting
     // is ~100 units/frame. 2000 comfortably covers vehicles without letting
     // teleports/scene cuts through.
@@ -785,9 +792,6 @@ namespace dxvk {
       bool     m_hasSolved = false;
     };
 
-    // Same threading contract as the trackers above: one immediate context
-    // driven from a single app thread.
-    CameraRelativeWorldAnchor s_cameraRelativeWorldAnchor;
 
     // The rotation-only inverse of a view matrix. Column i of R^T is row i of
     // R, which in this column-major Matrix4 is (m[0][i], m[1][i], m[2][i]).
@@ -818,7 +822,7 @@ namespace dxvk {
          || std::abs(clip[3]) < 1.0e-20f)
           return false;
         position = Vector3(clip[0] * invXScale, clip[1] * invYScale, clip[3]);
-        return true;
+        return std::isfinite(position.x) && std::isfinite(position.y) && std::isfinite(position.z);
       }
 
       const Vector4 p = clipToPosition * Vector4(clip[0], clip[1], clip[2], clip[3]);
@@ -827,7 +831,7 @@ namespace dxvk {
         return false;
       const float invW = 1.0f / p.w;
       position = Vector3(p.x * invW, p.y * invW, p.z * invW);
-      return true;
+      return std::isfinite(position.x) && std::isfinite(position.y) && std::isfinite(position.z);
     }
 
     // DX11_V291_CROSS_CONTEXT_DIAG: Dolphin-style hosts render the guest on a
@@ -944,8 +948,15 @@ namespace dxvk {
     }
   }
 
+  struct D3D11Rtx::CameraTrackingState {
+    ViewSpaceCameraTracker viewSpace;
+    CameraRelativeWorldAnchor worldAnchor;
+  };
+
   D3D11Rtx::D3D11Rtx(D3D11DeviceContext* pContext)
-    : m_context(pContext) {}
+    : m_context(pContext), m_cameraTrackingState(std::make_unique<CameraTrackingState>()) {}
+
+  D3D11Rtx::~D3D11Rtx() = default;
 
   uint32_t D3D11Rtx::getAcceptedSceneDrawCount() const {
     if (m_submitRejectStats.realSceneAccepted > 0) {
@@ -1137,6 +1148,14 @@ namespace dxvk {
 
   bool D3D11Rtx::OnDrawAuto() {
     BeginNativeRasterDrawRouting();
+    auto* buffer = m_context->m_state.ia.vertexBuffers[0].buffer.ptr();
+    if (buffer != nullptr && buffer->GetSOCounter().defined()) {
+      // The stream-output count is GPU-produced. Until capture can consume
+      // that count in command order, preserve the native frame instead of
+      // replacing this otherwise unrepresented draw with a partial RT scene.
+      m_forceRasterPassThroughThisFrame = true;
+      m_allowNativeRasterForCurrentDraw = true;
+    }
     return m_allowNativeRasterForCurrentDraw;
   }
 
@@ -1170,26 +1189,16 @@ namespace dxvk {
       return m_allowNativeRasterForCurrentDraw;
 
     const auto* buffer = static_cast<D3D11Buffer*>(argumentBuffer);
-    const auto mapped = buffer->GetMappedSlice();
-    const uint8_t* bytes = reinterpret_cast<const uint8_t*>(mapped.mapPtr);
     const size_t byteWidth = buffer->Desc()->ByteWidth;
-    if (bytes == nullptr || argumentOffset > byteWidth
-     || sizeof(D3D11_DRAW_INSTANCED_INDIRECT_ARGS) > byteWidth - argumentOffset) {
-      static uint32_t sGpuIndirectLogCount = 0;
-      if (sGpuIndirectLogCount++ < 8u) {
-        Logger::info(
-          "[D3D11Rtx] GPU-only DrawInstancedIndirect arguments are not CPU-visible at record time; "
-          "leaving the raster draw untouched instead of submitting guessed RTX geometry");
-      }
+    if ((argumentOffset & 3u) != 0u || argumentOffset > byteWidth
+     || sizeof(D3D11_DRAW_INSTANCED_INDIRECT_ARGS) > byteWidth - argumentOffset)
       return m_allowNativeRasterForCurrentDraw;
-    }
 
-    D3D11_DRAW_INSTANCED_INDIRECT_ARGS args = {};
-    std::memcpy(&args, bytes + argumentOffset, sizeof(args));
-    if (args.VertexCountPerInstance == 0u || args.InstanceCount == 0u)
-      return m_allowNativeRasterForCurrentDraw;
-    SubmitInstancedDraw(false, args.VertexCountPerInstance,
-      args.StartVertexLocation, 0, args.InstanceCount, args.StartInstanceLocation);
+    // A mapped allocation is not a synchronized argument snapshot: queued
+    // CopyResource, CopyStructureCount, or UAV writes can still change it.
+    // Keep the GPU draw native without adding a CPU/GPU readback stall.
+    m_forceRasterPassThroughThisFrame = true;
+    m_allowNativeRasterForCurrentDraw = true;
     return m_allowNativeRasterForCurrentDraw;
   }
 
@@ -1199,27 +1208,13 @@ namespace dxvk {
       return m_allowNativeRasterForCurrentDraw;
 
     const auto* buffer = static_cast<D3D11Buffer*>(argumentBuffer);
-    const auto mapped = buffer->GetMappedSlice();
-    const uint8_t* bytes = reinterpret_cast<const uint8_t*>(mapped.mapPtr);
     const size_t byteWidth = buffer->Desc()->ByteWidth;
-    if (bytes == nullptr || argumentOffset > byteWidth
-     || sizeof(D3D11_DRAW_INDEXED_INSTANCED_INDIRECT_ARGS) > byteWidth - argumentOffset) {
-      static uint32_t sGpuIndexedIndirectLogCount = 0;
-      if (sGpuIndexedIndirectLogCount++ < 8u) {
-        Logger::info(
-          "[D3D11Rtx] GPU-only DrawIndexedInstancedIndirect arguments are not CPU-visible at record time; "
-          "leaving the raster draw untouched instead of submitting guessed RTX geometry");
-      }
+    if ((argumentOffset & 3u) != 0u || argumentOffset > byteWidth
+     || sizeof(D3D11_DRAW_INDEXED_INSTANCED_INDIRECT_ARGS) > byteWidth - argumentOffset)
       return m_allowNativeRasterForCurrentDraw;
-    }
 
-    D3D11_DRAW_INDEXED_INSTANCED_INDIRECT_ARGS args = {};
-    std::memcpy(&args, bytes + argumentOffset, sizeof(args));
-    if (args.IndexCountPerInstance == 0u || args.InstanceCount == 0u)
-      return m_allowNativeRasterForCurrentDraw;
-    SubmitInstancedDraw(true, args.IndexCountPerInstance,
-      args.StartIndexLocation, args.BaseVertexLocation,
-      args.InstanceCount, args.StartInstanceLocation);
+    m_forceRasterPassThroughThisFrame = true;
+    m_allowNativeRasterForCurrentDraw = true;
     return m_allowNativeRasterForCurrentDraw;
   }
 
@@ -1339,7 +1334,6 @@ namespace dxvk {
     // per-draw capture are hard per-draw and per-frame ceilings so a
     // pathological frame degrades to the flat-albedo fallback instead of
     // stalling the GPU).
-    static constexpr uint32_t     kMaxCaptureVerticesPerDraw = 512u << 10;
     // Transform-feedback replays share the graphics queue with BLAS builds and
     // path tracing. Bound them so a scene containing many shader-only UV
     // streams degrades to the existing flat-albedo path instead of creating a
@@ -1351,8 +1345,9 @@ namespace dxvk {
     const VkDeviceSize kMaxCaptureBytesPerFrame =
       VkDeviceSize(std::max(RtxOptions::captureMaxMiBPerFrame(), 1)) << 20;
 
+    constexpr uint32_t kMaxTexcoordCaptureVerticesPerDraw = 512u << 10;
     const uint32_t vertexCount = geo.vertexCount;
-    if (vertexCount == 0 || vertexCount > kMaxCaptureVerticesPerDraw)
+    if (vertexCount == 0 || vertexCount > kMaxTexcoordCaptureVerticesPerDraw)
       return false;
 
     const VkDeviceSize captureBytes = VkDeviceSize(vertexCount) * 8u;
@@ -1601,7 +1596,6 @@ namespace dxvk {
         return false;
     }
 
-    static constexpr uint32_t     kMaxCaptureVerticesPerDraw = 512u << 10;
     // Cold capture and dynamic replay must be amortized.  Treating hundreds of
     // Unreal ring-buffer draws as one frame of mandatory work can keep a single
     // NVIDIA queue submission busy past TDR even when shader compilation is
@@ -1661,8 +1655,12 @@ namespace dxvk {
     const uint64_t totalVertexCount =
       uint64_t(verticesPerInstance) * uint64_t(replayInstanceCount);
     if (verticesPerInstance == 0 || totalVertexCount == 0
-     || totalVertexCount > kMaxCaptureVerticesPerDraw)
+     || (multiInstanceCapture && (!triangleList || verticesPerInstance % 3u != 0u))
+     || totalVertexCount > kMaxPositionCaptureVerticesPerDraw) {
+      m_forceRasterPassThroughThisFrame = true;
+      m_allowNativeRasterForCurrentDraw = true;
       return false;
+    }
     const uint32_t vertexCount = uint32_t(totalVertexCount);
 
     if (m_context->m_state.vs.shader == nullptr)
@@ -1809,11 +1807,13 @@ namespace dxvk {
       : (indexed ? uint32_t(std::max(base, 0)) : start);
     std::array<bool, D3D11_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT> captureInputSlots = {};
     std::array<bool, D3D11_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT> capturePerInstanceSlots = {};
+    std::array<uint32_t, D3D11_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT> captureInstanceStepRates = {};
     if (m_context->m_state.ia.inputLayout != nullptr) {
       for (const auto& semantic : m_context->m_state.ia.inputLayout->GetRtxSemantics()) {
         if (semantic.inputSlot < captureInputSlots.size()) {
           captureInputSlots[semantic.inputSlot] = true;
           capturePerInstanceSlots[semantic.inputSlot] |= semantic.perInstance;
+          captureInstanceStepRates[semantic.inputSlot] = semantic.instanceStepRate;
         }
       }
     } else {
@@ -1837,7 +1837,7 @@ namespace dxvk {
       stateHash = XXH3_64bits_withSeed(
         &replayInstanceCount, sizeof(replayInstanceCount), stateHash);
       bool readable = true;
-      const bool hasNarrowTransformBinding = captureBinding != nullptr
+      const bool hasNarrowTransformBinding = !captureIncludesTexcoord && captureBinding != nullptr
         && captureBinding->matrixCount >= 1u
         && captureBinding->matrixCount <= 2u;
 
@@ -1863,7 +1863,7 @@ namespace dxvk {
       };
 
       auto isExactProjectionRegister = [&](uint32_t slot, uint32_t shaderRegister) {
-        if (m_projStage != 0 || m_projSlot != slot || m_projOffset == SIZE_MAX)
+        if (captureIncludesTexcoord || m_projStage != 0 || m_projSlot != slot || m_projOffset == SIZE_MAX)
           return false;
         const auto& cb = m_context->m_state.vs.constantBuffers[slot];
         const size_t absoluteRegisterOffset =
@@ -1964,7 +1964,7 @@ namespace dxvk {
             // around the exact projection block so TAA jitter remains a
             // camera change, not a geometry/BLAS change.
             const bool projectionInThisBinding =
-              m_projStage == 0 && m_projSlot == dependency.slot
+              !captureIncludesTexcoord && m_projStage == 0 && m_projSlot == dependency.slot
               && m_projOffset != SIZE_MAX
               && m_projOffset >= bindingBase
               && m_projOffset + 64u <= bindingEnd;
@@ -2014,11 +2014,64 @@ namespace dxvk {
         }
       }
 
-      // Dynamic IA buffers are host visible in DXVK. Hash precisely the vertex
-      // interval replayed by transform feedback, so WRITE_NO_OVERWRITE changes
-      // invalidate the capture while an unchanged renamed buffer does not create
-      // a new BLAS every frame. Device-local inputs retain their logical/physical
-      // allocation identity below and are immutable in the common static path.
+      // Bound CPU hashing independently of GPU capture size. Large or GPU-only
+      // mutable inputs are replayed on the GPU; they must never be declared
+      // unchanged based only on their allocation address.
+      constexpr uint64_t kMaxCaptureIdentityBytes = 1ull << 20;
+      uint64_t identityBytes = 0;
+      rtx::CaptureVertexSpan sourceSpan { firstVertex, verticesPerInstance };
+      if (flattenIndexed && readable) {
+        const auto& ib = m_context->m_state.ia.indexBuffer;
+        const uint64_t indexSize = ib.format == DXGI_FORMAT_R16_UINT ? 2u : 4u;
+        const uint64_t begin = uint64_t(ib.offset) + uint64_t(start) * indexSize;
+        const uint64_t bytes = uint64_t(count) * indexSize;
+        // An immutable index allocation is already a content identity. Only
+        // mutable per-vertex inputs require its index range to select bytes
+        // for CPU hashing. Avoid rescanning megabytes of immutable indices on
+        // every draw of a large static mesh.
+        bool needsSourceSpan = false;
+        for (uint32_t slot = 0; slot < captureInputSlots.size(); ++slot) {
+          const auto& vb = m_context->m_state.ia.vertexBuffers[slot];
+          needsSourceSpan |= captureInputSlots[slot] && !capturePerInstanceSlots[slot]
+            && vb.buffer != nullptr && vb.buffer->Desc()->Usage != D3D11_USAGE_IMMUTABLE;
+        }
+        const bool immutableIndices = ib.buffer != nullptr
+          && ib.buffer->Desc()->Usage == D3D11_USAGE_IMMUTABLE;
+        const bool validIndexRange = ib.buffer != nullptr
+          && begin <= ib.buffer->Desc()->ByteWidth
+          && bytes <= uint64_t(ib.buffer->Desc()->ByteWidth) - begin;
+        const bool useImmutableIdentity = validIndexRange && immutableIndices && !needsSourceSpan;
+        const uint8_t* indices = nullptr;
+        if (useImmutableIdentity) {
+          const uint64_t content = ib.buffer->GetBuffer()->contentCookie();
+          stateHash = XXH3_64bits_withSeed(&content, sizeof(content), stateHash);
+          stateHash = XXH3_64bits_withSeed(&begin, sizeof(begin), stateHash);
+          stateHash = XXH3_64bits_withSeed(&bytes, sizeof(bytes), stateHash);
+          stateHash = XXH3_64bits_withSeed(&base, sizeof(base), stateHash);
+        }
+        else if (validIndexRange
+          && bytes <= kMaxCaptureIdentityBytes) {
+          const auto usage = ib.buffer->Desc()->Usage;
+          if (usage == D3D11_USAGE_IMMUTABLE) {
+            indices = static_cast<const uint8_t*>(ib.buffer->GetIndexShadow(begin, bytes));
+          } else if (usage == D3D11_USAGE_DYNAMIC) {
+            const auto* mapped = static_cast<const uint8_t*>(ib.buffer->GetMappedSlice().mapPtr);
+            if (mapped != nullptr)
+              indices = mapped + size_t(begin);
+          }
+        }
+        if (!useImmutableIdentity && indices == nullptr) {
+          readable = false;
+        } else if (!useImmutableIdentity) {
+          stateHash = XXH3_64bits_withSeed(indices, size_t(bytes), stateHash);
+          identityBytes += bytes;
+          sourceSpan = indexSize == 2u
+            ? rtx::captureVertexSpan<uint16_t>(indices, count, base)
+            : rtx::captureVertexSpan<uint32_t>(indices, count, base);
+          readable = sourceSpan.count != 0;
+        }
+      }
+
       for (uint32_t slot = 0; slot < captureInputSlots.size() && readable; ++slot) {
         if (!captureInputSlots[slot])
           continue;
@@ -2027,24 +2080,37 @@ namespace dxvk {
           continue;
         stateHash = XXH3_64bits_withSeed(&slot, sizeof(slot), stateHash);
         stateHash = XXH3_64bits_withSeed(&vb.stride, sizeof(vb.stride), stateHash);
-        if (vb.buffer->GetMapMode() == D3D11_COMMON_BUFFER_MAP_MODE_NONE)
+        stateHash = XXH3_64bits_withSeed(&vb.offset, sizeof(vb.offset), stateHash);
+        const uint32_t inputRate = capturePerInstanceSlots[slot] ? 1u : 0u;
+        stateHash = XXH3_64bits_withSeed(&inputRate, sizeof(inputRate), stateHash);
+        stateHash = XXH3_64bits_withSeed(&captureInstanceStepRates[slot],
+          sizeof(captureInstanceStepRates[slot]), stateHash);
+        if (vb.buffer->Desc()->Usage == D3D11_USAGE_IMMUTABLE) {
+          const uint64_t content = vb.buffer->GetBuffer()->contentCookie();
+          stateHash = XXH3_64bits_withSeed(&content, sizeof(content), stateHash);
           continue;
+        }
+        if (vb.buffer->Desc()->Usage != D3D11_USAGE_DYNAMIC) {
+          readable = false;
+          break;
+        }
         const DxvkBufferSliceHandle mapped = vb.buffer->GetMappedSlice();
         const uint8_t* ptr = reinterpret_cast<const uint8_t*>(mapped.mapPtr);
         const size_t bufferSize = vb.buffer->Desc()->ByteWidth;
         const bool perInstance = capturePerInstanceSlots[slot];
-        const size_t elementIndex = perInstance
-          ? size_t(replayFirstInstance)
-          : size_t(firstVertex);
-        const size_t begin = size_t(vb.offset) + elementIndex * vb.stride;
-        const size_t byteLength = perInstance
-          ? size_t(vb.stride) * size_t(replayInstanceCount)
-          : size_t(verticesPerInstance) * vb.stride;
-        if (ptr == nullptr || begin >= bufferSize || byteLength > bufferSize - begin) {
+        const uint64_t elementIndex = perInstance ? replayFirstInstance : sourceSpan.first;
+        const uint64_t elementCount = perInstance
+          ? rtx::captureInstanceElementCount(replayInstanceCount, captureInstanceStepRates[slot])
+          : sourceSpan.count;
+        const uint64_t begin = uint64_t(vb.offset) + elementIndex * vb.stride;
+        const uint64_t byteLength = elementCount * vb.stride;
+        if (ptr == nullptr || begin >= bufferSize || byteLength > bufferSize - begin
+          || byteLength > kMaxCaptureIdentityBytes - identityBytes) {
           readable = false;
           break;
         }
-        stateHash = XXH3_64bits_withSeed(ptr + begin, byteLength, stateHash);
+        stateHash = XXH3_64bits_withSeed(ptr + size_t(begin), size_t(byteLength), stateHash);
+        identityBytes += byteLength;
       }
 
       // D3D11 retains stale SRVs until the application explicitly unbinds
@@ -2081,7 +2147,11 @@ namespace dxvk {
     // This intentionally trades coverage for correctness under the bounded
     // capture budget: an omitted draw cannot occlude the valid scene, while a
     // stale or guessed transform can cover the entire camera with a false wall.
-    bool captureMustReplayEveryFrame = capturedSkinnedPositions
+    // The dependency fingerprint above covers homogeneous capture only.
+    // A profiled pre-projection output can still deform through any VS input,
+    // constant or sampled resource even when skinning was not recognized.
+    const bool captureMustReplayEveryFrame = !capturesHomogeneousClip
+      || capturedSkinnedPositions
       || (capturesHomogeneousClip && !hasHomogeneousTransformStateIdentity);
     // View-space vertices bake placement into the BLAS, so the draw cache must
     // keep separate same-frame BLAS slots for separate instances even when the
@@ -2384,7 +2454,9 @@ namespace dxvk {
       mixCacheKey(uint64_t(static_cast<uint32_t>(base)));
       mixCacheKey(uint64_t(count));
     }
-    if (capturesHomogeneousClip) {
+    // Repeated draws can change shader state without changing their buffers.
+    // Keep each occurrence separate, including profiled pre-projection output.
+    {
       const uint64_t contractKey = cacheKey;
       const uint32_t occurrence =
         m_positionCaptureOccurrencesThisFrame[contractKey]++;
@@ -2422,8 +2494,11 @@ namespace dxvk {
          || it->second.lastUsedFrame < oldest->second.lastUsedFrame)
           oldest = it;
       }
-      if (oldest == m_positionCaptureCache.end())
+      if (oldest == m_positionCaptureCache.end()) {
+        m_forceRasterPassThroughThisFrame = true;
+        m_allowNativeRasterForCurrentDraw = true;
         return false;
+      }
       m_positionCaptureCacheBytes -= oldest->second.capacity;
       m_positionCaptureCache.erase(oldest);
       existing = m_positionCaptureCache.find(cacheKey);
@@ -2465,13 +2540,14 @@ namespace dxvk {
     const bool haveUsableBuffer = entry.buffer != nullptr && entry.capacity >= captureBytes;
     const bool haveReusableCapture = haveUsableBuffer
       && entry.lastCapturedFrame != ~0u
+      && entry.capturedVertexCount == vertexCount
+      && entry.capturedStride == captureStride
       && (!capturesHomogeneousClip || entry.hasCapturedClipToPosition);
     const bool transformStateMatches = capturesHomogeneousClip
       && hasHomogeneousTransformStateIdentity
       && entry.hasTransformStateIdentity
       && entry.transformStateIdentity == homogeneousTransformStateIdentity;
-    const bool captureIsCurrent = haveUsableBuffer
-      && entry.lastCapturedFrame != ~0u
+    const bool captureIsCurrent = haveReusableCapture
       && (captureMustReplayEveryFrame
         ? entry.lastCapturedFrame == curFrame
         : (!capturesHomogeneousClip || transformStateMatches));
@@ -2520,9 +2596,9 @@ namespace dxvk {
         otherLaneCap - std::min(otherLaneUsed, otherLaneCap);
       const bool classBudgetExhausted = ownLaneUsed >= ownLaneCap + otherLaneUnused;
 
-      const bool reuseStaleCapture = totalBudgetExhausted || classBudgetExhausted
+      const bool captureBudgetExhausted = totalBudgetExhausted || classBudgetExhausted
         || m_positionCaptureBytesThisFrame + captureBytes > kMaxCaptureBytesPerFrame;
-      if (reuseStaleCapture) {
+      if (captureBudgetExhausted) {
         ++m_submitRejectStats.positionCaptureBudgetRejected;
         static uint32_t sPositionCaptureBudgetLogCount = 0;
         if (sPositionCaptureBudgetLogCount < 24) {
@@ -2545,36 +2621,15 @@ namespace dxvk {
             " base=", base,
             " cameraRelative=", dcs.transformData.cameraRelativeView ? 1 : 0));
         }
-        if (!haveReusableCapture) {
-          // DX11_V298_PHASE1_STASH (adapted from FO4-Remix e00baae): a
-          // budget-refused draw is PENDING, not absent. Keep the cache entry -
-          // it already carries the contract identity, occurrence bookkeeping
-          // and canonical transforms - so next frame's retry resumes against
-          // warm state instead of re-emplacing from scratch every frame while
-          // the cold-capture lane is saturated (level loads). The entry holds
-          // no buffer, so it costs a map slot and nothing else; LRU eviction
-          // reclaims it if the draw never returns.
-          return false;
-        }
-
-        // A previous exact capture is safer than either dropping a mesh every
-        // other frame or recapturing an unbounded dynamic scene.  Its matching
-        // clip-to-position matrix remains stored in this entry, and the hash
-        // below is tied to lastCapturedFrame so the scene manager reuses the
-        // corresponding BLAS instead of interpreting stale bytes as new data.
-        static uint32_t sStalePositionCaptureLogCount = 0;
-        if (sStalePositionCaptureLogCount < 32u) {
-          ++sStalePositionCaptureLogCount;
-          Logger::info(str::format(
-            "[D3D11Rtx][position-capture] reusing last exact capture under bounded replay lane",
-            " frame=", curFrame,
-            " capturedFrame=", entry.lastCapturedFrame,
-            " vertices=", vertexCount,
-            " drawId=", dcs.drawCallID));
-        }
+        // The dependency state changed: an older capture is not evidence of
+        // the current mesh, even when its producing camera is known. Keep the
+        // entry for a later retry, but present the complete native frame.
+        m_forceRasterPassThroughThisFrame = true;
+        m_allowNativeRasterForCurrentDraw = true;
+        return false;
       }
 
-      if (!reuseStaleCapture && !haveUsableBuffer) {
+      if (!haveUsableBuffer) {
         DxvkBufferCreateInfo info;
         info.size   = desiredCapacity;
         info.usage  = VK_BUFFER_USAGE_TRANSFORM_FEEDBACK_BUFFER_BIT_EXT
@@ -2594,6 +2649,8 @@ namespace dxvk {
         if (newBuffer == nullptr) {
           if (entry.buffer == nullptr)
             m_positionCaptureCache.erase(cacheKey);
+          m_forceRasterPassThroughThisFrame = true;
+          m_allowNativeRasterForCurrentDraw = true;
           return false;
         }
         m_positionCaptureCacheBytes += desiredCapacity - entry.capacity;
@@ -2603,7 +2660,7 @@ namespace dxvk {
         entry.hasCapturedClipToPosition = false;
       }
 
-      if (!reuseStaleCapture) {
+      {
       // Transform feedback is the sole writer and the following BLAS build is
       // the consumer. Reuse the dedicated device-local allocation and let
       // DxvkContext insert the write/read barriers. Calling allocSlice() here
@@ -2648,27 +2705,8 @@ namespace dxvk {
           && ((m_positionCapturesThisFrame + 1u) % kMaxCaptureDrawsPerSubmission) == 0u)
         || queuedCaptureVertices >= kMaxCaptureVerticesPerSubmission;
 
-      // DX11_V303_CAPTURE_READBACK_ONLY_WAIT: the boundary does two separable
-      // things - it flushes (bounding submission size, which is cheap and always
-      // worth doing) and it BLOCKS the render thread until the GPU retires the
-      // write (a full round trip, ~100ms under FIFO). The block is only required
-      // because the camera-motion estimator maps this buffer on the CPU further
-      // down; if nothing reads it back, GPU-side ordering already guarantees the
-      // RT stream sees the finished write and stalling buys nothing.
-      //
-      // The estimator only runs on the camera-relative fallback, and only when a
-      // real view has not been confirmed - a game whose view Remix can read has
-      // no need to infer camera motion from captured geometry. So a confirmed
-      // view now costs no readback and no stall.
-      const bool captureWillBeReadBackOnCpu =
-        capturesHomogeneousClip
-        && !useWorldAnchoredHomogeneousCapture
-        && RtxOptions::estimateViewSpaceCameraMotion()
-        && !isKnownEmulatorHostProcess()
-        && !m_viewConfirmed;
-
-      const bool waitForCaptureWrite =
-        forceCaptureSubmissionBoundary && captureWillBeReadBackOnCpu;
+      // Camera estimators consume completed staging batches asynchronously.
+      // Capture submission boundaries bound GPU work without CPU readback waits.
       m_positionCaptureVerticesSinceSubmission = forceCaptureSubmissionBoundary
         ? 0u : queuedCaptureVertices;
 
@@ -2760,19 +2798,35 @@ namespace dxvk {
                          cFlattenIndexed = flattenIndexed,
                          cStartIndex = start,
                          cBaseVertex = base,
-                         cForceSubmissionBoundary = forceCaptureSubmissionBoundary,
-                         cWaitForCaptureWrite = waitForCaptureWrite](DxvkContext* ctx) {
+                         cStride = captureStride,
+                         cForceSubmissionBoundary = forceCaptureSubmissionBoundary](DxvkContext* ctx) {
         const DxvkInputAssemblyState pointIa = { VK_PRIMITIVE_TOPOLOGY_POINT_LIST, VK_FALSE, 0 };
         ctx->bindShader(VK_SHADER_STAGE_GEOMETRY_BIT, cGs);
-        ctx->bindXfbBuffer(0, cBuf, DxvkBufferSlice());
         ctx->setInputAssemblyState(pointIa);
-        if (cFlattenIndexed) {
-          ctx->drawIndexed(cCount, cInstanceCount, cStartIndex, cBaseVertex, cFirstInstance);
-        } else {
-          ctx->draw(cCount, cInstanceCount, cFirst, cFirstInstance);
+        // Split the vertex/index range, never the instance range. Every replay
+        // keeps the original SV_InstanceID and divisor-based IA inputs. Chunk
+        // boundaries preserve complete triangles, so the chunk-major output
+        // is an equivalent non-indexed triangle list even with instancing.
+        constexpr uint32_t kMaxReplayVerticesPerSubmission = 256u << 10;
+        const uint32_t chunkLimit = std::max(3u,
+          (kMaxReplayVerticesPerSubmission / cInstanceCount / 3u) * 3u);
+        VkDeviceSize outputOffset = 0;
+        for (uint32_t first = 0; first < cCount;) {
+          const uint32_t chunkCount = std::min(chunkLimit, cCount - first);
+          const VkDeviceSize chunkBytes = VkDeviceSize(chunkCount) * cInstanceCount * cStride;
+          ctx->bindXfbBuffer(0, cBuf.subSlice(outputOffset, chunkBytes), DxvkBufferSlice());
+          if (cFlattenIndexed) {
+            ctx->drawIndexed(chunkCount, cInstanceCount, cStartIndex + first, cBaseVertex, cFirstInstance);
+          } else {
+            ctx->draw(chunkCount, cInstanceCount, cFirst + first, cFirstInstance);
+          }
+          first += chunkCount;
+          outputOffset += chunkBytes;
+          ctx->bindXfbBuffer(0, DxvkBufferSlice(), DxvkBufferSlice());
+          if (first < cCount)
+            ctx->DxvkContext::flushCommandList();
         }
         ctx->bindShader(VK_SHADER_STAGE_GEOMETRY_BIT, nullptr);
-        ctx->bindXfbBuffer(0, DxvkBufferSlice(), DxvkBufferSlice());
         ctx->setInputAssemblyState(cRestoreIa);
         if (cForceSubmissionBoundary) {
           // This replay runs before RTX injection, so use the base DXVK flush:
@@ -2780,15 +2834,6 @@ namespace dxvk {
           // list without invoking RtxContext's end-of-frame sky handling.
           ctx->DxvkContext::flushCommandList();
 
-          // Only block when the CPU is about to map this allocation. The RT
-          // stream consumes it on the GPU, where queue ordering already
-          // guarantees the write has landed - stalling the render thread for
-          // that case just serialises CPU and GPU for no benefit. The readback
-          // path (camera-motion estimation) genuinely cannot proceed without
-          // the data, so it still waits.
-          if (cWaitForCaptureWrite) {
-            ctx->getDevice()->waitForResource(cBuf.buffer(), DxvkAccess::Write);
-          }
         }
       });
 
@@ -2805,6 +2850,8 @@ namespace dxvk {
       }
 
       entry.lastCapturedFrame = curFrame;
+      entry.capturedVertexCount = vertexCount;
+      entry.capturedStride = captureStride;
       if (capturesHomogeneousClip) {
         entry.capturedClipToPosition = capturedClipToPosition;
         entry.hasCapturedClipToPosition = true;
@@ -2831,8 +2878,6 @@ namespace dxvk {
         // very motion the solve is measuring.
         entry.capturedViewRotationToWorld = viewRotationToWorld(originalWorldToView);
         entry.hasCapturedViewRotationToWorld = true;
-        entry.capturedVertexCount = vertexCount;
-        entry.capturedStride = captureStride;
       } else if (capturesHomogeneousClip) {
         entry.hasCanonicalCapturedToWorld = false;
         entry.hasCapturedViewRotationToWorld = false;
@@ -2963,10 +3008,10 @@ namespace dxvk {
     // Dynamic output is already animated/renamed before it reaches the capture
     // stream, so update its cached vertices and refit its BLAS every frame.
     // Rigid view-space output instead uses the immutable canonical pair above.
-    if (capturesHomogeneousClip && hasHomogeneousTransformStateIdentity) {
+    if (capturesHomogeneousClip && entry.hasTransformStateIdentity) {
       outputHash = XXH3_64bits_withSeed(
-        &homogeneousTransformStateIdentity,
-        sizeof(homogeneousTransformStateIdentity), outputHash);
+        &entry.transformStateIdentity,
+        sizeof(entry.transformStateIdentity), outputHash);
     } else if (captureMustReplayEveryFrame) {
       // The buffer can intentionally be reused when its bounded replay lane is
       // full. Seed the content identity with the frame that actually produced
@@ -2987,72 +3032,22 @@ namespace dxvk {
       if (!useWorldAnchoredHomogeneousCapture) {
         dcs.transformData.worldToView = Matrix4();
 
-        // DX11_V287_PC_VIEWSPACE_CAMERA: this is the camera-relative fallback
-        // (no proven world matrix, unconfirmed view - the "camera position is
-        // wrong / pinned at origin" case for PC games). Estimate the real
-        // camera motion from the captured geometry itself, exactly like the
-        // emulator path but with a SEPARATE tracker instance so PC and
-        // emulator camera state never mix. objectToView stays untouched, so
-        // raster alignment is identical; only the world anchoring changes.
-        // Must stay in lockstep with captureWillBeReadBackOnCpu above: that flag
-        // decides whether the render thread waited for the GPU write. Mapping
-        // here without that wait would read a buffer the GPU may still be
-        // filling, so the two conditions have to agree exactly - including the
-        // m_viewConfirmed term, which skips the estimator entirely when a real
-        // view is available and there is nothing to infer.
+        // Feed the estimator through host-visible staging. The capture itself
+        // is device-local, and must never be mapped or waited on here.
         if (RtxOptions::estimateViewSpaceCameraMotion()
          && !isKnownEmulatorHostProcess()
          && !m_viewConfirmed) {
-          const float projectionScaleX = dcs.transformData.viewToProjection[0][0];
-          const float projectionScaleY = dcs.transformData.viewToProjection[1][1];
-          const bool perspectiveWDepth =
-            dcs.transformData.viewToProjection[2][3] == 1.0f
-            && std::isfinite(projectionScaleX) && projectionScaleX > 1.0e-5f
-            && std::isfinite(projectionScaleY) && projectionScaleY > 1.0e-5f;
-          const uint8_t* clipBase = reinterpret_cast<const uint8_t*>(
-            capturedPositions.mapPtr(capturedPositions.offsetFromSlice()));
-          const uint32_t clipStride = capturedPositions.stride();
-          if (perspectiveWDepth && clipBase != nullptr && clipStride >= 16u
-           && vertexCount >= 3u) {
-            // Unproject a small sample back to view space: for a standard
-            // perspective projection clip = (view.x*P00, view.y*P11, ...,
-            // view.z), so view is recovered exactly from x/P00, y/P11, w.
-            constexpr uint32_t kSampleCount = ViewSpaceCameraTracker::kPointsPerMesh;
-            float viewSamples[kSampleCount * 3u] = {};
-            const uint32_t step = std::max(1u, vertexCount / kSampleCount);
-            uint32_t sampled = 0;
-            bool samplesValid = true;
-            for (uint32_t vertex = 0; vertex < vertexCount
-                 && sampled < kSampleCount; vertex += step) {
-              const float* clip = reinterpret_cast<const float*>(
-                clipBase + size_t(vertex) * clipStride);
-              const float w = clip[3];
-              if (!std::isfinite(w) || std::abs(w) < 1.0e-6f
-               || !std::isfinite(clip[0]) || !std::isfinite(clip[1])) {
-                samplesValid = false;
-                break;
-              }
-              viewSamples[sampled * 3u + 0u] = clip[0] / projectionScaleX;
-              viewSamples[sampled * 3u + 1u] = clip[1] / projectionScaleY;
-              viewSamples[sampled * 3u + 2u] = w;
-              ++sampled;
-            }
-            if (samplesValid && sampled >= 3u) {
-              // postVsCaptureIdentity is the camera-independent mesh identity
-              // built above - the exact stable key the tracker needs.
-              s_pcViewSpaceCamera.addMeshSample(
-                geo.postVsCaptureIdentity, viewSamples, sampled);
-            }
-          }
+          if (entry.lastCapturedFrame == curFrame)
+            QueueCameraAnchorSample(entry, cacheKey, true);
 
           // DX11_V293_CONFIDENCE_GATE: before the first successful solve the
           // estimated pose is only the seed; applying it changed menu/intro
           // frames (no trackable meshes - e.g. Call of Duty front-ends) away
           // from the proven camera-relative fallback. Keep the original
           // fallback bit-for-bit until real camera motion has been solved.
-          if (s_pcViewSpaceCamera.hasConfidentPose()) {
-            dcs.transformData.worldToView = s_pcViewSpaceCamera.worldToView();
-            dcs.transformData.objectToWorld = s_pcViewSpaceCamera.viewToWorld();
+          if (m_cameraTrackingState->viewSpace.hasConfidentPose()) {
+            dcs.transformData.worldToView = m_cameraTrackingState->viewSpace.worldToView();
+            dcs.transformData.objectToWorld = m_cameraTrackingState->viewSpace.viewToWorld();
             dcs.transformData.cameraRelativeView = false;
           }
         }
@@ -3086,7 +3081,7 @@ namespace dxvk {
         }
       } else if (!RtxOptions::estimateViewSpaceCameraMotion()
             || isKnownEmulatorHostProcess()
-            || !s_pcViewSpaceCamera.hasConfidentPose()) {
+            || !m_cameraTrackingState->viewSpace.hasConfidentPose()) {
         dcs.transformData.cameraRelativeView = true;
       }
       dcs.transformData.exactReplacementCamera = true;
@@ -3096,17 +3091,9 @@ namespace dxvk {
       // this valid path and leave optimized Unity scenes permanently raster-only.
       dcs.transformData.usedViewportFallbackProjection = false;
 
-      // DX11_V309_CAMERA_RESOLVER (shadow): record which space this capture
-      // actually landed in, for the comparison at the accept site. Recording
-      // only - nothing above or below reads these.
-      m_shadowCapturedPostTransform = true;
-      m_shadowCaptureWorldAnchored = useWorldAnchoredHomogeneousCapture;
     } else {
       dcs.transformData.cameraRelativeView = false;
       dcs.transformData.exactReplacementCamera = false;
-
-      m_shadowCapturedPostTransform = false;
-      m_shadowCaptureWorldAnchored = false;
     }
 
     static uint32_t sPositionCaptureLogCount = 0;
@@ -3196,163 +3183,178 @@ namespace dxvk {
   }
 
   void D3D11Rtx::QueueCameraAnchorSample(const PositionCaptureEntry& entry,
-                                         uint64_t meshKey) {
-    auto& requests = m_cameraAnchorRequests[m_cameraAnchorWriteIndex];
-    if (requests.size() >= kCameraAnchorMaxSampleMeshes)
+                                         uint64_t meshKey, bool viewSpaceCamera) {
+    const uint32_t currentFrame = m_context->m_device->getCurrentFrameId();
+    if (m_cameraAnchorLastConsumedFrame == currentFrame || entry.buffer == nullptr
+     || !entry.hasCapturedClipToPosition || entry.capturedStride < sizeof(float) * 4u
+     || entry.capturedVertexCount < 3u || m_context->m_device->getDeviceStatus() != VK_SUCCESS)
       return;
 
-    if (entry.buffer == nullptr
-     || !entry.hasCapturedViewRotationToWorld
-     || !entry.hasCapturedClipToPosition
-     || entry.capturedStride == 0u
-     || entry.capturedVertexCount < kCameraAnchorSampleVertices)
+    // Translation-only anchoring needs the game's real view rotation. The
+    // full view-space estimator can also use the paired synthetic clip-W space.
+    if (!viewSpaceCamera
+     && (!entry.hasCapturedViewRotationToWorld || entry.capturedClipUsesWDepth))
       return;
 
-    // The clip-W reconstruction is a synthetic replacement-camera space built
-    // from a viewport-derived projection, not the game's view space, so the
-    // game's view rotation does not belong to it and R^T*v would be meaningless.
-    // Those captures are simply not sampled; a title that never recovers a real
-    // projection keeps its existing camera-relative behavior.
-    if (entry.capturedClipUsesWDepth)
+    const uint32_t sampleVertices = std::min(kCameraAnchorSampleVertices, entry.capturedVertexCount);
+    const VkDeviceSize sampleBytes = VkDeviceSize(sampleVertices) * entry.capturedStride;
+    if (sampleBytes > kCameraAnchorSampleSlotBytes || sampleBytes > entry.capacity)
       return;
 
-    const VkDeviceSize sampleBytes =
-      VkDeviceSize(kCameraAnchorSampleVertices) * entry.capturedStride;
-    if (sampleBytes > VkDeviceSize(kCameraAnchorSampleSlotBytes)
-     || sampleBytes > entry.capacity)
-      return;
+    if (m_cameraAnchorWriteIndex < kCameraAnchorBatchCount
+     && m_cameraAnchorBatches[m_cameraAnchorWriteIndex].frame != currentFrame)
+      SealCameraAnchorSamples();
 
-    Rc<DxvkBuffer>& staging = m_cameraAnchorStaging[m_cameraAnchorWriteIndex];
-    if (staging == nullptr) {
-      DxvkBufferCreateInfo info;
-      info.size   = VkDeviceSize(kCameraAnchorMaxSampleMeshes)
-                  * VkDeviceSize(kCameraAnchorSampleSlotBytes);
-      info.usage  = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-      info.stages = VK_PIPELINE_STAGE_TRANSFER_BIT;
-      info.access = VK_ACCESS_TRANSFER_WRITE_BIT;
-
-      staging = m_context->m_device->createBuffer(
-        info,
-        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-        DxvkMemoryStats::Category::RTXBuffer,
-        "dx11 world-anchor camera samples");
-      if (staging == nullptr)
+    if (m_cameraAnchorWriteIndex == kCameraAnchorBatchCount) {
+      for (uint32_t index = 0; index < kCameraAnchorBatchCount; ++index) {
+        if (m_cameraAnchorBatches[index].requests.empty()) {
+          m_cameraAnchorWriteIndex = index;
+          break;
+        }
+      }
+      // All batches are queued or executing. Skip this sample rather than
+      // overwriting pending GPU copies or serializing the render thread.
+      if (m_cameraAnchorWriteIndex == kCameraAnchorBatchCount)
         return;
     }
 
-    // One fixed slot per request keeps the copies independent of each other,
-    // so a request that is skipped never shifts the bytes of the ones already
-    // queued this frame.
-    const VkDeviceSize dstOffset =
-      VkDeviceSize(requests.size()) * VkDeviceSize(kCameraAnchorSampleSlotBytes);
-    m_context->EmitCs([cDst      = staging,
-                       cDstOffset = dstOffset,
-                       cSrc      = entry.buffer,
-                       cBytes    = sampleBytes](DxvkContext* ctx) {
+    auto& batch = m_cameraAnchorBatches[m_cameraAnchorWriteIndex];
+    if (batch.requests.size() >= kCameraAnchorMaxSampleMeshes)
+      return;
+    for (const auto& request : batch.requests) {
+      if (request.meshKey == meshKey && request.viewSpaceCamera == viewSpaceCamera)
+        return;
+    }
+
+    if (batch.staging == nullptr) {
+      DxvkBufferCreateInfo info;
+      info.size = VkDeviceSize(kCameraAnchorMaxSampleMeshes) * kCameraAnchorSampleSlotBytes;
+      info.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+      // copyBuffer publishes transfer writes to these host reads before the
+      // command list signals completion. The allocation is host-coherent.
+      info.stages = VK_PIPELINE_STAGE_HOST_BIT;
+      info.access = VK_ACCESS_HOST_READ_BIT;
+      batch.staging = m_context->m_device->createBuffer(
+        info, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+        DxvkMemoryStats::Category::RTXBuffer, "dx11 camera estimator samples");
+      batch.completion = new sync::Fence(0);
+      batch.requests.reserve(kCameraAnchorMaxSampleMeshes);
+    }
+    if (batch.staging == nullptr)
+      return;
+
+    if (batch.requests.empty()) {
+      batch.frame = currentFrame;
+      batch.sequence = ++m_cameraAnchorNextSequence;
+      batch.sealed = false;
+    }
+    const VkDeviceSize dstOffset = VkDeviceSize(batch.requests.size()) * kCameraAnchorSampleSlotBytes;
+    m_context->EmitCs([cDst = batch.staging, cDstOffset = dstOffset,
+                       cSrc = entry.buffer, cBytes = sampleBytes](DxvkContext* ctx) {
       ctx->copyBuffer(cDst, cDstOffset, cSrc, 0, cBytes);
     });
 
     CameraAnchorSampleRequest request;
-    request.meshKey             = meshKey;
+    request.meshKey = meshKey;
     request.viewRotationToWorld = entry.capturedViewRotationToWorld;
-    request.clipToPosition      = entry.capturedClipToPosition;
-    request.clipUsesWDepth      = entry.capturedClipUsesWDepth;
-    request.vertexCount         = kCameraAnchorSampleVertices;
-    request.stride              = entry.capturedStride;
-    requests.push_back(request);
+    request.clipToPosition = entry.capturedClipToPosition;
+    request.clipUsesWDepth = entry.capturedClipUsesWDepth;
+    request.viewSpaceCamera = viewSpaceCamera;
+    request.vertexCount = sampleVertices;
+    request.stride = entry.capturedStride;
+    batch.requests.push_back(request);
+  }
+
+  void D3D11Rtx::SealCameraAnchorSamples() {
+    if (m_cameraAnchorWriteIndex == kCameraAnchorBatchCount)
+      return;
+    auto& batch = m_cameraAnchorBatches[m_cameraAnchorWriteIndex];
+    if (!batch.requests.empty()) {
+      // Queued after every copy in this batch. Unlike isInUse(), this cannot
+      // report ready before the CS thread has recorded the copy commands.
+      m_context->EmitCs([cCompletion = batch.completion, cSequence = batch.sequence](DxvkContext* ctx) {
+        ctx->signal(cCompletion, cSequence);
+      });
+      batch.sealed = true;
+    }
+    m_cameraAnchorWriteIndex = kCameraAnchorBatchCount;
   }
 
   void D3D11Rtx::ConsumeCameraAnchorSamples() {
-    // EndFrame is not guaranteed to run exactly once per presented frame.
-    // Running this twice would flip the ping-pong back onto the batch queued a
-    // moment ago and wait on copies that have not retired - reintroducing
-    // precisely the CPU/GPU round trip the two-buffer scheme exists to avoid.
     const uint32_t currentFrame = m_context->m_device->getCurrentFrameId();
     if (m_cameraAnchorLastConsumedFrame == currentFrame)
       return;
     m_cameraAnchorLastConsumedFrame = currentFrame;
+    SealCameraAnchorSamples();
+    // Queue retirement also signals canceled work after device loss. Such a
+    // signal releases resources, but does not establish valid captured bytes.
+    if (m_context->m_device->getDeviceStatus() != VK_SUCCESS)
+      return;
 
-    // The batch read here is the one queued during the PREVIOUS frame: its
-    // copies were submitted a whole frame and a present ago, so waiting on them
-    // is free while still being a real guarantee rather than an assumption
-    // about how far the CS thread has run. Reading this frame's batch would
-    // mean blocking the render thread on the GPU instead.
-    const uint32_t readIndex = m_cameraAnchorWriteIndex ^ 1u;
-    auto& requests = m_cameraAnchorRequests[readIndex];
-    const Rc<DxvkBuffer>& staging = m_cameraAnchorStaging[readIndex];
+    // Completed batches are solved in capture order. Never mix samples from
+    // several source frames in one fit, even when the GPU retires them together.
+    for (uint32_t count = 0; count < kCameraAnchorBatchCount; ++count) {
+      CameraAnchorSampleBatch* oldest = nullptr;
+      for (auto& batch : m_cameraAnchorBatches) {
+        if (batch.sealed && (!oldest || batch.sequence < oldest->sequence))
+          oldest = &batch;
+      }
+      if (!oldest || oldest->completion->value() < oldest->sequence)
+        break;
 
-    // DX11_V319_ANCHOR_NEVER_BLOCKS: poll, never wait.
-    //
-    // This used to call waitForResource() on the previous frame's staging
-    // buffer, on the assumption that a copy submitted a frame ago had certainly
-    // retired. Under a path-traced frame the GPU is routinely more than a frame
-    // behind, so that wait became a full CPU/GPU serialisation every frame.
-    // Measured in Skyrim SE: frames pinned at 98-104ms (10 FPS) with the entire
-    // cost inside a single 12-index draw and every phase timer at zero - the
-    // signature of a sync, not of work. No other title showed it, and Skyrim is
-    // the only one where this anchor path runs at all.
-    //
-    // Nothing here is worth a stall: the samples only refine a camera position
-    // that is already correct to within a frame of motion. If the copy has not
-    // retired, drop the batch and take the next one. Skipping frames is safe
-    // because the estimator accumulates total displacement - a delta measured
-    // across a two-frame gap is still the right total - and endFrame() keeps the
-    // previous sample window when a frame yields nothing.
-    const bool stagingReady = staging != nullptr
-                           && !staging->isInUse(DxvkAccess::Write);
-
-    if (!requests.empty() && stagingReady) {
-      const uint8_t* const base =
-        reinterpret_cast<const uint8_t*>(staging->mapPtr(0));
-
-      for (size_t index = 0; base != nullptr && index < requests.size(); ++index) {
-        const CameraAnchorSampleRequest& request = requests[index];
-        const uint8_t* const slot =
-          base + index * size_t(kCameraAnchorSampleSlotBytes);
-
-        // Any consistent point on a rigid mesh works here - only the
-        // frame-to-frame difference carries the camera translation - but
-        // averaging a handful of vertices damps the float noise a single
-        // unprojected position would contribute to the median.
+      const uint8_t* base = reinterpret_cast<const uint8_t*>(oldest->staging->mapPtr(0));
+      bool addedViewSpaceSamples = false;
+      bool addedAnchorSamples = false;
+      for (size_t index = 0; base && index < oldest->requests.size(); ++index) {
+        const auto& request = oldest->requests[index];
+        const uint8_t* slot = base + index * kCameraAnchorSampleSlotBytes;
+        float viewSamples[kCameraAnchorSampleVertices * 3u] = {};
         Vector3 offsetSum(0.0f, 0.0f, 0.0f);
         uint32_t sampled = 0;
         for (uint32_t vertex = 0; vertex < request.vertexCount; ++vertex) {
-          const float* const clip = reinterpret_cast<const float*>(
-            slot + size_t(vertex) * size_t(request.stride));
-
+          float clip[4];
+          std::memcpy(clip, slot + size_t(vertex) * request.stride, sizeof(clip));
           Vector3 viewPosition;
-          if (!unprojectCapturedClip(request.clipToPosition,
-                                     request.clipUsesWDepth, clip, viewPosition))
-            continue;
-
-          // q = R^T * v is where this vertex sits relative to the camera in
-          // WORLD orientation, which is the quantity whose frame-to-frame
-          // difference is exactly the camera translation.
-          const Vector4 offset =
-            request.viewRotationToWorld * Vector4(viewPosition, 1.0f);
-          offsetSum += Vector3(offset.x, offset.y, offset.z);
+          if (!unprojectCapturedClip(request.clipToPosition, request.clipUsesWDepth, clip, viewPosition))
+            break;
+          viewSamples[sampled * 3u + 0u] = viewPosition.x;
+          viewSamples[sampled * 3u + 1u] = viewPosition.y;
+          viewSamples[sampled * 3u + 2u] = viewPosition.z;
+          if (!request.viewSpaceCamera) {
+            const Vector4 offset = request.viewRotationToWorld * Vector4(viewPosition, 1.0f);
+            offsetSum += Vector3(offset.x, offset.y, offset.z);
+          }
           ++sampled;
         }
+        if (sampled != request.vertexCount)
+          continue;
 
-        if (sampled == request.vertexCount) {
-          s_cameraRelativeWorldAnchor.addSample(
-            request.meshKey, offsetSum / float(sampled));
+        if (request.viewSpaceCamera) {
+          if (RtxOptions::estimateViewSpaceCameraMotion() && !isKnownEmulatorHostProcess()) {
+            m_cameraTrackingState->viewSpace.addMeshSample(request.meshKey, viewSamples, sampled);
+            addedViewSpaceSamples = true;
+          }
+        } else {
+          m_cameraTrackingState->worldAnchor.addSample(request.meshKey, offsetSum / float(sampled));
+          addedAnchorSamples = true;
         }
       }
+      if (addedViewSpaceSamples)
+        m_cameraTrackingState->viewSpace.beginFrame(kPcCameraMinSamplePoints, kPcCameraMaxTranslationPerFrame);
+      if (addedAnchorSamples)
+        m_cameraTrackingState->worldAnchor.endFrame(kCameraAnchorMaxTranslationPerFrame);
+
+      oldest->requests.clear();
+      oldest->sealed = false;
     }
-
-    requests.clear();
-    // Next frame writes into the batch that was just drained; the batch queued
-    // during this frame becomes the one read at the end of the next.
-    m_cameraAnchorWriteIndex = readIndex;
-
-    s_cameraRelativeWorldAnchor.endFrame(kCameraAnchorMaxTranslationPerFrame);
   }
 
   void D3D11Rtx::SubmitInstancedDraw(bool indexed, UINT count, UINT start, INT base,
                                        UINT instanceCount, UINT startInstance) {
-    if (instanceCount <= 1) {
-      SubmitDraw(indexed, count, start, base);
+    if (instanceCount == 0 || count == 0)
+      return;
+    if (instanceCount == 1) {
+      SubmitDraw(indexed, count, start, base, nullptr, startInstance, 1u, true);
       return;
     }
 
@@ -3383,34 +3385,30 @@ namespace dxvk {
       m_context->m_state.ia.primitiveTopology == D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
 
     if (canCaptureExactInstances) {
-      // Bound pathological vegetation draws while retaining every instance in
-      // ordinary Unity/Unreal batches. Each replay is also capped at two million
-      // emitted vertices, matching the capture allocator's hard safety limit.
+      // Preserve one original instanced draw. Splitting and changing
+      // StartInstanceLocation resets SV_InstanceID for each batch and advances
+      // divisor-based IA streams by the wrong number of elements. Until an
+      // exact draw fits the capture limits, retain the complete native frame.
       static constexpr UINT kMaxExactInstancesPerDraw = 4096u;
-      static constexpr UINT kMaxCaptureVerticesPerBatch = 2u << 20;
       const UINT requestedLimit = std::max(1u, RtxOptions::maxInstanceSubmissions());
-      const UINT selectedCount = std::min(
-        instanceCount, std::min(requestedLimit, kMaxExactInstancesPerDraw));
-      const UINT instancesPerBatch = std::max(1u, std::min(
-        selectedCount, kMaxCaptureVerticesPerBatch / std::max(1u, count)));
-      const UINT batchCount =
-        (selectedCount + instancesPerBatch - 1u) / instancesPerBatch;
+      if (instanceCount > std::min(requestedLimit, kMaxExactInstancesPerDraw)
+        || uint64_t(instanceCount) * count > kMaxPositionCaptureVerticesPerDraw) {
+        m_forceRasterPassThroughThisFrame = true;
+        m_allowNativeRasterForCurrentDraw = true;
+        return;
+      }
 
       static uint32_t sExactInstanceLogCount = 0;
       if (sExactInstanceLogCount++ < 12u) {
         Logger::info(str::format(
           "[D3D11Rtx] Exact shader-profile instancing: sourceInstances=",
-          instanceCount, " selected=", selectedCount,
-          " batches=", batchCount,
+          instanceCount, " selected=", instanceCount,
+          " batches=1",
           " startInstance=", startInstance,
           " indexed=", indexed ? 1 : 0));
       }
 
-      for (UINT offset = 0; offset < selectedCount; offset += instancesPerBatch) {
-        const UINT batchInstances = std::min(instancesPerBatch, selectedCount - offset);
-        SubmitDraw(indexed, count, start, base, nullptr,
-          startInstance + offset, batchInstances, true);
-      }
+      SubmitDraw(indexed, count, start, base, nullptr, startInstance, instanceCount, true);
       return;
     }
 
@@ -6071,51 +6069,10 @@ namespace dxvk {
       }
     }
 
-    // --- CAMERA POSITION SMOOTHING ---
-    // The view matrix encodes camera position in its translation row (row 3).
-    // Floating-point rounding in cbuffer reads causes sub-pixel jitter between
-    // draws/frames. Apply exponential moving average on the position to dampen
-    // this without introducing visible lag. The rotation (upper 3x3) is left
-    // untouched â€” rotation jitter is rare and smoothing it causes ghosting.
-    //
-    // D3D row-major view matrix layout:
-    //   [R00 R01 R02  0]    pos = -R^T * t
-    //   [R10 R11 R12  0]    where t = (V[3][0], V[3][1], V[3][2])
-    //   [R20 R21 R22  0]
-    //   [tx  ty  tz   1]
-    if (!isIdentityExact(transforms.worldToView)) {
-      const auto& V = transforms.worldToView;
-      // Camera world position: pos = -R^T * t for view matrix V = [R | 0; t | 1]
-      Vector3 t(V[3][0], V[3][1], V[3][2]);
-      Vector3 camPos(
-        -(V[0][0] * t.x + V[1][0] * t.y + V[2][0] * t.z),
-        -(V[0][1] * t.x + V[1][1] * t.y + V[2][1] * t.z),
-        -(V[0][2] * t.x + V[1][2] * t.y + V[2][2] * t.z));
-
-      constexpr float kSmoothAlpha = 0.8f; // 0 = full smooth (laggy), 1 = no smooth (jittery)
-      constexpr float kTeleportThreshold = 5.0f; // snap on large jumps (cutscene, teleport)
-
-      if (m_hasPrevCamPos) {
-        Vector3 delta = camPos - m_smoothedCamPos;
-        float distSq = delta.x * delta.x + delta.y * delta.y + delta.z * delta.z;
-        if (distSq < kTeleportThreshold * kTeleportThreshold) {
-          m_smoothedCamPos = Vector3(
-            m_smoothedCamPos.x + kSmoothAlpha * (camPos.x - m_smoothedCamPos.x),
-            m_smoothedCamPos.y + kSmoothAlpha * (camPos.y - m_smoothedCamPos.y),
-            m_smoothedCamPos.z + kSmoothAlpha * (camPos.z - m_smoothedCamPos.z));
-        } else {
-          m_smoothedCamPos = camPos;
-        }
-      } else {
-        m_smoothedCamPos = camPos;
-        m_hasPrevCamPos = true;
-      }
-
-      // Reconstruct translation row from smoothed position: t = -R * smoothPos
-      transforms.worldToView[3][0] = -(V[0][0] * m_smoothedCamPos.x + V[0][1] * m_smoothedCamPos.y + V[0][2] * m_smoothedCamPos.z);
-      transforms.worldToView[3][1] = -(V[1][0] * m_smoothedCamPos.x + V[1][1] * m_smoothedCamPos.y + V[1][2] * m_smoothedCamPos.z);
-      transforms.worldToView[3][2] = -(V[2][0] * m_smoothedCamPos.x + V[2][1] * m_smoothedCamPos.y + V[2][2] * m_smoothedCamPos.z);
-    }
+    // Preserve the exact recovered view used by the application's VS. Smoothing
+    // this matrix per draw pairs captured clip positions with a different camera,
+    // displacing static geometry during motion and creating draw-order-dependent
+    // silhouettes. Temporal estimation belongs only to unresolved camera paths.
 
     // --- WORLD MATRIX ---
     // Object-to-world transform, changes every draw call but usually lives
@@ -6795,8 +6752,8 @@ namespace dxvk {
         && std::abs(view[3][2]) < kZeroTranslationEpsilon;
 
       if (m_cameraAnchorViewTranslationFree
-       && s_cameraRelativeWorldAnchor.hasPosition()) {
-        const Vector3& cameraPosition = s_cameraRelativeWorldAnchor.position();
+       && m_cameraTrackingState->worldAnchor.hasPosition()) {
+        const Vector3& cameraPosition = m_cameraTrackingState->worldAnchor.position();
 
         // t = -R*P for this column-major layout: t_row = -sum_col V[col][row]*P_col.
         for (uint32_t row = 0; row < 3u; ++row) {
@@ -6823,7 +6780,7 @@ namespace dxvk {
             "with zero translation); anchoring the world with a camera position "
             "solved from captured geometry: pos=[",
             cameraPosition.x, ",", cameraPosition.y, ",", cameraPosition.z,
-            "] meshes=", s_cameraRelativeWorldAnchor.lastMatchedMeshes()));
+            "] meshes=", m_cameraTrackingState->worldAnchor.lastMatchedMeshes()));
         }
       }
     }
@@ -7714,9 +7671,13 @@ namespace dxvk {
     // below is still measured - a draw that is expensive to *reject* costs the
     // frame just as much as one that is expensive to accept, and the rejection
     // paths are where the surprises tend to be.
-    const auto drawCpuStart = std::chrono::high_resolution_clock::now();
+    const bool timeDrawSubmission = RtxOptions::logDrawSubmissionPerf();
+    const auto drawCpuStart = timeDrawSubmission ? std::chrono::high_resolution_clock::now()
+      : std::chrono::high_resolution_clock::time_point();
     const uint32_t timedDrawId = m_drawCallID;
     const auto drawCpuScopeExit = [&]() {
+      if (!timeDrawSubmission)
+        return;
       const uint64_t elapsedNs = static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::nanoseconds>(
           std::chrono::high_resolution_clock::now() - drawCpuStart).count());
@@ -7732,7 +7693,7 @@ namespace dxvk {
       }
     };
     struct ScopeGuard {
-      const std::function<void()>& fn;
+      const decltype(drawCpuScopeExit)& fn;
       ~ScopeGuard() { fn(); }
     } drawCpuGuard { drawCpuScopeExit };
 
@@ -7916,6 +7877,7 @@ namespace dxvk {
     // Read actual depth/stencil state from the OM â€” don't hardcode.
     bool zEnable = true;
     bool zWriteEnable = true;
+    D3D11_COMPARISON_FUNC depthComparison = D3D11_COMPARISON_LESS;
     bool stencilEnabled = false;
     D3D11DepthStencilState* dsState = m_context->m_state.om.dsState;
     if (dsState) {
@@ -7923,6 +7885,7 @@ namespace dxvk {
       dsState->GetDesc(&dsDesc);
       zEnable         = dsDesc.DepthEnable != FALSE;
       zWriteEnable    = dsDesc.DepthWriteMask != D3D11_DEPTH_WRITE_MASK_ZERO;
+      depthComparison = dsDesc.DepthFunc;
       stencilEnabled  = dsDesc.StencilEnable != FALSE;
     }
 
@@ -9466,11 +9429,21 @@ namespace dxvk {
     // FogState defaults to mode=0 (none), which is correct.
 
     const auto isLikelyScreenSpaceCompositePass = [&]() {
-      if (!dcs.transformData.usedViewportFallbackProjection)
+      const bool fallbackSpace = dcs.transformData.usedViewportFallbackProjection
+        && isIdentityExact(dcs.transformData.objectToWorld)
+        && isIdentityExact(dcs.transformData.worldToView);
+      const bool unoccludedFullscreenDraw = count <= 6u && !zWriteEnable
+        && (!zEnable || depthComparison == D3D11_COMPARISON_ALWAYS);
+      if (!fallbackSpace && !unoccludedFullscreenDraw)
         return false;
 
-      if (!isIdentityExact(dcs.transformData.objectToWorld)
-       || !isIdentityExact(dcs.transformData.worldToView))
+      const D3D11CommonShader* pixelShader = m_context->m_state.ps.shader != nullptr
+        ? m_context->m_state.ps.shader->GetCommonShader() : nullptr;
+      const bool knownResources = pixelShader && pixelShader->HasCompleteSampledResourceProfile();
+      // A recovered camera can remain bound during post processing. In that
+      // case require actual sampled render targets and a depth-independent
+      // fullscreen draw; a camera-extraction failure is not required.
+      if (!fallbackSpace && !knownResources)
         return false;
 
       const bool likelyFullscreenPrimitive = count <= 12;
@@ -9514,8 +9487,11 @@ namespace dxvk {
       uint32_t candidateCount = 0;
       uint32_t rtSizedCount = 0;
       uint32_t contentLikeCount = 0;
+      bool onlyRenderedInputs = true;
 
       for (uint32_t slot = 0; slot < D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT; ++slot) {
+        if (knownResources && !pixelShader->SamplesResourceSlot(slot))
+          continue;
         D3D11ShaderResourceView* srv = m_context->m_state.ps.shaderResources.views[slot].ptr();
         if (!srv || srv->GetResourceType() != D3D11_RESOURCE_DIMENSION_TEXTURE2D)
           continue;
@@ -9529,6 +9505,8 @@ namespace dxvk {
           continue;
 
         ++candidateCount;
+        onlyRenderedInputs &= (imgInfo.usage &
+          (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT)) != 0;
 
         D3D11_SHADER_RESOURCE_VIEW_DESC1 srvDesc = {};
         srv->GetDesc1(&srvDesc);
@@ -9554,9 +9532,10 @@ namespace dxvk {
       }
 
       if (candidateCount == 0)
-        return likelyFullscreenPrimitive && likelyScreenSpaceDepthState;
+        return fallbackSpace && likelyFullscreenPrimitive && likelyScreenSpaceDepthState;
 
-      return rtSizedCount == candidateCount && contentLikeCount == 0;
+      return rtSizedCount == candidateCount && contentLikeCount == 0
+        && (fallbackSpace || onlyRenderedInputs);
     };
 
     const auto isLikelyScreenSpaceUiPass = [&]() {
@@ -9788,13 +9767,15 @@ namespace dxvk {
       }
     }
 
-    if (allowViewportFallbackScreenSpaceReject && isLikelyScreenSpaceCompositePass()) {
+    if (!renderDocAttached
+      && (allowViewportFallbackScreenSpaceReject || !dcs.transformData.usedViewportFallbackProjection)
+      && isLikelyScreenSpaceCompositePass()) {
       ++m_submitRejectStats.compositeSkip;
       static uint32_t sScreenSpaceCompositeSkipLogCount = 0;
       if (sScreenSpaceCompositeSkipLogCount < 8) {
           ++sScreenSpaceCompositeSkipLogCount;
         Logger::info(str::format(
-          "[D3D11Rtx] Skipping screen-space composite pass: viewport fallback camera + identity transforms + RT-sized/empty inputs (count=",
+          "[D3D11Rtx] Preserving screen-space composite as raster: camera fallback or depth-independent sampled render targets (count=",
           count,
           ", zEnable=",
           zEnable ? 1 : 0,
@@ -10526,23 +10507,15 @@ namespace dxvk {
 
     ++m_submitRejectStats.accepted;
 
-    // DX11_V309_CAMERA_RESOLVER - STEP 1, SHADOW MODE. Changes no behaviour.
-    //
-    // Ask the new single-authority resolver which space this draw's vertices are
-    // in, and compare that with what the legacy cameraRelativeView bool amounts
-    // to. Only DISAGREEMENTS are logged: those are the draws where the 13
-    // scattered writes to that bool produced a different answer than the ranked
-    // evidence does, and one of them is the geometry that encloses the eye.
-    //
-    // Step 2 switches the submit path onto this resolver once the disagreement
-    // list has been reviewed. Nothing below reads resolvedSpace today.
+    // Resolve only this draw's uncaptured IA transforms. Exact position capture
+    // runs after admission and establishes its own paired camera/geometry space.
+    // Carrying capture flags in context members here used the PREVIOUS draw's
+    // result, allowing an unrelated overlay to reclassify the next world mesh.
     {
       CameraEvidence evidence;
       evidence.objectToWorld = dcs.transformData.objectToWorld;
       evidence.worldToView = dcs.transformData.worldToView;
       evidence.viewToProjection = dcs.transformData.viewToProjection;
-      evidence.capturedPostTransform = m_shadowCapturedPostTransform;
-      evidence.worldAnchoredCapture = m_shadowCaptureWorldAnchored;
       evidence.viewConfirmed = m_viewConfirmed;
       evidence.viewIsCameraRelative = m_viewCameraRelative;
       evidence.usedViewportFallbackProjection =
@@ -10579,10 +10552,11 @@ namespace dxvk {
         // turns this off without a rebuild if it regresses.
         constexpr uint32_t kMinConfidenceToOverride = 75u;
 
-        if (RtxOptions::dx11UseResolvedTransformSpace()
+        const bool applyResolvedSpace = RtxOptions::dx11UseResolvedTransformSpace()
          && resolved.confidence >= kMinConfidenceToOverride
          && (resolved.space == TransformSpace::View
-          || resolved.space == TransformSpace::World)) {
+          || resolved.space == TransformSpace::World);
+        if (applyResolvedSpace) {
           dcs.transformData.cameraRelativeView =
             (resolved.space == TransformSpace::View);
         }
@@ -10590,9 +10564,9 @@ namespace dxvk {
         static uint32_t sCameraResolverDisagreeLogCount = 0;
         if (sCameraResolverDisagreeLogCount < 64u) {
           ++sCameraResolverDisagreeLogCount;
-          Logger::warn(str::format(
+          Logger::debug(str::format(
             "[D3D11Rtx][camera-resolver] ",
-            RtxOptions::dx11UseResolvedTransformSpace() ? "APPLIED" : "DISAGREE(log-only)",
+            applyResolvedSpace ? "APPLIED" : "DISAGREE(log-only)",
             " resolved=", transformSpaceName(resolved.space),
             " legacy=", transformSpaceName(legacySpace),
             " confidence=", resolved.confidence,
@@ -10602,8 +10576,6 @@ namespace dxvk {
             " cameraRelative=", dcs.transformData.cameraRelativeView ? 1 : 0,
             " viewConfirmed=", m_viewConfirmed ? 1 : 0,
             " viewIsCamRel=", m_viewCameraRelative ? 1 : 0,
-            " postTransform=", m_shadowCapturedPostTransform ? 1 : 0,
-            " worldAnchored=", m_shadowCaptureWorldAnchored ? 1 : 0,
             " identityObjToWorld=", isIdentityExact(dcs.transformData.objectToWorld) ? 1 : 0,
             " identityWorldToView=", isIdentityExact(dcs.transformData.worldToView) ? 1 : 0,
             " zWrite=", dcs.zWriteEnable ? 1 : 0,
@@ -10612,182 +10584,66 @@ namespace dxvk {
       }
     }
 
-    // DX11_V300_CAMERA_OBSTRUCTION_LOG: identify geometry that ends up sitting on
-    // the camera. Transform the object-space bounding box into VIEW space - a mesh
-    // that is genuinely elsewhere in the world lands away from the view origin,
-    // while anything pinned to the viewpoint (bad anchoring, a mis-scoped
-    // transform, camera-relative capture) brackets the origin and fills the
-    // screen no matter where the player looks. Report the draws that enclose the
-    // eye, plus what they are, so the obstruction can be named instead of guessed.
-    if (RtxOptions::logCameraObstruction()) {
-      // Below this per-axis size a mesh cannot meaningfully block the view; it is
-      // a flat quad or a degenerate sliver. Deliberately generous - real hits are
-      // orders of magnitude larger.
-      constexpr float kMinObstructionExtent = 0.01f;
-
+    // Raw IA bounds precede the vertex shader and cannot prove final placement.
+    // A shader may place an origin-centered mesh far from the eye. Require exact
+    // capture for suspicious bounds instead of deleting that draw before replay.
+    bool eyeBoundsRequireExactCapture = false;
+    if (RtxOptions::logCameraObstruction() || RtxOptions::dropCollapsedEyeGeometry()) {
       const AxisAlignedBoundingBox& objectBox = dcs.geometryData.boundingBox;
-
-      // The bounds are produced asynchronously (see futureBoundingBox); until that
-      // resolves the box is still its empty sentinel, min=+FLT_MAX / max=-FLT_MAX.
-      // Transforming that yields infinities which trivially bracket the origin, so
-      // every draw would look like an obstruction. Only judge a resolved box.
       const bool boundsResolved =
         objectBox.minPos.x <= objectBox.maxPos.x &&
         objectBox.minPos.y <= objectBox.maxPos.y &&
-        objectBox.minPos.z <= objectBox.maxPos.z;
-
-      // Screen-space and HUD geometry is FLAT - zero extent on one axis - and is
-      // authored around the origin with no translation, so it trivially brackets
-      // the view origin and floods this report without ever being an obstruction.
-      // A mesh that actually blocks the camera has volume. Requiring extent on
-      // all three axes separates the two cleanly: a real hit measured hundreds of
-      // units per side, while the false positives are sub-unit flat quads.
-      const bool geometryIsVolumetric =
-        (objectBox.maxPos.x - objectBox.minPos.x) > kMinObstructionExtent &&
-        (objectBox.maxPos.y - objectBox.minPos.y) > kMinObstructionExtent &&
-        (objectBox.maxPos.z - objectBox.minPos.z) > kMinObstructionExtent;
-
-      const Matrix4 objectToView = dcs.transformData.worldToView * dcs.transformData.objectToWorld;
-
-      if (boundsResolved && geometryIsVolumetric) {
-
-      // Project all eight corners; an arbitrary transform can rotate the box, so
-      // transforming only min/max would understate the extents.
-      Vector3 viewMin( FLT_MAX,  FLT_MAX,  FLT_MAX);
-      Vector3 viewMax(-FLT_MAX, -FLT_MAX, -FLT_MAX);
-      for (uint32_t corner = 0; corner < 8; ++corner) {
-        const Vector3 objectCorner(
-          (corner & 1) ? objectBox.maxPos.x : objectBox.minPos.x,
-          (corner & 2) ? objectBox.maxPos.y : objectBox.minPos.y,
-          (corner & 4) ? objectBox.maxPos.z : objectBox.minPos.z);
-        const Vector4 viewCorner = objectToView * Vector4(objectCorner, 1.0f);
-        viewMin = min(viewMin, viewCorner.xyz());
-        viewMax = max(viewMax, viewCorner.xyz());
-      }
-
-      // "On the camera" = the box brackets the view origin on every axis.
-      const bool enclosesEye =
-        viewMin.x <= 0.0f && viewMax.x >= 0.0f &&
-        viewMin.y <= 0.0f && viewMax.y >= 0.0f &&
-        viewMin.z <= 0.0f && viewMax.z >= 0.0f;
-
-      if (enclosesEye) {
-        static uint32_t sObstructionLogCount = 0;
-        if (sObstructionLogCount < RtxOptions::logCameraObstructionMaxEntries()) {
-          ++sObstructionLogCount;
-          Logger::warn(str::format(
-            "[D3D11Rtx][cam-obstruction] geometry encloses the eye: drawId=", m_drawCallID,
-            " indices=", count,
-            " prims=", dcs.geometryData.calculatePrimitiveCount(),
-            " textureHash=0x", std::hex, dcs.materialData.getHash(), std::dec,
-            " cameraRelative=", dcs.transformData.cameraRelativeView ? 1 : 0,
-            // If worldToView is identity then "world" space IS camera space, so
-            // an object placed with no translation lands exactly on the eye.
-            // Reporting it alongside cameraRelative exposes the mismatch where
-            // the view is camera-relative but the draw was not flagged as such.
-            " identityView=", isIdentityExact(dcs.transformData.worldToView) ? 1 : 0,
-            " objToWorldT=[", dcs.transformData.objectToWorld[3][0], ",",
-                              dcs.transformData.objectToWorld[3][1], ",",
-                              dcs.transformData.objectToWorld[3][2], "]",
-            " worldToViewT=[", dcs.transformData.worldToView[3][0], ",",
-                               dcs.transformData.worldToView[3][1], ",",
-                               dcs.transformData.worldToView[3][2], "]",
-            " texgen=", static_cast<uint32_t>(dcs.transformData.texgenMode),
-            " viewBox=[", viewMin.x, ",", viewMin.y, ",", viewMin.z,
-            "]..[", viewMax.x, ",", viewMax.y, ",", viewMax.z, "]",
-            " objectBox=[", objectBox.minPos.x, ",", objectBox.minPos.y, ",", objectBox.minPos.z,
-            "]..[", objectBox.maxPos.x, ",", objectBox.maxPos.y, ",", objectBox.maxPos.z, "]"));
+        objectBox.minPos.z <= objectBox.maxPos.z &&
+        std::isfinite(objectBox.minPos.x) && std::isfinite(objectBox.minPos.y) &&
+        std::isfinite(objectBox.minPos.z) && std::isfinite(objectBox.maxPos.x) &&
+        std::isfinite(objectBox.maxPos.y) && std::isfinite(objectBox.maxPos.z);
+      const Vector3 extent = objectBox.maxPos - objectBox.minPos;
+      if (boundsResolved && extent.x > 0.01f && extent.y > 0.01f && extent.z > 0.01f) {
+        const Matrix4 objectToView = dcs.transformData.worldToView * dcs.transformData.objectToWorld;
+        Vector3 viewMin(FLT_MAX, FLT_MAX, FLT_MAX);
+        Vector3 viewMax(-FLT_MAX, -FLT_MAX, -FLT_MAX);
+        bool finiteBounds = true;
+        for (uint32_t corner = 0; corner < 8; ++corner) {
+          const Vector3 objectCorner(
+            (corner & 1) ? objectBox.maxPos.x : objectBox.minPos.x,
+            (corner & 2) ? objectBox.maxPos.y : objectBox.minPos.y,
+            (corner & 4) ? objectBox.maxPos.z : objectBox.minPos.z);
+          const Vector4 viewCorner = objectToView * Vector4(objectCorner, 1.0f);
+          finiteBounds &= std::isfinite(viewCorner.x) && std::isfinite(viewCorner.y)
+                       && std::isfinite(viewCorner.z);
+          viewMin = min(viewMin, viewCorner.xyz());
+          viewMax = max(viewMax, viewCorner.xyz());
         }
-
-        // DX11_V314_DROP_COLLAPSED_EYE_GEOMETRY: actually remove the mesh that
-        // sits on the eye, rather than only reporting it.
-        //
-        // Enclosing the eye is NOT on its own a defect - stand inside a room,
-        // a cave or a water volume and that mesh legitimately brackets the
-        // camera on all three axes. Culling on "enclosesEye" alone would delete
-        // interiors. So this requires the DEGENERATE COLLAPSE signature seen in
-        // every field log of the black box:
-        //
-        //   objToWorldT=[0,0,0]   worldToViewT=[-0,-0,-0]
-        //
-        // both the object AND the camera sitting exactly at the world origin.
-        // A real interior has a non-zero object placement, or a camera that is
-        // somewhere other than the origin. When both translations are zero the
-        // geometry has not been placed at all - it has collapsed onto the
-        // viewpoint - and it occludes the scene that renders correctly behind it.
-        //
-        // This is a SAFETY NET, not the cure. The cure is submitting the draw in
-        // the right coordinate space (rtx.dx11UseResolvedTransformSpace); if that
-        // works, the collapse stops happening and this never fires.
-        // rtx.dropCollapsedEyeGeometry turns it off without a rebuild.
-        if (RtxOptions::dropCollapsedEyeGeometry()) {
-          auto translationIsOrigin = [](const Matrix4& m) {
-            constexpr float kOriginEpsilon = 1.0e-4f;
-            return std::abs(m[3][0]) < kOriginEpsilon
-                && std::abs(m[3][1]) < kOriginEpsilon
-                && std::abs(m[3][2]) < kOriginEpsilon;
+        const bool enclosesEye = finiteBounds
+          && viewMin.x <= 0.0f && viewMax.x >= 0.0f
+          && viewMin.y <= 0.0f && viewMax.y >= 0.0f
+          && viewMin.z <= 0.0f && viewMax.z >= 0.0f;
+        if (enclosesEye) {
+          auto translationIsOrigin = [](const Matrix4& matrix) {
+            return std::abs(matrix[3][0]) < 1.0e-4f
+                && std::abs(matrix[3][1]) < 1.0e-4f
+                && std::abs(matrix[3][2]) < 1.0e-4f;
           };
-
-          // DX11_V319_DROP_EYE_ENCLOSING_QUAD: the collapse test above requires
-          // BOTH translations to be exactly zero, which only catches geometry
-          // that was never placed at all. A screen-space quad that carries a
-          // real transform slips straight through it.
-          //
-          // Field evidence (SpongeBob: Battle for Bikini Bottom - Rehydrated):
-          // 31 draws of "indices=6 prims=2 textureHash=0x0" bracketing the view
-          // origin on all three axes - a single untextured two-triangle quad
-          // wrapped around the player. That is the "weird box around SpongeBob".
-          // Its translations are non-zero, so nothing dropped it.
-          //
-          // Two primitives cannot bound a volume. Any mesh that genuinely
-          // encloses the camera - a room, a cave, a water volume - is made of
-          // many more triangles than that, so requiring a degenerate primitive
-          // count keeps real interiors safe while removing the flat quad that
-          // is really a post-process/UI blit misrouted into the world. The
-          // untextured test is the same signal the raster-overlay rule already
-          // trusts for solid-colour batches.
-          constexpr uint32_t kMaxEyeEnclosingQuadPrimitives = 2u;
-          const bool degenerateEyeEnclosingQuad =
-               dcs.geometryData.calculatePrimitiveCount() <= kMaxEyeEnclosingQuadPrimitives
-            && !dcs.materialData.usesTexture();
-
-          if (degenerateEyeEnclosingQuad) {
-            ++m_submitRejectStats.collapsedEyeGeometry;
-
-            static uint32_t sEyeQuadCullLogCount = 0;
-            if (sEyeQuadCullLogCount < 16u) {
-              ++sEyeQuadCullLogCount;
-              Logger::warn(str::format(
-                "[D3D11Rtx][cam-obstruction] DROPPED eye-enclosing untextured quad: drawId=", m_drawCallID,
-                " indices=", count,
-                " prims=", dcs.geometryData.calculatePrimitiveCount(),
-                " (two triangles cannot bound a volume, so this is a screen-space blit"
-                " wrapped around the camera rather than world geometry)"));
-            }
-            return;
-          }
-
-          if (translationIsOrigin(dcs.transformData.objectToWorld)
-           && translationIsOrigin(dcs.transformData.worldToView)) {
-            ++m_submitRejectStats.collapsedEyeGeometry;
-
-            static uint32_t sCollapsedEyeCullLogCount = 0;
-            if (sCollapsedEyeCullLogCount < 16u) {
-              ++sCollapsedEyeCullLogCount;
-              Logger::warn(str::format(
-                "[D3D11Rtx][cam-obstruction] DROPPED collapsed-on-eye geometry: drawId=", m_drawCallID,
-                " indices=", count,
-                " textureHash=0x", std::hex, dcs.materialData.getHash(), std::dec,
-                " (object and camera translations are both zero, so this mesh was never placed;"
-                " it occludes the scene rendering correctly behind it)"));
-            }
-            return;
+          const bool ambiguousOrigin = translationIsOrigin(dcs.transformData.objectToWorld)
+                                   && translationIsOrigin(dcs.transformData.worldToView);
+          const bool ambiguousQuad = dcs.geometryData.calculatePrimitiveCount() <= 2u
+                                  && !dcs.materialData.usesTexture();
+          eyeBoundsRequireExactCapture = RtxOptions::dropCollapsedEyeGeometry()
+            && dcs.usesVertexShader && !pcsx2PostTransformDraw
+            && (ambiguousOrigin || ambiguousQuad);
+          static uint32_t sObstructionLogCount = 0;
+          if (RtxOptions::logCameraObstruction()
+           && sObstructionLogCount < RtxOptions::logCameraObstructionMaxEntries()) {
+            ++sObstructionLogCount;
+            Logger::debug(str::format(
+              "[D3D11Rtx][cam-obstruction] pre-shader bounds enclose eye: drawId=", m_drawCallID,
+              " indices=", count, " requireExactCapture=", eyeBoundsRequireExactCapture,
+              " viewBox=[", viewMin.x, ",", viewMin.y, ",", viewMin.z,
+              "]..[", viewMax.x, ",", viewMax.y, ",", viewMax.z, "]"));
           }
         }
-      }
       }
     }
-
     // DX11_V319_DEFERRED_LIGHT_VOLUMES: turn a deferred renderer's light-volume
     // draws into real Remix lights.
     //
@@ -11035,6 +10891,14 @@ namespace dxvk {
         usedWholeVertexBufferFallback);
     const bool exactCaptureBudgetRejected =
       m_submitRejectStats.positionCaptureBudgetRejected != captureBudgetRejectsBefore;
+    if (eyeBoundsRequireExactCapture && !capturedExactPositions) {
+      // Preserve a complete native frame instead of submitting uncertain mesh
+      // placement or presenting a partially captured world with missing walls.
+      ++m_submitRejectStats.collapsedEyeGeometry;
+      m_forceRasterPassThroughThisFrame = true;
+      m_allowNativeRasterForCurrentDraw = true;
+      return;
+    }
     if (capturedExactPositions) {
       ++m_submitRejectStats.positionCaptured;
       // Exact indexed capture must own one compact vertex per source index and
@@ -11048,6 +10912,8 @@ namespace dxvk {
           dcs.drawCallID,
           " count=", count,
           " capturedVertices=", dcs.geometryData.vertexCount));
+        m_forceRasterPassThroughThisFrame = true;
+        m_allowNativeRasterForCurrentDraw = true;
         return;
       }
     } else if (!pcsx2PostTransformDraw
@@ -11066,6 +10932,8 @@ namespace dxvk {
       // exactly those batches through and they are the largest meshes in a
       // Unity/Unreal frame, so they produced the black enclosing box.
       ++m_submitRejectStats.unsafeCameraRelativeSkipped;
+      m_forceRasterPassThroughThisFrame = true;
+      m_allowNativeRasterForCurrentDraw = true;
       static uint32_t sUnsafeCameraRelativeSkipLogCount = 0;
       if (sUnsafeCameraRelativeSkipLogCount < 32) {
         ++sUnsafeCameraRelativeSkipLogCount;
@@ -11364,19 +11232,9 @@ namespace dxvk {
         ::RemixReassertCrashSignatureFilter();
     }
 
-    // DX11_V287_PC_VIEWSPACE_CAMERA: advance the PC view-space camera tracker
-    // on the app-thread frame boundary (the same thread that samples in the
-    // capture path, so no synchronization is needed). The emulator tracker
-    // rotates separately on the publisher's guest frameId - the two never mix.
-    if (RtxOptions::estimateViewSpaceCameraMotion() && !isKnownEmulatorHostProcess()) {
-      s_pcViewSpaceCamera.beginFrame(
-        kPcCameraMinSamplePoints, kPcCameraMaxTranslationPerFrame);
-    }
-
-    // DX11_V319_WORLD_ANCHOR_CAMERA: read back the previous frame's geometry
-    // samples and advance the camera-position solve for camera-relative
-    // engines. Runs on the same app thread as the capture path that queued
-    // them, so the sample maps need no synchronization of their own.
+    // Seal this frame's camera samples and consume only GPU-completed batches.
+    // Each estimator advances once per source batch, preserving gaps without
+    // mixing capture frames or blocking on the CS thread/GPU.
     ConsumeCameraAnchorSamples();
 
     // An in-process GPU capture is the only reliable way to diagnose a
@@ -11573,9 +11431,10 @@ namespace dxvk {
 
     static std::chrono::steady_clock::time_point s_lastSubmitSummaryTime {};
     const auto submitSummaryNow = std::chrono::steady_clock::now();
-    const bool submitSummaryPeriodicDue =
-      s_lastSubmitSummaryTime.time_since_epoch().count() == 0
-      || (submitSummaryNow - s_lastSubmitSummaryTime) >= std::chrono::seconds(3);
+    static const bool logCaptureDiagnostics = env::getEnvVar("DXVK_REMIX_CAPTURE_LOG") == "1";
+    const bool submitSummaryPeriodicDue = logCaptureDiagnostics &&
+      (s_lastSubmitSummaryTime.time_since_epoch().count() == 0
+       || (submitSummaryNow - s_lastSubmitSummaryTime) >= std::chrono::seconds(3));
 
     // Budget the burst separately for menu and world so neither starves the
     // other: whichever kind of frame is running, the first few are reported.
@@ -11583,7 +11442,7 @@ namespace dxvk {
     const uint32_t burstBudget = frameHasSceneGeometry
       ? s_submitSummaryWorldLogCount : s_submitSummaryLogCount;
 
-    if ((burstBudget < 24 || submitSummaryPeriodicDue)
+    if ((burstBudget < 4 || submitSummaryPeriodicDue)
      && m_submitRejectStats.total > draws) {
       s_lastSubmitSummaryTime = submitSummaryNow;
 

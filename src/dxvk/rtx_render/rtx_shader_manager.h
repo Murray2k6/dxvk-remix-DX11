@@ -163,6 +163,14 @@ namespace dxvk {
     static const uint32_t getPushBufferSize() { return 0; }
     static const uint32_t getInterfaceInputSlots() { return 0; }
     static const uint32_t getInterfaceOutputSlots() { return 0; }
+    static const bool allowAsyncCompilation() { return false; }
+  };
+
+  // These passes invalidate frame/history state through skipped-dispatch
+  // accounting. Geometry and texture cache builders deliberately use the base.
+  class AsyncManagedShader : public ManagedShader {
+  public:
+    static const bool allowAsyncCompilation() { return true; }
   };
 
   // This is a helper for pre-warming pipelines with the driver.
@@ -262,6 +270,7 @@ namespace dxvk {
         info.m_staticCode = SpirvCodeBuffer(uint32_t(codeSize / sizeof(uint32_t)), staticCode);
         info.m_interfaceInputs = T::getInterfaceInputSlots();
         info.m_interfaceOutputs = T::getInterfaceOutputSlots();
+        info.m_allowAsyncCompilation = T::allowAsyncCompilation();
 
         Rc<DxvkShader> shader = createShader(info);
         info.m_shader.push_back(shader);
@@ -309,13 +318,15 @@ namespace dxvk {
       VkShaderStageFlagBits m_shaderType;
       uint32_t m_interfaceInputs;
       uint32_t m_interfaceOutputs;
+      bool m_allowAsyncCompilation;
     };
 
     ShaderManager();
     ~ShaderManager();
 
     Rc<DxvkShader> createShader(const ShaderInfo& info) {
-      DxvkShaderOptions options;
+        DxvkShaderOptions options;
+        options.allowAsyncCompilation = info.m_allowAsyncCompilation;
 
       if (info.m_requiresExtraLayout) {
         options.extraLayouts = m_extraLayouts;

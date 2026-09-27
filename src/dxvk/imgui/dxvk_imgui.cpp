@@ -1734,12 +1734,9 @@ namespace dxvk {
       ImGui::Unindent();
     }
 
-    // DX11_V292_PRECOMPILER_WIDGET: Fossilize / Steam-precache-style
-    // on-demand shader precompilation with visible progress. "Precompile
-    // cached shaders" recompiles everything the game has ever created (plus
-    // anything the boot scan harvested); "Deep scan" additionally re-reads
-    // the game's own data files with a generous budget to collect shaders
-    // the game has not created yet this session.
+    // Register previously used shaders within a bounded background job.
+    // Game-file scanning is explicit because raw DXBC cannot supply the
+    // pipeline states needed to precompile unseen graphics permutations.
     if (RemixGui::CollapsingHeader("Shader Precompiler", collapsingHeaderFlags)) {
       ImGui::Indent();
 
@@ -1747,11 +1744,11 @@ namespace dxvk {
       const uint32_t pendingPipelines =
         m_device->getCommon()->pipelineManager().shaderCompilationCount();
 
-      ImGui::TextUnformatted("Compiles every shader the game has used, or that a deep scan");
-      ImGui::TextUnformatted("finds inside the game's files, before gameplay stalls on them.");
+      ImGui::TextUnformatted("Preloads previously used shaders in the background.");
+      ImGui::TextUnformatted("Work is bounded; remaining shaders compile when needed.");
       ImGui::Separator();
       ImGui::Text("Cached shaders on disk:    %u", precompiler.cachedShadersOnDisk);
-      ImGui::Text("Compiled this session:     %u  (rejected: %u)",
+      ImGui::Text("Registered this job:       %u  (rejected: %u)",
         precompiler.loadedShaders, precompiler.rejectedShaders);
       ImGui::Text("Pipelines still compiling: %u", pendingPipelines);
 
@@ -1767,13 +1764,12 @@ namespace dxvk {
           break;
         }
         case RtxShaderPrecompiler::Phase::Compiling: {
-          const uint32_t processed =
-            precompiler.loadedShaders + precompiler.rejectedShaders;
+          const uint32_t processed = precompiler.examinedCachedShaders;
           const float fraction = precompiler.cachedShadersOnDisk > 0u
             ? float(processed) / float(precompiler.cachedShadersOnDisk)
             : 0.0f;
           ImGui::ProgressBar(fraction, ImVec2(-1.0f, 0.0f));
-          ImGui::Text("Compiling cached shaders: %u / %u",
+          ImGui::Text("Examining cached shaders: %u / %u",
             processed, precompiler.cachedShadersOnDisk);
           break;
         }
@@ -1782,10 +1778,10 @@ namespace dxvk {
             ImGui::TextUnformatted(
               "Precompiler unavailable (game shader cache disabled or helper process).");
           } else {
-            if (ImGui::Button("Precompile cached shaders"))
+            if (ImGui::Button("Preload used shaders"))
               RtxShaderPrecompiler::start(false);
             ImGui::SameLine();
-            if (ImGui::Button("Deep scan game files + precompile"))
+            if (ImGui::Button("Scan game files + preload used shaders"))
               RtxShaderPrecompiler::start(true);
           }
           break;

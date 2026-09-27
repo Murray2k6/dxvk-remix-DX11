@@ -101,6 +101,14 @@ int wmain(int argc, wchar_t** argv) {
     target->Release();
     hr = swapChain->Present(0, 0);
     if (FAILED(hr)) break;
+    const HWND presentation = FindWindowExW(window, nullptr, L"RemixDx11PresentationWindow", nullptr);
+    if (!presentation || presentation == window || GetParent(presentation) != window
+     || (GetWindowLongPtrW(presentation, GWL_STYLE) & WS_DISABLED) == 0
+     || (GetWindowLongPtrW(presentation, GWL_STYLE) & WS_VISIBLE) != 0) {
+      std::fputs("Bridge did not preserve a separate hidden presentation HWND during native fallback.\n", stderr);
+      hr = E_FAIL;
+      break;
+    }
   }
   if (swapChain) swapChain->Release();
   context->Release();
@@ -124,6 +132,6 @@ int wmain(int argc, wchar_t** argv) {
     std::fputs("The x86 game fell back to native rendering; the x64 Remix startup/present handshake did not complete.\n", stderr);
     return 1;
   }
-  std::puts("The x86 client initialized the x64 Remix runtime and completed two acknowledged frames.");
+  std::puts("The x86 client initialized x64 Remix on independent presentation HWNDs while native DXGI remained live, with two acknowledged fallback frames.");
   return 0;
 }

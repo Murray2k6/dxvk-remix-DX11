@@ -31,6 +31,11 @@ The build directories are `_Comp64release` for the runtime,
 `bridge_dx11_work/_Comp32release` for the client and launcher. Per-step logs are
 in `_build_logs`. Shader compilation uses the canonical source files and a
 transitive depfile; unchanged shader builds do not rerun the compiler.
+The offline shader compiler defaults to four workers. Set
+`DXVK_SHADER_COMPILER_JOBS` explicitly to choose between one and sixteen.
+Runtime preload uses observed pipeline state, bounded CPU/memory concurrency,
+and cancellation at device teardown. Scanning game archives is opt-in through
+`DXVK_GAME_SHADER_SCAN=1` or the developer menu.
 
 Useful switches are `-ConfigureOnly`, `-RuntimeOnly`, `-BridgeOnly`, `-NoStage`
 and `-SkipZip`. `-StageOnly -SkipZip` assembles existing built binaries without
@@ -45,6 +50,11 @@ together. D3D11 explicitly loads its sibling DXGI when adapting a system-created
 adapter. The local DXGI factory therefore participates even when the game first
 obtained its adapter from the system DXGI. Adapter selection matches the actual
 requested adapter instead of assuming the first enumerated GPU.
+
+When the proxy receives a native Windows D3D11 device or D3D12 command queue,
+it forwards swapchain creation and presentation to system DXGI. This preserves
+native presentation for paths such as Starfield's D3D12 renderer; it does not
+provide D3D12 Remix capture or ray tracing. Use the matching DXGI/D3D11 pair.
 
 For a 32-bit game, copy all contents of `_output/x86`, including `.trex`:
 
@@ -75,12 +85,37 @@ normal process exit. Shutdown errors and an exceeded cleanup timeout are logged
 as failures.
 
 The frontend updates the HWND on each presentation, including a switch from a
-splash window to the main window. Native presentation is retained until the
+splash window to the main window. Remix presents to its own independently pumped
+child window so the native DXGI swapchain and Vulkan do not compete for the same
+window. That child is hidden during native fallback. Native presentation is retained until the
 current frame has captured geometry, a current world camera and an acknowledged,
 completed ray-traced output. The server drains queued CPU presentation work
 before handing the window back to the native swapchain.
 
+The mesh cache owns and releases server meshes with bounded memory and entry
+counts. Native resource lifetime tags release CPU buffer/shader/texture/layout
+metadata when the corresponding D3D11 resource is destroyed.
+
 ## Capture limits
+
+The x64 native frontend admits up to 2,097,152 post-VS vertices in one draw,
+including its instances. Large triangle lists replay in chunks of at most
+262,144 vertices while preserving the original instance range and IA divisors.
+The default aggregate capture budget is 96 MiB per frame, separately from a
+384 MiB capture-cache limit. Indexed capture expands each triangle to three
+vertices; triangle count and actual capture stride determine its cost.
+Unchanged exact captures reuse their buffers. Budget exhaustion retains the
+complete native frame; it does not display stale poses or an incomplete world.
+
+GPU-generated indirect arguments and stream-output `DrawAuto` counts are not
+CPU snapshots. These calls now retain native rendering and prevent subsequent
+RTX injection for that frame, without a blocking readback or guessed counts.
+The regression mixes each path with captured direct geometry, checks native
+pixels and the completed-RTX counter, then verifies direct-only recovery.
+This does not implement ray-traced capture of GPU-driven draw counts. If an
+unsupported call arrives after an earlier UI-triggered RTX composite has
+already executed, the original native target cannot be recovered retroactively;
+that interleaved rendering path still needs game-specific validation.
 
 The x86 capture frontend currently reconstructs supported `Draw` and
 `DrawIndexed` geometry. It does not reconstruct arbitrary per-instance shader
@@ -115,6 +150,13 @@ eligibility code to check mixed draw orderings, empty draws, camera freshness an
 frame transitions on both architectures. The separate
 `tests/d3d11/test_remix_rendering.cpp` performs actual ray-traced rendering and
 readback; its results must be considered separately from initialization checks.
+
+`test_remix_capture.cpp` exercises actual D3D11 shaders, mutable/GPU buffers,
+index ranges, instancing and fullscreen composites through native Present. Its
+depth checks reject camera obstruction. `test_dxgi_native_presentation.cpp`
+exercises native D3D12 and D3D11 presentation through the DXGI proxy. Test meshes
+and mod fixtures belong to isolated validation executables/directories; the
+architecture payloads do not include a test scene or a box around the camera.
 
 `package_release.ps1` creates `_release/dxvk-remix-dx11-<version>.zip`. Packaging
 preserves hidden files and directories, including `.trex`.

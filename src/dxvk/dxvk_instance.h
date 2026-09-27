@@ -33,6 +33,7 @@
 namespace dxvk {
 
   struct DxvkDebugUtilsContext;
+  struct DxvkSharedInstanceState;
   
   /**
    * \brief DXVK instance
@@ -48,6 +49,10 @@ namespace dxvk {
     DxvkInstance();
     ~DxvkInstance();
 
+    // Coordinate the final intrusive reference with the non-owning instance
+    // cache. The cache must never keep Vulkan alive until DLL process detach.
+    uint32_t decRef();
+
     // DX11_V283_SHARED_VK_INSTANCE: process-wide shared instance. D3D11 games
     // reach instance creation from several entry points on different threads
     // (DXGI factory creation, D3D11CreateDevice with a foreign adapter);
@@ -58,7 +63,9 @@ namespace dxvk {
     // immediately before vkCreateInstance). All entry points share ONE
     // instance behind a mutex: the second caller waits - holding no loader
     // or Vulkan locks - instead of racing, and gets the same adapters.
-    // DXVK_REMIX_SHARED_INSTANCE=0 reverts to per-call instances.
+    // The cache is non-owning: the final factory/device owner retires it and
+    // destroys Vulkan during normal API teardown. DXVK_REMIX_SHARED_INSTANCE=0
+    // reverts to per-call instances.
     static Rc<DxvkInstance> getOrCreateSharedInstance();
 
     // True while either dxgi.dll or d3d11.dll in this process is constructing
@@ -151,6 +158,7 @@ namespace dxvk {
     }
 
   private:
+    DxvkSharedInstanceState* m_sharedState = nullptr;
     Config              m_config;
     DxvkOptions         m_options;
     // NV-DXVK start: Integrate Aftermath
@@ -169,6 +177,7 @@ namespace dxvk {
     // NV-DXVK end
 
     std::vector<DxvkExtensionProvider*> m_extProviders;
+    std::unique_ptr<DxvkExtensionProvider> m_rtxIoExtensionProvider;
     std::vector<Rc<DxvkAdapter>> m_adapters;
     
     VkInstance createInstance();

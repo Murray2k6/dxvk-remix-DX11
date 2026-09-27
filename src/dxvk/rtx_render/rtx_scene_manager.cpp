@@ -332,6 +332,8 @@ namespace dxvk {
       if (input.hashes[HashComponents::Indices] == inOutGeometry.hashes[HashComponents::Indices]) {
         // Check if the vertex positions have changed, requiring a BVH refit
         if (input.hashes[HashComponents::VertexPosition] == inOutGeometry.hashes[HashComponents::VertexPosition]
+         && input.hashes[HashComponents::VertexTexcoord] == inOutGeometry.hashes[HashComponents::VertexTexcoord]
+         && input.hashes[HashComponents::VertexLayout] == inOutGeometry.hashes[HashComponents::VertexLayout]
          && input.hashes[HashComponents::VertexShader] == inOutGeometry.hashes[HashComponents::VertexShader]
          && drawCallState.getSkinningState().boneHash == inOutGeometry.lastBoneHash) {
           result = ObjectCacheState::kUpdateInstance;
@@ -375,6 +377,14 @@ namespace dxvk {
     const bool needsSmoothNormals = drawCallState.categories.test(InstanceCategories::SmoothNormals);
     const bool forceNormals = needsSmoothNormals && !input.normalBuffer.defined();
 
+    // A material/category change can add or remove an attribute without changing
+    // positions or indices. Repack the actual data before publishing descriptors;
+    // the original IA offset/stride may not address the compact cached buffer.
+    if (result == ObjectCacheState::kUpdateInstance
+      && !RtxGeometryUtils::matchesGeometryAttributes(input, output, forceNormals)) {
+      result = ObjectCacheState::kUpdateBVH;
+    }
+
     // When smooth normals state changes (added or removed), promote to kUpdateBVH so the vertex
     // data is re-interleaved and the smooth normals dispatch runs (or original normals are restored).
     if (needsSmoothNormals != output.smoothNormalsApplied && result == ObjectCacheState::kUpdateInstance) {
@@ -386,7 +396,11 @@ namespace dxvk {
 
     // If forceNormals is true, we can't use the fast "already interleaved" path since
     // we need to change the layout to include normal space.
-    const size_t vertexStride = (input.isVertexDataInterleaved() && input.areFormatsGpuFriendly() && !forceNormals)
+    // Homogeneous post-VS positions always pass through the interleaver for
+    // inverse projection. Allocate its compact output layout, not the capture
+    // buffer's float4 stride; cacheVertexDataOnGPU uses this same condition.
+    const size_t vertexStride = (input.isVertexDataInterleaved() && input.areFormatsGpuFriendly()
+      && !forceNormals && !input.postVsPositionIsHomogeneousClip)
       ? input.positionBuffer.stride()
       : RtxGeometryUtils::computeOptimalVertexStride(input, forceNormals);
 
@@ -491,19 +505,6 @@ namespace dxvk {
       }
       default:
         break;
-    }
-
-    // Update color buffer in BVH with DrawCallState
-    // The user can disable/enable color buffer for specific materials, so we manually sync the DrawCallState and BVH here to keep the color buffer in BVH updated.
-    // Note, we don't setup kUpdateBVH because it's too waste to update all buffers if only the color buffer needs to be updated.
-    if (output.color0Buffer.defined() && !drawCallState.geometryData.color0Buffer.defined()) {
-      // Remove the color buffer in BVH if the color buffer from drawcall is removed by ignoreBakedLighting
-      output.color0Buffer = RaytraceBuffer();
-    } else if (!output.color0Buffer.defined() && drawCallState.geometryData.color0Buffer.defined()) {
-      // Write the color buffer back to BVH if the color buffer is enabled again
-      const DxvkBufferSlice slice = DxvkBufferSlice(output.historyBuffer[0]);
-      const auto& colorBuffer = drawCallState.geometryData.color0Buffer;
-      output.color0Buffer = RaytraceBuffer(slice, colorBuffer.offsetFromSlice(), colorBuffer.stride(), colorBuffer.vertexFormat());
     }
 
     // Update buffers in the cache

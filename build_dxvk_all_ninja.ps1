@@ -105,7 +105,25 @@ function Build-SourceTree {
   $python = Resolve-BuildTools
   $setupArgs = @('-m', 'mesonbuild.mesonmain', 'setup', '--backend=ninja', "--buildtype=$BuildFlavour")
   if (Test-Path -LiteralPath (Join-Path $BuildDir 'meson-private\coredata.dat')) {
-    $setupArgs += '--reconfigure'
+    $infoPath = Join-Path $BuildDir 'meson-info\meson-info.json'
+    $relocated = $false
+    if (Test-Path -LiteralPath $infoPath) {
+      $info = Get-Content -LiteralPath $infoPath -Raw | ConvertFrom-Json
+      $relocated = [IO.Path]::GetFullPath($info.directories.source) -ne [IO.Path]::GetFullPath($Source) -or
+                   [IO.Path]::GetFullPath($info.directories.build) -ne [IO.Path]::GetFullPath($BuildDir)
+    }
+    if ($relocated) {
+      $resolvedBuild = [IO.Path]::GetFullPath($BuildDir)
+      $workspacePrefix = [IO.Path]::GetFullPath($repoRoot).TrimEnd('\') + '\'
+      if (-not $resolvedBuild.StartsWith($workspacePrefix, [StringComparison]::OrdinalIgnoreCase) -or
+          [IO.Path]::GetFileName($resolvedBuild) -notmatch '^_Comp(32|64)(debug|debugoptimized|release)$') {
+        throw "Refusing to reset relocated build metadata outside a managed build directory: $resolvedBuild"
+      }
+      Write-Host "[build] Recreating relocated Meson build: $resolvedBuild"
+      $setupArgs += '--wipe'
+    } else {
+      $setupArgs += '--reconfigure'
+    }
   }
   $setupArgs += $Options
   $setupArgs += @($BuildDir, $Source)

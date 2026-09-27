@@ -222,19 +222,11 @@ namespace dxvk::vk {
     // NV-DXVK start: DLFG integration
     if (isDlfgPresenting) {
       // DLFG manages swapchain images directly and can have more than one acquire outstanding at a time
-      m_acquireStatus = m_vkd->vkAcquireNextImageKHR(m_vkd->device(),
-                                                     m_swapchain,
-                                                     std::numeric_limits<uint64_t>::max(),
-                                                     sync.acquire,
-                                                     VK_NULL_HANDLE,
-                                                     &index);
-      assert(m_acquireStatus != VK_NOT_READY);
+      m_acquireStatus = acquireImage(m_frameIndex, index);
     } else {
       // Don't acquire more than one image at a time
       if (m_acquireStatus == VK_NOT_READY) {
-        m_acquireStatus = m_vkd->vkAcquireNextImageKHR(m_vkd->device(),
-          m_swapchain, std::numeric_limits<uint64_t>::max(),
-          sync.acquire, VK_NULL_HANDLE, &m_imageIndex);
+        m_acquireStatus = acquireImage(m_frameIndex, m_imageIndex);
       }
     }
 
@@ -246,6 +238,17 @@ namespace dxvk::vk {
 
     if (!isDlfgPresenting) {
       index = m_imageIndex;
+    }
+
+    // Queue submission completion does not retire a presentation wait. Only
+    // reacquiring that same swapchain image guarantees its previous present
+    // semaphore can be signaled again. Acquisition semaphores keep their frame
+    // ring; presentation semaphores follow the image returned by WSI.
+    sync.present = m_semaphores.at(index).present;
+    if (isDlfgPresenting) {
+      // DLFG can acquire several images before submitting their work. Each
+      // acquisition must signal a different binary semaphore in that batch.
+      m_frameIndex = (m_frameIndex + 1) % m_semaphores.size();
     }
 
     return m_acquireStatus;
@@ -354,6 +357,8 @@ namespace dxvk::vk {
     info.sType              = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
     info.pNext              = presentMetering;
     info.waitSemaphoreCount = 1;
+    const uint32_t presentedImageIndex = isDlfgPresenting ? imageIndex : m_imageIndex;
+    sync.present = m_semaphores.at(presentedImageIndex).present;
     info.pWaitSemaphores    = &sync.present;
     info.swapchainCount     = 1;
     info.pSwapchains        = &m_swapchain;
@@ -366,7 +371,14 @@ namespace dxvk::vk {
     // NV-DXVK end
     info.pResults           = nullptr;
 
-    VkResult status = m_vkd->vkQueuePresentKHR(m_device.queue, &info);
+    // The blit/interpolation submit that waited on this image's acquire
+    // semaphore precedes presentImage on this queue. Record its completion
+    // without draining the queue; only recycling that acquire slot waits.
+    VkResult status = trackAcquireConsumption(presentedImageIndex);
+    if (status != VK_SUCCESS)
+      return status;
+
+    status = m_vkd->vkQueuePresentKHR(m_device.queue, &info);
 
     if (status != VK_SUCCESS && status != VK_SUBOPTIMAL_KHR)
       return status;
@@ -384,17 +396,70 @@ namespace dxvk::vk {
       m_frameIndex += 1;
       m_frameIndex %= m_semaphores.size();
 
-      sync = m_semaphores.at(m_frameIndex);
-
-      m_acquireStatus = m_vkd->vkAcquireNextImageKHR(m_vkd->device(),
-        m_swapchain, std::numeric_limits<uint64_t>::max(),
-        sync.acquire, VK_NULL_HANDLE, &m_imageIndex);
+      m_acquireStatus = acquireImage(m_frameIndex, m_imageIndex);
     }
 
     bool vsync = m_info.presentMode == VK_PRESENT_MODE_FIFO_KHR
               || m_info.presentMode == VK_PRESENT_MODE_FIFO_RELAXED_KHR;
 
     m_fpsLimiter.delay(vsync);
+    return status;
+  }
+
+
+  VkResult Presenter::acquireImage(uint32_t slot, uint32_t& imageIndex) {
+    auto& completion = m_acquireCompletions.at(slot);
+    if (completion.acquired) {
+      // A batched caller must submit/present an acquired image before reusing
+      // its slot. An acquisition fence alone cannot prove the subsequent
+      // semaphore wait has completed.
+      if (!completion.submitted)
+        return VK_NOT_READY;
+
+      VkResult status = m_vkd->vkGetFenceStatus(m_vkd->device(), completion.fence);
+      if (status == VK_NOT_READY) {
+        constexpr uint64_t kAcquireRecycleTimeoutNs = 2'000'000'000ull;
+        status = m_vkd->vkWaitForFences(m_vkd->device(), 1,
+          &completion.fence, VK_TRUE, kAcquireRecycleTimeoutNs);
+      }
+      if (status != VK_SUCCESS)
+        return status;
+
+      completion.acquired = false;
+      completion.submitted = false;
+    }
+
+    const VkResult status = m_vkd->vkAcquireNextImageKHR(m_vkd->device(),
+      m_swapchain, std::numeric_limits<uint64_t>::max(),
+      m_semaphores.at(slot).acquire, VK_NULL_HANDLE, &imageIndex);
+    if (status == VK_SUCCESS || status == VK_SUBOPTIMAL_KHR) {
+      completion.acquired = true;
+      m_imageAcquireSlots.at(imageIndex) = slot;
+    }
+    return status;
+  }
+
+
+  VkResult Presenter::trackAcquireConsumption(uint32_t imageIndex) {
+    const uint32_t slot = m_imageAcquireSlots.at(imageIndex);
+    if (slot >= m_acquireCompletions.size())
+      return VK_ERROR_INITIALIZATION_FAILED;
+
+    auto& completion = m_acquireCompletions[slot];
+    if (!completion.acquired || completion.submitted)
+      return VK_ERROR_INITIALIZATION_FAILED;
+
+    VkResult status = m_vkd->vkResetFences(m_vkd->device(), 1, &completion.fence);
+    if (status != VK_SUCCESS)
+      return status;
+
+    // A fence on an empty queue submission includes all earlier submissions
+    // on that queue, including the wait that consumed the acquire semaphore.
+    // WSI's present semaphore still follows swapchain image ownership; this
+    // fence does not claim to retire a presentation wait.
+    status = m_vkd->vkQueueSubmit(m_device.queue, 0, nullptr, completion.fence);
+    if (status == VK_SUCCESS)
+      completion.submitted = true;
     return status;
   }
 
@@ -766,8 +831,11 @@ namespace dxvk::vk {
         return status;
     }
 
-    // Create one set of semaphores per swap image
+    // Both rings have imageCount entries, but acquire is indexed by frame and
+    // present by the acquired image. WSI may acquire images out of order.
     m_semaphores.resize(m_info.imageCount);
+    m_acquireCompletions.resize(m_info.imageCount);
+    m_imageAcquireSlots.assign(m_info.imageCount, ~0u);
 
     for (uint32_t i = 0; i < m_semaphores.size(); i++) {
       VkSemaphoreCreateInfo semInfo;
@@ -781,6 +849,11 @@ namespace dxvk::vk {
 
       if ((status = m_vkd->vkCreateSemaphore(m_vkd->device(),
           &semInfo, nullptr, &m_semaphores[i].present)) != VK_SUCCESS)
+        return status;
+
+      const VkFenceCreateInfo fenceInfo = { VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
+      if ((status = m_vkd->vkCreateFence(m_vkd->device(),
+          &fenceInfo, nullptr, &m_acquireCompletions[i].fence)) != VK_SUCCESS)
         return status;
 
       // NV-DXVK start: add debug names to VkImage objects
@@ -1087,11 +1160,15 @@ namespace dxvk::vk {
       m_vkd->vkDestroySemaphore(m_vkd->device(), sem.acquire, nullptr);
       m_vkd->vkDestroySemaphore(m_vkd->device(), sem.present, nullptr);
     }
+    for (const auto& completion : m_acquireCompletions)
+      m_vkd->vkDestroyFence(m_vkd->device(), completion.fence, nullptr);
 
     m_vkd->vkDestroySwapchainKHR(m_vkd->device(), m_swapchain, nullptr);
 
     m_images.clear();
     m_semaphores.clear();
+    m_acquireCompletions.clear();
+    m_imageAcquireSlots.clear();
 
     m_swapchain = VK_NULL_HANDLE;
   }

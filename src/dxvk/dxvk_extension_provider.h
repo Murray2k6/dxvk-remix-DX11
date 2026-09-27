@@ -20,6 +20,7 @@ namespace dxvk {
   class DxvkExtensionProvider {
 
   public:
+    virtual ~DxvkExtensionProvider() = default;
 
     /**
      * \brief Extension provider name

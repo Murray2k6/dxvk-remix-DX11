@@ -72,10 +72,13 @@ namespace dxvk {
    */
   struct DxvkShaderOptions {
     /// Rasterized stream, or -1
-    int32_t rasterizedStream;
+    int32_t rasterizedStream = -1;
     /// Xfb vertex strides
-    uint32_t xfbStrides[MaxNumXfbBuffers];
+    uint32_t xfbStrides[MaxNumXfbBuffers] = {};
     std::vector<VkDescriptorSetLayout> extraLayouts;
+    // Only audited frame passes may skip while compiling. Resource/cache fill
+    // shaders must finish before their caller publishes the resulting data.
+    bool allowAsyncCompilation = false;
   };
 
 
@@ -215,6 +218,10 @@ namespace dxvk {
      */
     DxvkShaderOptions shaderOptions() const {
       return m_options;
+    }
+
+    bool allowsAsyncCompilation() const {
+      return m_options.allowAsyncCompilation;
     }
 
     /**

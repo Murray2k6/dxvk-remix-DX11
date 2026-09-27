@@ -141,8 +141,12 @@ void main(int2 threadIndex : SV_DispatchThreadID)
   bool isGBufferSimilar;
   RTXDI_TemporalResampling(state, pixelCoordinate, surface, rng, tparams, temporalSamplePixelPos, isGBufferSimilar);
 
+  // The SDK keeps isGBufferSimilar set when enlarged-pixel rejection
+  // invalidates the selected coordinate. Never fetch history at that sentinel.
+  const bool hasTemporalPosition = all(temporalSamplePixelPos >= 0)
+    && all(temporalSamplePixelPos < int2(cb.camera.resolution));
   float currentReprojectionConfidence = 0;
-  if (isGBufferSimilar)
+  if (isGBufferSimilar && hasTemporalPosition)
   {
     currentReprojectionConfidence = PreviousReprojectionConfidence[temporalSamplePixelPos];
   }
@@ -152,7 +156,7 @@ void main(int2 threadIndex : SV_DispatchThreadID)
 
   // Remember which pixel the temporal reservoir belongs to, if it comes from a valid reprojection.
   // Needed for the gradients pass.
-  if (!isGBufferSimilar)
+  if (!isGBufferSimilar || !hasTemporalPosition)
   {
     temporalSamplePixelPos = -1;
   }

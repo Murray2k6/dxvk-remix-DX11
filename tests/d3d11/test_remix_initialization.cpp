@@ -2,10 +2,12 @@
 #include <windows.h>
 #include <d3d11.h>
 #include <d3d11_1.h>
+#include <d3dcompiler.h>
 #include <dxgi1_2.h>
 #include <wrl/client.h>
 #include <atomic>
 #include <cstdio>
+#include <cstring>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -60,6 +62,142 @@ Device create(PFN_D3D11_CREATE_DEVICE createDevice, IDXGIAdapter1* adapter) {
     result.context.GetAddressOf()), "D3D11CreateDevice");
   require(actual >= requested, "Insufficient D3D11 feature level");
   return result;
+}
+
+std::atomic<unsigned> destroyedDeviceProbes = 0;
+class DeviceLifetimeProbe final : public IUnknown {
+  std::atomic<ULONG> refs = 1;
+public:
+  HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void** result) override {
+    if (!result) return E_POINTER;
+    *result = nullptr;
+    if (iid != __uuidof(IUnknown)) return E_NOINTERFACE;
+    *result = this; AddRef(); return S_OK;
+  }
+  ULONG STDMETHODCALLTYPE AddRef() override { return ++refs; }
+  ULONG STDMETHODCALLTYPE Release() override {
+    const ULONG count = --refs;
+    if (!count) { ++destroyedDeviceProbes; delete this; }
+    return count;
+  }
+};
+
+void testBoundStateRelease(PFN_D3D11_CREATE_DEVICE createDevice, IDXGIAdapter1* adapter) {
+  // Device-owned private data is released by the real COM device destructor.
+  // This catches a device/context/child cycle even if another device keeps the
+  // shared Vulkan backend alive, and does not rely on reported COM ref counts.
+  const GUID probeId = { 0x52dcf07a, 0x6d8a, 0x44c7, { 0xb3, 0x20, 0x91, 0xa8, 0x9a, 0xc8, 0x07, 0x51 } };
+  const char shaderSource[] =
+    "cbuffer Constants : register(b0) { float4 tint; };"
+    "float4 vs(float3 p : POSITION) : SV_Position { return float4(p,1); }"
+    "float4 ps() : SV_Target { return tint; }"
+    "RWTexture2D<uint> outputImage : register(u0);"
+    "[numthreads(1,1,1)] void cs(uint3 p : SV_DispatchThreadID) { outputImage[p.xy] = 7; }";
+  const auto compile = [&](const char* entry, const char* target) {
+    ComPtr<ID3DBlob> code, errors;
+    const HRESULT hr = D3DCompile(shaderSource, std::strlen(shaderSource), "bound-state-lifetime",
+      nullptr, nullptr, entry, target, D3DCOMPILE_OPTIMIZATION_LEVEL3, 0,
+      code.GetAddressOf(), errors.GetAddressOf());
+    if (errors) std::fwrite(errors->GetBufferPointer(), 1, errors->GetBufferSize(), stderr);
+    checked(hr, "Compile lifetime shader"); return code;
+  };
+  const auto vsCode = compile("vs", "vs_5_0"), psCode = compile("ps", "ps_5_0"), csCode = compile("cs", "cs_5_0");
+  struct ExpectedUnwind { };
+  for (unsigned iteration = 0; iteration < 2; ++iteration) {
+    const unsigned before = destroyedDeviceProbes.load();
+    try {
+      Device device = create(createDevice, adapter);
+      ComPtr<IUnknown> probe; probe.Attach(new DeviceLifetimeProbe());
+      checked(device.device->SetPrivateDataInterface(probeId, probe.Get()), "Attach device lifetime probe");
+      probe.Reset();
+      ComPtr<ID3D11VertexShader> vs;
+      ComPtr<ID3D11PixelShader> ps;
+      ComPtr<ID3D11ComputeShader> cs;
+      checked(device.device->CreateVertexShader(vsCode->GetBufferPointer(), vsCode->GetBufferSize(), nullptr, vs.GetAddressOf()), "Lifetime VS");
+      checked(device.device->CreatePixelShader(psCode->GetBufferPointer(), psCode->GetBufferSize(), nullptr, ps.GetAddressOf()), "Lifetime PS");
+      checked(device.device->CreateComputeShader(csCode->GetBufferPointer(), csCode->GetBufferSize(), nullptr, cs.GetAddressOf()), "Lifetime CS");
+      const D3D11_INPUT_ELEMENT_DESC element = { "POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0 };
+      ComPtr<ID3D11InputLayout> layout;
+      checked(device.device->CreateInputLayout(&element, 1, vsCode->GetBufferPointer(), vsCode->GetBufferSize(), layout.GetAddressOf()), "Lifetime input layout");
+      const auto makeBuffer = [&](UINT flags) {
+        D3D11_BUFFER_DESC description = {}; description.ByteWidth = 64;
+        description.Usage = D3D11_USAGE_DEFAULT; description.BindFlags = flags;
+        ComPtr<ID3D11Buffer> buffer;
+        checked(device.device->CreateBuffer(&description, nullptr, buffer.GetAddressOf()), "Lifetime buffer"); return buffer;
+      };
+      auto vertex = makeBuffer(D3D11_BIND_VERTEX_BUFFER | D3D11_BIND_INDEX_BUFFER);
+      auto constant = makeBuffer(D3D11_BIND_CONSTANT_BUFFER);
+      auto stream = makeBuffer(D3D11_BIND_STREAM_OUTPUT);
+      D3D11_TEXTURE2D_DESC textureInfo = {}; textureInfo.Width = textureInfo.Height = 8;
+      textureInfo.MipLevels = textureInfo.ArraySize = 1; textureInfo.SampleDesc.Count = 1;
+      textureInfo.Format = DXGI_FORMAT_R32_UINT; textureInfo.Usage = D3D11_USAGE_DEFAULT;
+      textureInfo.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+      ComPtr<ID3D11Texture2D> sampled, writable;
+      checked(device.device->CreateTexture2D(&textureInfo, nullptr, sampled.GetAddressOf()), "Lifetime sampled texture");
+      textureInfo.BindFlags = D3D11_BIND_UNORDERED_ACCESS;
+      checked(device.device->CreateTexture2D(&textureInfo, nullptr, writable.GetAddressOf()), "Lifetime writable texture");
+      ComPtr<ID3D11ShaderResourceView> srv;
+      ComPtr<ID3D11UnorderedAccessView> uav;
+      checked(device.device->CreateShaderResourceView(sampled.Get(), nullptr, srv.GetAddressOf()), "Lifetime SRV");
+      checked(device.device->CreateUnorderedAccessView(writable.Get(), nullptr, uav.GetAddressOf()), "Lifetime UAV");
+      const D3D11_QUERY_DESC queryInfo = { D3D11_QUERY_OCCLUSION_PREDICATE, 0 };
+      ComPtr<ID3D11Predicate> predicate;
+      checked(device.device->CreatePredicate(&queryInfo, predicate.GetAddressOf()), "Lifetime predicate");
+      device.context->VSSetShader(vs.Get(), nullptr, 0);
+      device.context->PSSetShader(ps.Get(), nullptr, 0);
+      device.context->CSSetShader(cs.Get(), nullptr, 0);
+      device.context->IASetInputLayout(layout.Get());
+      ID3D11Buffer* vb = vertex.Get(); const UINT stride = 12, offset = 0;
+      device.context->IASetVertexBuffers(0, 1, &vb, &stride, &offset);
+      device.context->IASetIndexBuffer(vertex.Get(), DXGI_FORMAT_R32_UINT, 0);
+      ID3D11Buffer* cb = constant.Get(); device.context->PSSetConstantBuffers(0, 1, &cb);
+      ID3D11Buffer* so = stream.Get(); device.context->SOSetTargets(1, &so, &offset);
+      ID3D11ShaderResourceView* sr = srv.Get(); device.context->PSSetShaderResources(0, 1, &sr);
+      ID3D11UnorderedAccessView* ua = uav.Get(); device.context->CSSetUnorderedAccessViews(0, 1, &ua, nullptr);
+      device.context->SetPredication(predicate.Get(), FALSE);
+
+      // A retained context-state snapshot must obey the same private binding
+      // ownership rule as the current context. Restore the real bindings and
+      // drop the caller's snapshots before testing the final context release.
+      ComPtr<ID3D11Device1> device1;
+      ComPtr<ID3D11DeviceContext1> context1;
+      checked(device.device.As(&device1), "Lifetime Device1");
+      checked(device.context.As(&context1), "Lifetime Context1");
+      ComPtr<ID3DDeviceContextState> emptyState, savedState, replacedState;
+      const D3D_FEATURE_LEVEL requestedLevel = D3D_FEATURE_LEVEL_11_0;
+      D3D_FEATURE_LEVEL selectedLevel = {};
+      checked(device1->CreateDeviceContextState(0, &requestedLevel, 1, D3D11_SDK_VERSION,
+        __uuidof(ID3D11Device), &selectedLevel, emptyState.GetAddressOf()), "Lifetime context state");
+      require(selectedLevel == requestedLevel, "Context state selected wrong feature level");
+      context1->SwapDeviceContextState(emptyState.Get(), savedState.GetAddressOf());
+      require(savedState != nullptr, "Context state did not preserve previous bindings");
+      context1->SwapDeviceContextState(savedState.Get(), replacedState.GetAddressOf());
+      replacedState.Reset(); savedState.Reset(); emptyState.Reset(); context1.Reset(); device1.Reset();
+
+      // Drop every caller object reference while the objects remain bound.
+      vs.Reset(); ps.Reset(); cs.Reset(); layout.Reset(); vertex.Reset(); constant.Reset(); stream.Reset();
+      srv.Reset(); uav.Reset(); sampled.Reset(); writable.Reset(); predicate.Reset();
+      device.device.Reset();
+      ComPtr<ID3D11VertexShader> retainedVs;
+      ComPtr<ID3D11Buffer> retainedVb;
+      ComPtr<ID3D11ShaderResourceView> retainedSrv;
+      ComPtr<ID3D11UnorderedAccessView> retainedUav;
+      device.context->VSGetShader(retainedVs.GetAddressOf(), nullptr, nullptr);
+      device.context->IAGetVertexBuffers(0, 1, retainedVb.GetAddressOf(), nullptr, nullptr);
+      device.context->PSGetShaderResources(0, 1, retainedSrv.GetAddressOf());
+      device.context->CSGetUnorderedAccessViews(0, 1, retainedUav.GetAddressOf());
+      require(retainedVs && retainedVb && retainedSrv && retainedUav, "Bound objects died when caller references were released");
+      ComPtr<ID3D11Device> recoveredDevice;
+      retainedVb->GetDevice(recoveredDevice.GetAddressOf());
+      require(recoveredDevice && recoveredDevice->GetFeatureLevel() == D3D_FEATURE_LEVEL_11_0, "Bound resource lost its live device");
+      require(destroyedDeviceProbes.load() == before, "Device died while context still had a caller reference");
+      // Both ordinary scope exit and exception unwinding deliberately omit
+      // ClearState/Flush. Final context/device release must retire bindings.
+      if (iteration) throw ExpectedUnwind();
+    } catch (const ExpectedUnwind&) { }
+    require(destroyedDeviceProbes.load() == before + 1, "Bound-state device leaked without ClearState");
+  }
+  std::puts("Bound-state release without ClearState: live Get* references and normal/exception teardown passed.");
 }
 struct Window {
   HWND handle = nullptr;
@@ -396,6 +534,7 @@ int wmain(int argc, wchar_t** argv) {
   bool passed = false;
   try {
     testLifetime(factory, adapter, createDevice, initialize, wasRayTraced);
+    testBoundStateRelease(createDevice, adapter);
     testParallelCreate(createDevice, adapter);
     passed = true;
   } catch (const std::exception& error) {

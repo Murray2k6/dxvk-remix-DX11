@@ -46,7 +46,7 @@ namespace dxvk {
 
     DxvkNameSet getInstanceExtensions();
     DxvkNameSet getDeviceExtensions(uint32_t adapterId);
-    bool getDeviceFeatures(VkPhysicalDevice device,
+    static bool getDeviceFeatures(VkInstance instance, VkPhysicalDevice device,
                            DxvkDeviceFeatures& features);
 
     void initInstanceExtensions() { }
@@ -54,7 +54,6 @@ namespace dxvk {
       m_vkInstance = instance;
     }
 
-    static RtxIoExtensionProvider s_instance;
   };
 
   class RtxIo : public Singleton<RtxIo> {

@@ -9,6 +9,7 @@
 #include <string>
 #include <vector>
 #include "../../public/include/remix/remix_c.h"
+#include "../../external/nrd/Include/NRD.h"
 
 namespace {
 // Odd extents exercise the partial workgroups and gradient strata at the edges.
@@ -41,8 +42,8 @@ class Watchdog {
   HANDLE thread = nullptr;
   static DWORD WINAPI run(void* self) {
     const auto* watchdog = static_cast<Watchdog*>(self);
-    if (WaitForSingleObject(watchdog->stop, 720000) == WAIT_TIMEOUT) {
-      std::fputs("Rendering smoke exceeded its 720-second process limit.\n", stderr);
+    if (WaitForSingleObject(watchdog->stop, 1800000) == WAIT_TIMEOUT) {
+      std::fputs("Rendering smoke exceeded its 1800-second process limit.\n", stderr);
       std::fflush(stderr);
       TerminateProcess(GetCurrentProcess(), 124);
     }
@@ -68,6 +69,8 @@ struct Runtime {
   ID3D11DeviceContext* context = nullptr;
   ID3D11Texture2D* output = nullptr;
   ID3D11Texture2D* staging = nullptr;
+  UINT width = kWidth;
+  UINT height = kHeight;
   remixapi_MaterialHandle material = nullptr;
   remixapi_MeshHandle mesh = nullptr;
   remixapi_LightHandle light = nullptr;
@@ -101,6 +104,26 @@ void pumpMessages() {
     TranslateMessage(&message);
     DispatchMessageW(&message);
   }
+}
+
+void createReadbackTargets(Runtime& runtime, UINT width, UINT height) {
+  if (runtime.staging) { runtime.staging->Release(); runtime.staging = nullptr; }
+  if (runtime.output) { runtime.output->Release(); runtime.output = nullptr; }
+  runtime.width = width;
+  runtime.height = height;
+  D3D11_TEXTURE2D_DESC texture = {};
+  texture.Width = width;
+  texture.Height = height;
+  texture.MipLevels = texture.ArraySize = 1;
+  texture.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+  texture.SampleDesc.Count = 1;
+  texture.Usage = D3D11_USAGE_DEFAULT;
+  texture.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+  require(SUCCEEDED(runtime.device->CreateTexture2D(&texture, nullptr, &runtime.output)), "Create output texture failed");
+  texture.Usage = D3D11_USAGE_STAGING;
+  texture.BindFlags = 0;
+  texture.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+  require(SUCCEEDED(runtime.device->CreateTexture2D(&texture, nullptr, &runtime.staging)), "Create staging texture failed");
 }
 
 void makeScene(Runtime& runtime) {
@@ -177,10 +200,10 @@ void readback(Runtime& runtime, const char* mode) {
   bool finite = true;
   double total = 0.0;
   unsigned litPixels = 0;
-  for (UINT y = 0; y < kHeight; ++y) {
+  for (UINT y = 0; y < runtime.height; ++y) {
     const auto* row = reinterpret_cast<const float*>(
       static_cast<const unsigned char*>(mapped.pData) + size_t(y) * mapped.RowPitch);
-    for (UINT x = 0; x < kWidth; ++x) {
+    for (UINT x = 0; x < runtime.width; ++x) {
       const float* rgba = row + size_t(x) * 4;
       for (unsigned component = 0; component < 4; ++component) finite &= std::isfinite(rgba[component]);
       const double sum = double(rgba[0]) + rgba[1] + rgba[2];
@@ -190,15 +213,16 @@ void readback(Runtime& runtime, const char* mode) {
   }
   runtime.context->Unmap(runtime.staging, 0);
   require(finite, "Final-color image contains NaN or infinity");
-  require(litPixels > kWidth * kHeight / 100, "Final-color image is black or almost empty");
+  require(litPixels > runtime.width * runtime.height / 100, "Final-color image is black or almost empty");
+  std::printf("%s readback extent: %ux%u\n", mode, runtime.width, runtime.height);
   std::printf("%s readback: %u lit pixels, mean RGB %.6f, all finite\n",
-              mode, litPixels, total / (double(kWidth) * kHeight * 3.0));
+              mode, litPixels, total / (double(runtime.width) * runtime.height * 3.0));
 }
 }
 
 int wmain(int argc, wchar_t** argv) {
   if (argc < 2 || argc > 4) {
-    std::fputs("Usage: test_remix_rendering.exe ABSOLUTE_RUNTIME_DIRECTORY [all|compute|sharc|restir|traceray|di-off|di-no-reuse|di-reset] [--skip-startup-cycle]\n", stderr);
+    std::fputs("Usage: test_remix_rendering.exe ABSOLUTE_RUNTIME_DIRECTORY [all|compute|sharc|restir|traceray|di-off|di-no-reuse|di-reset|nrd] [--skip-startup-cycle]\n", stderr);
     return 2;
   }
   const std::wstring selected = argc >= 3 ? argv[2] : L"all";
@@ -209,7 +233,7 @@ int wmain(int argc, wchar_t** argv) {
   }
   if (selected != L"all" && selected != L"compute" && selected != L"sharc"
    && selected != L"restir" && selected != L"traceray"
-   && selected != L"di-off" && selected != L"di-no-reuse" && selected != L"di-reset") {
+   && selected != L"di-off" && selected != L"di-no-reuse" && selected != L"di-reset" && selected != L"nrd") {
     std::fputs("Unknown rendering phase selector.\n", stderr);
     return 2;
   }
@@ -291,19 +315,7 @@ int wmain(int argc, wchar_t** argv) {
       { "rtx.shader.enableAsyncCompilationUI", "False" }
     };
     for (const auto& option : options) checked(runtime.api.SetConfigVariable(option.first, option.second), option.first);
-    D3D11_TEXTURE2D_DESC texture = {};
-    texture.Width = kWidth;
-    texture.Height = kHeight;
-    texture.MipLevels = texture.ArraySize = 1;
-    texture.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
-    texture.SampleDesc.Count = 1;
-    texture.Usage = D3D11_USAGE_DEFAULT;
-    texture.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
-    require(SUCCEEDED(runtime.device->CreateTexture2D(&texture, nullptr, &runtime.output)), "Create output texture failed");
-    texture.Usage = D3D11_USAGE_STAGING;
-    texture.BindFlags = 0;
-    texture.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-    require(SUCCEEDED(runtime.device->CreateTexture2D(&texture, nullptr, &runtime.staging)), "Create staging texture failed");
+    createReadbackTargets(runtime, kWidth, kHeight);
     makeScene(runtime);
     remixapi_CameraInfoParameterizedEXT parameters = {};
     parameters.sType = REMIXAPI_STRUCT_TYPE_CAMERA_INFO_PARAMETERIZED_EXT;
@@ -334,6 +346,11 @@ int wmain(int argc, wchar_t** argv) {
       const char* enableDI;
       const char* reuseDI;
       bool rasterGap;
+      nrd::Denoiser denoiser = nrd::Denoiser::RELAX_DIFFUSE_SPECULAR;
+      bool separateDenoisers = true;
+      bool denoising = true;
+      UINT width = kWidth;
+      UINT height = kHeight;
     };
     const Phase phases[] = {
       { L"compute", "Importance sampled / ray query", "0", "0", "0", "0", "True", "True", false },
@@ -343,10 +360,34 @@ int wmain(int argc, wchar_t** argv) {
       { L"di-off", "Direct RTXDI disabled", "0", "0", "0", "0", "False", "True", false },
       { L"di-no-reuse", "Direct RTXDI reuse disabled", "0", "0", "0", "0", "True", "False", false },
       { L"di-reset", "Direct RTXDI after raster gap and camera move", "0", "0", "0", "0", "True", "True", true },
+      { L"nrd-relax", "NRD ReLAX split", "0", "0", "0", "0", "True", "True", false },
+      { L"nrd-reblur", "NRD ReBLUR combined", "0", "0", "0", "0", "True", "True", false, nrd::Denoiser::REBLUR_DIFFUSE_SPECULAR, false },
+      { L"nrd-reference", "NRD reference split", "0", "0", "0", "0", "True", "True", false, nrd::Denoiser::REFERENCE },
+      { L"nrd-relax-return", "NRD ReLAX combined restored", "0", "0", "0", "0", "True", "True", false, nrd::Denoiser::RELAX_DIFFUSE_SPECULAR, false },
+      { L"nrd-resize", "NRD ReLAX resized down", "0", "0", "0", "0", "True", "True", false, nrd::Denoiser::RELAX_DIFFUSE_SPECULAR, false, true, 227, 173 },
+      { L"nrd-full", "NRD ReLAX resized back", "0", "0", "0", "0", "True", "True", false, nrd::Denoiser::RELAX_DIFFUSE_SPECULAR, false },
+      { L"nrd-off", "NRD disabled", "0", "0", "0", "0", "True", "True", false, nrd::Denoiser::RELAX_DIFFUSE_SPECULAR, false, false },
+      { L"nrd-on", "NRD ReLAX split re-enabled", "0", "0", "0", "0", "True", "True", false },
     };
     for (const Phase& phase : phases) {
-      if (selected != L"all" && selected != phase.selector)
+      const bool nrdGroup = selected == L"nrd" && std::wstring(phase.selector).find(L"nrd-") == 0;
+      if (selected != L"all" && selected != phase.selector && !nrdGroup)
         continue;
+      const auto nrdMode = std::to_string(static_cast<uint32_t>(phase.denoiser));
+      checked(runtime.api.SetConfigVariable("rtx.denoiserMode", nrdMode.c_str()), "Set NRD primary/secondary mode");
+      checked(runtime.api.SetConfigVariable("rtx.denoiserIndirectMode", nrdMode.c_str()), "Set NRD indirect mode");
+      checked(runtime.api.SetConfigVariable("rtx.denoiseDirectAndIndirectLightingSeparately", phase.separateDenoisers ? "True" : "False"), "Set NRD signal grouping");
+      checked(runtime.api.SetConfigVariable("rtx.useDenoiser", phase.denoising ? "True" : "False"), "Set NRD enabled");
+      if (runtime.width != phase.width || runtime.height != phase.height) {
+        RECT resized = { 0, 0, LONG(phase.width), LONG(phase.height) };
+        require(AdjustWindowRect(&resized, WS_OVERLAPPEDWINDOW, FALSE) != FALSE, "Adjust resize rectangle failed");
+        require(SetWindowPos(window, nullptr, 0, 0, resized.right - resized.left, resized.bottom - resized.top,
+          SWP_NOMOVE | SWP_NOACTIVATE | SWP_NOZORDER) != FALSE, "Resize rendering window failed");
+        RECT client = {};
+        require(GetClientRect(window, &client) && client.right == LONG(phase.width) && client.bottom == LONG(phase.height), "Client extent did not change");
+        createReadbackTargets(runtime, phase.width, phase.height);
+        parameters.aspect = float(phase.width) / float(phase.height);
+      }
       checked(runtime.api.SetConfigVariable("rtx.integrateIndirectMode", phase.integrationMode), "Set indirect mode");
       checked(runtime.api.SetConfigVariable("rtx.renderPassGBufferRaytraceMode", phase.gbufferMode), "Set GBuffer tracing mode");
       checked(runtime.api.SetConfigVariable("rtx.renderPassIntegrateDirectRaytraceMode", phase.directMode), "Set direct tracing mode");

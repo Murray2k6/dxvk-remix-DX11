@@ -1,9 +1,11 @@
 #include "dxvk_raytracing.h"
 
 #include <future>
+#include <array>
 
 #include "dxvk_device.h"
 #include "dxvk_pipemanager.h"
+#include "dxvk_compiler_policy.h"
 #include "rtx_render/rtx.h"
 #include "rtx_render/rtx_options.h"
 #include "rtx_render/rtx_opacity_micromap_manager.h"
@@ -133,8 +135,9 @@ namespace dxvk {
       std::lock_guard<sync::Spinlock> lock(m_mutex);
 
       if (m_threadPool == nullptr) {
-        uint32_t numCpuCores = dxvk::thread::hardware_concurrency();
-        m_threadPool = new ThreadPoolType(numCpuCores / 4, "dxvk-deferredop-finalizer");
+        const uint32_t helpers = std::max(1u, deferredCompilerHelpers(UINT32_MAX,
+          dxvk::thread::hardware_concurrency()));
+        m_threadPool = new ThreadPoolType(uint8_t(helpers), "dxvk-deferredop-finalizer");
       }
 
       Future<VkResult> future;
@@ -179,14 +182,22 @@ namespace dxvk {
 
     std::lock_guard<dxvk::mutex> lock(m_mutex);
 
-    if (!m_isCompiled) {
+    if (!m_isCompiled && !m_compileFailed) {
       if (WAR4000939::shouldApply(m_pipeMgr->m_device)) {
         WAR4000939::syncWithOMMPipeline(m_shaders);
       }
 
-      createPipeline();
-      createShaderBindingTable();
-      releaseTmpResources();
+      try {
+        createPipeline();
+        createShaderBindingTable();
+        releaseTmpResources();
+      } catch (...) {
+        // Preserve native rendering after a failed pipeline, without retrying
+        // the same driver failure and logging it on every frame.
+        m_compileFailed.store(true);
+        releaseTmpResources();
+        throw;
+      }
 
       m_isCompiled = true;
 
@@ -201,6 +212,8 @@ namespace dxvk {
     if (m_isCompiled) {
       return m_pipeline;
     }
+    if (m_compileFailed)
+      return VK_NULL_HANDLE;
 
     // DX11_V248_NONBLOCKING_RT_PIPELINES: never compile in-place on the render
     // thread when async compilation is enabled. Ray tracing pipelines take tens
@@ -216,15 +229,8 @@ namespace dxvk {
     // commitRaytracingState -> traceRays), and RtxContext holds off ray tracing
     // while remixShaderCompilationCount() > 0, so rendering simply resumes when
     // the compile lands. Prewarm becomes an optimization, not a requirement.
-    if (RtxOptions::Shader::enableAsyncCompilation()) {
+    if (RtxOptions::Shader::enableAsyncCompilation() && m_pipeMgr->hasAsyncCompiler()) {
       m_pipeMgr->registerRaytracingShaders(m_shaders);
-
-      static uint32_t s_asyncRequestLog = 0;
-      if (s_asyncRequestLog < 8) {
-        ++s_asyncRequestLog;
-        Logger::info(str::format("Raytracing pipeline not ready, compiling asynchronously: ",
-          m_shaders.debugName ? m_shaders.debugName : "<unnamed>"));
-      }
 
       return VK_NULL_HANDLE;
     }
@@ -355,38 +361,47 @@ namespace dxvk {
     THROW_IF_FALSE(rtProperties.maxRayRecursionDepth >= rayPipelineInfo.maxPipelineRayRecursionDepth);
 
     VkDeferredOperationKHR deferredOp = VK_NULL_HANDLE;
+    std::array<Future<VkResult>, 2> joins;
+    size_t scheduled = 0;
 
-    if (useDeferredOperations()) {
+    if (useDeferredOperations())
       VK_THROW_IF_FAILED(m_vkd->vkCreateDeferredOperationKHR(m_vkd->device(), VK_NULL_HANDLE, &deferredOp));
+
+    VkResult result = m_vkd->vkCreateRayTracingPipelinesKHR(m_vkd->device(), deferredOp,
+      m_pipeMgr->m_cache->handle(), 1, &rayPipelineInfo, nullptr, &m_pipeline);
+
+    if (result == VK_OPERATION_DEFERRED_KHR) {
+      const uint32_t helpers = deferredCompilerHelpers(
+        m_vkd->vkGetDeferredOperationMaxConcurrencyKHR(m_vkd->device(), deferredOp),
+        dxvk::thread::hardware_concurrency());
+      // Scheduling helpers is optional. If allocation/thread creation fails,
+      // the compiler worker itself still guarantees forward progress.
+      try {
+        while (scheduled < helpers) {
+          joins[scheduled] = DxvkDeferredOpFinalizer::get().finalize(m_vkd, deferredOp);
+          ++scheduled;
+        }
+      } catch (...) { }
+
+      m_vkd->vkDeferredOperationJoinKHR(m_vkd->device(), deferredOp);
+      // Do not destroy the operation or throw before all scheduled joins end.
+      // A join can return THREAD_IDLE or THREAD_DONE while another still runs.
+      for (size_t i = 0; i < scheduled; ++i)
+        joins[i].get();
+      result = m_vkd->vkGetDeferredOperationResultKHR(m_vkd->device(), deferredOp);
+      while (result == VK_NOT_READY) {
+        m_vkd->vkDeferredOperationJoinKHR(m_vkd->device(), deferredOp);
+        result = m_vkd->vkGetDeferredOperationResultKHR(m_vkd->device(), deferredOp);
+        if (result == VK_NOT_READY)
+          std::this_thread::yield();
+      }
     }
 
-    VkResult result = m_vkd->vkCreateRayTracingPipelinesKHR(m_vkd->device(), deferredOp, m_pipeMgr->m_cache->handle(),
-                                                               1, &rayPipelineInfo, nullptr, &m_pipeline);
+    if (deferredOp != VK_NULL_HANDLE)
+      m_vkd->vkDestroyDeferredOperationKHR(m_vkd->device(), deferredOp, VK_NULL_HANDLE);
     VK_THROW_IF_FAILED(result);
+    THROW_IF_FALSE(m_pipeline != VK_NULL_HANDLE);
 
-    if (deferredOp == VK_NULL_HANDLE) {
-      return;
-    }
-
-    if (result != VK_OPERATION_NOT_DEFERRED_KHR) {
-      uint32_t numLaunches = m_vkd->vkGetDeferredOperationMaxConcurrencyKHR(m_vkd->device(), deferredOp);
-
-      std::vector<Future<VkResult>> joins;
-      while (numLaunches > 1) {
-        joins.emplace_back(DxvkDeferredOpFinalizer::get().finalize(m_vkd, deferredOp));
-        --numLaunches;
-      }
-
-      VK_THROW_IF_FAILED(m_vkd->vkDeferredOperationJoinKHR(m_vkd->device(), deferredOp));
-
-      for (auto& f : joins) {
-        VK_THROW_IF_FAILED(f.get());
-      }
-
-      VK_THROW_IF_FAILED(m_vkd->vkGetDeferredOperationResultKHR(m_vkd->device(), deferredOp));
-    }
-
-    m_vkd->vkDestroyDeferredOperationKHR(m_vkd->device(), deferredOp, VK_NULL_HANDLE);
   }
 
   // Each shader binding table is populated with shader records 
