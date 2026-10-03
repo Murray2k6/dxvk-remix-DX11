@@ -25,6 +25,7 @@
 #ifdef _WIN32
 #include <windows.h>
 #include <cstring>
+#include <cwchar>
 #endif
 
 // NV-DXVK start: Fix some circular inclusion stuff
@@ -197,6 +198,99 @@ namespace dxvk::env {
   //     missing hard dependency);
   //   - breadcrumb present, main log absent -> attach succeeded and the
   //     process died before device creation (see [crash] lines / bypass state).
+  // Microsoft's "Dozen" Vulkan driver (vulkan_dzn.dll, D3D Mapping Layers
+  // package) implements Vulkan on D3D12. With vkd3d-proton's d3d12.dll next
+  // to a DX12 game, Dozen's D3D12 is vkd3d, which creates a Vulkan instance,
+  // which initialises Dozen again: endless recursion and a stack overflow on
+  // the first adapter enumeration (Starfield). Remix never wants a Vulkan
+  // driver layered on D3D12, so hide it from the Vulkan loader in this
+  // process (VK_LOADER_DRIVERS_DISABLE takes globs of driver manifest names,
+  // loader 1.3.234+), keeping any filter the user set. Kernel32 only, safe in
+  // DllMain; call before the first Vulkan instance.
+  inline void remixDisableDozenVulkanDriver() {
+    constexpr const char* kName = "VK_LOADER_DRIVERS_DISABLE";
+    constexpr const char* kDozen = "*dzn*";
+    char current[1024] = {};
+    const DWORD length = ::GetEnvironmentVariableA(kName, current, DWORD(sizeof(current)));
+
+    if (length >= DWORD(sizeof(current)))
+      return;  // an unusually long user filter: leave it alone
+
+    if (length != 0 && std::strstr(current, "dzn") != nullptr)
+      return;
+
+    char value[sizeof(current) + 16] = {};
+    size_t pos = 0;
+
+    for (DWORD i = 0; i < length; i++)
+      value[pos++] = current[i];
+
+    if (length != 0)
+      value[pos++] = ',';
+
+    for (const char* s = kDozen; *s != '\0'; s++)
+      value[pos++] = *s;
+
+    ::SetEnvironmentVariableA(kName, value);
+  }
+
+  // Turns the Remix Vulkan layer on for this process, with no registry entry:
+  // when remix_vk_layer.json sits next to `module` (Remix's dxgi.dll /
+  // d3d11.dll in the game folder), the Vulkan loader is told to search that
+  // folder (VK_ADD_LAYER_PATH) and to enable the layer by name
+  // (VK_LOADER_LAYERS_ENABLE, loader 1.3.234+). DX12 games load Remix's
+  // dxgi.dll before vkd3d-proton creates its Vulkan instance, so the layer
+  // sees it. DISABLE_REMIX_VK_LAYER=1 leaves it off. Existing values are kept.
+  // Kernel32 only, safe in DllMain.
+  inline void remixEnableVulkanLayer(HMODULE module) {
+    wchar_t flag[8] = {};
+    if (::GetEnvironmentVariableW(L"DISABLE_REMIX_VK_LAYER", flag, 8) != 0 && flag[0] == L'1')
+      return;
+
+    wchar_t dir[MAX_PATH] = {};
+    const DWORD length = ::GetModuleFileNameW(module, dir, MAX_PATH);
+    if (length == 0 || length >= MAX_PATH)
+      return;
+
+    int slash = -1;
+    for (int i = 0; dir[i] != L'\0'; i++) {
+      if (dir[i] == L'\\')
+        slash = i;
+    }
+    if (slash < 0 || slash > MAX_PATH - 24)
+      return;
+    dir[slash] = L'\0';
+
+    wchar_t manifest[MAX_PATH] = {};
+    std::memcpy(manifest, dir, size_t(slash) * sizeof(wchar_t));
+    std::memcpy(manifest + slash, L"\\remix_vk_layer.json", sizeof(L"\\remix_vk_layer.json"));
+    if (::GetFileAttributesW(manifest) == INVALID_FILE_ATTRIBUTES)
+      return;
+
+    // Appends `item` to a separator-list variable unless already present.
+    auto append = [](const wchar_t* name, const wchar_t* item, wchar_t separator) {
+      wchar_t current[2048] = {};
+      const DWORD n = ::GetEnvironmentVariableW(name, current, 2048);
+      if (n >= 2048)
+        return;
+      if (n != 0 && std::wcsstr(current, item) != nullptr)
+        return;
+
+      wchar_t value[2048 + MAX_PATH + 2] = {};
+      size_t pos = 0;
+      for (DWORD i = 0; i < n; i++)
+        value[pos++] = current[i];
+      if (n != 0)
+        value[pos++] = separator;
+      for (const wchar_t* s = item; *s != L'\0' && pos < sizeof(value) / sizeof(value[0]) - 1; s++)
+        value[pos++] = *s;
+      ::SetEnvironmentVariableW(name, value);
+    };
+
+    append(L"VK_ADD_LAYER_PATH", dir, L';');
+    append(L"VK_LOADER_LAYERS_ENABLE", L"VK_LAYER_NV_remix_dx11", L',');
+  }
+
   inline void remixAppendBootLine(const char* component, const char* message) {
     char exePath[MAX_PATH] = {};
     const DWORD exeLen = ::GetModuleFileNameA(nullptr, exePath, DWORD(sizeof(exePath)));

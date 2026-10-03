@@ -339,6 +339,11 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
     // the way the V261 vectored handler could.
     RemixReassertCrashSignatureFilter();
     if (!dxvk::env::shouldBypassRemixForCurrentProcess()) {
+      // Before any Vulkan instance: see remixDisableDozenVulkanDriver and
+      // remixEnableVulkanLayer (DX12 / Vulkan capture, no registry entry).
+      dxvk::env::remixDisableDozenVulkanDriver();
+      dxvk::env::remixEnableVulkanLayer(hModule);
+
       wchar_t path[MAX_PATH];
       if (GetModuleFileNameW(hModule, path, MAX_PATH)) {
         wchar_t* sep = wcsrchr(path, L'\\');

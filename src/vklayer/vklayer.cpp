@@ -40,12 +40,12 @@ namespace remix_vklayer {
       if (dir.empty())
         return;
 
-      // Remix is installed for this game: its d3d11.dll and a Remix config
-      // sit next to the executable.
+      // Remix is installed for this game: its d3d11.dll sits next to the
+      // executable (checked below for remix_vkfe_get_api, so another
+      // d3d11.dll leaves the layer a pass-through). No config file needed.
       const std::wstring d3d11 = dir + L"\\d3d11.dll";
-      const bool config = exists(dir + L"\\rtx.conf") || exists(dir + L"\\rtx-remix");
 
-      if (!exists(d3d11) || !config)
+      if (!exists(d3d11))
         return;
 
       // Kernel and user-mode anti-cheat treat an injected layer as a cheat
