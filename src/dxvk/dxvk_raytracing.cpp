@@ -173,7 +173,10 @@ namespace dxvk {
 
   DxvkRaytracingPipeline::~DxvkRaytracingPipeline() {
     if (m_pipeline != VK_NULL_HANDLE) {
-      vkDestroyPipeline(m_vkd->device(), m_pipeline, nullptr);
+      // Through Remix's dispatch, never vulkan-1.dll's export: on a game's
+      // device (DX12 / Vulkan front ends) the export re-enters the Remix
+      // layer, which no longer knows the device during its teardown.
+      m_vkd->vkDestroyPipeline(m_vkd->device(), m_pipeline, nullptr);
     }
   };
 

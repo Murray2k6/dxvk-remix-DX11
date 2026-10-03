@@ -236,7 +236,18 @@ namespace dxvk {
         return hr;
       }
       Com<IDXGIVkSwapChain> adapter = new DxgiVkPresenterAdapter(presenter.ptr());
-      *ppSwapChain = ref(new DxgiSwapChain(this, adapter.ptr(), hWnd, pDesc, pFullscreenDesc));
+
+      // No fullscreen description means a windowed swap chain (Starfield
+      // through Streamline passes none); DxgiSwapChain copies one.
+      DXGI_SWAP_CHAIN_FULLSCREEN_DESC descFs = {};
+      descFs.ScanlineOrdering = DXGI_MODE_SCANLINE_ORDER_UNSPECIFIED;
+      descFs.Scaling          = DXGI_MODE_SCALING_UNSPECIFIED;
+      descFs.Windowed         = TRUE;
+
+      if (pFullscreenDesc)
+        descFs = *pFullscreenDesc;
+
+      *ppSwapChain = ref(new DxgiSwapChain(this, adapter.ptr(), hWnd, pDesc, &descFs));
       Logger::info("DXGI: D3D12 swap chain created through vkd3d-proton");
       return S_OK;
     }

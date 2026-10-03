@@ -909,6 +909,7 @@ namespace dxvk {
     draw.bindingBytes.resize(draw.bindings.size());
 
     std::lock_guard lock(m_mutex);
+    draw.imageSeq = m_imageDestroySeq;
 
     for (size_t i = 0; i < draw.bindings.size(); i++) {
       auto& b = draw.bindings[i];
@@ -1313,6 +1314,10 @@ namespace dxvk {
     // once Remix's GPU work that used it has completed.
     std::lock_guard lock(m_mutex);
     m_capture.textures.erase(image);
+
+    // Draws recorded before now that are committed later must not wrap it
+    // again: the handle is about to be freed (or reused for another image).
+    m_destroyedImages[image] = DestroyedImage { ++m_imageDestroySeq, m_presentCount };
   }
 
 
@@ -1624,6 +1629,18 @@ namespace dxvk {
       // 3. Scene input for this frame.
       captureFrame(m_frameDraws);
       m_frameDraws.clear();
+
+      // Destroyed-image entries no draw can still be committed against.
+      {
+        constexpr uint64_t kKeepFrames = 16;
+
+        for (auto i = m_destroyedImages.begin(); i != m_destroyedImages.end(); ) {
+          if (i->second.frame + kKeepFrames < m_presentCount)
+            i = m_destroyedImages.erase(i);
+          else
+            ++i;
+        }
+      }
 
       // Bake / UI layer images replaced long enough ago that no game
       // command buffer in flight renders into them.

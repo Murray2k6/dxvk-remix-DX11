@@ -957,6 +957,13 @@ struct PooledBlas : public RcObject {
   // unchanged, the GPU build can be skipped entirely.
   XXH64_hash_t contentHash = kEmptyHash;
 
+  // Topology (index data, primitive offsets, first vertices) last built into
+  // this BLAS. An update (refit) must keep the source build's index data
+  // (VUID-vkCmdBuildAccelerationStructuresKHR-pInfos-03768/03769); refitting a
+  // recycled BLAS over another mesh's indices is undefined and has corrupted
+  // the BVH badly enough for traversal to read unmapped memory (device lost).
+  XXH64_hash_t topologyHash = kEmptyHash;
+
   explicit PooledBlas();
   ~PooledBlas();
 };

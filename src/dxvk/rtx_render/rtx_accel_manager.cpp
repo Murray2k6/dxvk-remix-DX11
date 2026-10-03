@@ -1256,9 +1256,34 @@ namespace dxvk {
         }
       }
 
+      // Topology of this bucket, as upstream dxvk-remix hashes it: each
+      // geometry's index data plus where its range starts. A pooled BLAS is
+      // the smallest free one that fits, so it usually last held a different
+      // mesh with the same primitive counts; only a matching topology may be
+      // refit in place.
+      struct TopologyHashData {
+        XXH64_hash_t previousHash;
+        XXH64_hash_t indexHash;
+        uint32_t primitiveOffset;
+        uint32_t firstVertex;
+      };
+      static_assert(sizeof(TopologyHashData) == 24, "TopologyHashData must remain fully padded for stable hashing.");
+      XXH64_hash_t newTopologyHash = kEmptyHash;
+      for (uint32_t gi = 0; gi < bucket->geometries.size(); ++gi) {
+        const TopologyHashData topologyHashData {
+          newTopologyHash,
+          bucket->originalInstances[gi]->getBlas()->modifiedGeometryData.hashes[HashComponents::Indices],
+          bucket->ranges[gi].primitiveOffset,
+          bucket->ranges[gi].firstVertex,
+        };
+        newTopologyHash = XXH3_64bits(&topologyHashData, sizeof(topologyHashData));
+      }
+
       // Must ensure that if we are updating an existing blas, rather than rebuilding, the blas is compatible with our new build info
       // Cannot update a blas that contains OMM instances, this leads to sporadic device lost errors
-      if (!bucket->hasOmmInstances && selectedBlas && validateUpdateMode(selectedBlas->buildInfo, buildInfo) && selectedBlas->primitiveCounts == bucket->primitiveCounts) {
+      if (!bucket->hasOmmInstances && selectedBlas
+       && selectedBlas->topologyHash == newTopologyHash
+       && validateUpdateMode(selectedBlas->buildInfo, buildInfo) && selectedBlas->primitiveCounts == bucket->primitiveCounts) {
         buildInfo.mode = VK_BUILD_ACCELERATION_STRUCTURE_MODE_UPDATE_KHR;
       }
 
@@ -1272,6 +1297,7 @@ namespace dxvk {
       }
       assert(selectedBlas);
       selectedBlas->frameLastTouched = currentFrame;
+      selectedBlas->topologyHash = newTopologyHash;
       ++m_blasFrameStats.mergedCount;
       for (uint32_t prims : bucket->primitiveCounts)
         m_blasFrameStats.mergedPrims += prims;

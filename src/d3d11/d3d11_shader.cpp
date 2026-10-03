@@ -2052,9 +2052,14 @@ namespace dxvk {
   // The pixel-shader input that multiplies a texture sample is the vertex
   // colour (tint, baked lighting): the same rule as the DX12 / Vulkan SPIR-V
   // analysis (d3d11_vk_spirv.cpp). Per temp component the pass tracks whether
-  // it carries a sample and which single input register it comes from; a
-  // mul / mad of the two votes for the input. The most-voted float input
-  // with at least three components wins, COLOR-named inputs breaking ties.
+  // it carries a sample and which single input register it comes from, and
+  // which channel of each; a mul / mad votes for the input only when it pairs
+  // the sample's and the input's channels one to one (r*r, g*g, b*b) on at
+  // least three components. A tint is that; a tangent-space transform is not:
+  // it broadcasts one channel of the sampled normal over an interpolated
+  // basis vector (Unreal's TangentToWorld in TEXCOORD10 / 11), which read as a
+  // colour paints surfaces blue. The most-voted float input with at least
+  // three components wins, COLOR-named inputs breaking ties.
   static void parseDxbcVertexColorInput(
     const DxbcModule&                 module,
     D3D11SampledTexcoordSemantic&     out,
@@ -2069,7 +2074,9 @@ namespace dxvk {
     // static: used by a capture-less lambda. Taint spells kNone as -1: MSVC
     // rejects a local constant in a local struct's member initializer.
     static constexpr int32_t kNone = -1, kMixed = -2;
-    struct Taint { bool sample = false; int32_t input = -1; };
+    // sampleChannel / inputChannel: the source channel this component holds
+    // (-1 none, -2 mixed).
+    struct Taint { bool sample = false; int32_t input = -1; int32_t sampleChannel = -1; int32_t inputChannel = -1; };
     std::unordered_map<uint32_t, std::array<Taint, 4>> temps;
     std::unordered_map<int32_t, uint32_t> votes;
 
@@ -2077,7 +2084,7 @@ namespace dxvk {
       if (r.idxDim == 0 || r.idx[0].relReg != nullptr || r.idx[0].offset < 0)
         return {};
       if (r.type == DxbcOperandType::Input)
-        return { false, int32_t(r.idx[0].offset) };
+        return { false, int32_t(r.idx[0].offset), -1, int32_t(r.swizzle[component]) };
       if (r.type == DxbcOperandType::Temp) {
         const auto it = temps.find(uint32_t(r.idx[0].offset));
         return it != temps.end() ? it->second[r.swizzle[component]] : Taint();
@@ -2103,6 +2110,9 @@ namespace dxvk {
       const bool sample = ins.opClass == DxbcInstClass::TextureSample || ins.opClass == DxbcInstClass::TextureGather;
       const bool product = (ins.op == DxbcOpcode::Mul || ins.op == DxbcOpcode::Mad) && ins.srcCount >= 2u;
 
+      // Channel-matched sample * input pairs of this instruction, per input.
+      std::unordered_map<int32_t, uint32_t> matched;
+
       for (uint32_t c = 0; c < 4u; ++c) {
         if (!dst.mask[c])
           continue;
@@ -2111,28 +2121,42 @@ namespace dxvk {
 
         if (sample) {
           result.sample = true;
+          // The texel channel written to this component: the resource
+          // operand's swizzle.
+          result.sampleChannel = ins.srcCount >= 2u ? int32_t(ins.src[1].swizzle[c]) : int32_t(c);
         } else if (product) {
           const Taint a = taintOf(ins.src[0], c);
           const Taint b = taintOf(ins.src[1], c);
 
-          // sample * input (either order): the input is the colour.
-          if (a.sample && !b.sample && b.input >= 0)
-            votes[b.input]++;
-          else if (b.sample && !a.sample && a.input >= 0)
-            votes[a.input]++;
+          // sample * input (either order), channel for channel: a colour.
+          if (a.sample && !b.sample && b.input >= 0 && a.sampleChannel >= 0 && a.sampleChannel == b.inputChannel)
+            matched[b.input]++;
+          else if (b.sample && !a.sample && a.input >= 0 && b.sampleChannel >= 0 && b.sampleChannel == a.inputChannel)
+            matched[a.input]++;
 
           result.sample = a.sample || b.sample;
+          result.sampleChannel = a.sample && b.sample ? merge(a.sampleChannel, b.sampleChannel)
+                               : a.sample ? a.sampleChannel : b.sample ? b.sampleChannel : kNone;
           result.input = result.sample ? kNone : merge(a.input, b.input);
+          result.inputChannel = result.sample ? kNone : merge(a.inputChannel, b.inputChannel);
         } else {
           // Moves, saturates, adds and the like keep both kinds of origin.
           for (uint32_t s = 0; s < ins.srcCount; ++s) {
             const Taint t = taintOf(ins.src[s], c);
             result.sample |= t.sample;
+            if (t.sample)
+              result.sampleChannel = merge(result.sampleChannel, t.sampleChannel);
             result.input = merge(result.input, t.input);
+            result.inputChannel = merge(result.inputChannel, t.inputChannel);
           }
         }
 
         written[c] = result;
+      }
+
+      for (const auto& m : matched) {
+        if (m.second >= 3u)
+          votes[m.first]++;
       }
 
       temps[uint32_t(dst.idx[0].offset)] = written;

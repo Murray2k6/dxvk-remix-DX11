@@ -489,7 +489,7 @@ namespace dxvk {
     // admits over one million triangles at the maximum 24-byte capture stride.
     // Cache memory is separately bounded, and an incomplete frame stays native.
     RTX_OPTION("rtx.dx11", int, captureMaxDrawsPerFrame, 128,
-               "Maximum post-VS position captures performed per frame. If required geometry exceeds a capture budget, retain the complete native frame and retry on subsequent frames. Unchanged exact captures do not consume this budget.");
+               "Maximum post-VS position captures performed per frame. If required geometry exceeds a capture budget, retain the complete native frame and retry on subsequent frames. Unchanged exact captures do not consume this budget. First-time captures of small meshes (up to 256 KiB) are bounded by the byte budget and a ceiling of 8x this value instead, so a level's first frame enters the ray-traced scene whole.");
     RTX_OPTION("rtx.dx11", int, captureMaxNewBuffersPerFrame, 64,
                "Maximum NEW capture buffers allocated per frame (cold captures of meshes never seen before).");
     RTX_OPTION("rtx.dx11", int, captureMaxReplaysPerFrame, 64,
