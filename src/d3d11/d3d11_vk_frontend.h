@@ -120,6 +120,11 @@ namespace dxvk {
     D3D11VkCaptureChunk*                      captureChunk = nullptr;
     uint32_t                                  counterSlot = ~0u;
 
+    // Image destruction count when the draw was recorded (onImageDestroy):
+    // images destroyed after it are not wrapped when the draw is committed
+    // later (pending GPU-driven draws commit two frames on).
+    uint64_t                                  imageSeq = 0;
+
     // Terrain bake asked for (bakeSlot) and recorded by the caller (baked,
     // on_bake), with the cascade layout it used.
     int32_t                                   bakeSlot = -1;
@@ -538,6 +543,20 @@ namespace dxvk {
     uint64_t                          m_presentCount = 0;
     // Alt+X was held at the last present (rising-edge menu toggle).
     bool                              m_menuHotkeyDown = false;
+
+    // Images the game destroyed, with the destruction count at the time
+    // (D3D11VkDraw::imageSeq) and the present count. An image can only be
+    // destroyed once the submissions using it have completed, and a draw is
+    // committed at most a few presents after its submission, so entries
+    // are dropped some presents later.
+    struct DestroyedImage {
+      uint64_t                                  seq = 0;
+      uint64_t                                  frame = 0;
+    };
+    uint64_t                                    m_imageDestroySeq = 0;
+    std::unordered_map<VkImage, DestroyedImage> m_destroyedImages;
+    // The recording point of the draw being committed (commitDraw).
+    uint64_t                                    m_commitImageSeq = ~0ull;
 
     void destroySwapchain(D3D11VkSwapchain& swapchain);
 

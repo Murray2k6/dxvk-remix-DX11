@@ -548,6 +548,26 @@ namespace remix_vklayer {
       if (!device)
         return;
 
+      // Remix drains its GPU work and releases everything on the device
+      // before the device goes away. The device stays registered meanwhile,
+      // with Remix detached: a call Remix's teardown makes through the
+      // loader reaches the layer's hooks and must pass straight through.
+      remix_vkfe_device remix = nullptr;
+
+      {
+        std::shared_lock lock(g_registryMutex);
+        auto it = g_devices.find(keyOf(device));
+
+        if (it == g_devices.end())
+          return;
+
+        remix = it->second->remix;
+        it->second->remix = nullptr;
+      }
+
+      if (remix)
+        remixApi()->destroy_device(remix);
+
       std::unique_ptr<DeviceData> data;
 
       {
@@ -560,11 +580,6 @@ namespace remix_vklayer {
         data = std::move(it->second);
         g_devices.erase(it);
       }
-
-      // Remix drains its GPU work and releases everything on the device
-      // before the device goes away.
-      if (data->remix)
-        remixApi()->destroy_device(data->remix);
 
       reflexDestroyDevice(data.get());
 

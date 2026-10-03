@@ -3678,7 +3678,23 @@ namespace dxvk {
         otherLaneCap - std::min(otherLaneUsed, otherLaneCap);
       const bool classBudgetExhausted = ownLaneUsed >= ownLaneCap + otherLaneUnused;
 
-      const bool captureBudgetExhausted = totalBudgetExhausted || classBudgetExhausted
+      // A small first-time capture is exempt from the draw-count caps. It has
+      // no earlier capture to fall back on, so a refusal removes the mesh from
+      // the ray-traced scene and leaves it to the native raster. An Unreal 4
+      // level's first frame is ~870 draws in only ~4 MiB of capture: with a
+      // 128-draw cap, 739 meshes went to raster and half the scene was
+      // rasterized. Such captures are cheap (the game draws the same vertices
+      // itself) and the 8-capture submission boundaries already bound the GPU
+      // work per submission. The byte cap and a hard ceiling still bound the
+      // frame. Replays stay capped: they reuse their last capture when refused.
+      static constexpr VkDeviceSize kSmallColdCaptureBytes = 256u << 10;
+      static constexpr uint32_t     kColdCaptureCeilingScale = 8u;
+      const bool smallColdCapture = needsNewCaptureBuffer
+        && captureBytes <= kSmallColdCaptureBytes
+        && m_positionCapturesThisFrame < kMaxCapturesPerFrame * kColdCaptureCeilingScale;
+
+      const bool captureBudgetExhausted =
+        (!smallColdCapture && (totalBudgetExhausted || classBudgetExhausted))
         || m_positionCaptureBytesThisFrame + captureBytes > kMaxCaptureBytesPerFrame;
       if (captureBudgetExhausted) {
         ++m_submitRejectStats.positionCaptureBudgetRejected;
@@ -14845,7 +14861,7 @@ namespace dxvk {
         ++sUnsafeCameraRelativeSkipLogCount;
         Logger::warn(str::format(
           "[D3D11Rtx][position-capture] skipped unsafe uncaptured draw: reason=",
-          requireExactPositionCapture && exactCaptureBudgetRejected ? "budget"
+          exactCaptureBudgetRejected ? "budget"
             : (usedWholeVertexBufferFallback ? "gpu-index-flatten-required"
               : (requireExactPositionCapture ? "instanced-exact-required" : "camera-relative")),
           " count=",

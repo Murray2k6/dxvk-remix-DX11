@@ -138,6 +138,11 @@ namespace dxvk {
                             | (1u << REMIX_VKFE_STAGE_GEOMETRY))) != 0;
     }
 
+    // An empty reference for a texture wrapTexture refused (destroyed image).
+    TextureRef textureRef(Rc<DxvkImageView> view) {
+      return view != nullptr ? TextureRef(std::move(view)) : TextureRef();
+    }
+
     bool depthOnly(const D3D11VkDraw& draw) {
       return draw.desc.render_target_count == 0 || !draw.pipeline || draw.pipeline->state.color_write_mask == 0;
     }
@@ -724,6 +729,16 @@ namespace dxvk {
 
   Rc<DxvkImageView> D3D11VkFrontendDevice::wrapTexture(const remix_vkfe_binding& binding) {
     auto& st = m_capture;
+
+    // The game destroyed the image after the draw being committed was
+    // recorded (GPU-driven draws commit two frames late; loading screens
+    // free textures constantly): wrapping the freed handle crashes the driver.
+    // The draw keeps its geometry, without this texture.
+    auto destroyed = m_destroyedImages.find(binding.image);
+
+    if (destroyed != m_destroyedImages.end() && destroyed->second.seq > m_commitImageSeq)
+      return nullptr;
+
     auto& entry = st.textures[binding.image];
 
     const bool same = entry.view != nullptr && entry.format == binding.format
@@ -837,6 +852,9 @@ namespace dxvk {
 
   Rc<DxvkImageView> D3D11VkFrontendDevice::wrapColorTexture(const remix_vkfe_binding& binding) {
     Rc<DxvkImageView> view = wrapTexture(binding);
+
+    if (view == nullptr)
+      return nullptr;
 
     // Grey-scale colour maps (R8, BC4) and grey + alpha (R8G8, BC5 used as
     // luminance-alpha): the game's shader reads .r as the colour.
@@ -1075,6 +1093,9 @@ namespace dxvk {
 
     if (!vertexCount)
       return;
+
+    // Texture wraps below check against the point this draw was recorded at.
+    m_commitImageSeq = draw.imageSeq;
 
     DrawCallState dcs;
     RasterGeometry& geo = dcs.geometryData;
@@ -1344,7 +1365,7 @@ namespace dxvk {
       if (b.kind == REMIX_VKFE_BINDING_TEXTURE && b.image && pixelStage(b) && !isDepthFormat(b.format)
        && !(context.earlierTargets && context.earlierTargets->count(b.image))) {
         Rc<DxvkImageView> view = wrapTexture(b);
-        const XXH64_hash_t hash = view->image()->getHash();
+        const XXH64_hash_t hash = view != nullptr ? view->image()->getHash() : 0;
 
         if (hash)
           ImGUI::AddTexture(hash, view, textureUiFlags(view));
@@ -1352,27 +1373,27 @@ namespace dxvk {
     }
 
     if (albedo && (layout.texcoord || context.lift2D)) {
-      mat.colorTextures[0] = TextureRef(wrapColorTexture(*albedo));
+      mat.colorTextures[0] = textureRef(wrapColorTexture(*albedo));
       mat.samplers[0] = st.sampler;
       mat.colorTextureIsSrgb = isSrgbFormat(albedo->format);
     }
 
     if (normal && layout.texcoord) {
-      mat.normalTexture = TextureRef(wrapTexture(*normal));
+      mat.normalTexture = textureRef(wrapTexture(*normal));
       mat.normalEncoding = normalEncoding;
       st.statNormalMaps++;
     }
 
     if (metallic && layout.texcoord) {
-      mat.metallicTexture = TextureRef(wrapTexture(*metallic));
+      mat.metallicTexture = textureRef(wrapTexture(*metallic));
       mat.metallicChannel = metallicChannel;
     }
 
     if (emissive && layout.texcoord && !context.lift2D)
-      mat.emissiveTexture = TextureRef(wrapTexture(*emissive));
+      mat.emissiveTexture = textureRef(wrapTexture(*emissive));
 
     if (rough && layout.texcoord) {
-      mat.roughnessTexture = TextureRef(wrapTexture(*rough));
+      mat.roughnessTexture = textureRef(wrapTexture(*rough));
       mat.roughnessChannel = roughChannel;
       mat.roughnessIsSmoothness = roughIsSmoothness;
       mat.roughnessAuthored = authoredRoughness;

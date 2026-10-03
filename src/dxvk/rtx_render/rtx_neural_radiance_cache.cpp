@@ -1029,8 +1029,8 @@ namespace dxvk {
         barriers.push_back(m_nrcCtx->createVkBufferMemoryBarrier(nrc::BufferIdx::DebugTrainingPathInfo, srcAccessMask, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT));
       }
 
-      // Create the barrier batch
-      vkCmdPipelineBarrier(ctx.getCmdBuffer(DxvkCmdBuffer::ExecBuffer), srcStageMask, dstStageMask, 0, 0, NULL, barriers.size(), barriers.data(), 0, NULL);
+      // Create the barrier batch (through Remix's dispatch, not vulkan-1.dll's export)
+      ctx.getDevice()->vkd()->vkCmdPipelineBarrier(ctx.getCmdBuffer(DxvkCmdBuffer::ExecBuffer), srcStageMask, dstStageMask, 0, 0, NULL, barriers.size(), barriers.data(), 0, NULL);
     }
 
     // Bind resources
@@ -1144,8 +1144,8 @@ namespace dxvk {
           barriers.push_back(m_nrcCtx->createVkBufferMemoryBarrier(nrc::BufferIdx::DebugTrainingPathInfo, srcAccessMask, destAccessMask));
         }
 
-        // Create the barrier batch
-        vkCmdPipelineBarrier(ctx.getCmdBuffer(DxvkCmdBuffer::ExecBuffer), srcStageMask, dstStageMask, 0, 0, NULL, barriers.size(), barriers.data(), 0, NULL);
+        // Create the barrier batch (through Remix's dispatch, not vulkan-1.dll's export)
+        ctx.getDevice()->vkd()->vkCmdPipelineBarrier(ctx.getCmdBuffer(DxvkCmdBuffer::ExecBuffer), srcStageMask, dstStageMask, 0, 0, NULL, barriers.size(), barriers.data(), 0, NULL);
       }
 
       // Dispatch SDK's query and train
