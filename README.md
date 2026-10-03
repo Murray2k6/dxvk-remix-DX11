@@ -12,7 +12,7 @@ A community fork of [NVIDIA's DXVK-Remix](https://github.com/NVIDIAGameWorks/dxv
 
 - **64-bit DX11 games:** copy all of `_output/x64` next to the game executable.
 - **32-bit DX11 games:** copy `_output/x86` (with its `.trex` folder) next to the game executable.
-- **DX12 games:** copy `_output/x64` and the two DLLs from its `vkd3d` folder next to the game executable (or `deploy_d3d11.ps1 -GameDir <game folder> -Dx12`). The Remix Vulkan layer turns itself on; no config or registry step.
+- **DX12 games:** the same; `_output/x64` includes vkd3d-proton's `d3d12.dll` and `d3d12core.dll`. Everything stays in the game folder: the Remix Vulkan layer turns itself on, no config or registry step.
 - **Vulkan games:** copy `_output/x64` next to the game executable and register the layer once with `install_remix_vk_layer.ps1`.
 
 Games with anti-cheat (EasyAntiCheat, BattlEye, ...) are not supported; Remix stays off next to them.

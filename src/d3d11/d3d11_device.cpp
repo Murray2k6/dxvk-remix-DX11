@@ -4095,6 +4095,17 @@ namespace dxvk {
   static std::mutex      g_sharedDeviceMutex;
   static Rc<DxvkDevice>  g_sharedDevice;
   static uint32_t        g_sharedDeviceRefCount = 0;
+  static bool            g_sharedDeviceImported = false;
+
+  bool D3D11DXGIDevice::RemixRunsOnGameDevice() {
+    std::lock_guard lock(g_sharedDeviceMutex);
+    return g_sharedDevice != nullptr && g_sharedDeviceImported;
+  }
+
+  bool D3D11DXGIDevice::RemixDeviceLive() {
+    std::lock_guard lock(g_sharedDeviceMutex);
+    return g_sharedDevice != nullptr;
+  }
 
   D3D11DXGIDevice::SharedDeviceLease::SharedDeviceLease(
     const Rc<DxvkInstance>& instance,
@@ -4147,6 +4158,7 @@ namespace dxvk {
 
     Logger::info("D3D11DXGIDevice: running on the game's imported VkDevice");
     g_sharedDevice = importedDevice;
+    g_sharedDeviceImported = true;
     m_device = importedDevice;
     g_sharedDeviceRefCount++;
   }
@@ -4165,6 +4177,7 @@ namespace dxvk {
         g_gameShaderPrewarmComplete = false;
       }
       g_sharedDevice = nullptr;
+      g_sharedDeviceImported = false;
     }
     // Release the lease while still holding the lifecycle mutex, including
     // the final DxvkDevice destructor and ShaderManager singleton teardown.

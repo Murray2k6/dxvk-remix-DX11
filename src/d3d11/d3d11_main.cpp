@@ -553,6 +553,59 @@ extern "C" {
       SDKVersion, ppDevice, pFeatureLevel, ppImmediateContext);
   }
 
+  // Remix renders on the game's own VkDevice (DX12 through vkd3d-proton,
+  // Vulkan through the layer): one renderer per process. A D3D11 device the
+  // game creates beside it (video, overlay, interop) runs on Windows' D3D11;
+  // on Remix's device its draws would enter the game's scene and its
+  // presents would path trace a second window. Windows' D3D11 needs the
+  // adapter from Windows' DXGI, found by the LUID of ours.
+  static HRESULT createSideDeviceOnSystemD3D11(
+          IDXGIAdapter*       pAdapter,
+          UINT                Flags,
+    const D3D_FEATURE_LEVEL*  pFeatureLevels,
+          UINT                FeatureLevels,
+          ID3D11Device**      ppDevice) {
+    DXGI_ADAPTER_DESC wanted = {};
+    if (pAdapter == nullptr || FAILED(pAdapter->GetDesc(&wanted)))
+      return E_INVALIDARG;
+
+    wchar_t sysPath[MAX_PATH];
+    GetSystemDirectoryW(sysPath, MAX_PATH);
+    wcscat_s(sysPath, L"\\dxgi.dll");
+    HMODULE sysDxgi = LoadLibraryExW(sysPath, nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+    if (sysDxgi == nullptr)
+      return E_FAIL;
+
+    using PFN_CreateDXGIFactory1 = HRESULT(WINAPI*)(REFIID, void**);
+    auto createFactory = reinterpret_cast<PFN_CreateDXGIFactory1>(GetProcAddress(sysDxgi, "CreateDXGIFactory1"));
+    if (createFactory == nullptr)
+      return E_FAIL;
+
+    Com<IDXGIFactory1> factory;
+    HRESULT hr = createFactory(__uuidof(IDXGIFactory1), reinterpret_cast<void**>(&factory));
+    if (FAILED(hr))
+      return hr;
+
+    Com<IDXGIAdapter1> adapter;
+    for (UINT i = 0; factory->EnumAdapters1(i, &adapter) != DXGI_ERROR_NOT_FOUND; i++) {
+      DXGI_ADAPTER_DESC1 desc = {};
+      if (SUCCEEDED(adapter->GetDesc1(&desc))
+       && desc.AdapterLuid.LowPart  == wanted.AdapterLuid.LowPart
+       && desc.AdapterLuid.HighPart == wanted.AdapterLuid.HighPart)
+        break;
+      adapter = nullptr;
+    }
+
+    if (adapter == nullptr) {
+      Logger::err("D3D11: no Windows DXGI adapter matches the requested one");
+      return E_FAIL;
+    }
+
+    Logger::info("D3D11: Remix renders on the game's VkDevice; this D3D11 device runs on Windows' D3D11");
+    return forwardToSystemD3D11CreateDevice(adapter.ptr(), D3D_DRIVER_TYPE_UNKNOWN, nullptr, Flags,
+      pFeatureLevels, FeatureLevels, D3D11_SDK_VERSION, ppDevice, nullptr, nullptr);
+  }
+
   static HRESULT forwardToSystemD3D11CreateDeviceAndSwapChain(
           IDXGIAdapter*         pAdapter,
           D3D_DRIVER_TYPE       DriverType,
@@ -619,6 +672,9 @@ extern "C" {
     }
 
     InitReturnPtr(ppDevice);
+
+    if (D3D11DXGIDevice::RemixRunsOnGameDevice())
+      return createSideDeviceOnSystemD3D11(pAdapter, Flags, pFeatureLevels, FeatureLevels, ppDevice);
 
     D3D11InitRemixFileSystem();
 

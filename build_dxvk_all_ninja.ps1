@@ -209,7 +209,10 @@ if (-not $RuntimeOnly) {
   Assert-PeMachine $launcher x86
   Assert-PeMachine $server x64
   Copy-Item -LiteralPath $launcher -Destination $x86 -Force
-  Get-ChildItem -LiteralPath $x64 -Force | Copy-Item -Destination $trex -Recurse -Force
+  # vkd3d-proton's DX12 DLLs are for 64-bit DX12 games, not the bridge server.
+  Get-ChildItem -LiteralPath $x64 -Force |
+    Where-Object { $_.Name -notin @('d3d12.dll', 'd3d12core.dll') } |
+    Copy-Item -Destination $trex -Recurse -Force
   Copy-Item -LiteralPath $server -Destination $trex -Force
   $clientVersion = Get-Content -LiteralPath (Join-Path $clientBuild 'version.h') -Raw
   $serverVersion = Get-Content -LiteralPath (Join-Path $serverBuild 'version.h') -Raw

@@ -849,6 +849,13 @@ namespace dxvk {
     
     Rc<DxvkDevice> STDMETHODCALLTYPE GetDXVKDevice();
 
+    // True while Remix renders on the game's own VkDevice (DX12 / Vulkan
+    // front ends): that device is the process's one Remix renderer.
+    static bool RemixRunsOnGameDevice();
+
+    // True while any Remix renderer (a DxvkDevice) is live in this process.
+    static bool RemixDeviceLive();
+
   private:
 
     // Owns one frontend's share of the Vulkan device. Declared before all
@@ -860,8 +867,8 @@ namespace dxvk {
                         const Rc<DxvkAdapter>& adapter,
                         D3D_FEATURE_LEVEL featureLevel);
       // A DxvkDevice running on the game's VkDevice (DX12 / Vulkan front
-      // ends). It becomes the process's shared device, so later D3D11
-      // devices in the process run on it as well.
+      // ends). It becomes the process's shared device; D3D11 devices the
+      // game creates beside it run on Windows' D3D11 (D3D11CoreCreateDevice).
       explicit SharedDeviceLease(const Rc<DxvkDevice>& importedDevice);
       ~SharedDeviceLease();
       SharedDeviceLease(const SharedDeviceLease&) = delete;

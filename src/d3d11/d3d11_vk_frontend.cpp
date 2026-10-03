@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <cwctype>
 
@@ -24,7 +25,43 @@ struct remix_vkfe_instance_t {
   remix_vkfe_frontend          frontend;
 };
 
+namespace dxvk {
+
+  // One Remix renderer per process: the first game VkDevice Remix starts on
+  // holds the claim until it is destroyed; devices the game creates beside
+  // it run without Remix. Taken in planDevice, before Remix changes the
+  // device's create info.
+  class RendererClaim {
+  public:
+    RendererClaim() = default;
+    RendererClaim(const RendererClaim&) = delete;
+    RendererClaim& operator=(const RendererClaim&) = delete;
+    ~RendererClaim() {
+      if (m_held)
+        s_claimed.store(false, std::memory_order_release);
+    }
+
+    bool tryTake() {
+      bool expected = false;
+      m_held = s_claimed.compare_exchange_strong(expected, true, std::memory_order_acq_rel);
+      return m_held;
+    }
+
+    // Takes over another holder's claim (this one holds none).
+    void adopt(RendererClaim& other) {
+      m_held = std::exchange(other.m_held, false);
+    }
+
+  private:
+    bool m_held = false;
+    inline static std::atomic<bool> s_claimed { false };
+  };
+
+}
+
 struct remix_vkfe_device_t {
+  // Declared first, so it is released after the device has shut down.
+  dxvk::RendererClaim                          claim;
   std::unique_ptr<dxvk::D3D11VkFrontendDevice> device;
 };
 
@@ -44,6 +81,7 @@ namespace dxvk {
     };
 
     struct DevicePending : remix_vkfe_pending_t {
+      RendererClaim                       claim;
       remix_vkfe_frontend                 frontend;
       Rc<DxvkInstance>                    instance;
       Rc<DxvkAdapter>                     adapter;
@@ -1622,6 +1660,18 @@ namespace {
     }
 
     auto pending = std::make_unique<DevicePending>();
+
+    // A D3D11 device the game created earlier already runs Remix here.
+    if (D3D11DXGIDevice::RemixDeviceLive() && !D3D11DXGIDevice::RemixRunsOnGameDevice()) {
+      Logger::warn("[Remix-VkFrontend] Remix already renders on a D3D11 device in this process; this VkDevice runs without Remix");
+      return REMIX_VKFE_UNSUPPORTED;
+    }
+
+    if (!pending->claim.tryTake()) {
+      Logger::warn("[Remix-VkFrontend] Remix already renders on another of the game's VkDevices; this one runs without Remix");
+      return REMIX_VKFE_UNSUPPORTED;
+    }
+
     pending->frontend = request->instance->frontend;
     pending->instance = instance;
     pending->adapter  = adapter;
@@ -1662,11 +1712,12 @@ namespace {
     try {
       Rc<DxvkDevice> dxvkDevice = pending->importer->import(device, getDeviceProcAddr);
 
-      auto* result = new remix_vkfe_device_t;
+      auto result = std::make_unique<remix_vkfe_device_t>();
       result->device = std::make_unique<D3D11VkFrontendDevice>(
         pending->frontend, pending->instance, pending->adapter, dxvkDevice,
         pending->importer->sharesGameQueue());
-      *outDevice = result;
+      result->claim.adopt(pending->claim);
+      *outDevice = result.release();
       return REMIX_VKFE_OK;
     } catch (const DxvkError& e) {
       Logger::err(str::format("[Remix-VkFrontend] Remix could not start on the game's device: ", e.message()));
