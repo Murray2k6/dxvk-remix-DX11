@@ -33,7 +33,8 @@
 extern "C" {
 #endif
 
-#define REMIX_VKFE_VERSION 1u
+/* 2: get_reflex_mode, on_swapchain_window. */
+#define REMIX_VKFE_VERSION 2u
 #define REMIX_VKFE_ENTRY_POINT "remix_vkfe_get_api"
 
 typedef enum remix_vkfe_result {
@@ -631,7 +632,20 @@ typedef struct remix_vkfe_api {
   void (*on_submit_bytes)(remix_vkfe_device device, VkCommandBuffer command_buffer,
                           uint32_t draw_index, uint32_t binding_index,
                           const void* data, VkDeviceSize size);
+
+  /* Remix's Reflex setting, which the layer applies to the game's swap chain
+   * through VK_NV_low_latency2 (Remix's own Reflex library cannot run on the
+   * game's device). REMIX_VKFE_REFLEX_*; read every present. */
+  uint32_t (*get_reflex_mode)(remix_vkfe_device device);
+
+  /* After on_swapchain: the window (HWND) behind the swap chain's surface,
+   * where Remix draws its menu and reads its input. */
+  void (*on_swapchain_window)(remix_vkfe_device device, VkSwapchainKHR swapchain, void* window);
 } remix_vkfe_api;
+
+#define REMIX_VKFE_REFLEX_OFF           0u
+#define REMIX_VKFE_REFLEX_LOW_LATENCY   1u
+#define REMIX_VKFE_REFLEX_BOOST         2u
 
 typedef remix_vkfe_result (*PFN_remix_vkfe_get_api)(uint32_t version, const remix_vkfe_api** api);
 

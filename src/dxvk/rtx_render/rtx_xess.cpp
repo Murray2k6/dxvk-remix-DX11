@@ -142,6 +142,14 @@ namespace dxvk {
   }
 
   bool DxvkXeSS::validateXeSSSupport(DxvkDevice* device) {
+    // XeSS takes raw handles and calls vulkan-1.dll itself; on the game's own
+    // device (DX12 / Vulkan front ends) the loader aborts on the layer
+    // chain's handles.
+    if (device->instance()->isImported()) {
+      Logger::warn("XeSS: not available on the game's own Vulkan device");
+      return false;
+    }
+
     if (!isXeSSLibraryAvailable()) {
       return false;
     }

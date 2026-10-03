@@ -24,14 +24,17 @@
 #define ProfilerPlotValueI64(name, val) \
         TracyPlot(name, int64_t(val))
 
+// GPU zones are inactive where the queue has no Tracy context (the game's
+// own device, DX12 / Vulkan front ends: DxvkDevice skips them there).
 #define ScopedGpuProfileZone(ctx, name) \
         ScopedCpuProfileZoneN(name); \
-        TracyVkZone((ctx)->getDevice()->queues().graphics.tracyCtx, (ctx)->getCmdBuffer(DxvkCmdBuffer::ExecBuffer), name); \
+        TracyVkNamedZone((ctx)->getDevice()->queues().graphics.tracyCtx, __tracyGpuZone, (ctx)->getCmdBuffer(DxvkCmdBuffer::ExecBuffer), name, \
+          (ctx)->getDevice()->queues().graphics.tracyCtx != nullptr); \
         __ScopedAnnotation __scopedAnnotation(ctx, name)
 
 #define ScopedGpuProfileZoneQ(device, cmdbuf, queue, name) \
         ScopedCpuProfileZoneN(name); \
-        TracyVkZone((device)->queues().queue.tracyCtx, cmdbuf, name); \
+        TracyVkNamedZone((device)->queues().queue.tracyCtx, __tracyGpuZone, cmdbuf, name, (device)->queues().queue.tracyCtx != nullptr); \
         __ScopedQueueAnnotation __scopedQueueAnnotation(device, cmdbuf, name)
 
 #define ScopedGpuProfileZone_Present(device, cmdbuf, name) \
@@ -47,7 +50,8 @@
   #define ScopedGpuProfileZoneDynamicZ(ctx, name) \
           ScopedCpuProfileZone(); \
           ZoneText(name, std::strlen(name)); \
-          TracyVkZoneTransient((ctx)->getDevice()->queues().graphics.tracyCtx, TracyConcat(__tracy_gpu_source_location,__LINE__), (ctx)->getCmdBuffer(DxvkCmdBuffer::ExecBuffer), name, true); \
+          TracyVkZoneTransient((ctx)->getDevice()->queues().graphics.tracyCtx, TracyConcat(__tracy_gpu_source_location,__LINE__), (ctx)->getCmdBuffer(DxvkCmdBuffer::ExecBuffer), name, \
+            (ctx)->getDevice()->queues().graphics.tracyCtx != nullptr); \
           __ScopedAnnotation __scopedAnnotation(ctx, name)
 
   #define TRACY_OBJECT_MEMORY_PROFILING \

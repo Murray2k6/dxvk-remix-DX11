@@ -1158,8 +1158,15 @@ namespace remix_vklayer {
         return;
 
       remix_vkfe_draw_desc desc = {};
-      std::vector<remix_vkfe_vertex_buffer> vbs;
-      std::vector<remix_vkfe_binding> bindings;
+      // Per-thread scratch, filled for this draw and copied by Remix during
+      // on_draw: no allocation per draw once they have grown.
+      thread_local std::vector<remix_vkfe_vertex_buffer> vbsScratch;
+      thread_local std::vector<remix_vkfe_binding> bindingsScratch;
+      thread_local std::vector<uint32_t> dynamicScratch;
+      std::vector<remix_vkfe_vertex_buffer>& vbs = vbsScratch;
+      std::vector<remix_vkfe_binding>& bindings = bindingsScratch;
+      vbs.clear();
+      bindings.clear();
       VkPipeline variant = VK_NULL_HANDLE;
       bool dynamicDiscard = false;
       BakePipeline bake;
@@ -1273,7 +1280,8 @@ namespace remix_vklayer {
             continue;
 
           // Dynamic offset index per (binding, element), in binding order.
-          std::vector<uint32_t> dynamicBindings;
+          std::vector<uint32_t>& dynamicBindings = dynamicScratch;
+          dynamicBindings.clear();
 
           if (bound.set->layout) {
             for (const auto& b : bound.set->layout->bindings) {
@@ -2552,6 +2560,9 @@ namespace remix_vklayer {
           buffers.insert(buffers.end(), pSubmits[i].pCommandBuffers, pSubmits[i].pCommandBuffers + pSubmits[i].commandBufferCount);
 
         reportSubmit(dev, queue, buffers);
+
+        if (!buffers.empty())
+          reflexOnSubmit(dev);
       }
 
       QueueLock lock(dev, queue);
@@ -2572,6 +2583,9 @@ namespace remix_vklayer {
         std::vector<VkCommandBuffer> buffers;
         collectSubmit2(count, pSubmits, buffers);
         reportSubmit(dev, queue, buffers);
+
+        if (!buffers.empty())
+          reflexOnSubmit(dev);
       }
 
       QueueLock lock(dev, queue);
@@ -2585,6 +2599,9 @@ namespace remix_vklayer {
         std::vector<VkCommandBuffer> buffers;
         collectSubmit2(count, pSubmits, buffers);
         reportSubmit(dev, queue, buffers);
+
+        if (!buffers.empty())
+          reflexOnSubmit(dev);
       }
 
       QueueLock lock(dev, queue);
@@ -2623,7 +2640,30 @@ namespace remix_vklayer {
           info.imageUsage |= caps.supportedUsageFlags & kTransfer;
       }
 
+      // Reflex (vklayer_reflex.cpp) needs latency mode on the swap chain.
+      // vkd3d-proton chains its own when the driver has the extension.
+      VkSwapchainLatencyCreateInfoNV latency = { VK_STRUCTURE_TYPE_SWAPCHAIN_LATENCY_CREATE_INFO_NV };
+      latency.pNext = const_cast<void*>(pCreateInfo->pNext);
+      latency.latencyModeEnable = VK_TRUE;
+      bool latencyMode = dev->reflex.enabled;
+      bool gameLatency = false;
+
+      for (auto* s = reinterpret_cast<const VkBaseInStructure*>(pCreateInfo->pNext); s; s = s->pNext) {
+        if (s->sType == VK_STRUCTURE_TYPE_SWAPCHAIN_LATENCY_CREATE_INFO_NV)
+          gameLatency = reinterpret_cast<const VkSwapchainLatencyCreateInfoNV*>(s)->latencyModeEnable == VK_TRUE;
+      }
+
+      if (latencyMode && !gameLatency)
+        info.pNext = &latency;
+
       VkResult result = dev->CreateSwapchainKHR(device, &info, pAllocator, pSwapchain);
+
+      if (result != VK_SUCCESS && latencyMode && !gameLatency) {
+        log("swap chain creation with Reflex latency mode failed (%d); creating it without", result);
+        latencyMode = false;
+        info.pNext = pCreateInfo->pNext;
+        result = dev->CreateSwapchainKHR(device, &info, pAllocator, pSwapchain);
+      }
 
       if (result != VK_SUCCESS && info.imageUsage != pCreateInfo->imageUsage) {
         log("swap chain creation with transfer usage failed (%d); creating the game's swap chain unchanged", result);
@@ -2646,6 +2686,9 @@ namespace remix_vklayer {
         sc.images = images;
         sc.format = info.imageFormat;
         sc.extent = info.imageExtent;
+        sc.latency = latencyMode && (gameLatency || info.pNext == &latency);
+        sc.reflexMode = UINT32_MAX;
+        sc.lastPresentId = 0;
 
         for (VkImage image : images) {
           ImageInfo ii;
@@ -2659,6 +2702,10 @@ namespace remix_vklayer {
       }
 
       remixApi()->on_swapchain(dev->remix, *pSwapchain, &info, imageCount, images.data());
+
+      if (HWND window = dev->instance->windowOf(info.surface))
+        remixApi()->on_swapchain_window(dev->remix, *pSwapchain, window);
+
       return result;
     }
 
@@ -2742,17 +2789,53 @@ namespace remix_vklayer {
           dev->DestroyFramebuffer(dev->device, fb, nullptr);
       }
 
-      QueueLock lock(dev, queue);
+      // Reflex markers and present ID (vklayer_reflex.cpp).
+      uint64_t gamePresentId = 0;
 
-      if (!result.wait_semaphore)
-        return dev->QueuePresentKHR(queue, pPresentInfo);
+      // VK_KHR_present_id2's VkPresentId2KHR (newer than this branch's
+      // Vulkan headers) has VkPresentIdKHR's layout; vkd3d-proton uses either.
+      constexpr VkStructureType kPresentId2 = VkStructureType(1000479001);
+
+      for (auto* s = reinterpret_cast<const VkBaseInStructure*>(pPresentInfo->pNext); s; s = s->pNext) {
+        if (s->sType == VK_STRUCTURE_TYPE_PRESENT_ID_KHR || s->sType == kPresentId2) {
+          const auto* ids = reinterpret_cast<const VkPresentIdKHR*>(s);
+
+          if (ids->swapchainCount && ids->pPresentIds)
+            gamePresentId = ids->pPresentIds[0];
+        }
+      }
+
+      const uint64_t layerPresentId = reflexBeforePresent(dev, desc.swapchain, gamePresentId);
 
       // Remix waited on the game's semaphores and signals its own when its
       // frame is in the image.
       VkPresentInfoKHR present = *pPresentInfo;
-      present.waitSemaphoreCount = 1;
-      present.pWaitSemaphores    = &result.wait_semaphore;
-      return dev->QueuePresentKHR(queue, &present);
+
+      if (result.wait_semaphore) {
+        present.waitSemaphoreCount = 1;
+        present.pWaitSemaphores    = &result.wait_semaphore;
+      }
+
+      VkPresentIdKHR presentId = { VK_STRUCTURE_TYPE_PRESENT_ID_KHR };
+
+      if (layerPresentId && pPresentInfo->swapchainCount == 1) {
+        presentId.pNext          = present.pNext;
+        presentId.swapchainCount = 1;
+        presentId.pPresentIds    = &layerPresentId;
+        present.pNext            = &presentId;
+      }
+
+      VkResult presentResult;
+
+      {
+        QueueLock lock(dev, queue);
+        presentResult = dev->QueuePresentKHR(queue, &present);
+      }
+
+      // Outside the queue lock: the sleep holds the game's thread back until
+      // its next frame should start.
+      reflexAfterPresent(dev, desc.swapchain, gamePresentId ? gamePresentId : layerPresentId);
+      return presentResult;
     }
 
   }
@@ -2855,13 +2938,8 @@ namespace remix_vklayer {
       std::lock_guard lock(dev.mutex);
       auto it = dev.commandBuffers.find(cmd);
 
-      if (it != dev.commandBuffers.end()) {
-        const VkCommandPool pool = it->second->pool;
-        const bool primary = it->second->primary;
-        *it->second = CommandState();
-        it->second->pool = pool;
-        it->second->primary = primary;
-      }
+      if (it != dev.commandBuffers.end())
+        it->second->reset();
     }
 
     if (dev.remix)

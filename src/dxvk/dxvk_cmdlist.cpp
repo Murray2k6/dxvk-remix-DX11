@@ -206,7 +206,9 @@ namespace dxvk {
   
   
   void DxvkCommandList::endRecording() {
-    TracyVkCollect(m_device->queues().graphics.tracyCtx, m_execBuffer);
+    if (m_device->queues().graphics.tracyCtx) {
+      TracyVkCollect(m_device->queues().graphics.tracyCtx, m_execBuffer);
+    }
 
     if (m_vkd->vkEndCommandBuffer(m_execBuffer) != VK_SUCCESS
      || m_vkd->vkEndCommandBuffer(m_initBuffer) != VK_SUCCESS

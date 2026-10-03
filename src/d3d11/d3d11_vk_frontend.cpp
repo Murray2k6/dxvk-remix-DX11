@@ -5,8 +5,11 @@
 
 #include "d3d11_vk_frontend.h"
 #include "d3d11_vk_spirv.h"
+#include "d3d11_input_guard.h"
 
+#include "../dxvk/imgui/dxvk_imgui.h"
 #include "../dxvk/rtx_render/rtx_context.h"
+#include "../dxvk/rtx_render/rtx_option_manager.h"
 #include "../dxvk/rtx_render/rtx_options.h"
 #include "../dxvk/dxvk_scoped_annotation.h"
 
@@ -132,6 +135,97 @@ namespace dxvk {
       return first;
     }
 
+    // ---------------------------------------------------------------------
+    // Remix menu input on the game's window (DX12 / Vulkan): the counterpart
+    // of D3D11SwapChain's window procedure for DX11 games.
+
+    struct MenuWindowHook {
+      WNDPROC         previous = nullptr;
+      Rc<DxvkDevice>  device;
+    };
+
+    std::mutex                                  g_menuHookMutex;
+    std::unordered_map<HWND, MenuWindowHook>    g_menuHooks;
+
+    LRESULT CALLBACK menuWindowProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+      WNDPROC previous = nullptr;
+      Rc<DxvkDevice> device;
+
+      {
+        std::lock_guard lock(g_menuHookMutex);
+        auto it = g_menuHooks.find(hWnd);
+
+        if (it != g_menuHooks.end()) {
+          previous = it->second.previous;
+          device   = it->second.device;
+        }
+      }
+
+      if (device != nullptr) {
+        ImGUI& gui = device->getCommon()->getImgui();
+
+        // ImGui only sees the window's messages while the menu is open, so
+        // the game's input is untouched otherwise (the Alt+X toggle is
+        // polled at present).
+        if (gui.isInit() && gui.isMenuOpen()) {
+          if (gui.wndProcHandler(hWnd, msg, wParam, lParam))
+            return 0;
+
+          const bool key   = (msg >= WM_KEYFIRST && msg <= WM_KEYLAST) || (msg >= WM_SYSKEYDOWN && msg <= WM_SYSDEADCHAR);
+          const bool mouse = msg >= WM_MOUSEFIRST && msg <= WM_MOUSELAST;
+
+          // The game must not turn the camera or fire while the menu is used.
+          if (RtxOptions::blockInputToGameInUI() && (key || mouse || msg == WM_INPUT))
+            return 0;
+
+          // Alt+F4, Alt+Enter and a bare Alt still reach the game.
+          if ((msg == WM_SYSKEYDOWN || msg == WM_SYSKEYUP) && wParam != VK_MENU && wParam != VK_F4 && wParam != VK_RETURN)
+            return 0;
+
+          if (msg == WM_SYSCHAR)
+            return 0;
+        }
+      }
+
+      return previous ? CallWindowProcW(previous, hWnd, msg, wParam, lParam)
+                      : DefWindowProcW(hWnd, msg, wParam, lParam);
+    }
+
+    void hookMenuWindow(HWND window, const Rc<DxvkDevice>& device) {
+      if (!IsWindow(window))
+        return;
+
+      std::lock_guard lock(g_menuHookMutex);
+      auto& hook = g_menuHooks[window];
+      hook.device = device;
+
+      WNDPROC current = reinterpret_cast<WNDPROC>(GetWindowLongPtrW(window, GWLP_WNDPROC));
+
+      if (current != menuWindowProc) {
+        hook.previous = current;
+        SetWindowLongPtrW(window, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(menuWindowProc));
+        Logger::info(str::format("[Remix-VkFrontend] Remix menu input hooked on HWND ", uintptr_t(window)));
+      }
+    }
+
+    void unhookMenuWindows(const Rc<DxvkDevice>& device) {
+      std::lock_guard lock(g_menuHookMutex);
+
+      for (auto it = g_menuHooks.begin(); it != g_menuHooks.end(); ) {
+        if (it->second.device != device) {
+          ++it;
+          continue;
+        }
+
+        // Only restore when no one hooked the window after Remix.
+        if (IsWindow(it->first)
+         && reinterpret_cast<WNDPROC>(GetWindowLongPtrW(it->first, GWLP_WNDPROC)) == menuWindowProc)
+          SetWindowLongPtrW(it->first, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(it->second.previous));
+
+        it = g_menuHooks.erase(it);
+      }
+    }
+
   }
 
 
@@ -234,6 +328,9 @@ namespace dxvk {
 
 
   D3D11VkFrontendDevice::~D3D11VkFrontendDevice() {
+    // The window keeps receiving messages after Remix is gone.
+    unhookMenuWindows(m_device);
+
     // The game destroys its VkDevice right after this returns: drain Remix's
     // CS thread and GPU work first.
     if (m_context) {
@@ -471,6 +568,23 @@ namespace dxvk {
   }
 
 
+  void D3D11VkFrontendDevice::onSwapchainWindow(VkSwapchainKHR swapchain, HWND window) {
+    {
+      std::lock_guard lock(m_mutex);
+      auto it = m_swapchains.find(swapchain);
+
+      if (it == m_swapchains.end())
+        return;
+
+      it->second.window = window;
+    }
+
+    hookMenuWindow(window, m_device);
+    // DirectInput / cursor hooks that hold the game back while the menu is open.
+    D3D11InputGuard::install();
+  }
+
+
   void D3D11VkFrontendDevice::onSwapchainDestroy(VkSwapchainKHR swapchain) {
     std::lock_guard lock(m_mutex);
 
@@ -561,6 +675,12 @@ namespace dxvk {
       const auto& ps = pipeline->stages[REMIX_VKFE_STAGE_PIXEL].code;
       pipeline->pixelAnalysis = D3D11VkAnalyzePixelShader(reinterpret_cast<const uint32_t*>(ps.data()), ps.size() / 4);
     }
+
+    // Depth-only pipelines (prepasses, shadow maps): their draws are never
+    // committed (captureFrame drops depth-only draws), so no capture variant
+    // is compiled for them. A write mask set per draw keeps its variant.
+    if (desc->render_target_count == 0 || (desc->color_write_mask == 0 && !desc->bake_blocking_dynamic_state))
+      pipeline->captureSupported = false;
 
     if (pipeline->captureSupported) {
       plan->supported  = 1;
@@ -779,6 +899,7 @@ namespace dxvk {
     constexpr VkDeviceSize kMaxConstantBytes = 64ull << 10;
     constexpr VkDeviceSize kMaxStorageBytes  = 512ull << 10;
 
+    ScopedCpuProfileZone();
     *capture = remix_vkfe_draw_capture{};
 
     D3D11VkDraw draw;
@@ -840,12 +961,18 @@ namespace dxvk {
     if (pipeline != m_pipelines.end())
       draw.pipeline = pipeline->second;
 
-    // Capture: triangle draws of pipelines with a capture variant.
+    // Capture: triangle draws of pipelines with a capture variant. Depth-only
+    // draws are never committed (captureFrame); their bindings still feed the
+    // sun and the camera, so they are recorded, just not replayed.
     const bool gpuCounted = desc->indirect_buffer
       || (draw.pipeline && (draw.pipeline->state.topology == VK_PRIMITIVE_TOPOLOGY_MAX_ENUM
                          || draw.pipeline->captureCountedOnGpu));
+    const bool depthOnlyDraw = desc->render_target_count == 0
+      || (draw.pipeline && draw.pipeline->state.color_write_mask == 0);
 
-    if (draw.pipeline && draw.pipeline->captureSupported && gpuCounted) {
+    if (depthOnlyDraw) {
+      // No capture.
+    } else if (draw.pipeline && draw.pipeline->captureSupported && gpuCounted) {
       // GPU-counted (indirect, dynamic topology, tessellation / GS): the
       // vertex count is decided on the GPU (Unreal's culling writes the
       // arguments every frame), so reserve a range and let the XFB byte
@@ -959,7 +1086,20 @@ namespace dxvk {
       }
     }
 
-    m_recorded[desc->command_buffer].push_back(std::move(draw));
+    auto recording = m_recorded.find(desc->command_buffer);
+
+    if (recording == m_recorded.end()) {
+      std::vector<D3D11VkDraw> draws;
+
+      if (!m_spareRecordings.empty()) {
+        draws = std::move(m_spareRecordings.back());
+        m_spareRecordings.pop_back();
+      }
+
+      recording = m_recorded.emplace(desc->command_buffer, std::move(draws)).first;
+    }
+
+    recording->second.push_back(std::move(draw));
   }
 
 
@@ -985,8 +1125,22 @@ namespace dxvk {
 
 
   void D3D11VkFrontendDevice::onCommandBufferReset(VkCommandBuffer commandBuffer) {
+    ScopedCpuProfileZone();
     std::lock_guard lock(m_mutex);
-    m_recorded.erase(commandBuffer);
+
+    // A bounded pool: enough for a frame's command buffers in flight.
+    constexpr size_t kMaxSpareRecordings = 256;
+    auto recording = m_recorded.find(commandBuffer);
+
+    if (recording != m_recorded.end()) {
+      if (m_spareRecordings.size() < kMaxSpareRecordings) {
+        recording->second.clear();
+        m_spareRecordings.push_back(std::move(recording->second));
+      }
+
+      m_recorded.erase(recording);
+    }
+
     m_uiSnapshotCommands.erase(commandBuffer);
     m_uiLayerCommands.erase(commandBuffer);
     m_uiLayerIncomplete.erase(commandBuffer);
@@ -1274,6 +1428,7 @@ namespace dxvk {
           uint32_t                    bindingIndex,
     const void*                       data,
           VkDeviceSize                size) {
+    ScopedCpuProfileZone();
     constexpr VkDeviceSize kMaxConstantBytes = 64ull << 10;
     constexpr VkDeviceSize kMaxStorageBytes  = 512ull << 10;
 
@@ -1309,6 +1464,7 @@ namespace dxvk {
 
 
   void D3D11VkFrontendDevice::onSubmit(const remix_vkfe_submit_desc* desc) {
+    ScopedCpuProfileZone();
     std::lock_guard lock(m_mutex);
 
     // Submit-time bytes (onSubmitBytes, called just before) are shared
@@ -1371,6 +1527,24 @@ namespace dxvk {
     }
 
     D3D11VkSwapchain& sc = it->second;
+
+    // Remix menu (as D3D11SwapChain::PresentImage): Alt+X toggles it - polled,
+    // since the window procedure hands ImGui messages only while it is open -
+    // and the game's input is held back while it is open.
+    if (sc.window) {
+      ImGUI& gui = m_device->getCommon()->getImgui();
+      D3D11InputGuard::setBlocking(gui.isInit() && gui.isMenuOpen() && RtxOptions::blockInputToGameInUI());
+
+      const bool down = (::GetAsyncKeyState(VK_MENU) & 0x8000) && (::GetAsyncKeyState('X') & 0x8000);
+
+      if (down && !m_menuHotkeyDown && GetForegroundWindow() == sc.window) {
+        gui.toggleMenuFromHotkey();
+        gui.markRemixMenuHotkeyHandled();
+      }
+
+      m_menuHotkeyDown = down;
+    }
+
     const uint32_t index = desc->image_index;
     const VkSemaphore gameDone  = sc.gameDone[index];
     const VkSemaphore remixDone = sc.remixDone[index];
@@ -1509,6 +1683,23 @@ namespace dxvk {
         compositeUi(sc, *uiSnapshot);
 
       const Rc<DxvkImage> presented = (uiSnapshot || uiLayer) ? sc.uiOut : target;
+
+      // The Remix menu over everything, the game's HUD included.
+      if (sc.window) {
+        RtxOptionManager::applyPendingValues(m_device.ptr(), false);
+        Rc<DxvkImageView> menuTarget = compositeView(m_device, presented, sc.format, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
+
+        m_context->EmitCs([device = m_device, window = sc.window, menuTarget, extent] (DxvkContext* ctx) {
+          DxvkRenderTargets targets;
+          targets.color[0].view   = menuTarget;
+          targets.color[0].layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+          ctx->bindRenderTargets(targets);
+
+          device->getCommon()->getImgui().render(window, Rc<DxvkContext>(ctx), extent, false);
+
+          ctx->bindRenderTargets(DxvkRenderTargets());
+        });
+      }
 
       m_context->EmitCs([remixDone, image, presented, layers, copyExtent] (DxvkContext* ctx) {
         ctx->copyImage(image, layers, VkOffset3D(), presented, layers, VkOffset3D(), copyExtent);
@@ -1845,6 +2036,22 @@ namespace {
       device->device->onSubmitBytes(cmd, drawIndex, bindingIndex, data, size);
   }
 
+  void onSwapchainWindow(remix_vkfe_device device, VkSwapchainKHR swapchain, void* window) {
+    if (device && window)
+      device->device->onSwapchainWindow(swapchain, static_cast<HWND>(window));
+  }
+
+  uint32_t getReflexMode(remix_vkfe_device) {
+    if (!RtxOptions::isReflexEnabled())
+      return REMIX_VKFE_REFLEX_OFF;
+
+    switch (RtxOptions::reflexMode()) {
+      case ReflexMode::LowLatency:      return REMIX_VKFE_REFLEX_LOW_LATENCY;
+      case ReflexMode::LowLatencyBoost: return REMIX_VKFE_REFLEX_BOOST;
+      default:                          return REMIX_VKFE_REFLEX_OFF;
+    }
+  }
+
   void lockQueue(remix_vkfe_device device, VkQueue queue) {
     if (device)
       device->device->lockQueue(queue);
@@ -1880,6 +2087,8 @@ namespace {
     getUiLayer,
     onUiLayer,
     onSubmitBytes,
+    getReflexMode,
+    onSwapchainWindow,
   };
 
 }

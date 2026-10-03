@@ -74,6 +74,19 @@ namespace remix_vklayer {
     remix_vkfe_instance                             remix = nullptr;
     // The application is vkd3d-proton (a DX12 game), not a native Vulkan game.
     bool                                            vkd3d = false;
+
+    // The window behind each surface, for the Remix menu (input and drawing)
+    // on the swap chains created for it.
+    PFN_vkCreateWin32SurfaceKHR                     CreateWin32SurfaceKHR = nullptr;
+    PFN_vkDestroySurfaceKHR                         DestroySurfaceKHR = nullptr;
+    std::mutex                                      surfaceMutex;
+    std::unordered_map<VkSurfaceKHR, HWND>          surfaceWindows;
+
+    HWND windowOf(VkSurfaceKHR surface) {
+      std::lock_guard lock(surfaceMutex);
+      auto it = surfaceWindows.find(surface);
+      return it != surfaceWindows.end() ? it->second : nullptr;
+    }
   };
 
   // ------------------------------------------------------------------------
@@ -265,6 +278,37 @@ namespace remix_vklayer {
     std::vector<VkImage> images;
     VkFormat             format = VK_FORMAT_UNDEFINED;
     VkExtent2D           extent = { 0u, 0u };
+    // Created with latency mode enabled (DeviceData::reflex).
+    bool                 latency = false;
+    // Reflex mode last applied (REMIX_VKFE_REFLEX_*; UINT32_MAX: none yet).
+    uint32_t             reflexMode = UINT32_MAX;
+    // Highest present ID used on this swap chain; IDs must increase.
+    uint64_t             lastPresentId = 0;
+  };
+
+  // Reflex on the game's swap chain through VK_NV_low_latency2. Remix's own
+  // Reflex library cannot run on the game's device, and on Windows the game's
+  // NVAPI Reflex calls never reach vkd3d-proton; so the layer applies Remix's
+  // Reflex setting itself - unless the game enabled VK_NV_low_latency2 and
+  // drives it already.
+  struct ReflexState {
+    bool                            enabled = false;
+    // VK_KHR_present_id is on, so present IDs tie markers to presents.
+    bool                            presentIds = false;
+    PFN_vkSetLatencySleepModeNV     setLatencySleepMode = nullptr;
+    PFN_vkLatencySleepNV            latencySleep = nullptr;
+    PFN_vkSetLatencyMarkerNV        setLatencyMarker = nullptr;
+    PFN_vkCreateSemaphore           createSemaphore = nullptr;
+    PFN_vkDestroySemaphore          destroySemaphore = nullptr;
+    PFN_vkWaitSemaphores            waitSemaphores = nullptr;
+    VkSemaphore                     semaphore = VK_NULL_HANDLE;   // timeline, signaled by the sleep
+    uint64_t                        sleepValue = 0;
+    // The frame being recorded: its swap chain and ID, and whether its first
+    // submission (end of simulation, start of render submission) was marked.
+    std::mutex                      mutex;
+    VkSwapchainKHR                  swapchain = VK_NULL_HANDLE;
+    uint64_t                        frameId = 0;
+    bool                            submitMarked = true;
   };
 
   // ------------------------------------------------------------------------
@@ -389,6 +433,32 @@ namespace remix_vklayer {
     // The last dynamic-rendering instance ended suspended: it resumes later,
     // and nothing may be recorded until it really ends.
     bool                                  renderingSuspended = false;
+
+    // Back to the initial state for a new recording, keeping the vectors'
+    // capacity: games re-record their command buffers every frame.
+    void reset() {
+      CommandState fresh;
+      fresh.pool    = pool;
+      fresh.primary = primary;
+
+      auto keep = [](auto& from, auto& to) {
+        from.clear();
+        to = std::move(from);
+      };
+
+      keep(imagelessViews,  fresh.imagelessViews);
+      keep(passViews,       fresh.passViews);
+      keep(renderingColors, fresh.renderingColors);
+      keep(secondaries,     fresh.secondaries);
+      keep(annotation,      fresh.annotation);
+      keep(submitReads,     fresh.submitReads);
+      keep(argsCopies,      fresh.argsCopies);
+
+      for (uint32_t i = 0; i < kMaxSets; i++)
+        keep(sets[i].dynamicOffsets, fresh.sets[i].dynamicOffsets);
+
+      *this = std::move(fresh);
+    }
   };
 
   struct DeviceData {
@@ -433,8 +503,35 @@ namespace remix_vklayer {
     std::atomic<bool>           snapshotTaken = { false };
     std::atomic<bool>           uiStarted = { false };
 
+    ReflexState                 reflex;
+
     bool active() const { return remix != nullptr; }
   };
+
+  // vklayer_reflex.cpp
+  // Extensions and features Reflex adds to the game's device create info;
+  // the storage the modified create info points into.
+  struct ReflexDeviceRequest {
+    VkDeviceCreateInfo                        info = {};
+    std::vector<const char*>                  extensions;
+    VkPhysicalDevicePresentIdFeaturesKHR      presentId = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_FEATURES_KHR };
+    bool                                      enabled = false;
+    bool                                      presentIds = false;
+  };
+
+  // Fills request from info (the create info Remix planned) when the device
+  // supports VK_NV_low_latency2 and the game (gameInfo) does not use it.
+  void reflexPlanDevice(InstanceData* inst, VkPhysicalDevice physical,
+                        const VkDeviceCreateInfo* gameInfo, const VkDeviceCreateInfo* info,
+                        ReflexDeviceRequest* request);
+  void reflexInitDevice(DeviceData* dev, const ReflexDeviceRequest& request);
+  void reflexDestroyDevice(DeviceData* dev);
+  // First queue submission of a frame.
+  void reflexOnSubmit(DeviceData* dev);
+  // Around the game's present on swapchain; returns the present ID to chain
+  // (0: none). gameId: the game's own VkPresentIdKHR value, 0 if it has none.
+  uint64_t reflexBeforePresent(DeviceData* dev, VkSwapchainKHR swapchain, uint64_t gameId);
+  void reflexAfterPresent(DeviceData* dev, VkSwapchainKHR swapchain, uint64_t presentId);
 
   // Registries (vklayer_dispatch.cpp).
   InstanceData* findInstance(DispatchKey key);

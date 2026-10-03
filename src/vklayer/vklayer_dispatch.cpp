@@ -279,6 +279,10 @@ namespace remix_vklayer {
         gipa(*pInstance, "vkGetPhysicalDeviceFeatures2KHR"));
       data->GetPhysicalDeviceSurfaceCapabilitiesKHR = reinterpret_cast<PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR>(
         gipa(*pInstance, "vkGetPhysicalDeviceSurfaceCapabilitiesKHR"));
+      data->CreateWin32SurfaceKHR = reinterpret_cast<PFN_vkCreateWin32SurfaceKHR>(
+        gipa(*pInstance, "vkCreateWin32SurfaceKHR"));
+      data->DestroySurfaceKHR = reinterpret_cast<PFN_vkDestroySurfaceKHR>(
+        gipa(*pInstance, "vkDestroySurfaceKHR"));
 
       if (pending) {
         if (api->finish_instance(pending, result, *pInstance, gipa, &data->remix) == REMIX_VKFE_OK)
@@ -314,6 +318,43 @@ namespace remix_vklayer {
         remixApi()->destroy_instance(data->remix);
 
       data->DestroyInstance(instance, pAllocator);
+    }
+
+
+    VKAPI_ATTR VkResult VKAPI_CALL CreateWin32SurfaceKHR(
+            VkInstance                      instance,
+      const VkWin32SurfaceCreateInfoKHR*    pCreateInfo,
+      const VkAllocationCallbacks*          pAllocator,
+            VkSurfaceKHR*                   pSurface) {
+      InstanceData* inst = findInstance(keyOf(instance));
+
+      if (!inst || !inst->CreateWin32SurfaceKHR)
+        return VK_ERROR_EXTENSION_NOT_PRESENT;
+
+      VkResult result = inst->CreateWin32SurfaceKHR(instance, pCreateInfo, pAllocator, pSurface);
+
+      if (result == VK_SUCCESS && inst->remix) {
+        std::lock_guard lock(inst->surfaceMutex);
+        inst->surfaceWindows[*pSurface] = pCreateInfo->hwnd;
+      }
+
+      return result;
+    }
+
+
+    VKAPI_ATTR void VKAPI_CALL DestroySurfaceKHR(VkInstance instance, VkSurfaceKHR surface,
+                                                 const VkAllocationCallbacks* pAllocator) {
+      InstanceData* inst = findInstance(keyOf(instance));
+
+      if (!inst || !inst->DestroySurfaceKHR)
+        return;
+
+      {
+        std::lock_guard lock(inst->surfaceMutex);
+        inst->surfaceWindows.erase(surface);
+      }
+
+      inst->DestroySurfaceKHR(instance, surface, pAllocator);
     }
 
 
@@ -434,19 +475,36 @@ namespace remix_vklayer {
       const VkDeviceCreateInfo* info = pCreateInfo;
       remix_vkfe_pending pending = nullptr;
 
+      ReflexDeviceRequest reflex;
+      // Remix's planned create info, before Reflex adds to it.
+      const VkDeviceCreateInfo* remixInfo = pCreateInfo;
+
       if (api) {
         remix_vkfe_device_request request = { inst->remix, physicalDevice, pCreateInfo };
         remix_vkfe_device_plan plan = {};
 
         if (api->plan_device(&request, &plan) == REMIX_VKFE_OK) {
           info = plan.create_info;
+          remixInfo = info;
           pending = plan.pending;
+
+          reflexPlanDevice(inst, physicalDevice, pCreateInfo, info, &reflex);
+
+          if (reflex.enabled)
+            info = &reflex.info;
         } else {
           log("Remix cannot run on this device (no ray tracing support or no spare queue); passing through");
         }
       }
 
       VkResult result = createDevice(physicalDevice, info, pAllocator, pDevice);
+
+      if (result != VK_SUCCESS && reflex.enabled) {
+        log("vkCreateDevice with Reflex's extensions failed (%d); retrying without them", result);
+        reflex.enabled = false;
+        chain->u.pLayerInfo = nextLink;
+        result = createDevice(physicalDevice, remixInfo, pAllocator, pDevice);
+      }
 
       if (result != VK_SUCCESS && pending) {
         remix_vkfe_device unused = nullptr;
@@ -477,6 +535,9 @@ namespace remix_vklayer {
           log("Remix could not start on the game's VkDevice; see Remix's log");
       }
 
+      if (data->remix)
+        reflexInitDevice(data.get(), reflex);
+
       std::unique_lock lock(g_registryMutex);
       g_devices[keyOf(*pDevice)] = std::move(data);
       return VK_SUCCESS;
@@ -504,6 +565,8 @@ namespace remix_vklayer {
       // before the device goes away.
       if (data->remix)
         remixApi()->destroy_device(data->remix);
+
+      reflexDestroyDevice(data.get());
 
       // The layer's own framebuffers around Remix's bake / UI layer images.
       // The game's work has finished by now (vkDestroyDevice requires it).
@@ -550,6 +613,8 @@ namespace remix_vklayer {
     REMIX_VKLAYER_HOOK(EnumerateDeviceExtensionProperties)
     REMIX_VKLAYER_HOOK(GetPhysicalDeviceFeatures2)
     REMIX_VKLAYER_HOOK(GetPhysicalDeviceFeatures2KHR)
+    REMIX_VKLAYER_HOOK(CreateWin32SurfaceKHR)
+    REMIX_VKLAYER_HOOK(DestroySurfaceKHR)
 #undef REMIX_VKLAYER_HOOK
     return nullptr;
   }

@@ -88,6 +88,15 @@ namespace dxvk {
       return;
     }
 
+    // On the game's own device (DX12 / Vulkan front ends) NvLowLatencyVk does
+    // not work ("No Vulkan support"); the Remix layer applies this Reflex
+    // setting to the game's swap chain through VK_NV_low_latency2 instead
+    // (src/vklayer/vklayer_reflex.cpp).
+    if (m_device->instance()->isImported()) {
+      Logger::info("Reflex: applied by the Remix Vulkan layer on the game's swap chain");
+      return;
+    }
+
     // Initialize Reflex
 
     NvLL_VK_Status status = NvLL_VK_Initialize();

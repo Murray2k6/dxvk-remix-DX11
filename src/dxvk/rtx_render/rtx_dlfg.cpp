@@ -1049,7 +1049,9 @@ namespace dxvk {
   }
 
   void DxvkDLFGCommandList::endRecording() {
-    TracyVkCollect(m_device->queues().__DLFG_QUEUE.tracyCtx, m_cmdBuf);
+    if (m_device->queues().__DLFG_QUEUE.tracyCtx) {
+      TracyVkCollect(m_device->queues().__DLFG_QUEUE.tracyCtx, m_cmdBuf);
+    }
 
     if (m_device->vkd()->vkEndCommandBuffer(m_cmdBuf) != VK_SUCCESS) {
       Logger::err("DxvkDLFGCommandList::endRecording: vkEndCommandBuffer failed");
