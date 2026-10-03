@@ -6,6 +6,7 @@ vklayer_src = files([
   'vklayer_dispatch.cpp',
   'vklayer_track.cpp',
   'vklayer_commands.cpp',
+  'vklayer_reflex.cpp',
 ])
 
 vklayer_dll = shared_library('remix_vk_layer', vklayer_src,

@@ -143,6 +143,16 @@ namespace dxvk {
       return s_isNrcSupported;
     }
 
+    // The NRC SDK takes raw handles and calls vulkan-1.dll itself; on the
+    // game's own device (DX12 / Vulkan front ends) those handles come from
+    // inside the layer chain and the loader aborts on them.
+    if (device->instance()->isImported()) {
+      Logger::info("[RTX info] Neural Radiance Cache: not supported on the game's own Vulkan device");
+      s_isNrcSupported = false;
+      s_hasCheckedNrcSupport = true;
+      return false;
+    }
+
     s_isNrcSupported = true;
 
     struct ExtensionSupportCapability {

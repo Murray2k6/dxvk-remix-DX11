@@ -78,6 +78,12 @@ namespace dxvk {
     // NV-DXVK end
 
  #ifdef TRACY_ENABLE
+    // Tracy's Vulkan context calls vulkan-1.dll's own entry points
+    // (vkGetPhysicalDeviceProperties, vkQueueSubmit, ...). On the game's own
+    // device (DX12 / Vulkan front ends) Remix's handles come from inside the
+    // layer chain and the loader aborts on them, so GPU zones stay off there;
+    // CPU zones still record.
+    if (!instance->isImported()) {
     VkCommandPoolCreateInfo poolInfo;
     poolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
     poolInfo.pNext = nullptr;
@@ -123,6 +129,7 @@ namespace dxvk {
                                                            vki->vkGetPhysicalDeviceCalibrateableTimeDomainsEXT,
                                                            m_vkd->vkGetCalibratedTimestampsEXT);
       TracyVkContextName(m_queues.present.tracyCtx, "Present Queue", strlen("Present Queue"));
+    }
     }
 #endif
   }

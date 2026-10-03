@@ -144,6 +144,19 @@ namespace dxvk
     auto instance = m_device->instance();
     VkInstance vkInstance = instance->handle();
 
+    // On the game's own device (DX12 / Vulkan front ends) Remix's handles
+    // come from inside the Vulkan layer chain: the loader's exported entry
+    // points abort on them (unknown VkPhysicalDevice, 0xC0000409). NGX then
+    // dispatches through the chain's own functions instead of vulkan-1.dll.
+    const bool imported = instance->isImported();
+    PFN_vkGetInstanceProcAddr vkGipa = imported ? instance->vki()->getInstanceProcAddr() : nullptr;
+    PFN_vkGetDeviceProcAddr vkGdpa = imported ? m_device->vkd()->getDeviceProcAddr() : nullptr;
+
+    if (imported && (!vkGipa || !vkGdpa)) {
+      Logger::err("NGX: the game's device has no layer-chain dispatch to hand NGX; DLSS stays off");
+      return false;
+    }
+
     // Note: Enable DLSS logging for debugging in debug mode. Note this will disable all other DLSS logging sinks to ensure all logging
     // goes through the DXVK logging system.
     NVSDK_NGX_FeatureCommonInfo featureCommonInfo{};
@@ -168,7 +181,7 @@ namespace dxvk
     result = NVSDK_NGX_VULKAN_Init(
       RtxOptions::applicationId(), logFolder.c_str(),
       vkInstance, vkPhysicalDevice, vkDevice,
-      nullptr, nullptr,
+      vkGipa, vkGdpa,
       &featureCommonInfo);
 
     if (NVSDK_NGX_FAILED(result)) {
@@ -228,7 +241,18 @@ namespace dxvk
     m_supportsDLSS = checkDLSSSupport(tempParams);
     checkDLFGSupport(tempParams);
 
-    // Check DLSS-RR Support
+    // Check DLSS-RR Support. GetFeatureRequirements takes no dispatch
+    // functions and would reach the loader with the chain's handles, so on
+    // the game's device the capability parameters answer instead.
+    if (imported) {
+      int rrAvailable = 0;
+      if (!NVSDK_NGX_FAILED(tempParams->Get(NVSDK_NGX_Parameter_SuperSamplingDenoising_Available, &rrAvailable)) && rrAvailable)
+        m_supportsRayReconstruction = true;
+      else
+        Logger::warn("NVIDIA DLSS-RR not available on this hardware/platform");
+      return true;
+    }
+
     NVSDK_NGX_FeatureCommonInfo ci = {};
     memset(&ci, 0, sizeof(ci));
     // DX11_V290_RUNTIME_DIR: include the dedicated runtime directory in the

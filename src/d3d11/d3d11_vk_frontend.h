@@ -266,6 +266,10 @@ namespace dxvk {
     // Per swap chain image: game rendering done -> Remix; Remix done -> present.
     std::vector<VkSemaphore>                  gameDone;
     std::vector<VkSemaphore>                  remixDone;
+    // The window behind the surface (remix_vkfe_api::on_swapchain_window):
+    // the Remix menu is drawn into this swap chain and reads that window's
+    // input. Null: no menu on this swap chain.
+    HWND                                      window = nullptr;
   };
 
 
@@ -308,6 +312,10 @@ namespace dxvk {
       const VkImage*                    images);
 
     void onSwapchainDestroy(VkSwapchainKHR swapchain);
+
+    // remix_vkfe_api::on_swapchain_window: hooks the window's messages for
+    // the Remix menu (as D3D11SwapChain does for DX11 games).
+    void onSwapchainWindow(VkSwapchainKHR swapchain, HWND window);
 
     void onPipeline(
       const remix_vkfe_pipeline_desc*   desc,
@@ -372,6 +380,9 @@ namespace dxvk {
     std::unordered_map<VkSwapchainKHR, D3D11VkSwapchain>             m_swapchains;
     std::unordered_map<uint64_t, std::shared_ptr<D3D11VkPipeline>>   m_pipelines;
     std::unordered_map<VkCommandBuffer, std::vector<D3D11VkDraw>>    m_recorded;
+    // Cleared recordings of reset command buffers, reused with their capacity
+    // by the next command buffer that records (no regrowth every frame).
+    std::vector<std::vector<D3D11VkDraw>>                            m_spareRecordings;
 
     std::vector<std::unique_ptr<D3D11VkCaptureChunk>>                m_captureChunks;
     D3D11VkCaptureChunk*                                             m_captureCurrent = nullptr;
@@ -525,6 +536,8 @@ namespace dxvk {
     std::unordered_map<const void*, std::shared_ptr<const std::vector<uint8_t>>> m_submitBytes;
 
     uint64_t                          m_presentCount = 0;
+    // Alt+X was held at the last present (rising-edge menu toggle).
+    bool                              m_menuHotkeyDown = false;
 
     void destroySwapchain(D3D11VkSwapchain& swapchain);
 

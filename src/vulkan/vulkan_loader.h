@@ -76,6 +76,7 @@ namespace dxvk::vk {
       PFN_vkGetDeviceProcAddr getDeviceProcAddr = nullptr);
     PFN_vkVoidFunction sym(const char* name) const;
     VkDevice device() const { return m_device; }
+    PFN_vkGetDeviceProcAddr getDeviceProcAddr() const { return m_getDeviceProcAddr; }
   protected:
     const PFN_vkGetDeviceProcAddr m_getDeviceProcAddr;
     const VkDevice                m_device;
