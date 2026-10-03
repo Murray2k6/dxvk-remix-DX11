@@ -1,20 +1,17 @@
 # Deploy the built Remix runtime from _output\x64 next to a game executable.
-# Build first (build.bat -RuntimeOnly -SkipZip; build_vkd3d_proton.ps1 for DX12).
+# Build first (build.bat -SkipZip; build_vkd3d_proton.ps1 for DX12).
 #
 # Usage:
 #   .\deploy_d3d11.ps1 -GameDir "E:\SteamLibrary\steamapps\common\Fallout 4"
-#   .\deploy_d3d11.ps1 -GameDir "D:\...\Starfield" -Dx12
 #
-# DX11 games: d3d11.dll and dxgi.dll (with their .pdb files).
-# DX12 games (-Dx12): also vkd3d-proton's d3d12.dll and d3d12core.dll from
-# _output\x64\vkd3d (both are needed: Remix's heap-index export lives in
-# d3d12core.dll). DX12 and Vulkan games also need the Remix Vulkan layer
-# registered once (install_remix_vk_layer.ps1, writes HKCU) and an rtx.conf
-# or rtx-remix\ folder next to the game.
+# Copies the whole x64 folder: the runtime (d3d11.dll, dxgi.dll and their
+# satellite libraries), the Remix Vulkan layer and vkd3d-proton's d3d12.dll /
+# d3d12core.dll. Everything stays in the game folder: DX12 games use the
+# vkd3d DLLs there, the layer turns itself on for them, and nothing is
+# registered with Windows. DX11 games never load the DX12 files.
 [CmdletBinding()]
 param(
-  [Parameter(Mandatory = $true)][string]$GameDir,
-  [switch]$Dx12
+  [Parameter(Mandatory = $true)][string]$GameDir
 )
 
 Set-StrictMode -Version Latest
@@ -26,18 +23,10 @@ if (-not (Test-Path -LiteralPath $GameDir -PathType Container)) {
   throw "Game folder not found: $GameDir"
 }
 
-$files = @(
-  @{ src = Join-Path $out 'd3d11.dll'; required = $true },
-  @{ src = Join-Path $out 'dxgi.dll';  required = $true },
-  @{ src = Join-Path $out 'd3d11.pdb'; required = $false },
-  @{ src = Join-Path $out 'dxgi.pdb';  required = $false }
-)
-
-if ($Dx12) {
-  $files += @(
-    @{ src = Join-Path $out 'vkd3d\d3d12.dll';     required = $true },
-    @{ src = Join-Path $out 'vkd3d\d3d12core.dll'; required = $true }
-  )
+foreach ($required in 'd3d11.dll', 'dxgi.dll') {
+  if (-not (Test-Path -LiteralPath (Join-Path $out $required))) {
+    throw "$required not found in $out; build first."
+  }
 }
 
 # A running game keeps its DLLs open; copying would fail half-way.
@@ -47,16 +36,15 @@ foreach ($exe in Get-ChildItem -LiteralPath $GameDir -Filter *.exe -File) {
   }
 }
 
-foreach ($f in $files) {
-  if (-not (Test-Path -LiteralPath $f.src)) {
-    if ($f.required) { throw "$($f.src) not found; build first." }
-    continue
-  }
+Get-ChildItem -LiteralPath $out -Force | Copy-Item -Destination $GameDir -Recurse -Force
 
-  $dst = Join-Path $GameDir (Split-Path -Leaf $f.src)
-  Copy-Item -LiteralPath $f.src -Destination $dst -Force
-  $item = Get-Item -LiteralPath $dst
-  Write-Host ("  {0,-14} {1:yyyy-MM-dd HH:mm:ss}  {2} bytes" -f $item.Name, $item.LastWriteTime, $item.Length)
+foreach ($name in 'd3d11.dll', 'dxgi.dll', 'remix_vk_layer.dll', 'd3d12.dll', 'd3d12core.dll') {
+  $item = Get-Item -LiteralPath (Join-Path $GameDir $name) -ErrorAction SilentlyContinue
+  if ($item) {
+    Write-Host ("  {0,-20} {1:yyyy-MM-dd HH:mm:ss}" -f $item.Name, $item.LastWriteTime)
+  } else {
+    Write-Host ("  {0,-20} not built" -f $name) -ForegroundColor Yellow
+  }
 }
 
 Write-Host "Deployed to $GameDir" -ForegroundColor Green

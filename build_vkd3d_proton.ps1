@@ -10,8 +10,7 @@ param(
 # DX12 front end (documentation/engine_knowledge/DX12_PLAN.md): build vkd3d-proton's
 # d3d12.dll / d3d12core.dll with Remix's patch, using the MSYS2 UCRT64 toolchain, its
 # supported Windows route. Source and build live under _vkd3d\ (git-ignored); output
-# is staged to _output\x64\vkd3d\, apart from the DX11 runtime, so nothing deploys it
-# by accident.
+# is staged into _output\x64\ beside the runtime.
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $repoRoot = $PSScriptRoot
@@ -62,10 +61,14 @@ $buildMsys = ConvertTo-MsysPath (Join-Path $work 'build64')
 $setup = if (Test-Path -LiteralPath (Join-Path $work 'build64\build.ninja')) { '--reconfigure' } else { '' }
 Invoke-Ucrt64 "cd '$srcMsys' && meson setup $setup --buildtype release -Denable_tests=false '$buildMsys' && ninja -C '$buildMsys' -j $Jobs"
 
-$stage = Join-Path $repoRoot '_output\x64\vkd3d'
-# Fresh stage: only this script writes here.
-if (Test-Path -LiteralPath $stage) { Remove-Item -LiteralPath $stage -Recurse -Force }
+# Staged beside the runtime: everything a game needs is the one x64 folder
+# copied next to its executable (DX12 games load these instead of Windows'
+# D3D12; DX11 games never load them).
+$stage = Join-Path $repoRoot '_output\x64'
 New-Item -ItemType Directory -Force -Path $stage | Out-Null
+# Earlier builds staged into a vkd3d\ subfolder.
+$oldStage = Join-Path $stage 'vkd3d'
+if (Test-Path -LiteralPath $oldStage) { Remove-Item -LiteralPath $oldStage -Recurse -Force }
 $built = @(Get-ChildItem -LiteralPath (Join-Path $work 'build64\libs') -Recurse -File |
   Where-Object { $_.Name -in @('d3d12.dll', 'd3d12core.dll') })
 if ($built.Count -eq 0) { throw 'vkd3d-proton built no d3d12.dll' }
