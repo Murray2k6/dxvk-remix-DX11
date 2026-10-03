@@ -746,8 +746,10 @@ namespace dxvk {
   void RtxGeometryUtils::dispatchGenTriList(const Rc<DxvkContext>& ctx, const GenTriListArgs& cb, const DxvkBufferSlice& dstSlice, const RasterBuffer* srcBuffer) const {
     ScopedGpuProfileZone(ctx, "generateTriangleList");
     constexpr uint32_t kNumTrianglesToProcessOnCPU = 512;
+    // Device-local index buffers (D3D11 DEFAULT/IMMUTABLE usage) have no CPU
+    // mapping; reading them on the CPU dereferenced null (ELEX crash).
     const bool useGPU = (cb.useUint32 != 0)
-      || ((srcBuffer != nullptr) && (srcBuffer->isPendingGpuWrite()))
+      || ((srcBuffer != nullptr) && (srcBuffer->isPendingGpuWrite() || srcBuffer->mapPtr() == nullptr))
       || cb.primCount > kNumTrianglesToProcessOnCPU;
 
     if (useGPU) {

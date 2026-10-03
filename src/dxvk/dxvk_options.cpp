@@ -59,7 +59,7 @@ namespace dxvk {
     // NV-DXVK end
     
     // NV-DXVK start: configurable memory allocation chunk sizes
-    deviceLocalMemoryChunkSizeMB = config.getOption<uint32_t>("dxvk.deviceLocalMemoryChunkSizeMB", 320);
+    deviceLocalMemoryChunkSizeMB = config.getOption<uint32_t>("dxvk.deviceLocalMemoryChunkSizeMB", 64);
     otherMemoryChunkSizeMB = config.getOption<uint32_t>("dxvk.otherMemoryChunkSizeMB", 128);
     // NV-DXVK end
   }

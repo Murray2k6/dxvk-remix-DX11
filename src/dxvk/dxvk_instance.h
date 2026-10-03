@@ -42,12 +42,37 @@ namespace dxvk {
    * of adapters. This also provides methods for
    * device creation.
    */
+  /**
+   * \brief A VkInstance created by someone else
+   *
+   * DX12 (vkd3d-proton) and native Vulkan games own the VkInstance and
+   * VkDevice. Remix renders on the game's device, so it adopts the game's
+   * instance instead of creating one. The instance is never destroyed by
+   * Remix.
+   */
+  struct DxvkInstanceImport {
+    VkInstance                instance            = VK_NULL_HANDLE;
+    // Optional. A Vulkan layer passes the next layer's entry point.
+    PFN_vkGetInstanceProcAddr getInstanceProcAddr = nullptr;
+    // Instance extensions the creator enabled.
+    uint32_t                  extensionCount      = 0;
+    const char* const*        extensionNames      = nullptr;
+  };
+
   class DxvkInstance : public RcObject {
 
   public:
 
     DxvkInstance();
+    explicit DxvkInstance(const DxvkInstanceImport& import);
     ~DxvkInstance();
+
+    /**
+     * \brief Whether the VkInstance belongs to the game
+     */
+    bool isImported() const {
+      return m_imported;
+    }
 
     // Coordinate the final intrusive reference with the non-owning instance
     // cache. The cache must never keep Vulkan alive until DLL process detach.
@@ -179,7 +204,14 @@ namespace dxvk {
     std::vector<DxvkExtensionProvider*> m_extProviders;
     std::unique_ptr<DxvkExtensionProvider> m_rtxIoExtensionProvider;
     std::vector<Rc<DxvkAdapter>> m_adapters;
-    
+    bool m_imported = false;
+
+    // Shared by both constructors: RtxOptions, config, extension providers.
+    void initOptionsAndProviders();
+    // Shared by both constructors: adapters, device extensions, Aftermath,
+    // validation messenger.
+    void initAdapters();
+
     VkInstance createInstance();
 
     std::vector<Rc<DxvkAdapter>> queryAdapters();

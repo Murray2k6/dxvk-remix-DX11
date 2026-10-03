@@ -21,6 +21,7 @@
 * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 * DEALINGS IN THE SOFTWARE.
 */
+#include <cfloat>
 #include <mutex>
 #include <vector>
 
@@ -545,6 +546,7 @@ namespace dxvk {
       VkDeviceSize appBufferBytes = 0, appTextureBytes = 0;
       VkDeviceSize rtxBufferBytes = 0, rtxAsBytes = 0, rtxOmmBytes = 0;
       VkDeviceSize rtxMaterialBytes = 0, rtxTargetBytes = 0, rtxReplacementBytes = 0;
+      VkDeviceSize dxvkAllocatedBytes = 0, dxvkUsedBytes = 0, uncategorizedBytes = 0;
       {
         const DxvkAdapterMemoryInfo mem = m_device->adapter()->getMemoryHeapInfo();
         for (uint32_t i = 0; i < mem.heapCount; ++i) {
@@ -560,6 +562,9 @@ namespace dxvk {
             rtxMaterialBytes += stats.usedByCategory(DxvkMemoryStats::Category::RTXMaterialTexture);
             rtxTargetBytes += stats.usedByCategory(DxvkMemoryStats::Category::RTXRenderTarget);
             rtxReplacementBytes += stats.usedByCategory(DxvkMemoryStats::Category::RTXReplacementGeometry);
+            dxvkAllocatedBytes += stats.totalAllocated();
+            dxvkUsedBytes += stats.totalUsed();
+            uncategorizedBytes += stats.usedByCategory(DxvkMemoryStats::Category::Invalid);
           }
         }
       }
@@ -595,7 +600,19 @@ namespace dxvk {
           " ommMiB=", rtxOmmBytes >> 20,
           " matTexMiB=", rtxMaterialBytes >> 20,
           " rtTargetMiB=", rtxTargetBytes >> 20,
-          " replGeoMiB=", rtxReplacementBytes >> 20));
+          " replGeoMiB=", rtxReplacementBytes >> 20,
+          // Driver usage minus dxvkAllocated is memory outside the DXVK
+          // allocator (DLSS/NRD/driver); dxvkAllocated minus dxvkUsed is
+          // free space inside DXVK's chunks.
+          " dxvkAllocMiB=", dxvkAllocatedBytes >> 20,
+          " dxvkUsedMiB=", dxvkUsedBytes >> 20,
+          " uncategorizedMiB=", uncategorizedBytes >> 20));
+        const auto& blasStats = m_accelManager.getBlasFrameStats();
+        Logger::info(str::format("[Remix-DX11][vram] blas dynamic=", blasStats.dynamicCount,
+          " prims=", blasStats.dynamicPrims, " MiB=", blasStats.dynamicBytes >> 20,
+          " merged=", blasStats.mergedCount, " prims=", blasStats.mergedPrims,
+          " MiB=", blasStats.mergedBytes >> 20,
+          " pool=", blasStats.poolCount, " MiB=", blasStats.poolBytes >> 20));
       }
     }
 
@@ -863,7 +880,7 @@ namespace dxvk {
     const bool highlightUnsafeAnchor = RtxOptions::useHighlightUnsafeAnchorMode() && input.getGeometryData().indexBuffer.defined() && input.getGeometryData().vertexCount > input.getGeometryData().indexCount;
     if (highlightUnsafeAnchor) {
       const static MaterialData sHighlightMaterialData(OpaqueMaterialData(TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(),
-                                                                          0.f, 1.f, Vector3(0.2f, 0.2f, 0.2f), 1.0f, 0.1f, 0.1f, Vector3(0.46f, 0.26f, 0.31f), true, 1, 1, 0, false, false, 200.f, true, false, BlendType::kAlpha, false, AlphaTestType::kAlways, 0, 0.0f, 0.0f, Vector3(), 0.0f, Vector3(), 0.0f, false, Vector3(), 0.0f, 0.0f,
+                                                                          0.f, 1.f, Vector3(0.2f, 0.2f, 0.2f), 1.0f, 0.1f, 0.1f, Vector3(0.46f, 0.26f, 0.31f), true, 1, 1, 0, false, false, 200.f, true, false, BlendType::kAlpha, false, AlphaTestType::kAlways, 0, 0.0f, 0.0f, Vector3(), 0.0f, Vector3(), 0.0f, false, Vector3(), 0.0f, 0.0f, uint8_t(0),
                                                                           lss::Mdl::Filter::Nearest, lss::Mdl::WrapMode::Repeat, lss::Mdl::WrapMode::Repeat));
       return sHighlightMaterialData;
     }
@@ -877,6 +894,16 @@ namespace dxvk {
       MaterialData renderMaterialData = input.getMaterialData().as<RayPortalMaterialData>();
       renderMaterialData.getRayPortalMaterialData().setRayPortalIndex(rayPortalTextureIndex);
       return renderMaterialData;
+    }
+
+    // Surfaces the game shaded by refracting its own scene copy (water, glass)
+    // are path traced as a real translucent medium.
+    if (input.getMaterialData().isRefractiveSurface && !RtxOptions::useWhiteMaterialMode()) {
+      TranslucentMaterialData water = input.getMaterialData().as<TranslucentMaterialData>();
+      water.setRefractiveIndex(1.33f);
+      water.setTransmittanceColor(Vector3(0.80f, 0.92f, 0.90f));
+      water.setTransmittanceMeasurementDistance(RtxOptions::dx11RefractiveSurfaceDepth());
+      return MaterialData(water);
     }
 
     // Standard legacy material conversion
@@ -1000,7 +1027,7 @@ namespace dxvk {
         }
         if (highlightUnsafeReplacement) {
           const static MaterialData sHighlightMaterialData(OpaqueMaterialData(TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(),
-              0.f, 1.f, Vector3(0.2f, 0.2f, 0.2f), 1.f, 0.1f, 0.1f, Vector3(1.f, 0.f, 0.f), true, 1, 1, 0, false, false, 200.f, true, false, BlendType::kAlpha, false, AlphaTestType::kAlways, 0, 0.0f, 0.0f, Vector3(), 0.0f, Vector3(), 0.0f, false, Vector3(), 0.0f, 0.0f,
+              0.f, 1.f, Vector3(0.2f, 0.2f, 0.2f), 1.f, 0.1f, 0.1f, Vector3(1.f, 0.f, 0.f), true, 1, 1, 0, false, false, 200.f, true, false, BlendType::kAlpha, false, AlphaTestType::kAlways, 0, 0.0f, 0.0f, Vector3(), 0.0f, Vector3(), 0.0f, false, Vector3(), 0.0f, 0.0f, uint8_t(0),
               lss::Mdl::Filter::Nearest, lss::Mdl::WrapMode::Repeat, lss::Mdl::WrapMode::Repeat));
           if ((GlobalTime::get().absoluteTimeMs()) / 200 % 2 == 0) {
             renderMaterialData = sHighlightMaterialData;
@@ -1366,6 +1393,17 @@ namespace dxvk {
       sampler = patchSampler(samplerInfo.magFilter,
                              samplerInfo.addressModeU, samplerInfo.addressModeV, samplerInfo.addressModeW,
                              samplerInfo.borderColor);
+    } else if (sampler != nullptr && sampler->info().mipmapLodBias != 0.0f) {
+      // The game's own sampler (legacy material): a game with DLSS / FSR /
+      // XeSS on biases its mips negative for its lower internal resolution,
+      // which would alias and shimmer every path-traced texture. Remix does
+      // the upscaling, so its own mip bias replaces the game's; filtering and
+      // addressing stay the game's.
+      const DxvkSamplerCreateInfo& info = sampler->info();
+      sampler = m_device->getCommon()->getResources().getSampler(
+        info.magFilter, info.mipmapMode,
+        info.addressModeU, info.addressModeV, info.addressModeW,
+        info.borderColor, getTotalMipBias(), info.useAnisotropy);
     }
     if (drawCallState.isEye()) {
       // force eye whites and iris to not repeat
@@ -1537,6 +1575,25 @@ namespace dxvk {
         subsurfaceMaterialIndex = m_surfaceMaterialExtensionCache.track(subsurfaceMaterial);
       }
 
+      // Roughness read from the game's own texture (the draw's captured
+      // material, not a replacement asset) is inferred, not authored: the
+      // shader clamps it (METHODS.md, Materials: "Clamp inferred roughness
+      // to [0.3, 0.9]").
+      const TextureRef& gameRoughness = drawCallState.getMaterialData().roughnessTexture;
+      const bool inferredRoughness = !drawCallState.getMaterialData().roughnessAuthored
+        && gameRoughness.isValid() && opaqueMaterialData.getRoughnessTexture().isValid()
+        && opaqueMaterialData.getRoughnessTexture().getImageHash() == gameRoughness.getImageHash();
+      // Legacy envmap reflection, while the material is still the game's own
+      // (a replacement asset brings authored metallic and albedo).
+      const LegacyMaterialData& gameMaterial = drawCallState.getMaterialData();
+      const bool untintedReflection = gameMaterial.untintedReflection
+        && opaqueMaterialData.getAlbedoOpacityTexture().getImageHash() == gameMaterial.getColorTexture().getImageHash()
+        && (!gameMaterial.metallicTexture.isValid()
+            || opaqueMaterialData.getMetallicTexture().getImageHash() == gameMaterial.metallicTexture.getImageHash());
+      const uint16_t surfaceEncoding = uint16_t(opaqueMaterialData.getNormalEncoding())
+        | (inferredRoughness ? uint16_t(OPAQUE_SURFACE_MATERIAL_ENCODING_INFERRED_ROUGHNESS) : uint16_t(0))
+        | (untintedReflection ? uint16_t(OPAQUE_SURFACE_MATERIAL_ENCODING_UNTINTED_REFLECTION) : uint16_t(0));
+
       const RtOpaqueSurfaceMaterial opaqueSurfaceMaterial{
         albedoOpacityTextureIndex, normalTextureIndex,
         tangentTextureIndex, heightTextureIndex, roughnessTextureIndex,
@@ -1546,10 +1603,11 @@ namespace dxvk {
         roughnessConstant, metallicConstant,
         emissiveColorConstant, enableEmissive,
         ignoreAlphaChannel, thinFilmEnable, alphaIsThinFilmThickness,
-        thinFilmThicknessConstant, samplerIndex, displaceIn, displaceOut, 
+        thinFilmThicknessConstant, samplerIndex, displaceIn, displaceOut,
         subsurfaceMaterialIndex, isUsingRaytracedRenderTarget,
         samplerFeedbackStamp,
-        secondaryTextureIndex
+        secondaryTextureIndex,
+        surfaceEncoding
       };
 
       if (opaqueSurfaceMaterial.hasValidDisplacement()) {
@@ -1558,7 +1616,16 @@ namespace dxvk {
 
       surfaceMaterial.emplace(opaqueSurfaceMaterial);
     } else if (renderMaterialDataType == MaterialDataType::Translucent) {
-      surfaceMaterial.emplace(createTranslucentSurfaceMaterial(renderMaterialData.getTranslucentMaterialData(), samplerIndex, hasTexcoords));
+      // The game's own normal-map encoding applies only when the translucent
+      // material still uses the draw's captured normal map (DX11 water);
+      // replacement materials carry Remix octahedral normals.
+      const TranslucentMaterialData& translucentData = renderMaterialData.getTranslucentMaterialData();
+      const LegacyMaterialData& legacyData = drawCallState.getMaterialData();
+      const bool gameNormalMap = legacyData.normalEncoding != 0
+        && legacyData.normalTexture.isValid() && translucentData.getNormalTexture().isValid()
+        && legacyData.normalTexture.getImageHash() == translucentData.getNormalTexture().getImageHash();
+      surfaceMaterial.emplace(createTranslucentSurfaceMaterial(translucentData, samplerIndex, hasTexcoords,
+                                                               gameNormalMap ? uint8_t(legacyData.normalEncoding & 7u) : uint8_t(0)));
     } else if (renderMaterialDataType == MaterialDataType::RayPortal) {
       const auto& rayPortalMaterialData = renderMaterialData.getRayPortalMaterialData();
 
@@ -1594,7 +1661,8 @@ namespace dxvk {
 
   RtTranslucentSurfaceMaterial SceneManager::createTranslucentSurfaceMaterial(const TranslucentMaterialData& translucentMaterialData,
                                                                               uint32_t samplerIndex,
-                                                                              bool hasTexcoords) {
+                                                                              bool hasTexcoords,
+                                                                              uint8_t normalEncoding) {
     uint32_t normalTextureIndex = kSurfaceMaterialInvalidTextureIndex;
     uint32_t transmittanceTextureIndex = kSurfaceMaterialInvalidTextureIndex;
     uint32_t emissiveColorTextureIndex = kSurfaceMaterialInvalidTextureIndex;
@@ -1616,7 +1684,8 @@ namespace dxvk {
       translucentMaterialData.getEnableThinWalled(),
       translucentMaterialData.getThinWallThickness(),
       translucentMaterialData.getEnableDiffuseLayer(),
-      samplerIndex
+      samplerIndex,
+      normalEncoding
     };
   }
 
@@ -1865,6 +1934,130 @@ namespace dxvk {
     }
   }
 
+  void SceneManager::addProjectedDecal(const Matrix4& worldToDecal, uint32_t axis,
+                                       const TextureRef& texture, const Rc<DxvkSampler>& sampler) {
+    constexpr size_t kMaxDecalsPerFrame = 256;
+    if (m_pendingDecals.size() >= kMaxDecalsPerFrame || !texture.isValid() || sampler == nullptr)
+      return;
+    m_pendingDecals.push_back({ worldToDecal, axis, texture, sampler });
+  }
+
+  // Decal record (16 floats, read by applyProjectedDecals in
+  // opaque_surface_material_interaction.slangh): rows 0-2 of worldToDecal,
+  // then texture index, sampler index, flags (bits 0-1 axis, bit 2 texture
+  // already linear on sample) and opacity.
+  //
+  // After the records: a uniform grid over the union of the decal boxes
+  // (kDecalGridDim cells per axis), so a shading point tests only the decals
+  // whose box overlaps its cell instead of every record. Header (8 floats):
+  // grid min xyz, words per cell (uint), cells per world unit xyz, unused.
+  // Then per cell (x fastest), wordsPerCell uints of decal bits.
+  void SceneManager::prepareProjectedDecals(Rc<RtxContext> ctx) {
+    constexpr uint32_t kDecalGridDim = 16;
+
+    m_decalCount = 0;
+    m_decalBufferIndex = 0;
+    if (m_pendingDecals.empty())
+      return;
+
+    std::vector<float> records;
+    std::vector<Vector3> boxMin, boxMax;
+    records.reserve(m_pendingDecals.size() * 16u);
+    for (const PendingDecal& decal : m_pendingDecals) {
+      uint32_t textureIndex = kSurfaceMaterialInvalidTextureIndex;
+      trackTexture(decal.texture, textureIndex, true);
+      if (textureIndex == kSurfaceMaterialInvalidTextureIndex)
+        continue;
+      const uint32_t samplerIndex = trackSampler(decal.sampler);
+      bool srgb = false;
+      if (const DxvkImageView* view = decal.texture.getImageView())
+        srgb = imageFormatSamplesLinear(view->info().format);
+      for (uint32_t r = 0; r < 3; ++r)
+        for (uint32_t c = 0; c < 4; ++c)
+          records.push_back(decal.worldToDecal[c][r]);
+      const uint32_t flags = (decal.axis & 3u) | (srgb ? 4u : 0u);
+      float packed[3];
+      std::memcpy(&packed[0], &textureIndex, 4);
+      std::memcpy(&packed[1], &samplerIndex, 4);
+      std::memcpy(&packed[2], &flags, 4);
+      records.insert(records.end(), packed, packed + 3);
+      records.push_back(1.0f);
+
+      // World bounds of the unit box.
+      const Matrix4 decalToWorld = inverse(decal.worldToDecal);
+      Vector3 lo(FLT_MAX), hi(-FLT_MAX);
+      for (uint32_t corner = 0; corner < 8; ++corner) {
+        const Vector4 w = decalToWorld * Vector4((corner & 1) ? 0.5f : -0.5f,
+                                                 (corner & 2) ? 0.5f : -0.5f,
+                                                 (corner & 4) ? 0.5f : -0.5f, 1.0f);
+        const Vector3 p = w.xyz() / (w.w != 0.0f ? w.w : 1.0f);
+        lo = min(lo, p);
+        hi = max(hi, p);
+      }
+      boxMin.push_back(lo);
+      boxMax.push_back(hi);
+    }
+    m_pendingDecals.clear();
+    if (records.empty())
+      return;
+
+    const uint32_t decalCount = uint32_t(records.size() / 16u);
+    const uint32_t wordsPerCell = (decalCount + 31u) / 32u;
+    Vector3 gridMin(FLT_MAX), gridMax(-FLT_MAX);
+    for (uint32_t d = 0; d < decalCount; ++d) {
+      gridMin = min(gridMin, boxMin[d]);
+      gridMax = max(gridMax, boxMax[d]);
+    }
+    Vector3 cellsPerUnit;
+    for (uint32_t a = 0; a < 3; ++a) {
+      // Pad so points on the far face land in the last cell.
+      const float extent = std::max(gridMax[a] - gridMin[a], 1e-3f) * 1.001f;
+      cellsPerUnit[a] = float(kDecalGridDim) / extent;
+    }
+
+    std::vector<uint32_t> cells(size_t(kDecalGridDim) * kDecalGridDim * kDecalGridDim * wordsPerCell, 0u);
+    for (uint32_t d = 0; d < decalCount; ++d) {
+      uint32_t c0[3], c1[3];
+      for (uint32_t a = 0; a < 3; ++a) {
+        c0[a] = std::min(uint32_t(std::max((boxMin[d][a] - gridMin[a]) * cellsPerUnit[a], 0.0f)), kDecalGridDim - 1);
+        c1[a] = std::min(uint32_t(std::max((boxMax[d][a] - gridMin[a]) * cellsPerUnit[a], 0.0f)), kDecalGridDim - 1);
+      }
+      for (uint32_t z = c0[2]; z <= c1[2]; ++z)
+        for (uint32_t y = c0[1]; y <= c1[1]; ++y)
+          for (uint32_t x = c0[0]; x <= c1[0]; ++x) {
+            const size_t cell = (size_t(z) * kDecalGridDim + y) * kDecalGridDim + x;
+            cells[cell * wordsPerCell + d / 32u] |= 1u << (d % 32u);
+          }
+    }
+
+    float header[8] = { gridMin.x, gridMin.y, gridMin.z, 0.0f,
+                        cellsPerUnit.x, cellsPerUnit.y, cellsPerUnit.z, 0.0f };
+    std::memcpy(&header[3], &wordsPerCell, 4);
+    records.insert(records.end(), header, header + 8);
+    const size_t cellBase = records.size();
+    records.resize(cellBase + cells.size());
+    std::memcpy(records.data() + cellBase, cells.data(), cells.size() * sizeof(uint32_t));
+
+    const VkDeviceSize bytes = VkDeviceSize(records.size() * sizeof(float));
+    if (m_decalBuffer == nullptr || m_decalBuffer->info().size < bytes) {
+      DxvkBufferCreateInfo info;
+      info.size = std::max<VkDeviceSize>(bytes, 64u * 16u * sizeof(float));
+      info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+      info.stages = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR;
+      info.access = VK_ACCESS_SHADER_READ_BIT;
+      m_decalBuffer = m_device->createBuffer(info,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+        DxvkMemoryStats::Category::RTXBuffer, "DX11 projected decal records");
+    }
+    DxvkBufferSliceHandle slice = m_decalBuffer->allocSlice();
+    ctx->invalidateBuffer(m_decalBuffer, slice);
+    std::memcpy(slice.mapPtr, records.data(), size_t(bytes));
+
+    const RaytraceBuffer decalRecords(DxvkBufferSlice(m_decalBuffer, 0, bytes), 0, sizeof(float), VK_FORMAT_R32_SFLOAT);
+    m_decalBufferIndex = m_bufferCache.track(decalRecords);
+    m_decalCount = decalCount;
+  }
+
   void SceneManager::prepareSceneData(Rc<RtxContext> ctx, DxvkBarrierSet& execBarriers) {
     ScopedGpuProfileZone(ctx, "Build Scene");
 
@@ -1902,6 +2095,10 @@ namespace dxvk {
     m_graphManager.applySceneOverrides(ctx);
 
     m_terrainBaker->prepareSceneData(ctx);
+
+    // After garbage collection, before the bindless tables are built: the
+    // decal records reference this frame's texture, sampler and buffer slots.
+    prepareProjectedDecals(ctx);
 
     auto& textureManager = m_device->getCommon()->getTextureManager();
     m_bindlessResourceManager.prepareSceneData(ctx, textureManager.getTextureTable(), getBufferTable(), getSamplerTable());

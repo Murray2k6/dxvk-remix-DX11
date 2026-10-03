@@ -40,13 +40,24 @@ int main() {
         if (action == 2) mixed.recordUncapturedDraw(frame, 0, 10);
         if (action == 3) mixed.recordUncapturedDraw(frame, 10, 0);
       }
-      require(!mixed.canPresent(frame, true, frame), "mixed scene must retain native output");
+      require(!mixed.canPresent(frame, true, frame), "mixed scene dominated by uncaptured draws must retain native output");
       mixed.recordCapturedDraw(frame + 1);
       require(mixed.canPresent(frame + 1, true, frame + 1), "unsupported draw cannot poison next frame");
       require(!mixed.canPresent(frame + 1, true, frame), "stale camera cannot take over");
       require(!mixed.canPresent(frame + 1, false, frame + 1), "invalid camera cannot take over");
       require(!mixed.canPresent(frame + 2, true, frame + 2), "stale captured geometry cannot take over");
     } while (std::next_permutation(actions.begin(), actions.end()));
+
+    // A mostly captured frame takes over even when a few instanced/indirect
+    // draws are absent from the RT scene; a mostly uncaptured frame does not.
+    FrameCaptureCoverage mostlyCaptured;
+    mostlyCaptured.recordCapturedDraw(frame, 3000);
+    mostlyCaptured.recordUncapturedDraw(frame, 36, 4);
+    require(mostlyCaptured.canPresent(frame, true, frame), "mostly captured frame must take over");
+    FrameCaptureCoverage mostlyUncaptured;
+    mostlyUncaptured.recordCapturedDraw(frame, 36);
+    mostlyUncaptured.recordUncapturedDraw(frame, 3000, 2);
+    require(!mostlyUncaptured.canPresent(frame, true, frame), "mostly uncaptured frame must stay native");
 
     FrameCaptureCoverage zeros;
     zeros.recordCapturedDraw(frame);

@@ -110,8 +110,13 @@ namespace dxvk {
       }
       ++i;
     }
+
+    m_blasFrameStats.poolCount = uint32_t(m_blasPool.size());
+    m_blasFrameStats.poolBytes = 0;
+    for (const auto& blas : m_blasPool)
+      m_blasFrameStats.poolBytes += blas->accelStructure->info().size;
   }
-  
+
   PooledBlas::PooledBlas() {
     ++g_blasCount;
     buildInfo.geometryCount = 0;
@@ -831,6 +836,9 @@ namespace dxvk {
     }
 
     // Build/Update the dynamic BLAS
+    m_blasFrameStats.dynamicCount = 0;
+    m_blasFrameStats.dynamicPrims = 0;
+    m_blasFrameStats.dynamicBytes = 0;
     for (uint32_t uniqueBlasIdx = 0; uniqueBlasIdx < m_uniqueDynamicBlasCount; ++uniqueBlasIdx) {
       const UniqueBlasInstances& uniqueBlasEntry = m_uniqueDynamicBlas[uniqueBlasIdx];
       BlasEntry* blasEntry = uniqueBlasEntry.blasEntry;
@@ -920,6 +928,9 @@ namespace dxvk {
       assert(selectedBlas.ptr());
       selectedBlas->frameLastTouched = currentFrame;
       blasEntry->dynamicBlas->opacityMicromapSourceHash = boundOpacityMicromapHash;
+      ++m_blasFrameStats.dynamicCount;
+      m_blasFrameStats.dynamicPrims += blasEntry->buildRanges[0].primitiveCount;
+      m_blasFrameStats.dynamicBytes += selectedBlas->accelStructure->info().size;
 
       if (update || build) {
         if (update && !build) {
@@ -1214,6 +1225,9 @@ namespace dxvk {
     std::vector<BucketGeometryContentHashData> contentHashData;
 
     // Create or find a matching BLAS for each bucket, then build it
+    m_blasFrameStats.mergedCount = 0;
+    m_blasFrameStats.mergedPrims = 0;
+    m_blasFrameStats.mergedBytes = 0;
     for (const auto& bucket : blasBuckets) {
       // Fill out the build info
       VkAccelerationStructureBuildGeometryInfoKHR buildInfo {};
@@ -1258,6 +1272,10 @@ namespace dxvk {
       }
       assert(selectedBlas);
       selectedBlas->frameLastTouched = currentFrame;
+      ++m_blasFrameStats.mergedCount;
+      for (uint32_t prims : bucket->primitiveCounts)
+        m_blasFrameStats.mergedPrims += prims;
+      m_blasFrameStats.mergedBytes += selectedBlas->accelStructure->info().size;
 
       // Record the assigned BLAS on the bucket so the per-bucket cache can capture it
       bucket->assignedBlas = selectedBlas;

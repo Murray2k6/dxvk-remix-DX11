@@ -402,7 +402,9 @@ namespace dxvk {
      * corresponding xfb outputs, and sets up the
      * geometry shader for point-to-point mode.
      */
-    void processXfbPassthrough(bool preserveSystemValues = false);
+    // inputVertices: 1 = point input (VS replay as a point list), 3 = triangle
+    // input (tessellated or triangle-list replay).
+    void processXfbPassthrough(bool preserveSystemValues = false, uint32_t inputVertices = 1);
     
     /**
      * \brief Finalizes the shader
@@ -1118,6 +1120,7 @@ namespace dxvk {
     ///////////////////////////////
     // Shader finalization methods
     void emitVsFinalize();
+    void emitBakeTransform();
     void emitHsFinalize();
     void emitDsFinalize();
     void emitGsFinalize();
@@ -1131,7 +1134,8 @@ namespace dxvk {
     void emitXfbOutputSetup(
             uint32_t                          streamId,
             bool                              passthrough,
-            bool                              preserveSystemValues = false);
+            bool                              preserveSystemValues = false,
+            uint32_t                          vertexIndex = 0);
     
     ///////////////////////////////
     // Hull shader phase methods

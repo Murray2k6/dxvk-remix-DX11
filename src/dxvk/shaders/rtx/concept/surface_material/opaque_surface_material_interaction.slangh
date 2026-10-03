@@ -543,6 +543,85 @@ void overrideMaterialInteractionForEye(
 
 // Opaque Surface Material Interaction Functions
 
+// DX11 projected decals (documentation/engine_knowledge/METHODS.md, Decals):
+// each record is a world-to-unit-box transform; a surface point inside the box
+// takes the decal texture, projected along the box's thin axis, over its albedo.
+// Record layout: SceneManager::prepareProjectedDecals.
+// The mip level comes from the ray footprint (METHODS.md, Decals: "LOD comes
+// from the ray footprint, not hardware derivatives"): the cone's world-space
+// diameter at the hit, in decal texels.
+// The records are followed by a uniform grid over the decal boxes' union
+// (SceneManager::prepareProjectedDecals): a point tests only the decals whose
+// box overlaps its cell, and a point outside the grid touches no decal.
+static const uint kDecalGridDim = 16u;
+
+void applyProjectedDecal(uint buffer, uint d, vec3 worldPosition, float coneRadius, inout vec3 albedo)
+{
+  {
+    const uint base = d * 16u;
+    const vec4 r0 = vec4(geometries[nonuniformEXT(buffer)][base + 0u], geometries[nonuniformEXT(buffer)][base + 1u],
+                         geometries[nonuniformEXT(buffer)][base + 2u], geometries[nonuniformEXT(buffer)][base + 3u]);
+    const vec4 r1 = vec4(geometries[nonuniformEXT(buffer)][base + 4u], geometries[nonuniformEXT(buffer)][base + 5u],
+                         geometries[nonuniformEXT(buffer)][base + 6u], geometries[nonuniformEXT(buffer)][base + 7u]);
+    const vec4 r2 = vec4(geometries[nonuniformEXT(buffer)][base + 8u], geometries[nonuniformEXT(buffer)][base + 9u],
+                         geometries[nonuniformEXT(buffer)][base + 10u], geometries[nonuniformEXT(buffer)][base + 11u]);
+    const vec4 p4 = vec4(worldPosition, 1.0f);
+    const vec3 p = vec3(dot(r0, p4), dot(r1, p4), dot(r2, p4));
+    if (any(abs(p) > 0.5f))
+      return;
+    const uint textureIndex = asuint(geometries[nonuniformEXT(buffer)][base + 12u]);
+    const uint samplerIndex = asuint(geometries[nonuniformEXT(buffer)][base + 13u]);
+    const uint flags = asuint(geometries[nonuniformEXT(buffer)][base + 14u]);
+    const float opacity = geometries[nonuniformEXT(buffer)][base + 15u];
+    const uint axis = flags & 3u;
+    const uint ua = (axis + 1u) % 3u;
+    const uint va = (axis + 2u) % 3u;
+    // D3D UV: v grows downward.
+    const vec2 uv = vec2(p[ua] + 0.5f, 0.5f - p[va]);
+    // Decal UV per world unit along u and v: the lengths of those rows.
+    const vec3 rows[3] = { r0.xyz, r1.xyz, r2.xyz };
+    uint width = 1u, height = 1u;
+    textures[nonuniformEXT(textureIndex)].GetDimensions(width, height);
+    const float uvPerUnit = max(length(rows[ua]) * float(width), length(rows[va]) * float(height));
+    const float texels = 2.0f * coneRadius * uvPerUnit;
+    const float lod = texels > 1.0f ? log2(texels) : 0.0f;
+    vec4 decal = textures[nonuniformEXT(textureIndex)].SampleLevel(samplers[nonuniformEXT(samplerIndex)], uv, lod);
+    if ((flags & 4u) == 0u)
+      decal.rgb = gammaToLinear(decal.rgb);
+    albedo = mix(albedo, decal.rgb, saturate(decal.a * opacity));
+  }
+}
+
+void applyProjectedDecals(vec3 worldPosition, float coneRadius, inout vec3 albedo)
+{
+  const uint buffer = cb.decalBufferIndex;
+  const uint count = min(cb.decalCount, 256u);
+  const uint grid = count * 16u;
+  const vec3 gridMin = vec3(geometries[nonuniformEXT(buffer)][grid + 0u], geometries[nonuniformEXT(buffer)][grid + 1u],
+                            geometries[nonuniformEXT(buffer)][grid + 2u]);
+  const uint wordsPerCell = asuint(geometries[nonuniformEXT(buffer)][grid + 3u]);
+  const vec3 cellsPerUnit = vec3(geometries[nonuniformEXT(buffer)][grid + 4u], geometries[nonuniformEXT(buffer)][grid + 5u],
+                                 geometries[nonuniformEXT(buffer)][grid + 6u]);
+  const vec3 c = (worldPosition - gridMin) * cellsPerUnit;
+  // Written so a NaN position fails too.
+  if (!all(c >= 0.0f) || !all(c < float(kDecalGridDim)))
+    return;
+  const uvec3 ci = uvec3(c);
+  const uint cell = (ci.z * kDecalGridDim + ci.y) * kDecalGridDim + ci.x;
+  const uint cellBase = grid + 8u + cell * wordsPerCell;
+  for (uint w = 0; w < wordsPerCell; ++w)
+  {
+    uint bits = asuint(geometries[nonuniformEXT(buffer)][cellBase + w]);
+    while (bits != 0u)
+    {
+      const uint d = w * 32u + firstbitlow(bits);
+      bits &= bits - 1u;
+      // Records in submission order: later decals blend over earlier ones.
+      applyProjectedDecal(buffer, d, worldPosition, coneRadius, albedo);
+    }
+  }
+}
+
 OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
   OpaqueSurfaceMaterial opaqueSurfaceMaterial,
   Surface surface,
@@ -794,10 +873,30 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
       // REMIX-2224: Normals blended during terrain baking using programmable shaders can sometimes end up being invalid so we sanitize them at this point
       tangentNormal = sanitize(normalSample.xyz, cb.isZUp ? vec3(0.f, 0.f, 1.f) : vec3(0.f, 1.f, 0.f));
     }
-    else // Decode encoded normal sample
+    else if ((opaqueSurfaceMaterial.normalEncoding & 7u) == 0) // Remix octahedral
     {
       // Note: Using f16 from texture to decode from is fine as the original texture is only 8 bits of precision.
       tangentNormal = unsignedOctahedralToHemisphereDirection(vec2(normalSample.xy), cb.opaqueMaterialArgs.normalIntensity);
+    }
+    else // Game tangent-space normal map captured by the DX11 layer
+    {
+      // Bits 0-2 (NormalEncoding in rtx_material_data.h).
+      const uint encoding = opaqueSurfaceMaterial.normalEncoding & 7u;
+      // DXT5nm keeps X in alpha and Y in green; encoding 5 stores X and Y
+      // swapped (CRYENGINE BC5 ".yx"); encoding 6 is a signed (SNORM) XY map,
+      // sampled in [-1, 1] already.
+      vec2 xy = encoding == 4 ? vec2(normalSample.a, normalSample.g)
+              : encoding == 5 ? vec2(normalSample.g, normalSample.r)
+              : vec2(normalSample.xy);
+      if (encoding != 6)
+        xy = xy * 2.0f - 1.0f;
+      // Remix tangent space is +Y (OpenGL); DirectX maps store -Y.
+      if (encoding >= 2)
+        xy.y = -xy.y;
+      xy *= cb.opaqueMaterialArgs.normalIntensity;
+      // Two-channel maps (BC5/R8G8, DXT5nm) store no z: rebuild it.
+      const float z = (encoding >= 3) ? sqrt(saturate(1.0f - dot(xy, xy))) : (float(normalSample.z) * 2.0f - 1.0f);
+      tangentNormal = normalize(vec3(xy, max(z, 1.0e-3f)));
     }
     
     const f16mat3 tangentToWorld = transpose(worldToTangent);
@@ -842,7 +941,14 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
 
   if (roughnessLoaded)
   {
-    roughness = roughnessSample.x;
+    // Bits 3-4 pick the channel; bit 5 marks a smoothness (gloss) map.
+    roughness = roughnessSample[(opaqueSurfaceMaterial.normalEncoding >> 3u) & 3u];
+    if (((opaqueSurfaceMaterial.normalEncoding >> 5u) & 1u) != 0u)
+      roughness = 1.0f - roughness;
+    // Roughness inferred from a game texture (spec/gloss maps were not
+    // authored as PBR roughness): kept in [0.3, 0.9] (METHODS.md, Materials).
+    if ((opaqueSurfaceMaterial.normalEncoding & OPAQUE_SURFACE_MATERIAL_ENCODING_INFERRED_ROUGHNESS) != 0u)
+      roughness = clamp(roughness, 0.3f, 0.9f);
   }
 
 #if defined(RAY_TRACING_PRIMARY_RAY)
@@ -857,12 +963,23 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
   // Load Metallic
 
   float metallic = opaqueSurfaceMaterial.metallicConstant;
+  const bool untintedReflection =
+    (opaqueSurfaceMaterial.normalEncoding & OPAQUE_SURFACE_MATERIAL_ENCODING_UNTINTED_REFLECTION) != 0u;
 
-  if (metallicLoaded)
+  if (untintedReflection)
   {
-    metallic = metallicSample.x;
+    // Legacy envmap: the constant is the reflection strength / 4, scaling the
+    // mask channel when there is one.
+    metallic = 4.0f * opaqueSurfaceMaterial.metallicConstant;
+    if (metallicLoaded)
+      metallic *= metallicSample[(opaqueSurfaceMaterial.normalEncoding >> 6u) & 3u];
   }
-    
+  else if (metallicLoaded)
+  {
+    // Bits 6-7 pick the channel (packed ORM / mask maps).
+    metallic = metallicSample[(opaqueSurfaceMaterial.normalEncoding >> 6u) & 3u];
+  }
+
   metallic = saturate(metallic * cb.opaqueMaterialArgs.metallicScale + cb.opaqueMaterialArgs.metallicBias);
 
   // Transform to desired Opaque Material Interaction values
@@ -875,8 +992,13 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
 
   // Note: Opacity factored into albedo and base reflectivity to ensure NEE and indirect lighting off of objects with opacity properly
   // account for how much light is being transmitted due to the opacity (similar to how Fresnel on glass works).
+  if (cb.decalCount > 0u)
+    applyProjectedDecals(surfaceInteraction.position, minimalRayInteraction.coneRadius, albedo);
   opaqueSurfaceMaterialInteraction.albedo = surface.isMatte ? vec3(0) : albedoToAdjustedAlbedo(albedo, metallic, opacity);
-  opaqueSurfaceMaterialInteraction.baseReflectivity = surface.isMatte ? vec3(0) : calcBaseReflectivity(albedo, metallic, opacity);
+  // A legacy envmap reflection is added untinted by the game: white F0, not
+  // the (dark) albedo.
+  opaqueSurfaceMaterialInteraction.baseReflectivity = surface.isMatte ? vec3(0)
+    : calcBaseReflectivity(untintedReflection ? vec3(1.0f) : albedo, metallic, opacity);
    
   // Note: Roughness loaded from texture is a perceptual roughness value (for optimal encoding), so this works as intended.
   calcRoughness(roughness, opaqueSurfaceMaterial.anisotropy,

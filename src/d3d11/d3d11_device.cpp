@@ -3735,8 +3735,29 @@ namespace dxvk {
     m_wineFactory   (this, &m_d3d11Device) {
 
   }
-  
-  
+
+
+  D3D11DXGIDevice::D3D11DXGIDevice(
+          IDXGIAdapter*       pAdapter,
+    const Rc<DxvkInstance>&   pDxvkInstance,
+    const Rc<DxvkAdapter>&    pDxvkAdapter,
+    const Rc<DxvkDevice>&     pImportedDevice,
+          D3D_FEATURE_LEVEL   FeatureLevel,
+          UINT                FeatureFlags)
+  : m_dxgiAdapter   (pAdapter),
+    m_dxvkInstance  (pDxvkInstance),
+    m_dxvkAdapter   (pDxvkAdapter),
+    m_sharedDevice  (pImportedDevice),
+    m_d3d11Device   (this, FeatureLevel, FeatureFlags),
+    m_d3d11DeviceExt(this, &m_d3d11Device),
+    m_d3d11Interop  (this, &m_d3d11Device),
+    m_d3d11Video    (this, &m_d3d11Device),
+    m_metaDevice    (this),
+    m_wineFactory   (this, &m_d3d11Device) {
+
+  }
+
+
   D3D11DXGIDevice::~D3D11DXGIDevice() {
   }
   
@@ -4109,6 +4130,24 @@ namespace dxvk {
     
     g_sharedDevice = newDevice;
     m_device = newDevice;
+    g_sharedDeviceRefCount++;
+  }
+
+  D3D11DXGIDevice::SharedDeviceLease::SharedDeviceLease(
+    const Rc<DxvkDevice>& importedDevice) {
+    std::lock_guard lock(g_sharedDeviceMutex);
+
+    RtxOptions::Create();
+
+    // Remix's shader state is process-wide, so only one DxvkDevice may be
+    // live. A D3D11 device created earlier in a DX12/Vulkan game (launcher
+    // overlay, video player) holds the slot on its own VkDevice.
+    if (g_sharedDevice != nullptr && g_sharedDevice != importedDevice)
+      throw DxvkError("D3D11DXGIDevice: a DxvkDevice on another VkDevice is already live in this process");
+
+    Logger::info("D3D11DXGIDevice: running on the game's imported VkDevice");
+    g_sharedDevice = importedDevice;
+    m_device = importedDevice;
     g_sharedDeviceRefCount++;
   }
 

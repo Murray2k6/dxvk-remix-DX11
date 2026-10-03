@@ -338,11 +338,11 @@ namespace dxvk {
     return driverStr;
   }
 
-  Rc<DxvkDevice> DxvkAdapter::createDevice(
-    const Rc<DxvkInstance>&   instance,
-          DxvkDeviceFeatures  enabledFeatures) {
-    DxvkDeviceExtensions devExtensions;
-
+  bool DxvkAdapter::planDevice(
+    const Rc<DxvkInstance>&     instance,
+          DxvkDeviceExtensions& devExtensions,
+          DxvkDeviceFeatures&   enabledFeatures,
+          DxvkNameSet&          extensionsEnabled) {
     std::array<DxvkExt*, 44> devExtensionList = {{
       &devExtensions.amdMemoryOverallocationBehaviour,
       &devExtensions.amdShaderFragmentMask,
@@ -408,8 +408,6 @@ namespace dxvk {
       enabledFeatures.khrBufferDeviceAddress.bufferDeviceAddress = VK_TRUE;
     }
 
-    DxvkNameSet extensionsEnabled;
-
     // The promoted extension requires both Vulkan 1.2 feature bits when that
     // feature structure is present. Keep the geometry-shader blit fallback
     // available on devices that cannot enable the pair.
@@ -466,7 +464,6 @@ namespace dxvk {
 
     // Enable additional extensions if necessary
     extensionsEnabled.merge(m_extraExtensions);
-    DxvkNameList extensionNameList = extensionsEnabled.toNameList();
 
     // Enable additional device features if supported
 
@@ -631,6 +628,18 @@ namespace dxvk {
     }
     // NV-DXVK end
 
+    return enableCudaInterop;
+  }
+
+
+  Rc<DxvkDevice> DxvkAdapter::createDevice(
+    const Rc<DxvkInstance>&   instance,
+          DxvkDeviceFeatures  enabledFeatures) {
+    DxvkDeviceExtensions devExtensions;
+    DxvkNameSet extensionsEnabled;
+    const bool enableCudaInterop = planDevice(instance, devExtensions, enabledFeatures, extensionsEnabled);
+    DxvkNameList extensionNameList = extensionsEnabled.toNameList();
+
     // NV-DXVK start: Moved logging to where it is on more recent DXVK to properly show enabled features, also added more information to be logged
     // (Still needs driver version from latest DXVK though at the time of writing this, but we can wait on that since it needs larger changes)
 
@@ -666,6 +675,14 @@ namespace dxvk {
     // Note: This vendor/driver version check could be done much sooner, but we do it here instead just before device creation or anything else
     // substantial with Vulkan takes place so that the device info, extensions and enabled features can be printed out first (just to ensure
     // users get a bit more info in the log if the driver version check fails).
+    checkDriverVersion(instance);
+    // NV-DXVK end
+
+    return createDeviceWithPlan(instance, devExtensions, enabledFeatures, extensionsEnabled, extensionNameList, enableCudaInterop);
+  }
+
+
+  void DxvkAdapter::checkDriverVersion(const Rc<DxvkInstance>& instance) const {
     if (m_deviceInfo.core.properties.vendorID == static_cast<uint32_t>(DxvkGpuVendor::Nvidia)) {
       const auto driverVersion = m_deviceInfo.core.properties.driverVersion;
       const auto minDriverVersion = ::GetModuleHandle("winevulkan.dll") ? instance->options().nvidiaLinuxMinDriver : instance->options().nvidiaMinDriver;
@@ -693,8 +710,16 @@ namespace dxvk {
         // NV-DXVK end
       }
     }
-    // NV-DXVK end
+  }
 
+
+  Rc<DxvkDevice> DxvkAdapter::createDeviceWithPlan(
+    const Rc<DxvkInstance>&     instance,
+          DxvkDeviceExtensions& devExtensions,
+          DxvkDeviceFeatures&   enabledFeatures,
+          DxvkNameSet&          extensionsEnabled,
+          DxvkNameList&         extensionNameList,
+          bool                  enableCudaInterop) {
     // Report the desired overallocation behaviour to the driver
     VkDeviceMemoryOverallocationCreateInfoAMD overallocInfo;
     overallocInfo.sType = VK_STRUCTURE_TYPE_DEVICE_MEMORY_OVERALLOCATION_CREATE_INFO_AMD;

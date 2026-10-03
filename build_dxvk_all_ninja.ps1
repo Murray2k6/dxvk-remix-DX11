@@ -1,8 +1,10 @@
 [CmdletBinding()]
 param(
   [ValidateSet('debug', 'debugoptimized', 'release')][string]$BuildFlavour = 'release',
-  [ValidateSet('true', 'false')][string]$EnableTracy = 'false',
-  [ValidateRange(1, 256)][int]$Jobs = 8,
+  # Tracy is on by default: every runtime fix is measured with it, and a
+  # reconfigure with 'false' silently strips it from the existing build.
+  [ValidateSet('true', 'false')][string]$EnableTracy = 'true',
+  [ValidateRange(1, 256)][int]$Jobs = 6,
   [string]$PythonExecutable = '',
   [string]$OutputRoot = '_output',
   [switch]$NoDepsFetch,
@@ -130,6 +132,10 @@ function Build-SourceTree {
   Invoke-BuildTool $python $setupArgs $Source ($Label + '-configure')
   if (-not $ConfigureOnly) {
     Invoke-BuildTool $python @('-m', 'mesonbuild.mesonmain', 'compile', '-C', $BuildDir, '-j', "$Jobs") $Source ($Label + '-compile')
+    # Shader builds copy headers shared with C++ (rtx_shaders/*.h) during the
+    # compile, after ninja has already decided which C++ objects are stale.
+    # A second pass picks those up; it is a no-op when nothing changed.
+    Invoke-BuildTool $python @('-m', 'mesonbuild.mesonmain', 'compile', '-C', $BuildDir, '-j', "$Jobs") $Source ($Label + '-compile-pass2')
   }
   return $python
 }

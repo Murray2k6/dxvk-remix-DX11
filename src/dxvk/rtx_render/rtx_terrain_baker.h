@@ -21,6 +21,8 @@
 */
 #pragma once
 
+#include <mutex>
+
 #include "rtx_context.h"
 #include "rtx_geometry_utils.h"
 #include "rtx_resources.h"
@@ -32,6 +34,22 @@ namespace dxvk {
   public:
     TerrainBaker() { }
     ~TerrainBaker() { }
+
+    // Cascades of the last frame that baked terrain, for bakes recorded
+    // outside Remix's context (the DX12 / Vulkan front end bakes in the
+    // game's command buffer, before Remix's frame). Thread safe.
+    struct ExternalBakeLayout {
+      uint32_t numCascades = 0;
+      uint32_t cascadeMapSizeX = 0;
+      uint32_t cascadeMapSizeY = 0;
+      float    lastCascadeScale = 1.0f;
+      // World -> cascade clip space (the ortho projection times the scene
+      // view), per cascade; and world -> cascade 0 texture space.
+      Matrix4  worldToCascadeClip[16];
+      Matrix4  worldToCascade0Texture;
+    };
+
+    bool getExternalBakeLayout(ExternalBakeLayout& out) const;
 
     bool bakeDrawCall(Rc<RtxContext> rtxContext, const DxvkContextState& dxvkCtxState,
                       DxvkRaytracingInstanceState& rtState, const DrawParameters& params,
@@ -255,5 +273,28 @@ namespace dxvk {
     BakedTexture m_materialTextures[ReplacementMaterialTextureType::Count];
 
     Rc<DxvkSampler> m_terrainSampler;
+
+    // DX11 bake: the matrix the DXBC bake hook multiplies SV_Position by
+    // (DxbcCompiler::emitBakeTransform), bound at VS/DS cbuffer slot 15.
+    Rc<DxvkBuffer> m_bakeTransformBuffer;
+
+    // External bakes (DrawCallState::externalTerrainBake).
+    bool bakeExternal(Rc<RtxContext> ctx, const DxvkContextState& dxvkCtxState,
+                      const DrawCallState& drawCallState, Matrix4& textureTransformOut);
+
+    // Re-bake skipping (bakeDrawCall): draws baked this and the last terrain
+    // frame, by camera + geometry + material; the cascade layout unchanged
+    // since last frame; bakes skipped this frame (Tracy plot).
+    fast_unordered_set m_bakedDrawsThisFrame;
+    fast_unordered_set m_bakedDrawsLastFrame;
+    bool m_bakingParamsUnchanged = false;
+    uint32_t m_bakeSkippedThisFrame = 0;
+
+    mutable std::mutex m_externalMutex;
+    ExternalBakeLayout m_externalLayout;
+    bool m_externalLayoutValid = false;
+    // The external image copied into the cascade map this frame.
+    Rc<DxvkImageView> m_externalCopied;
+    uint32_t m_externalCopiedFrame = kInvalidFrameIndex;
   };
 }

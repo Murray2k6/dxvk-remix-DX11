@@ -1,0 +1,9 @@
+LIBRARY REMIX_VK_LAYER.DLL
+EXPORTS
+    vkNegotiateLoaderLayerInterfaceVersion
+    vkGetInstanceProcAddr
+    vkGetDeviceProcAddr
+    remix_vklayer_annotate_draw
+    remix_vklayer_note_indirect_layout
+    remix_vklayer_annotate_indirect
+    remix_vklayer_describe_view

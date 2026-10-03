@@ -23,6 +23,7 @@
 
 #include <iostream>
 #include <filesystem>
+#include <vector>
 #include <process.h>   // _getpid - per-process log filenames
 
 #include "../util_env.h"
@@ -65,6 +66,51 @@ namespace{
 
 namespace dxvk {
 
+  namespace {
+    // Clean slate per launch: logs of earlier runs (<name>.<pid>.log, one pair
+    // per launch) piled up beside the game. The first log this process opens
+    // moves them into remix-previous-logs/, replacing what the launch before
+    // left there, so the folder holds only the current run while the previous
+    // run's logs stay available once. A log still held open by a running
+    // process (a game that re-launched itself) cannot be moved and stays.
+    void archivePreviousRunLogs(const std::filesystem::path& logDir) {
+      // Once per folder: the DLL-named log opens beside the game, the
+      // remix-dxvk log later in rtx-remix/logs.
+      static std::vector<std::filesystem::path> s_done;
+      std::error_code ec;
+      const std::filesystem::path base = logDir.empty() ? std::filesystem::current_path(ec) : logDir;
+      if (ec)
+        return;
+      for (const auto& done : s_done)
+        if (std::filesystem::equivalent(done, base, ec))
+          return;
+      s_done.push_back(base);
+      const std::string ownSuffix = "." + std::to_string(_getpid()) + ".log";
+      std::vector<std::filesystem::path> previous;
+      for (std::filesystem::directory_iterator it(base, ec), end; !ec && it != end; it.increment(ec)) {
+        const std::string name = it->path().filename().string();
+        const bool runtimeLog = name.rfind("d3d11.", 0) == 0 || name.rfind("dxgi.", 0) == 0
+                             || name.rfind("remix-dxvk.", 0) == 0;
+        const bool pidLog = name.size() > ownSuffix.size() && name.size() > 4
+                         && name.compare(name.size() - 4, 4, ".log") == 0;
+        const bool ours = name.size() >= ownSuffix.size()
+                       && name.compare(name.size() - ownSuffix.size(), ownSuffix.size(), ownSuffix) == 0;
+        if (runtimeLog && pidLog && !ours && it->is_regular_file(ec))
+          previous.push_back(it->path());
+      }
+      if (previous.empty())
+        return;
+
+      const std::filesystem::path archive = base / "remix-previous-logs";
+      std::filesystem::remove_all(archive, ec);
+      std::filesystem::create_directories(archive, ec);
+      for (const auto& file : previous) {
+        std::error_code moveError;
+        std::filesystem::rename(file, archive / file.filename(), moveError);
+      }
+    }
+  }
+
   Logger::Logger(const std::string& fileName, const LogLevel logLevel)
   : m_minLevel(logLevel)
   // NV-DXVK start: Don't double print every line
@@ -87,6 +133,7 @@ namespace dxvk {
       const auto path = getFilePath(fileName);
 
       if (!path.empty()) {
+        archivePreviousRunLogs(std::filesystem::path(path).parent_path());
         m_fileStream = std::ofstream(str::tows(path.c_str()).c_str());
         assert(m_fileStream.is_open());
       }

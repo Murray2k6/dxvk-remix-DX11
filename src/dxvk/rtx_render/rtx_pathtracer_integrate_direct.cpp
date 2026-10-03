@@ -38,7 +38,7 @@ namespace dxvk {
 
   // Defined within an unnamed namespace to ensure unique definition across binary
   namespace {
-    class IntegrateDirectRayGenShader : public AsyncManagedShader {
+    class IntegrateDirectRayGenShader : public ManagedShader {
     public:
       BINDLESS_ENABLED()
 

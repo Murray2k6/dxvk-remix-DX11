@@ -36,9 +36,11 @@ uint inputToHistogramBucket(const float3 inputColor)
 {
   const float inputLuminance = calcBt709Luminance(inputColor);
 
-  // Count nearly black pixels in the 0th bucket
+  // Count nearly black pixels in the 0th bucket. Non-finite pixels (NaN/Inf
+  // from a bad surface or denoiser history) go there too: their EV is
+  // meaningless and must not steer exposure.
   const float kEpsilon = 0.00001f;
-  if (inputLuminance < kEpsilon)
+  if (!isfinite(inputLuminance) || inputLuminance < kEpsilon)
   {
     return 0;
   }

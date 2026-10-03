@@ -1,8 +1,10 @@
 #include <cmath>
 #include <cstring>
+#include <unordered_set>
 
 #include "../util/xxHash/xxhash.h"
 
+#include "d3d11_buffer.h"
 #include "d3d11_context.h"
 #include "d3d11_device.h"
 #include "d3d11_query.h"
@@ -1368,7 +1370,48 @@ namespace dxvk {
     if (IsPredicatedOff())
       return;
 
-    
+    // Temporary diagnostic (light import research): once per compute shader,
+    // describe the buffers it reads. Tiled deferred renderers keep the frame's
+    // light list in a CPU-written structured buffer read here.
+    if (m_state.cs.shader != nullptr) {
+      static std::unordered_set<const void*> s_loggedCs;
+      static uint32_t s_csLogs = 0;
+      const void* csKey = m_state.cs.shader->GetCommonShader();
+      if (s_csLogs < 48u && s_loggedCs.insert(csKey).second) {
+        ++s_csLogs;
+        std::string report = str::format("[D3D11Rtx][cs-buffers] cs=0x", std::hex,
+          m_state.cs.shader->GetCommonShader()->GetBytecodeHash(), std::dec,
+          " groups=", ThreadGroupCountX, "x", ThreadGroupCountY, "x", ThreadGroupCountZ);
+        for (uint32_t slot = 0; slot < m_state.cs.shaderResources.views.size(); ++slot) {
+          D3D11ShaderResourceView* srv = m_state.cs.shaderResources.views[slot].ptr();
+          if (srv == nullptr || srv->GetResourceType() != D3D11_RESOURCE_DIMENSION_BUFFER)
+            continue;
+          Com<ID3D11Resource> resource;
+          srv->GetResource(&resource);
+          auto* buffer = static_cast<D3D11Buffer*>(resource.ptr());
+          D3D11_BUFFER_DESC desc;
+          buffer->GetDesc(&desc);
+          report += str::format(" | t", slot, " bytes=", desc.ByteWidth, " stride=", desc.StructureByteStride,
+            " usage=", uint32_t(desc.Usage), " cpu=", desc.CPUAccessFlags, " misc=", desc.MiscFlags);
+          const auto* mapped = reinterpret_cast<const float*>(buffer->GetMappedSlice().mapPtr);
+          if (mapped != nullptr && desc.ByteWidth >= 64u) {
+            report += " f=[";
+            for (uint32_t i = 0; i < 16u; ++i)
+              report += str::format(i ? "," : "", mapped[i]);
+            report += "]";
+          }
+        }
+        for (uint32_t slot = 0; slot < D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT; ++slot) {
+          if (m_state.cs.constantBuffers[slot].buffer == nullptr)
+            continue;
+          report += str::format(" | cb", slot, " bytes=", m_state.cs.constantBuffers[slot].buffer->Desc()->ByteWidth);
+        }
+        Logger::info(report);
+      }
+    }
+
+    m_rtx.OnDispatch();
+
     EmitCs([=] (DxvkContext* ctx) {
       ctx->dispatch(
         ThreadGroupCountX,

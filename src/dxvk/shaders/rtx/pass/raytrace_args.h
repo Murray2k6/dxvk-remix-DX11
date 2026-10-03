@@ -408,6 +408,11 @@ struct RaytraceArgs {
   float wboitDepthWeightTuning;
   uint wboitEnabled;
 
+  // DX11 projected decals (SceneManager::prepareProjectedDecals): bindless
+  // raw-buffer index of the frame's decal records and their count.
+  uint decalBufferIndex;
+  uint decalCount;
+
   // NOTE: Add structs to the top section of RaytraceArgs, not the bottom.
   // NOTE: bool does not work in debug builds, use uint instead.
 };

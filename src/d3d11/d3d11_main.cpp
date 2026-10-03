@@ -219,6 +219,17 @@ namespace {
   }
 }
 
+namespace dxvk {
+  // For the DX12 / Vulkan front end (d3d11_vk_frontend.cpp).
+  HMODULE D3D11LoadSiblingDxgi() {
+    return loadSiblingDxgi();
+  }
+
+  HMODULE D3D11GetModule() {
+    return g_d3d11Module;
+  }
+}
+
 // DX11_V263_CRASH_FILTER_SAFE: (re)install the log-only unhandled-exception
 // filter. Games install their own filter during startup (Unity CrashHandler,
 // launcher SEH), which would replace ours and silently eat the crash
@@ -361,6 +372,22 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
 
 namespace dxvk {
   Logger Logger::s_instance("d3d11.log");
+
+  // Initialise the RTX filesystem (log/mod/capture paths) relative to the
+  // game exe, then re-open the log file under that path. Called by every
+  // entry point that starts Remix (D3D11 device creation, the DX12 / Vulkan
+  // front end); runs once.
+  void D3D11InitRemixFileSystem() {
+    ONCE(
+      const auto exePath = env::getExePath();
+      const auto exeDir  = std::filesystem::path(exePath).parent_path();
+      util::RtxFileSys::init(exeDir.string());
+      Logger::initRtxLog();
+      util::RtxFileSys::print();
+    );
+
+    logRemixDx11BuildBanner();
+  }
 }
   
 extern "C" {
@@ -588,18 +615,7 @@ extern "C" {
 
     InitReturnPtr(ppDevice);
 
-    // Initialise the RTX filesystem (log/mod/capture paths) relative to the
-    // game exe, then re-open the log file under that path.  Must be ONCE since
-    // D3D11CoreCreateDevice can be called multiple times.
-    ONCE(
-      const auto exePath = env::getExePath();
-      const auto exeDir  = std::filesystem::path(exePath).parent_path();
-      util::RtxFileSys::init(exeDir.string());
-      Logger::initRtxLog();
-      util::RtxFileSys::print();
-    );
-
-    logRemixDx11BuildBanner();
+    D3D11InitRemixFileSystem();
 
     Rc<DxvkAdapter>  dxvkAdapter;
     Rc<DxvkInstance> dxvkInstance;
@@ -717,12 +733,13 @@ extern "C" {
     }
     
     // Feature levels to probe if the application does not specify any.
-    // Highest first: with d3d11.maxFeatureLevel = 12_1 (the shipped default
-    // config) modern engines that require FL 12_x on their D3D11 device get
-    // it; older hardware/config caps fall through to the next level down.
-    std::array<D3D_FEATURE_LEVEL, 9> defaultFeatureLevels = {
-      D3D_FEATURE_LEVEL_12_1, D3D_FEATURE_LEVEL_12_0,
-      D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0,
+    // This must match native D3D11, whose default list tops out at 11_0:
+    // 11_1 and 12_x are only ever returned when explicitly requested.
+    // Returning 12_1 here broke libraries that accept only 11_0/11_1 - e.g.
+    // NVIDIA's GFSDK_GodraysLib_OpenDX refused the device, its context stayed
+    // null and Fallout 4 crashed dereferencing GetInternalDepth's result.
+    std::array<D3D_FEATURE_LEVEL, 6> defaultFeatureLevels = {
+      D3D_FEATURE_LEVEL_11_0,
       D3D_FEATURE_LEVEL_10_1, D3D_FEATURE_LEVEL_10_0,
       D3D_FEATURE_LEVEL_9_3,  D3D_FEATURE_LEVEL_9_2,
       D3D_FEATURE_LEVEL_9_1,

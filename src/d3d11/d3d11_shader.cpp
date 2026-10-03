@@ -1,4 +1,5 @@
 #include <cctype>
+#include <cstring>
 #include <algorithm>
 #include <filesystem>
 #include <fstream>
@@ -367,7 +368,8 @@ namespace dxvk {
     auto matrixBindingEqual = [](const D3D11PositionTransformMatrixBinding& a,
                                  const D3D11PositionTransformMatrixBinding& b) {
       return a.constantBufferSlot == b.constantBufferSlot
-          && a.constantRegisters == b.constantRegisters;
+          && a.constantRegisters == b.constantRegisters
+          && a.columns == b.columns;
     };
 
     auto collapseTransform = [&](const TransformComponents& transform,
@@ -645,6 +647,272 @@ namespace dxvk {
     }
 
     collapseTransform(position, result);
+    return result;
+  }
+
+  // Column form of the same proof: `out = Σ_k in_k · cb[C_k]` written as
+  //   mul t, cb[C0], v.xxxx  /  mad t, cb[C1], v.yyyy, t  /  mad t, cb[C2], v.zzzz, t
+  //   add t, t, cb[C3]       (or mad t, cb[C3], v.wwww, t)
+  // which is what fxc emits for Unity's mul(M, v) (column-major matrices) and
+  // for UE's mul(v, M) with row_major packing. A second chain whose broadcast
+  // operands come from a finished first chain is the view-projection stage.
+  // Columns must be consecutive registers of one cbuffer, in input order.
+  static D3D11PositionTransformBinding findColumnPositionTransformBinding(const DxbcModule& module) {
+    D3D11PositionTransformBinding result;
+    const Rc<DxbcIsgn> osgn = module.osgn();
+    const Rc<DxbcIsgn> isgn = module.isgn();
+    if (osgn == nullptr || isgn == nullptr)
+      return result;
+
+    int32_t posOut = -1, posIn = -1;
+    for (const DxbcSgnEntry& e : *osgn) {
+      if (e.systemValue == DxbcSystemValue::Position) { posOut = int32_t(e.registerId); break; }
+    }
+    for (const DxbcSgnEntry& e : *isgn) {
+      std::string s = e.semanticName;
+      std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return char(std::toupper(c)); });
+      if (s == "POSITION" && e.semanticIndex == 0) { posIn = int32_t(e.registerId); break; }
+    }
+    if (posOut < 0 || posIn < 0)
+      return result;
+
+    auto staticIndex = [](const DxbcRegister& r, uint32_t dim, int32_t& out) {
+      if (r.idxDim <= dim || r.idx[dim].relReg != nullptr || r.idx[dim].offset < 0)
+        return false;
+      out = r.idx[dim].offset;
+      return true;
+    };
+
+    // Per temp component: which POSITION component (0..2), constant one (3),
+    // or nothing (-1) it holds, from `mov r.xyz, v0.xyz` / `mov r.w, l(1.0)`.
+    std::unordered_map<int32_t, std::array<int8_t, 4>> origins;
+
+    struct Chain {
+      bool active = false;
+      int32_t slot = -1;
+      std::array<int32_t, 4> columns = { -1, -1, -1, -1 };
+      uint32_t mask = 0;
+      int32_t sourceTemp = -1;  // -1: POSITION input; else temp holding stage 1
+    };
+    std::unordered_map<int32_t, Chain> chains;
+    Chain outputChain;
+    std::unordered_map<int32_t, Chain> finished;  // stage-1 chains by temp, snapshot
+
+    auto writtenMask = [](const DxbcRegister& dst) {
+      uint32_t m = 0;
+      for (uint32_t c = 0; c < 4; ++c) if (dst.mask[c]) m |= 1u << c;
+      return m;
+    };
+    auto firstComp = [](uint32_t mask) {
+      for (uint32_t c = 0; c < 4; ++c) if (mask & (1u << c)) return c;
+      return 0u;
+    };
+    // cb operand read component-for-component (swizzle c -> c on written comps).
+    auto asColumn = [&](const DxbcRegister& r, uint32_t mask, int32_t& slot, int32_t& reg) {
+      if (r.type != DxbcOperandType::ConstantBuffer || !r.modifiers.isClear()
+       || !staticIndex(r, 0, slot) || !staticIndex(r, 1, reg))
+        return false;
+      for (uint32_t c = 0; c < 4; ++c)
+        if ((mask & (1u << c)) && r.swizzle[c] != c)
+          return false;
+      return true;
+    };
+    // Broadcast vector operand: returns the input component k (0..3) it feeds
+    // and the source (-1 = POSITION, else the stage-1 temp).
+    auto asBroadcast = [&](const DxbcRegister& r, uint32_t mask, int32_t& k, int32_t& sourceTemp) {
+      if (!r.modifiers.isClear())
+        return false;
+      const uint32_t c0 = firstComp(mask);
+      const uint32_t comp = r.swizzle[c0];
+      for (uint32_t c = 0; c < 4; ++c)
+        if ((mask & (1u << c)) && r.swizzle[c] != comp)
+          return false;
+      int32_t index = -1;
+      if (r.type == DxbcOperandType::Input && staticIndex(r, 0, index) && index == posIn) {
+        if (comp > 3) return false;
+        k = int32_t(comp);
+        sourceTemp = -1;
+        return true;
+      }
+      if (r.type != DxbcOperandType::Temp || !staticIndex(r, 0, index))
+        return false;
+      auto o = origins.find(index);
+      if (o != origins.end() && o->second[comp] >= 0) {
+        k = o->second[comp];
+        sourceTemp = -1;
+        return true;
+      }
+      auto f = finished.find(index);
+      if (f != finished.end() && (f->second.mask & (1u << comp))) {
+        k = int32_t(comp);
+        sourceTemp = index;
+        return true;
+      }
+      return false;
+    };
+    auto addTerm = [&](Chain& chain, int32_t slot, int32_t reg, int32_t k, int32_t sourceTemp) {
+      if (chain.slot != slot || chain.sourceTemp != sourceTemp || chain.columns[k] >= 0)
+        return false;
+      chain.columns[k] = reg;
+      return true;
+    };
+    auto chainFor = [&](const DxbcRegister& dst, int32_t& tempIndex) -> Chain* {
+      int32_t index = -1;
+      if (dst.type == DxbcOperandType::Output && staticIndex(dst, 0, index) && index == posOut) {
+        tempIndex = -1;
+        return &outputChain;
+      }
+      if (dst.type == DxbcOperandType::Temp && staticIndex(dst, 0, index)) {
+        tempIndex = index;
+        return &chains[index];
+      }
+      return nullptr;
+    };
+    auto accumulatorOf = [&](const DxbcRegister& r, uint32_t mask) -> const Chain* {
+      int32_t index = -1;
+      if (r.type != DxbcOperandType::Temp || !r.modifiers.isClear() || !staticIndex(r, 0, index))
+        return nullptr;
+      for (uint32_t c = 0; c < 4; ++c)
+        if ((mask & (1u << c)) && r.swizzle[c] != c)
+          return nullptr;
+      auto it = chains.find(index);
+      return it != chains.end() && it->second.active ? &it->second : nullptr;
+    };
+    auto snapshotIfStage1 = [&](int32_t tempIndex, const Chain& chain) {
+      if (tempIndex >= 0 && chain.active && chain.sourceTemp < 0
+       && chain.columns[0] >= 0 && chain.columns[1] >= 0 && chain.columns[2] >= 0)
+        finished[tempIndex] = chain;
+    };
+
+    DxbcCodeSlice code = module.instructionSlice();
+    DxbcDecodeContext decoder;
+    while (!code.atEnd()) {
+      decoder.decodeInstruction(code);
+      const DxbcShaderInstruction& ins = decoder.getInstruction();
+      if (ins.dstCount == 0)
+        continue;
+      const DxbcRegister& dst = ins.dst[0];
+      int32_t tempIndex = -1;
+      Chain* chain = chainFor(dst, tempIndex);
+      const uint32_t mask = writtenMask(dst);
+      bool handled = false;
+
+      if (chain != nullptr && ins.op == DxbcOpcode::Mul && ins.srcCount == 2) {
+        for (uint32_t order = 0; order < 2 && !handled; ++order) {
+          int32_t slot, reg, k, src;
+          if (asColumn(ins.src[order], mask, slot, reg) && asBroadcast(ins.src[1 - order], mask, k, src)) {
+            *chain = Chain();
+            chain->active = true;
+            chain->slot = slot;
+            chain->columns[k] = reg;
+            chain->mask = mask;
+            chain->sourceTemp = src;
+            handled = true;
+          }
+        }
+      } else if (chain != nullptr && ins.op == DxbcOpcode::Mad && ins.srcCount == 3) {
+        if (const Chain* acc = accumulatorOf(ins.src[2], mask)) {
+          Chain next = *acc;
+          for (uint32_t order = 0; order < 2 && !handled; ++order) {
+            int32_t slot, reg, k, src;
+            if (asColumn(ins.src[order], mask, slot, reg) && asBroadcast(ins.src[1 - order], mask, k, src)
+             && (next.mask & mask) == mask && addTerm(next, slot, reg, k, src)) {
+              next.mask = mask;
+              *chain = next;
+              handled = true;
+            }
+          }
+        }
+      } else if (chain != nullptr && ins.op == DxbcOpcode::Add && ins.srcCount == 2) {
+        for (uint32_t order = 0; order < 2 && !handled; ++order) {
+          int32_t slot, reg;
+          const Chain* acc = accumulatorOf(ins.src[order], mask);
+          if (acc != nullptr && asColumn(ins.src[1 - order], mask, slot, reg)
+           && (acc->mask & mask) == mask) {
+            Chain next = *acc;
+            if (addTerm(next, slot, reg, 3, next.sourceTemp)) {
+              next.mask = mask;
+              *chain = next;
+              handled = true;
+            }
+          }
+        }
+      } else if (chain != nullptr && ins.op == DxbcOpcode::Mov && ins.srcCount == 1) {
+        if (const Chain* acc = accumulatorOf(ins.src[0], mask)) {
+          if ((acc->mask & mask) == mask) {
+            Chain copy = *acc;
+            copy.mask = mask;
+            *chain = copy;
+            handled = true;
+          }
+        }
+      }
+
+      if (handled) {
+        snapshotIfStage1(tempIndex, *chain);
+      } else if (chain != nullptr) {
+        // Any other write ends whatever chain this register carried.
+        if (tempIndex >= 0) {
+          chains.erase(tempIndex);
+          finished.erase(tempIndex);
+        } else {
+          outputChain = Chain();
+        }
+      }
+
+      // Origin tracking for `mov r.xyz, v0.xyz` and `mov r.w, l(1.0)`.
+      if (dst.type == DxbcOperandType::Temp && staticIndex(dst, 0, tempIndex) && !handled) {
+        auto& o = origins[tempIndex];
+        for (uint32_t c = 0; c < 4; ++c) {
+          if (!(mask & (1u << c)))
+            continue;
+          o[c] = -1;
+          if (ins.op != DxbcOpcode::Mov || ins.srcCount != 1 || !ins.src[0].modifiers.isClear())
+            continue;
+          const DxbcRegister& s = ins.src[0];
+          int32_t index = -1;
+          if (s.type == DxbcOperandType::Input && staticIndex(s, 0, index) && index == posIn && s.swizzle[c] < 3)
+            o[c] = int8_t(s.swizzle[c]);
+          else if (s.type == DxbcOperandType::Imm32) {
+            const uint32_t bits = s.componentCount == DxbcComponentCount::Component1 ? s.imm.u32_1 : s.imm.u32_4[c];
+            if (bits == 0x3f800000u)
+              o[c] = 3;  // w = 1: the translation column
+          }
+        }
+      }
+    }
+
+    // SV_Position must be the full xyzw result of a chain.
+    const Chain& out = outputChain;
+    if (!out.active || out.mask != 0xFu || out.columns[0] < 0 || out.columns[1] < 0 || out.columns[2] < 0)
+      return result;
+
+    auto toBinding = [](const Chain& c, D3D11PositionTransformMatrixBinding& b) {
+      // Present columns must be consecutive registers in input order.
+      for (uint32_t k = 1; k < 4; ++k)
+        if (c.columns[k] >= 0 && c.columns[k] != c.columns[0] + int32_t(k))
+          return false;
+      b.constantBufferSlot = uint32_t(c.slot);
+      b.columns = true;
+      b.affineW = (c.mask & 0x8u) == 0u;
+      for (uint32_t k = 0; k < 4; ++k)
+        b.constantRegisters[k] = c.columns[k] >= 0 ? uint32_t(c.columns[k]) : UINT32_MAX;
+      return true;
+    };
+
+    if (out.sourceTemp < 0) {
+      if (!toBinding(out, result.matrices[0]))
+        return result;
+      result.matrixCount = 1;
+    } else {
+      auto stage1 = finished.find(out.sourceTemp);
+      if (stage1 == finished.end() || out.columns[3] < 0
+       || !toBinding(stage1->second, result.matrices[0])
+       || !toBinding(out, result.matrices[1]))
+        return result;
+      result.matrixCount = 2;
+    }
+    result.valid = true;
     return result;
   }
 
@@ -1297,6 +1565,795 @@ namespace dxvk {
   // The analysis is deliberately conservative: a temporary carries the union
   // of input registers that feed it, and the most frequently sampled matching
   // float input wins for each texture resource slot.
+  // Far-plane geometry (sky domes, skyboxes, sun/moon/cloud layers) is pushed
+  // to depth 1 by writing SV_Position.z from the same value as .w (the common
+  // `pos.xyww` idiom). Detect it statically: plain movs into the position
+  // output whose z and w come from the same source register component.
+  // Camera-relative world transform, proven from the shader's data flow
+  // (reverse-engineered from Fallout 4's world shaders, the Creation Engine
+  // pattern):
+  //   row_i      = ( cbW[R+i].xyz, cbW[R+i].w - cbC[E].{x,y,z}[i] )   i = 0..2
+  //   world.i    = dp4(row_i, (POSITION.xyz, 1))
+  //   SV_Position.c = dp4(cbC[V+c], world)                              c = 0..3
+  // cbW[R..R+2] then hold the object's ABSOLUTE world matrix and cbC[E] the
+  // eye the engine subtracted. Optional: the UV scale/offset applied to
+  // TEXCOORD (mad uv, v.xy, cbU[k].zw, cbU[k].xy).
+  static D3D11CameraRelativeWorldBinding parseCameraRelativeWorldBinding(const DxbcModule& module) {
+    D3D11CameraRelativeWorldBinding result;
+    const Rc<DxbcIsgn> isgn = module.isgn();
+    const Rc<DxbcIsgn> osgn = module.osgn();
+    if (isgn == nullptr || osgn == nullptr)
+      return result;
+    int32_t posIn = -1, posOut = -1, texIn = -1;
+    for (const DxbcSgnEntry& e : *isgn) {
+      std::string s = e.semanticName;
+      std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return char(std::toupper(c)); });
+      if (s == "POSITION" && e.semanticIndex == 0) posIn = int32_t(e.registerId);
+      if (s == "TEXCOORD" && e.semanticIndex == 0) texIn = int32_t(e.registerId);
+      if (s == "BLENDINDICES" || s == "BLENDWEIGHT") return result;  // skinned
+    }
+    for (const DxbcSgnEntry& e : *osgn) {
+      if (e.systemValue == DxbcSystemValue::Position) { posOut = int32_t(e.registerId); break; }
+    }
+    if (posIn < 0 || posOut < 0)
+      return result;
+
+    // Dynamically indexed reads (cb[s][r + index], e.g. CRYENGINE SPIData[800])
+    // are not a fixed register and must never be taken for one.
+    auto isCb = [](const DxbcRegister& r) {
+      return r.type == DxbcOperandType::ConstantBuffer && r.idxDim >= 2
+          && r.idx[0].relReg == nullptr && r.idx[1].relReg == nullptr;
+    };
+    auto cbSlot = [](const DxbcRegister& r) { return uint32_t(r.idx[0].offset); };
+    auto cbReg = [](const DxbcRegister& r) { return uint32_t(r.idx[1].offset); };
+    auto singleComp = [](const DxbcRegMask& m) -> int32_t {
+      int32_t found = -1;
+      for (uint32_t c = 0; c < 4; ++c) {
+        if (m[c]) { if (found >= 0) return -1; found = int32_t(c); }
+      }
+      return found;
+    };
+
+    struct TempState {
+      std::array<int8_t, 4> posComp = { -1, -1, -1, -1 };  // component of POSITION, 3 = literal one
+      bool rowXyzValid = false; uint32_t rowSlot = 0, rowReg = 0;   // mov t.xyz, cbW[R].xyz
+      bool eyeWValid = false; uint32_t eyeSlot = 0, eyeReg = 0, eyeComp = 0, eyeRowSlot = 0, eyeRowReg = 0;
+      bool worldValid = false;                                        // t holds the world position
+      std::array<int32_t, 3> worldRows = { -1, -1, -1 };
+      // Second form (Dunia/Disrupt/Frostbite crViewProj): absolute world rows
+      // dp4'd straight from the cbuffer, then `add t.xyz, t.xyz, -eye.xyz`.
+      std::array<int32_t, 3> absRows = { -1, -1, -1 };
+      uint32_t absSlot = 0;
+      bool relValid = false; uint32_t relSlot = 0, relRow0 = 0, relEyeSlot = 0, relEyeReg = 0;
+    };
+    std::unordered_map<uint32_t, TempState> temps;
+
+    std::array<int32_t, 4> vpRows = { -1, -1, -1, -1 };
+    uint32_t vpSlot = UINT32_MAX, worldTempUsed = UINT32_MAX;
+    int32_t vpWorldRow = -1;
+
+    DxbcCodeSlice slice = module.instructionSlice();
+    DxbcDecodeContext decoder;
+    while (!slice.atEnd()) {
+      decoder.decodeInstruction(slice);
+      const DxbcShaderInstruction& ins = decoder.getInstruction();
+      if (ins.dstCount < 1)
+        continue;
+      const DxbcRegister& dst = ins.dst[0];
+
+      if (dst.type == DxbcOperandType::Temp && dst.idxDim >= 1) {
+        TempState& t = temps[uint32_t(dst.idx[0].offset)];
+        if (ins.op == DxbcOpcode::Mov && ins.srcCount == 1) {
+          const DxbcRegister& s = ins.src[0];
+          for (uint32_t c = 0; c < 4; ++c) {
+            if (!dst.mask[c]) continue;
+            t.posComp[c] = -1;
+            if (s.type == DxbcOperandType::Input && s.idxDim >= 1 && int32_t(s.idx[0].offset) == posIn
+             && s.modifiers.isClear() && s.swizzle[c] < 3)
+              t.posComp[c] = int8_t(s.swizzle[c]);
+            if (s.type == DxbcOperandType::Imm32) {
+              float f; std::memcpy(&f, &s.imm.u32_4[s.componentCount == DxbcComponentCount::Component1 ? 0 : c], sizeof(f));
+              if (f == 1.0f) t.posComp[c] = 3;
+            }
+          }
+          if (dst.mask[0] && dst.mask[1] && dst.mask[2] && isCb(s)
+           && s.swizzle[0] == 0 && s.swizzle[1] == 1 && s.swizzle[2] == 2) {
+            t.rowXyzValid = true; t.rowSlot = cbSlot(s); t.rowReg = cbReg(s);
+          } else if (dst.mask[0] || dst.mask[1] || dst.mask[2]) {
+            t.rowXyzValid = false;
+          }
+          if (dst.mask[3]) t.eyeWValid = false;
+          t.worldValid = false;
+        } else if (ins.op == DxbcOpcode::Add && ins.srcCount == 2 && singleComp(dst.mask) == 3) {
+          // w = cbW[R].w - cbC[E].c (either operand order)
+          t.eyeWValid = false;
+          for (uint32_t a = 0; a < 2; ++a) {
+            const DxbcRegister& eye = ins.src[a];
+            const DxbcRegister& row = ins.src[1 - a];
+            if (isCb(eye) && isCb(row) && eye.modifiers.test(DxbcRegModifier::Neg)
+             && row.modifiers.isClear() && row.swizzle[3] == 3 && eye.swizzle[3] < 3) {
+              ++result.debugEyeAdds;
+              t.eyeWValid = true;
+              t.eyeSlot = cbSlot(eye); t.eyeReg = cbReg(eye); t.eyeComp = eye.swizzle[3];
+              t.eyeRowSlot = cbSlot(row); t.eyeRowReg = cbReg(row);
+            }
+          }
+          t.posComp[3] = -1;
+          t.worldValid = false;
+        } else if (ins.op == DxbcOpcode::Add && ins.srcCount == 2 && dst.mask[0] && dst.mask[1] && dst.mask[2]
+                && !dst.mask[3]) {
+          // t.xyz = absWorld.xyz - eye.xyz (either operand order)
+          bool matched = false;
+          for (uint32_t a = 0; a < 2 && !matched; ++a) {
+            const DxbcRegister& w = ins.src[a];
+            const DxbcRegister& eye = ins.src[1 - a];
+            if (w.type != DxbcOperandType::Temp || !w.modifiers.isClear()
+             || w.swizzle[0] != 0 || w.swizzle[1] != 1 || w.swizzle[2] != 2)
+              continue;
+            if (!isCb(eye) || !eye.modifiers.test(DxbcRegModifier::Neg)
+             || eye.swizzle[0] != 0 || eye.swizzle[1] != 1 || eye.swizzle[2] != 2)
+              continue;
+            const TempState src = temps[uint32_t(w.idx[0].offset)];
+            if (src.absRows[0] >= 0 && src.absRows[1] == src.absRows[0] + 1 && src.absRows[2] == src.absRows[0] + 2) {
+              ++result.debugEyeAdds;
+              const std::array<int8_t, 4> keepPos = t.posComp;
+              t = TempState();
+              t.posComp = keepPos;
+              t.posComp[0] = t.posComp[1] = t.posComp[2] = -1;
+              t.relValid = true;
+              t.relSlot = src.absSlot;
+              t.relRow0 = uint32_t(src.absRows[0]);
+              t.relEyeSlot = cbSlot(eye);
+              t.relEyeReg = cbReg(eye);
+              matched = true;
+            }
+          }
+          if (!matched) {
+            for (uint32_t c = 0; c < 3; ++c) { t.posComp[c] = -1; t.worldRows[c] = -1; t.absRows[c] = -1; }
+            t.worldValid = false;
+            t.rowXyzValid = false;
+            t.relValid = false;
+          }
+        } else if (ins.op == DxbcOpcode::Dp4 && ins.srcCount == 2) {
+          const int32_t k = singleComp(dst.mask);
+          // Absolute world row: dp4 t.k, cbW[R+k], (POSITION.xyz, 1).
+          bool isAbsRow = false;
+          for (uint32_t a = 0; a < 2 && k >= 0 && k < 3; ++a) {
+            const DxbcRegister& m = ins.src[a];
+            const DxbcRegister& v = ins.src[1 - a];
+            if (!isCb(m) || !m.modifiers.isClear() || m.swizzle != DxbcRegSwizzle(0, 1, 2, 3))
+              continue;
+            bool posOk = false;
+            if (v.type == DxbcOperandType::Temp && v.modifiers.isClear() && v.swizzle == DxbcRegSwizzle(0, 1, 2, 3)) {
+              const TempState& pos = temps[uint32_t(v.idx[0].offset)];
+              posOk = pos.posComp[0] == 0 && pos.posComp[1] == 1 && pos.posComp[2] == 2 && pos.posComp[3] == 3;
+            }
+            if (posOk) {
+              isAbsRow = true;
+              t.absRows[k] = int32_t(cbReg(m));
+              t.absSlot = cbSlot(m);
+            }
+          }
+          if (!isAbsRow && k >= 0 && k < 3)
+            t.absRows[k] = -1;
+          if (k >= 0 && k < 3)
+            t.relValid = false;
+          bool isWorldRow = false;
+          for (uint32_t a = 0; a < 2 && k >= 0 && k < 3; ++a) {
+            if (ins.src[a].type != DxbcOperandType::Temp || ins.src[1 - a].type != DxbcOperandType::Temp)
+              continue;
+            const TempState& row = temps[uint32_t(ins.src[a].idx[0].offset)];
+            const TempState& pos = temps[uint32_t(ins.src[1 - a].idx[0].offset)];
+            const bool posOk = pos.posComp[0] == 0 && pos.posComp[1] == 1 && pos.posComp[2] == 2 && pos.posComp[3] == 3;
+            const bool rowOk = row.rowXyzValid && row.eyeWValid && row.eyeRowSlot == row.rowSlot
+              && row.eyeRowReg == row.rowReg && int32_t(row.eyeComp) == k;
+            if (posOk && rowOk) {
+              ++result.debugWorldRows;
+              isWorldRow = true;
+              t.worldRows[k] = int32_t(row.rowReg);
+              result.worldSlot = row.rowSlot;
+              result.cameraSlot = row.eyeSlot;
+              result.eyeRegister = row.eyeReg;
+            }
+          }
+          if (k >= 0)
+            t.posComp[k] = -1;
+          if (!isWorldRow && k >= 0 && k < 3)
+            t.worldRows[k] = -1;
+          t.worldValid = t.worldRows[0] >= 0 && t.worldRows[1] == t.worldRows[0] + 1 && t.worldRows[2] == t.worldRows[0] + 2;
+          if (t.worldValid)
+            ++result.debugWorldComplete;
+        } else {
+          for (uint32_t c = 0; c < 4; ++c)
+            if (dst.mask[c]) { t.posComp[c] = -1; if (c < 3) t.worldRows[c] = -1; }
+          t.worldValid = false;
+          if (dst.mask[0] || dst.mask[1] || dst.mask[2]) t.rowXyzValid = false;
+          if (dst.mask[3]) t.eyeWValid = false;
+        }
+      } else if (dst.type == DxbcOperandType::Output && dst.idxDim >= 1 && int32_t(dst.idx[0].offset) == posOut) {
+        const int32_t k = singleComp(dst.mask);
+        if (ins.op == DxbcOpcode::Dp4 && ins.srcCount == 2 && k >= 0) {
+          for (uint32_t a = 0; a < 2; ++a) {
+            const DxbcRegister& m = ins.src[a];
+            const DxbcRegister& v = ins.src[1 - a];
+            if (isCb(m) && m.modifiers.isClear() && v.type == DxbcOperandType::Temp
+             && temps[uint32_t(v.idx[0].offset)].worldValid) {
+              vpRows[k] = int32_t(cbReg(m));
+              ++result.debugVpRows;
+              vpSlot = cbSlot(m);
+              worldTempUsed = uint32_t(v.idx[0].offset);
+              // Snapshot now: engines reuse the temp afterwards (Fallout 4
+              // rebuilds the previous-frame position in the same register).
+              vpWorldRow = temps[worldTempUsed].worldRows[0];
+            } else if (isCb(m) && m.modifiers.isClear() && v.type == DxbcOperandType::Temp
+                    && temps[uint32_t(v.idx[0].offset)].relValid
+                    && temps[uint32_t(v.idx[0].offset)].posComp[3] == 3) {
+              // Camera-relative position (world - eye, w = 1) times ViewProj.
+              const TempState& rel = temps[uint32_t(v.idx[0].offset)];
+              vpRows[k] = int32_t(cbReg(m));
+              ++result.debugVpRows;
+              vpSlot = cbSlot(m);
+              worldTempUsed = uint32_t(v.idx[0].offset);
+              vpWorldRow = int32_t(rel.relRow0);
+              result.worldSlot = rel.relSlot;
+              result.cameraSlot = rel.relEyeSlot;
+              result.eyeRegister = rel.relEyeReg;
+            }
+          }
+        }
+      }
+
+      // UV scale/offset: mad uv.xy, TEXCOORD0.xy, cbU[k].zw, cbU[k].xy
+      if (ins.op == DxbcOpcode::Mad && ins.srcCount == 3 && texIn >= 0 && !result.hasUvTransform) {
+        const DxbcRegister& v = ins.src[0];
+        const DxbcRegister& s = ins.src[1];
+        const DxbcRegister& o = ins.src[2];
+        if (v.type == DxbcOperandType::Input && int32_t(v.idx[0].offset) == texIn
+         && v.swizzle[0] == 0 && v.swizzle[1] == 1
+         && isCb(s) && isCb(o) && cbSlot(s) == cbSlot(o) && cbReg(s) == cbReg(o)
+         && s.swizzle[0] == 2 && s.swizzle[1] == 3 && o.swizzle[0] == 0 && o.swizzle[1] == 1) {
+          result.hasUvTransform = true;
+          result.uvSlot = cbSlot(s);
+          result.uvRegister = cbReg(s);
+        }
+      }
+    }
+
+    // The eye and the ViewProj may live in different cbuffers (CRYENGINE 3:
+    // eye in PER_FRAME b2, matrices elsewhere); both locations are recorded.
+    const bool vpOk = vpRows[0] >= 0 && vpRows[1] == vpRows[0] + 1 && vpRows[2] == vpRows[0] + 2
+                   && vpRows[3] == vpRows[0] + 3 && vpSlot != UINT32_MAX;
+    if (worldTempUsed != UINT32_MAX && vpWorldRow >= 0 && vpOk) {
+      result.valid = true;
+      result.worldRegister = uint32_t(vpWorldRow);
+      result.viewProjRegister = uint32_t(vpRows[0]);
+      result.viewProjSlot = vpSlot;
+    }
+    return result;
+  }
+
+  // Vertex shaders that evaluate sin/cos animate their vertices over time:
+  // wind sway on foliage and grass (Fallout 4: sincos over per-object wind
+  // parameters feeding SV_Position), water waves, flags, cloth.
+  // Vertex texture fetch moves vertices too: CRYENGINE vegetation bending
+  // samples a wind grid, Frostbite terrain and tessellated water displace by
+  // height maps. Their positions are not the proven matrix transform of the
+  // input, so exact-world placement must not be used for them.
+  static bool parseDxbcUsesTrigonometry(const DxbcModule& module) {
+    DxbcCodeSlice slice = module.instructionSlice();
+    DxbcDecodeContext decoder;
+    while (!slice.atEnd()) {
+      decoder.decodeInstruction(slice);
+      const DxbcShaderInstruction& ins = decoder.getInstruction();
+      if (ins.op == DxbcOpcode::SinCos
+       || ins.opClass == DxbcInstClass::TextureSample
+       || ins.opClass == DxbcInstClass::TextureGather)
+        return true;
+    }
+    return false;
+  }
+
+  static bool parseDxbcWritesPositionAtFarPlane(const DxbcModule& module, std::string& outSummary,
+                                                bool& outConstantW) {
+    outConstantW = false;
+    const Rc<DxbcIsgn> outputSignature = module.osgn();
+    if (outputSignature == nullptr)
+      return false;
+    int32_t positionRegister = -1;
+    for (const DxbcSgnEntry& entry : *outputSignature) {
+      if (entry.systemValue == DxbcSystemValue::Position) {
+        positionRegister = int32_t(entry.registerId);
+        break;
+      }
+    }
+    if (positionRegister < 0)
+      return false;
+
+    struct ComponentSource {
+      bool     known = false;
+      uint32_t type = 0;
+      int32_t  reg = -1;
+      uint32_t component = 0;
+    };
+    ComponentSource zSource, wSource;
+
+    DxbcCodeSlice slice = module.instructionSlice();
+    DxbcDecodeContext decoder;
+    while (!slice.atEnd()) {
+      decoder.decodeInstruction(slice);
+      const DxbcShaderInstruction& ins = decoder.getInstruction();
+      for (uint32_t d = 0; d < ins.dstCount; ++d) {
+        const DxbcRegister& dst = ins.dst[d];
+        if (dst.type != DxbcOperandType::Output || dst.idxDim == 0
+         || dst.idx[0].offset != positionRegister)
+          continue;
+        if ((dst.mask[2] || dst.mask[3]) && outSummary.size() < 400) {
+          outSummary += str::format(" op", uint32_t(ins.op), " mask",
+            dst.mask[0] ? "x" : "", dst.mask[1] ? "y" : "", dst.mask[2] ? "z" : "", dst.mask[3] ? "w" : "");
+          for (uint32_t si = 0; si < ins.srcCount; ++si) {
+            const DxbcRegister& src = ins.src[si];
+            outSummary += str::format(" s", uint32_t(src.type), ":",
+              src.idxDim > 0 ? src.idx[0].offset : -1, ".",
+              uint32_t(src.swizzle[0]), uint32_t(src.swizzle[1]), uint32_t(src.swizzle[2]), uint32_t(src.swizzle[3]));
+            if (src.type == DxbcOperandType::Imm32)
+{
+              float f[4];
+              std::memcpy(f, src.imm.u32_4, sizeof(f));
+              outSummary += str::format("=", f[0], ",", f[1], ",", f[2], ",", f[3]);
+            }
+          }
+          outSummary += ";";
+        }
+        const bool plainMov = ins.op == DxbcOpcode::Mov && ins.srcCount == 1u
+          && ins.src[0].modifiers.isClear() && ins.src[0].idxDim > 0
+          && !ins.modifiers.saturate;
+        // SV_Position.w taken from an immediate: the vertices are already in
+        // screen space (post-process triangles, UI quads). The last write wins.
+        if (dst.mask[3]) {
+          outConstantW = ins.op == DxbcOpcode::Mov && ins.srcCount == 1u
+            && ins.src[0].type == DxbcOperandType::Imm32;
+        }
+        for (uint32_t c = 2; c < 4; ++c) {
+          if (!dst.mask[c])
+            continue;
+          ComponentSource& out = c == 2 ? zSource : wSource;
+          out = ComponentSource();
+          if (plainMov) {
+            out.known = true;
+            out.type = uint32_t(ins.src[0].type);
+            out.reg = ins.src[0].idx[0].offset;
+            out.component = ins.src[0].swizzle[c];
+          }
+        }
+      }
+    }
+    return zSource.known && wSource.known
+      && zSource.type == wSource.type
+      && zSource.reg == wSource.reg
+      && zSource.component == wSource.component;
+  }
+
+  // Texture decodes proven from the pixel shader's dataflow (METHODS.md,
+  // Materials). A normal map is whatever the shader unpacks with
+  // "sample * 2 - 1" (mad x, 2, -1, or mul 2 then add -1); the channel order
+  // of that unpack gives its encoding. A smoothness map is a sampled channel
+  // (optionally scaled by a constant) that the shader turns into roughness
+  // with "1 - x". Engine-independent: works on stripped shaders.
+  static void parseDxbcTextureDecodes(
+    const DxbcModule& module,
+    std::array<D3D11CommonShader::TextureDecode,
+      D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT>& out) {
+    // Per temp component: which texture channel it carries.
+    // stage 0 raw sample, 1 sample * 2 (awaiting -1), 2 scaled by a constant.
+    struct Origin { int16_t slot = -1; int8_t channel = -1; uint8_t stage = 0; };
+    std::unordered_map<uint32_t, std::array<Origin, 4>> temps;
+
+    auto originOf = [&](const DxbcRegister& r, uint32_t component) -> Origin {
+      if (r.type != DxbcOperandType::Temp || r.idxDim == 0 || r.idx[0].relReg != nullptr)
+        return {};
+      const auto it = temps.find(uint32_t(r.idx[0].offset));
+      return it != temps.end() ? it->second[r.swizzle[component]] : Origin();
+    };
+    auto immIs = [](const DxbcRegister& r, uint32_t component, float value) {
+      if (r.type != DxbcOperandType::Imm32 || !r.modifiers.isClear())
+        return false;
+      const uint32_t bits = r.componentCount == DxbcComponentCount::Component4
+        ? r.imm.u32_4[component] : r.imm.u32_1;
+      float f;
+      std::memcpy(&f, &bits, sizeof(f));
+      return f == value;
+    };
+    auto isConstant = [](const DxbcRegister& r) {
+      return r.type == DxbcOperandType::ConstantBuffer || r.type == DxbcOperandType::Imm32
+          || r.type == DxbcOperandType::ImmediateConstantBuffer;
+    };
+    // Normal unpacks per slot: texture channel feeding each output component.
+    std::array<std::array<int8_t, 4>, D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT> unpack;
+    for (auto& u : unpack)
+      u.fill(-1);
+
+    DxbcCodeSlice slice = module.instructionSlice();
+    DxbcDecodeContext decoder;
+    while (!slice.atEnd()) {
+      decoder.decodeInstruction(slice);
+      const DxbcShaderInstruction& ins = decoder.getInstruction();
+      if (ins.dstCount == 0 || ins.dst[0].type != DxbcOperandType::Temp || ins.dst[0].idxDim == 0)
+        continue;
+      const DxbcRegister& dst = ins.dst[0];
+      std::array<Origin, 4> written = temps[uint32_t(dst.idx[0].offset)];
+
+      const bool sample = (ins.opClass == DxbcInstClass::TextureSample
+                        || ins.opClass == DxbcInstClass::TextureGather)
+        && ins.srcCount >= 2u && ins.src[1].type == DxbcOperandType::Resource
+        && ins.src[1].idxDim > 0 && ins.src[1].idx[0].relReg == nullptr
+        && uint32_t(ins.src[1].idx[0].offset) < out.size();
+
+      for (uint32_t c = 0; c < 4u; ++c) {
+        if (!dst.mask[c])
+          continue;
+        Origin result;
+        if (sample) {
+          result = { int16_t(ins.src[1].idx[0].offset), int8_t(ins.src[1].swizzle[c]), 0 };
+        } else if (ins.op == DxbcOpcode::Mov && ins.srcCount == 1 && ins.src[0].modifiers.isClear()) {
+          result = originOf(ins.src[0], c);
+        } else if (ins.op == DxbcOpcode::Mad && ins.srcCount == 3) {
+          // tex * 2 - 1: the unpack itself.
+          for (uint32_t a = 0; a < 2u; ++a) {
+            const Origin o = originOf(ins.src[a], c);
+            if (o.slot >= 0 && o.stage == 0 && ins.src[a].modifiers.isClear()
+             && immIs(ins.src[1u - a], c, 2.0f) && immIs(ins.src[2], c, -1.0f)
+             && unpack[size_t(o.slot)][c] < 0)
+              unpack[size_t(o.slot)][c] = o.channel;
+          }
+        } else if (ins.op == DxbcOpcode::Mul && ins.srcCount == 2) {
+          for (uint32_t a = 0; a < 2u; ++a) {
+            const Origin o = originOf(ins.src[a], c);
+            if (o.slot < 0 || o.stage != 0 || !ins.src[a].modifiers.isClear())
+              continue;
+            if (immIs(ins.src[1u - a], c, 2.0f))
+              result = { o.slot, o.channel, 1 };
+            else if (isConstant(ins.src[1u - a]))
+              result = { o.slot, o.channel, 2 };
+          }
+        } else if (ins.op == DxbcOpcode::Add && ins.srcCount == 2) {
+          for (uint32_t a = 0; a < 2u; ++a) {
+            const DxbcRegister& v = ins.src[a];
+            const Origin o = originOf(v, c);
+            if (o.slot < 0)
+              continue;
+            // (tex * 2) - 1
+            if (o.stage == 1 && v.modifiers.isClear() && immIs(ins.src[1u - a], c, -1.0f)
+             && unpack[size_t(o.slot)][c] < 0)
+              unpack[size_t(o.slot)][c] = o.channel;
+            // 1 - smoothness
+            if (o.stage != 1 && v.modifiers.test(DxbcRegModifier::Neg) && !v.modifiers.test(DxbcRegModifier::Abs)
+             && immIs(ins.src[1u - a], c, 1.0f) && out[size_t(o.slot)].smoothnessChannel < 0)
+              out[size_t(o.slot)].smoothnessChannel = o.channel;
+          }
+        }
+        written[c] = result;
+      }
+      temps[uint32_t(dst.idx[0].offset)] = written;
+    }
+
+    for (size_t slot = 0; slot < out.size(); ++slot) {
+      const auto& u = unpack[slot];
+      if (u[0] < 0 || u[1] < 0)
+        continue;
+      if (u[0] == 3 && u[1] == 1)
+        out[slot].normalEncoding = 4;          // DXT5nm: X in alpha, Y in green
+      else if (u[0] == 1 && u[1] == 0)
+        out[slot].normalEncoding = 5;          // X and Y swapped
+      else if (u[0] == 0 && u[1] == 1)
+        out[slot].normalEncoding = u[2] == 2 ? 2 : 3;  // RGB, or XY with z rebuilt
+    }
+  }
+
+  // The pixel-shader input that multiplies a texture sample is the vertex
+  // colour (tint, baked lighting): the same rule as the DX12 / Vulkan SPIR-V
+  // analysis (d3d11_vk_spirv.cpp). Per temp component the pass tracks whether
+  // it carries a sample and which single input register it comes from; a
+  // mul / mad of the two votes for the input. The most-voted float input
+  // with at least three components wins, COLOR-named inputs breaking ties.
+  static void parseDxbcVertexColorInput(
+    const DxbcModule&                 module,
+    D3D11SampledTexcoordSemantic&     out,
+    uint32_t&                         outComponents) {
+    out = D3D11SampledTexcoordSemantic();
+    outComponents = 0;
+
+    const Rc<DxbcIsgn> isgn = module.isgn();
+    if (isgn == nullptr)
+      return;
+
+    // static: used by a capture-less lambda. Taint spells kNone as -1: MSVC
+    // rejects a local constant in a local struct's member initializer.
+    static constexpr int32_t kNone = -1, kMixed = -2;
+    struct Taint { bool sample = false; int32_t input = -1; };
+    std::unordered_map<uint32_t, std::array<Taint, 4>> temps;
+    std::unordered_map<int32_t, uint32_t> votes;
+
+    auto taintOf = [&](const DxbcRegister& r, uint32_t component) -> Taint {
+      if (r.idxDim == 0 || r.idx[0].relReg != nullptr || r.idx[0].offset < 0)
+        return {};
+      if (r.type == DxbcOperandType::Input)
+        return { false, int32_t(r.idx[0].offset) };
+      if (r.type == DxbcOperandType::Temp) {
+        const auto it = temps.find(uint32_t(r.idx[0].offset));
+        return it != temps.end() ? it->second[r.swizzle[component]] : Taint();
+      }
+      return {};
+    };
+    auto merge = [](int32_t a, int32_t b) {
+      if (a == kNone) return b;
+      if (b == kNone || a == b) return a;
+      return kMixed;
+    };
+
+    DxbcCodeSlice slice = module.instructionSlice();
+    DxbcDecodeContext decoder;
+    while (!slice.atEnd()) {
+      decoder.decodeInstruction(slice);
+      const DxbcShaderInstruction& ins = decoder.getInstruction();
+      if (ins.dstCount == 0 || ins.dst[0].type != DxbcOperandType::Temp || ins.dst[0].idxDim == 0)
+        continue;
+
+      const DxbcRegister& dst = ins.dst[0];
+      std::array<Taint, 4> written = temps[uint32_t(dst.idx[0].offset)];
+      const bool sample = ins.opClass == DxbcInstClass::TextureSample || ins.opClass == DxbcInstClass::TextureGather;
+      const bool product = (ins.op == DxbcOpcode::Mul || ins.op == DxbcOpcode::Mad) && ins.srcCount >= 2u;
+
+      for (uint32_t c = 0; c < 4u; ++c) {
+        if (!dst.mask[c])
+          continue;
+
+        Taint result;
+
+        if (sample) {
+          result.sample = true;
+        } else if (product) {
+          const Taint a = taintOf(ins.src[0], c);
+          const Taint b = taintOf(ins.src[1], c);
+
+          // sample * input (either order): the input is the colour.
+          if (a.sample && !b.sample && b.input >= 0)
+            votes[b.input]++;
+          else if (b.sample && !a.sample && a.input >= 0)
+            votes[a.input]++;
+
+          result.sample = a.sample || b.sample;
+          result.input = result.sample ? kNone : merge(a.input, b.input);
+        } else {
+          // Moves, saturates, adds and the like keep both kinds of origin.
+          for (uint32_t s = 0; s < ins.srcCount; ++s) {
+            const Taint t = taintOf(ins.src[s], c);
+            result.sample |= t.sample;
+            result.input = merge(result.input, t.input);
+          }
+        }
+
+        written[c] = result;
+      }
+
+      temps[uint32_t(dst.idx[0].offset)] = written;
+    }
+
+    int bestScore = -1;
+
+    for (const auto& v : votes) {
+      const DxbcSgnEntry* entry = isgn->findByRegister(uint32_t(v.first));
+      if (entry == nullptr || entry->systemValue != DxbcSystemValue::None
+       || entry->componentType != DxbcScalarType::Float32
+       || !entry->componentMask[0] || !entry->componentMask[1] || !entry->componentMask[2])
+        continue;
+
+      std::string upper = entry->semanticName;
+      for (auto& ch : upper)
+        ch = char(::toupper(static_cast<unsigned char>(ch)));
+
+      const int score = int(v.second) * 4 + (upper.compare(0, 5, "COLOR") == 0 ? 2 : 0);
+      if (score <= bestScore)
+        continue;
+
+      bestScore = score;
+      out.semanticName = entry->semanticName;
+      out.semanticIndex = entry->semanticIndex;
+      out.componentIndex = 0;
+      out.valid = true;
+      outComponents = entry->componentMask[3] ? 4u : 3u;
+    }
+  }
+
+  // Legacy cubemap reflections (Bethesda BSLightingShader / BSEffectShader
+  // envmaps, and any engine that adds "cube sample * strength * mask" to its
+  // colour): which TextureCube is sampled, the constant that scales the
+  // sample and up to two 2D texture channels that mask it, from the PS
+  // dataflow. Also the Creation deferred G-buffer envmap word, written as
+  // cb[N].x / 255 into a render target (fo4-decomp MODLOG.md: the pre-pass
+  // never samples the cube; a fullscreen composite adds it).
+  static void parseDxbcEnvmapReflection(
+    const DxbcModule&                     module,
+    D3D11CommonShader::EnvmapReflection&  out) {
+    out = D3D11CommonShader::EnvmapReflection();
+
+    std::array<bool, D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT> cube = {};
+
+    // Per temp component: the factors multiplied into the value so far.
+    struct Term {
+      bool    cube = false;
+      int8_t  cbSlot = -1;
+      uint16_t cbReg = 0;
+      uint8_t cbComponent = 0;
+      int8_t  texSlot[2] = { -1, -1 };
+      int8_t  texChannel[2] = { -1, -1 };
+      // A raw 2D sample (not yet multiplied by anything).
+      int8_t  sampleSlot = -1;
+      int8_t  sampleChannel = -1;
+    };
+    std::unordered_map<uint32_t, std::array<Term, 4>> temps;
+
+    auto termOf = [&](const DxbcRegister& r, uint32_t component) -> Term {
+      Term t;
+      if (r.idxDim == 0)
+        return t;
+      if (r.type == DxbcOperandType::Temp && r.idx[0].relReg == nullptr) {
+        const auto it = temps.find(uint32_t(r.idx[0].offset));
+        return it != temps.end() ? it->second[r.swizzle[component]] : t;
+      }
+      if (r.type == DxbcOperandType::ConstantBuffer && r.idxDim >= 2
+       && r.idx[0].relReg == nullptr && r.idx[1].relReg == nullptr
+       && r.idx[0].offset >= 0 && r.idx[0].offset < 14 && r.idx[1].offset >= 0 && r.idx[1].offset < 4096) {
+        t.cbSlot = int8_t(r.idx[0].offset);
+        t.cbReg = uint16_t(r.idx[1].offset);
+        t.cbComponent = uint8_t(r.swizzle[component]);
+      }
+      return t;
+    };
+
+    auto addTex = [](Term& t, int8_t slot, int8_t channel) {
+      for (uint32_t i = 0; i < 2; ++i) {
+        if (t.texSlot[i] == slot && t.texChannel[i] == channel)
+          return;
+        if (t.texSlot[i] < 0) {
+          t.texSlot[i] = slot;
+          t.texChannel[i] = channel;
+          return;
+        }
+      }
+    };
+
+    // Product of two terms: the union of their factors.
+    auto product = [&](const Term& a, const Term& b) {
+      Term r;
+      r.cube = a.cube || b.cube;
+      const Term& cbSrc = a.cbSlot >= 0 ? a : b;
+      r.cbSlot = cbSrc.cbSlot;
+      r.cbReg = cbSrc.cbReg;
+      r.cbComponent = cbSrc.cbComponent;
+      for (const Term* t : { &a, &b }) {
+        for (uint32_t i = 0; i < 2; ++i) {
+          if (t->texSlot[i] >= 0)
+            addTex(r, t->texSlot[i], t->texChannel[i]);
+        }
+        if (t->sampleSlot >= 0)
+          addTex(r, t->sampleSlot, t->sampleChannel);
+      }
+      return r;
+    };
+
+    int best = 0;
+
+    DxbcCodeSlice slice = module.instructionSlice();
+    DxbcDecodeContext decoder;
+    while (!slice.atEnd()) {
+      decoder.decodeInstruction(slice);
+      const DxbcShaderInstruction& ins = decoder.getInstruction();
+
+      if (ins.op == DxbcOpcode::DclResource && ins.dstCount > 0 && ins.dst[0].idxDim > 0) {
+        const uint32_t slot = uint32_t(ins.dst[0].idx[0].offset);
+        const DxbcResourceDim dim = ins.controls.resourceDim();
+        if (slot < cube.size())
+          cube[slot] = dim == DxbcResourceDim::TextureCube || dim == DxbcResourceDim::TextureCubeArr;
+        continue;
+      }
+
+      if (ins.dstCount == 0 || ins.dst[0].idxDim == 0)
+        continue;
+
+      const DxbcRegister& dst = ins.dst[0];
+
+      // Creation deferred envmap word: output.c = cb[N].x * (1 / 255).
+      if (dst.type == DxbcOperandType::Output && ins.op == DxbcOpcode::Mul && ins.srcCount == 2) {
+        for (uint32_t a = 0; a < 2u; ++a) {
+          const DxbcRegister& cbReg = ins.src[a];
+          const DxbcRegister& imm = ins.src[1u - a];
+          if (cbReg.type != DxbcOperandType::ConstantBuffer || cbReg.idxDim < 2
+           || cbReg.idx[0].relReg != nullptr || cbReg.idx[1].relReg != nullptr
+           || imm.type != DxbcOperandType::Imm32)
+            continue;
+          for (uint32_t c = 0; c < 4u; ++c) {
+            if (!dst.mask[c] || cbReg.swizzle[c] != 0)
+              continue;
+            const uint32_t bits = imm.componentCount == DxbcComponentCount::Component4 ? imm.imm.u32_4[c] : imm.imm.u32_1;
+            float f;
+            std::memcpy(&f, &bits, sizeof(f));
+            if (std::abs(f - 1.0f / 255.0f) < 1.0e-5f && out.gbufferCb < 0) {
+              out.gbufferCb = int8_t(cbReg.idx[0].offset);
+              out.gbufferReg = uint16_t(cbReg.idx[1].offset);
+            }
+          }
+        }
+        continue;
+      }
+
+      if (dst.type != DxbcOperandType::Temp || dst.idx[0].relReg != nullptr)
+        continue;
+
+      std::array<Term, 4> written = temps[uint32_t(dst.idx[0].offset)];
+
+      const bool sample = (ins.opClass == DxbcInstClass::TextureSample || ins.opClass == DxbcInstClass::TextureGather)
+        && ins.srcCount >= 2u && ins.src[1].type == DxbcOperandType::Resource && ins.src[1].idxDim > 0
+        && ins.src[1].idx[0].relReg == nullptr && uint32_t(ins.src[1].idx[0].offset) < cube.size();
+
+      for (uint32_t c = 0; c < 4u; ++c) {
+        if (!dst.mask[c])
+          continue;
+
+        Term result;
+
+        if (sample) {
+          const uint32_t slot = uint32_t(ins.src[1].idx[0].offset);
+          if (cube[slot]) {
+            result.cube = true;
+          } else {
+            result.sampleSlot = int8_t(slot);
+            result.sampleChannel = int8_t(ins.src[1].swizzle[c]);
+          }
+          if (cube[slot] && out.cubeSlot < 0)
+            out.cubeSlot = int8_t(slot);
+        } else if ((ins.op == DxbcOpcode::Mul || ins.op == DxbcOpcode::Mad) && ins.srcCount >= 2u) {
+          result = product(termOf(ins.src[0], c), termOf(ins.src[1], c));
+          if (result.cube) {
+            // The best-supported reflection term: a strength constant, then masks.
+            const int score = (result.cbSlot >= 0 ? 4 : 0)
+              + (result.texSlot[0] >= 0 ? 1 : 0) + (result.texSlot[1] >= 0 ? 1 : 0);
+            if (score > best) {
+              best = score;
+              out.scaleCb = result.cbSlot;
+              out.scaleReg = result.cbReg;
+              out.scaleComponent = result.cbComponent;
+              for (uint32_t i = 0; i < 2; ++i) {
+                out.maskSlot[i] = result.texSlot[i];
+                out.maskChannel[i] = result.texChannel[i];
+              }
+            }
+          }
+        } else if (ins.op == DxbcOpcode::Mov && ins.srcCount == 1) {
+          result = termOf(ins.src[0], c);
+        } else {
+          // Adds and the like: a cube value stays a cube value (factors kept
+          // from the cube side); anything else loses its factor history.
+          for (uint32_t s = 0; s < ins.srcCount; ++s) {
+            const Term t = termOf(ins.src[s], c);
+            if (t.cube) {
+              result = t;
+              break;
+            }
+          }
+        }
+
+        written[c] = result;
+      }
+
+      temps[uint32_t(dst.idx[0].offset)] = written;
+    }
+
+    // A cube sampled without a strength constant is not a material reflection
+    // (skyboxes, ambient probes).
+    if (out.scaleCb < 0)
+      out.cubeSlot = -1;
+  }
+
   static void parseDxbcSampledTexcoords(
     const DxbcModule& module,
     std::array<D3D11SampledTexcoordSemantic,
@@ -1318,6 +2375,10 @@ namespace dxvk {
     };
     using ComponentOrigins = std::array<InputOrigin, 4>;
     std::unordered_map<uint32_t, ComponentOrigins> tempOrigins;
+    // Diagnostics: last opcode that wrote each temp, to report why a sample
+    // coordinate could not be traced back to a pixel-shader input.
+    std::unordered_map<uint32_t, uint32_t> tempWriterOp;
+    std::string untracedReport;
     std::array<std::array<std::array<uint16_t, 3>, kMaxTrackedInputs>,
       D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT> directSampleCounts = {};
 
@@ -1340,6 +2401,8 @@ namespace dxvk {
       return {};
     };
 
+    const bool vertexStage = module.programInfo().type() == DxbcProgramType::VertexShader;
+
     DxbcCodeSlice slice = module.instructionSlice();
     DxbcDecodeContext decoder;
     while (!slice.atEnd()) {
@@ -1349,6 +2412,22 @@ namespace dxvk {
       const bool samplesTexture =
            ins.opClass == DxbcInstClass::TextureSample
         || ins.opClass == DxbcInstClass::TextureGather;
+
+      // Vertex shaders that read SRVs without sampling (ld, ld_structured,
+      // ld_raw, resinfo): UE GPUScene/skin cache, FO4 precombines (t5..t8),
+      // Source 2 transform buffers. The resource is then part of the draw's
+      // state, so a capture is never reused after its contents change.
+      if (vertexStage && !samplesTexture) {
+        for (uint32_t s = 0; s < ins.srcCount; ++s) {
+          const DxbcRegister& r = ins.src[s];
+          if (r.type != DxbcOperandType::Resource)
+            continue;
+          if (r.idxDim == 0 || r.idx[0].relReg != nullptr || r.idx[0].offset < 0)
+            outResourceProfileComplete = false;
+          else if (uint32_t(r.idx[0].offset) < outSampledResources.size())
+            outSampledResources[uint32_t(r.idx[0].offset)] = true;
+        }
+      }
       if (samplesTexture && ins.srcCount >= 3u
        && ins.src[1].type == DxbcOperandType::Resource) {
         if (ins.src[1].idxDim == 0
@@ -1366,6 +2445,18 @@ namespace dxvk {
             // original VS output and must fall back to an untextured material.
             const InputOrigin u = originFor(ins.src[0], 0u);
             const InputOrigin v = originFor(ins.src[0], 1u);
+            if ((!u.valid() || !v.valid()) && untracedReport.size() < 200u) {
+              const DxbcRegister& coord = ins.src[0];
+              uint32_t writer = UINT32_MAX;
+              if (coord.type == DxbcOperandType::Temp && coord.idxDim > 0) {
+                auto w = tempWriterOp.find(uint32_t(coord.idx[0].offset));
+                if (w != tempWriterOp.end())
+                  writer = w->second;
+              }
+              untracedReport += str::format(" t", resourceSlot, ":coordType=", uint32_t(coord.type),
+                ",writerOp=", writer == UINT32_MAX ? std::string("none") : std::to_string(writer),
+                ",mods=", coord.modifiers.isClear() ? 0 : 1, ";");
+            }
             if (u.valid() && v.valid()
              && u.registerId == v.registerId
              && v.component == u.component + 1
@@ -1384,17 +2475,60 @@ namespace dxvk {
         if (dst.type != DxbcOperandType::Temp || dst.idxDim == 0)
           continue;
         const uint32_t registerId = uint32_t(dst.idx[0].offset);
+        tempWriterOp[registerId] = uint32_t(ins.op);
         ComponentOrigins& origins = tempOrigins[registerId];
         const bool exactMove = ins.op == DxbcOpcode::Mov
           && ins.srcCount == 1u && ins.src[0].modifiers.isClear();
+
+        // Single-input affine UV transforms (material tiling scale/offset:
+        // mul/mad/add of ONE varying with constant or cbuffer operands) keep
+        // the varying's origin. The sampled texture is still the material's
+        // own; only the tiling of the captured UVs may differ when the scale
+        // is not identity. Rejecting these left most Fallout 4 materials
+        // untextured (white). Two varyings or any other op still break it.
+        int32_t affineVaryingSource = -1;
+        if (!exactMove && (ins.op == DxbcOpcode::Mul || ins.op == DxbcOpcode::Mad
+         || ins.op == DxbcOpcode::Add)) {
+          auto isConstantOperand = [](const DxbcRegister& r) {
+            return r.type == DxbcOperandType::ConstantBuffer
+                || r.type == DxbcOperandType::Imm32
+                || r.type == DxbcOperandType::ImmediateConstantBuffer;
+          };
+          // mad dst, a, b, c: the varying may be a or b; c must be constant.
+          const uint32_t varyingCandidates = ins.op == DxbcOpcode::Mad ? 2u : ins.srcCount;
+          bool valid = ins.srcCount >= 2u;
+          for (uint32_t i = 0; valid && i < ins.srcCount; ++i) {
+            const DxbcRegister& src = ins.src[i];
+            if (isConstantOperand(src))
+              continue;
+            const bool varying = (src.type == DxbcOperandType::Input
+                               || src.type == DxbcOperandType::Temp)
+                              && src.modifiers.isClear();
+            if (!varying || i >= varyingCandidates || affineVaryingSource >= 0)
+              valid = false;
+            else
+              affineVaryingSource = int32_t(i);
+          }
+          if (!valid)
+            affineVaryingSource = -1;
+        }
+
         for (uint32_t component = 0; component < 4u; ++component) {
           if (!dst.mask[component])
             continue;
           origins[component] = exactMove
             ? originFor(ins.src[0], component)
-            : InputOrigin();
+            : (affineVaryingSource >= 0
+              ? originFor(ins.src[uint32_t(affineVaryingSource)], component)
+              : InputOrigin());
         }
       }
+    }
+
+    if (!untracedReport.empty()) {
+      static std::atomic<uint32_t> s_untracedLogs { 0u };
+      if (s_untracedLogs.fetch_add(1u) < 40u)
+        Logger::info(str::format("[D3D11Shader][uv-trace] untraced sample coordinates:", untracedReport));
     }
 
     if (inputSignature == nullptr)
@@ -1437,6 +2571,38 @@ namespace dxvk {
         outSemantics[resourceSlot].semanticName = best->semanticName;
         outSemantics[resourceSlot].semanticIndex = best->semanticIndex;
         outSemantics[resourceSlot].componentIndex = bestComponent;
+        outSemantics[resourceSlot].valid = true;
+      }
+    }
+
+    // Sampled slots whose coordinate could not be traced exactly (UVs built
+    // with arithmetic through temps: tiling, parallax, detail scales) fall
+    // back to the shader's primary UV input - the lowest-index TEXCOORD with
+    // two float components. The texture identity (hash, tagging, replacement)
+    // stays exact; only the UV mapping may be approximate for unusual
+    // materials. Leaving these untraced rejected every such texture and
+    // rendered most Fallout 4 materials untextured (white).
+    const DxbcSgnEntry* primaryUv = nullptr;
+    for (const DxbcSgnEntry& entry : *inputSignature) {
+      if (entry.systemValue != DxbcSystemValue::None
+       || entry.componentType != DxbcScalarType::Float32
+       || !entry.componentMask[0] || !entry.componentMask[1])
+        continue;
+      std::string upper = entry.semanticName;
+      for (auto& c : upper)
+        c = char(::toupper(static_cast<unsigned char>(c)));
+      if (upper != "TEXCOORD")
+        continue;
+      if (primaryUv == nullptr || entry.semanticIndex < primaryUv->semanticIndex)
+        primaryUv = &entry;
+    }
+    if (primaryUv != nullptr) {
+      for (uint32_t resourceSlot = 0; resourceSlot < outSemantics.size(); ++resourceSlot) {
+        if (!outSampledResources[resourceSlot] || outSemantics[resourceSlot].valid)
+          continue;
+        outSemantics[resourceSlot].semanticName = primaryUv->semanticName;
+        outSemantics[resourceSlot].semanticIndex = primaryUv->semanticIndex;
+        outSemantics[resourceSlot].componentIndex = 0;
         outSemantics[resourceSlot].valid = true;
       }
     }
@@ -1488,8 +2654,57 @@ namespace dxvk {
         module, m_sampledTexcoordSemantics, m_sampledResourceSlots,
         m_sampledResourceProfileComplete);
 
+    if (pShaderKey->type() == VK_SHADER_STAGE_FRAGMENT_BIT) {
+      parseDxbcTextureDecodes(module, m_textureDecodes);
+      parseDxbcVertexColorInput(module, m_vertexColorSemantic, m_vertexColorComponents);
+      parseDxbcEnvmapReflection(module, m_envmapReflection);
+
+      // The colour input is never the input a texture is sampled with.
+      for (const auto& uv : m_sampledTexcoordSemantics) {
+        if (m_vertexColorSemantic.valid && uv.valid && uv.semanticIndex == m_vertexColorSemantic.semanticIndex
+         && uv.semanticName == m_vertexColorSemantic.semanticName)
+          m_vertexColorSemantic = D3D11SampledTexcoordSemantic();
+      }
+    }
+
     if (pShaderKey->type() == VK_SHADER_STAGE_VERTEX_BIT) {
       m_positionTransform = findPositionTransformBinding(module);
+      if (!m_positionTransform.valid)
+        m_positionTransform = findColumnPositionTransformBinding(module);
+      m_writesPositionAtFarPlane = parseDxbcWritesPositionAtFarPlane(module, m_positionWriteSummary,
+                                                                     m_writesScreenSpacePosition);
+      if (m_positionTransform.valid && m_positionTransform.matrices[0].columns) {
+        static uint32_t s_columnLogs = 0;
+        if (s_columnLogs++ < 12u) {
+          const auto& m0 = m_positionTransform.matrices[0];
+          Logger::info(str::format("[D3D11Shader] column-chain transform proven: ", name,
+            " matrices=", m_positionTransform.matrixCount, " cb", m0.constantBufferSlot,
+            "[", m0.constantRegisters[0], "..] affineW=", m0.affineW ? 1 : 0));
+        }
+      }
+      m_animatesVertices = parseDxbcUsesTrigonometry(module);
+      if (!m_animatesVertices)
+        m_cameraRelativeWorld = parseCameraRelativeWorldBinding(module);
+      if (!m_cameraRelativeWorld.valid && m_cameraRelativeWorld.debugEyeAdds >= 3u) {
+        static uint32_t s_worldMissLogs = 0;
+        if (s_worldMissLogs++ < 12u) {
+          Logger::info(str::format("[D3D11Shader] camera-relative world pattern NOT proven: ", name,
+            " hash=0x", std::hex, m_bytecodeHash, std::dec,
+            " eyeAdds=", m_cameraRelativeWorld.debugEyeAdds, " worldRows=", m_cameraRelativeWorld.debugWorldRows,
+            " worldComplete=", m_cameraRelativeWorld.debugWorldComplete, " vpRows=", m_cameraRelativeWorld.debugVpRows,
+            " animates=", m_animatesVertices ? 1 : 0));
+        }
+      }
+      if (m_cameraRelativeWorld.valid) {
+        static uint32_t s_worldBindingLogs = 0;
+        if (s_worldBindingLogs++ < 8u) {
+          Logger::info(str::format("[D3D11Shader] camera-relative world transform proven: ", name,
+            " world=cb", m_cameraRelativeWorld.worldSlot, "[", m_cameraRelativeWorld.worldRegister, "]",
+            " eye=cb", m_cameraRelativeWorld.cameraSlot, "[", m_cameraRelativeWorld.eyeRegister, "]",
+            " viewProj=cb", m_cameraRelativeWorld.viewProjSlot, "[", m_cameraRelativeWorld.viewProjRegister, "]",
+            m_cameraRelativeWorld.hasUvTransform ? str::format(" uv=cb", m_cameraRelativeWorld.uvSlot, "[", m_cameraRelativeWorld.uvRegister, "]") : std::string()));
+        }
+      }
       m_constantBufferDependencies = findConstantBufferDependencies(module);
     }
     
@@ -1501,8 +2716,11 @@ namespace dxvk {
     // an explicit marker beside the executable to enable the same raw DXBC/SPV
     // dump path without a registry or global environment mutation. The marker
     // is opt-in and has zero runtime cost after this creation-time check.
+    // Compute shaders are included: tiled/clustered deferred engines read
+    // their light lists there, and the reflection data names the layout.
     if (dumpPath.empty()
-     && pShaderKey->type() == VK_SHADER_STAGE_VERTEX_BIT
+     && (pShaderKey->type() == VK_SHADER_STAGE_VERTEX_BIT
+      || pShaderKey->type() == VK_SHADER_STAGE_COMPUTE_BIT)
      && std::filesystem::exists("dx11-camera-shader-dump.flag")) {
       dumpPath = "rtx-remix/logs/dx11-camera-shaders";
       std::error_code createError;
@@ -1617,6 +2835,75 @@ namespace dxvk {
         m_positionCapture->texcoordSemanticIndex = semanticIndex;
       }
     }
+
+    // Geometry shaders that emit triangles (point-sprite / GPU particle
+    // expansion, AC4 rain, fur shells): recompile the game's own GS with a
+    // stream-output entry on SV_Position, as CreateGeometryShaderWithStreamOutput
+    // does with GS bytecode. Point or line output gives nothing a BLAS can use.
+    if (pShaderKey->type() == VK_SHADER_STAGE_GEOMETRY_BIT
+     && pDxbcModuleInfo->xfb == nullptr
+     && BytecodeLength <= (1u << 20)) {
+      bool trianglesOut = false;
+      DxbcCodeSlice gsCode = module.instructionSlice();
+      DxbcDecodeContext gsDecoder;
+      while (!gsCode.atEnd()) {
+        gsDecoder.decodeInstruction(gsCode);
+        const DxbcShaderInstruction& ins = gsDecoder.getInstruction();
+        if (ins.op == DxbcOpcode::DclGsOutputPrimitiveTopology)
+          trianglesOut = ins.controls.primitiveTopology() == DxbcPrimitiveTopology::TriangleStrip;
+      }
+      if (trianglesOut) {
+        m_positionCapture = std::make_shared<D3D11PositionCaptureState>();
+        m_positionCapture->bytecode.assign(
+          reinterpret_cast<const char*>(pShaderBytecode),
+          reinterpret_cast<const char*>(pShaderBytecode) + BytecodeLength);
+        m_positionCapture->options = pDxbcModuleInfo->options;
+        m_positionCapture->shaderName = name;
+        m_positionCapture->semanticName = "SV_Position";
+        m_positionCapture->semanticIndex = 0;
+        m_positionCapture->positionSpace = D3D11CapturedPositionSpace::View;
+        m_positionCapture->homogeneousClipSpace = true;
+        m_positionCapture->loadedFromProfile = false;
+        m_positionCapture->recompileGeometryShader = true;
+        // The pixel shader reads its UVs from the GS outputs (stream 0).
+        std::string uvName;
+        uint32_t uvIndex = 0;
+        if (parseDxbcOutputTexcoord(pShaderBytecode, BytecodeLength, uvName, uvIndex,
+                                    &m_positionCapture->texcoordSemantics)) {
+          m_positionCapture->texcoordSemanticName = std::move(uvName);
+          m_positionCapture->texcoordSemanticIndex = uvIndex;
+        }
+      }
+    }
+
+    // Tessellated geometry (Frostbite terrain, Void water, UE/RAGE/ACU
+    // displacement): the domain shader writes the final SV_Position, so the
+    // capture GS is built from its output signature, as D3D11 stream output
+    // with DS bytecode does. Triangle input (see processXfbPassthrough).
+    if (pShaderKey->type() == VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT
+     && pDxbcModuleInfo->xfb == nullptr
+     && BytecodeLength <= (1u << 20)) {
+      m_positionCapture = std::make_shared<D3D11PositionCaptureState>();
+      m_positionCapture->bytecode.assign(
+        reinterpret_cast<const char*>(pShaderBytecode),
+        reinterpret_cast<const char*>(pShaderBytecode) + BytecodeLength);
+      m_positionCapture->options = pDxbcModuleInfo->options;
+      m_positionCapture->shaderName = name;
+      m_positionCapture->semanticName = "SV_Position";
+      m_positionCapture->semanticIndex = 0;
+      m_positionCapture->positionSpace = D3D11CapturedPositionSpace::View;
+      m_positionCapture->homogeneousClipSpace = true;
+      m_positionCapture->loadedFromProfile = false;
+      m_positionCapture->triangleInput = true;
+      // Without a GS the pixel shader reads its UVs from the DS outputs.
+      std::string uvName;
+      uint32_t uvIndex = 0;
+      if (parseDxbcOutputTexcoord(pShaderBytecode, BytecodeLength, uvName, uvIndex,
+                                  &m_positionCapture->texcoordSemantics)) {
+        m_positionCapture->texcoordSemanticName = std::move(uvName);
+        m_positionCapture->texcoordSemanticIndex = uvIndex;
+      }
+    }
   }
 
   bool D3D11CommonShader::GetSampledTexcoordSemantic(
@@ -1682,6 +2969,46 @@ namespace dxvk {
     semanticIndex = m_positionCapture->texcoordSemanticIndex;
     componentIndex = 0u;
     return true;
+  }
+
+
+  uint32_t D3D11CommonShader::ResolvePositionCaptureColor(const std::string& requestedName, uint32_t requestedIndex) const {
+    const std::shared_ptr<D3D11PositionCaptureState>& state = m_positionCapture;
+    if (state == nullptr || requestedName.empty())
+      return 0;
+
+    std::lock_guard<dxvk::mutex> lock(state->mutex);
+
+    if (!state->colorOutputsParsed) {
+      state->colorOutputsParsed = true;
+      try {
+        DxbcReader reader(state->bytecode.data(), state->bytecode.size());
+        DxbcModule module(reader);
+        const Rc<DxbcIsgn> osgn = module.osgn();
+        if (osgn != nullptr) {
+          for (const DxbcSgnEntry& e : *osgn) {
+            if (e.systemValue != DxbcSystemValue::None || e.componentType != DxbcScalarType::Float32
+             || e.streamId != 0 || !e.componentMask[0] || !e.componentMask[1] || !e.componentMask[2])
+              continue;
+            state->colorOutputs.push_back({ e.semanticName, e.semanticIndex, e.componentMask[3] ? 4u : 3u });
+          }
+        }
+      } catch (const DxvkError&) {
+        state->colorOutputs.clear();
+      }
+    }
+
+    for (const auto& o : state->colorOutputs) {
+      if (o.semanticIndex != requestedIndex || o.semanticName.size() != requestedName.size())
+        continue;
+      bool same = true;
+      for (size_t i = 0; i < o.semanticName.size() && same; ++i)
+        same = ::toupper(static_cast<unsigned char>(o.semanticName[i])) == ::toupper(static_cast<unsigned char>(requestedName[i]));
+      if (same)
+        return o.components;
+    }
+
+    return 0;
   }
 
 
@@ -1755,7 +3082,10 @@ namespace dxvk {
   Rc<DxvkShader> D3D11CommonShader::GetPositionCaptureShader(
       const std::string& texcoordSemanticName,
       uint32_t texcoordSemanticIndex,
-      uint32_t texcoordComponentIndex) const {
+      uint32_t texcoordComponentIndex,
+      const std::string& colorSemanticName,
+      uint32_t colorSemanticIndex,
+      uint32_t colorComponents) const {
     const std::shared_ptr<D3D11PositionCaptureState>& state = m_positionCapture;
     if (state == nullptr)
       return nullptr;
@@ -1767,6 +3097,12 @@ namespace dxvk {
       &texcoordSemanticIndex, sizeof(texcoordSemanticIndex), variantKey);
     variantKey = XXH3_64bits_withSeed(
       &texcoordComponentIndex, sizeof(texcoordComponentIndex), variantKey);
+    const bool captureColor = colorComponents >= 3u && !colorSemanticName.empty();
+    if (captureColor) {
+      variantKey = XXH3_64bits_withSeed(colorSemanticName.data(), colorSemanticName.size(), variantKey);
+      variantKey = XXH3_64bits_withSeed(&colorSemanticIndex, sizeof(colorSemanticIndex), variantKey);
+      variantKey = XXH3_64bits_withSeed(&colorComponents, sizeof(colorComponents), variantKey);
+    }
     D3D11PositionCaptureVariant& variant = state->variants[variantKey];
     if (variant.attempted)
       return variant.shader;
@@ -1780,6 +3116,7 @@ namespace dxvk {
       const uint32_t positionBytes = state->homogeneousClipSpace ? 16u : 12u;
       const bool captureTexcoord = !texcoordSemanticName.empty();
       xfb.entryCount = captureTexcoord ? 2 : 1;
+      const uint32_t colorOffset = positionBytes + (captureTexcoord ? 8u : 0u);
       xfb.entries[0].semanticName   = state->semanticName.c_str();
       xfb.entries[0].semanticIndex  = state->semanticIndex;
       xfb.entries[0].componentIndex = 0;
@@ -1796,7 +3133,18 @@ namespace dxvk {
         xfb.entries[1].bufferId       = 0;
         xfb.entries[1].offset         = positionBytes;
       }
-      xfb.strides[0] = positionBytes + (captureTexcoord ? 8u : 0u);
+      if (captureColor) {
+        // Vertex colour after position (and texcoord) in the same record.
+        DxbcXfbEntry& color = xfb.entries[xfb.entryCount++];
+        color.semanticName   = colorSemanticName.c_str();
+        color.semanticIndex  = colorSemanticIndex;
+        color.componentIndex = 0;
+        color.componentCount = colorComponents;
+        color.streamId       = 0;
+        color.bufferId       = 0;
+        color.offset         = colorOffset;
+      }
+      xfb.strides[0] = colorOffset + (captureColor ? colorComponents * 4u : 0u);
       xfb.rasterizedStream = -1;
 
       DxbcModuleInfo info;
@@ -1804,12 +3152,16 @@ namespace dxvk {
       info.tess = nullptr;
       info.xfb = &xfb;
 
-      Rc<DxvkShader> gs = module.compilePassthroughShader(
-        info, "dx11_position_capture_gs", true);
+      Rc<DxvkShader> gs = state->recompileGeometryShader
+        ? module.compile(info, "dx11_position_capture_game_gs")
+        : module.compilePassthroughShader(
+            info, "dx11_position_capture_gs", true, state->triangleInput ? 3u : 1u);
       const std::string captureContract = str::format(
         "dx11-position-texcoord-capture-system-value-v3:",
         texcoordSemanticName, ":", texcoordSemanticIndex, ":",
-        texcoordComponentIndex);
+        texcoordComponentIndex, state->triangleInput ? ":tri" : "",
+        state->recompileGeometryShader ? ":gs" : "",
+        captureColor ? str::format(":color:", colorSemanticName, ":", colorSemanticIndex, ":", colorComponents) : std::string());
       const Sha1Data shaderKeyData[] = {
         { state->bytecode.data(), state->bytecode.size() },
         { captureContract.data(), captureContract.size() },
@@ -1836,6 +3188,9 @@ namespace dxvk {
           : (state->loadedFromProfile ? "profile" : "auto-discovery"),
         ", texcoord=", captureTexcoord
           ? str::format(texcoordSemanticName, texcoordSemanticIndex)
+          : "none",
+        ", color=", captureColor
+          ? str::format(colorSemanticName, colorSemanticIndex, "x", colorComponents)
           : "none", ")"));
     } catch (const DxvkError& e) {
       Logger::warn(str::format(

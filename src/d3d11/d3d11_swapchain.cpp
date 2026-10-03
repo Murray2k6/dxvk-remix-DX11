@@ -1,6 +1,7 @@
 #include "d3d11_context_imm.h"
 #include "d3d11_device.h"
 #include "d3d11_swapchain.h"
+#include "d3d11_input_guard.h"
 
 #include "../dxvk/imgui/dxvk_imgui.h"
 #include "../dxvk/rtx_render/rtx_option_manager.h"
@@ -407,6 +408,7 @@ namespace dxvk {
     // Hook the game's WndProc so ImGui receives WM_KEYDOWN/WM_KEYUP for hotkeys.
     // Must use SetWindowLongPtrW (GWLP_WNDPROC) — the correct x64 API.
     InstallWndProcHook();
+    D3D11InputGuard::install();
 
     Logger::info(str::format("[D3D11SwapChain] Created: HWND=", (uintptr_t)hWnd,
       " ", pDesc->Width, "x", pDesc->Height,
@@ -716,6 +718,12 @@ namespace dxvk {
 
 
   HRESULT D3D11SwapChain::PresentImage(UINT SyncInterval) {
+    {
+      auto& gui = m_device->getCommon()->getImgui();
+      D3D11InputGuard::setBlocking(gui.isInit() && gui.isMenuOpen()
+        && RtxOptions::blockInputToGameInUI());
+    }
+
     Com<ID3D11DeviceContext> deviceContext = nullptr;
     m_parent->GetImmediateContext(&deviceContext);
 

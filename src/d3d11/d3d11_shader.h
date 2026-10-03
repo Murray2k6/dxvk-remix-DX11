@@ -27,6 +27,31 @@ namespace dxvk {
   struct D3D11PositionTransformMatrixBinding {
     uint32_t constantBufferSlot = 0;
     std::array<uint32_t, 4> constantRegisters = { 0, 0, 0, 0 };
+    // false: registers are matrix rows (dp4 per output component, HLSL
+    //        row-vector-major packing - FO4, UE3, many custom engines).
+    // true:  registers are matrix columns, one per input component, applied
+    //        as a mul/mad/add chain (Unity mul(M, v), UE mul(v, M) with
+    //        row_major packing). UINT32_MAX = zero column (no translation).
+    bool columns = false;
+    // Column form whose chain never wrote the w output: affine, w row (0,0,0,1).
+    bool affineW = false;
+  };
+
+  // Camera-relative world transform proven from a vertex shader's data flow
+  // (see parseCameraRelativeWorldBinding): the object's absolute world matrix
+  // rows live in cb[worldSlot][worldRegister..+2], the eye the engine
+  // subtracts in cb[cameraSlot][eyeRegister], ViewProj rows at
+  // cb[cameraSlot][viewProjRegister..+3]. Optional TEXCOORD0 scale/offset.
+  struct D3D11CameraRelativeWorldBinding {
+    bool valid = false;
+    uint32_t worldSlot = 0, worldRegister = 0;
+    uint32_t cameraSlot = 0, eyeRegister = 0, viewProjRegister = 0;
+    uint32_t viewProjSlot = 0;  // cbuffer of the ViewProj rows (may differ from the eye's)
+    bool hasUvTransform = false;
+    uint32_t uvSlot = 0, uvRegister = 0;
+    // Diagnostic: how far the data-flow match got (eye adds, world rows,
+    // world temp complete, viewproj rows found).
+    uint32_t debugEyeAdds = 0, debugWorldRows = 0, debugWorldComplete = 0, debugVpRows = 0;
   };
 
   struct D3D11PositionTransformBinding {
@@ -120,6 +145,10 @@ namespace dxvk {
     // geometry the rasterizer consumed. When true, stream output stores xyzw
     // clip coordinates and the RT interleaver unprojects them to view space.
     bool               homogeneousClipSpace = false;
+    // Domain-shader capture: the capture GS consumes tessellated triangles.
+    bool               triangleInput = false;
+    // Geometry-shader capture: the game's own GS is recompiled with XFB.
+    bool               recompileGeometryShader = false;
     // When the vertex shader also exposes a TEXCOORD output, capture it in the
     // same interleaved transform-feedback record as SV_Position. This keeps UVs
     // in the exact post-index-expansion domain consumed by the rasterizer and
@@ -130,6 +159,11 @@ namespace dxvk {
     // sample dataflow selects one at draw time; TEXCOORD0 is only the fallback
     // when a shader does not expose a traceable texture-coordinate input.
     std::vector<D3D11TexcoordSemantic> texcoordSemantics;
+    // Float outputs with three or four components (vertex colour candidates),
+    // parsed from the bytecode on first use (ResolvePositionCaptureColor).
+    struct ColorOutput { std::string semanticName; uint32_t semanticIndex = 0; uint32_t components = 0; };
+    std::vector<ColorOutput> colorOutputs;
+    bool               colorOutputsParsed = false;
     // Exact constant-buffer matrix proven by DXBC dataflow to transform this
     // captured output into SV_Position. At draw time the DX11 layer factors it
     // against the active projection to recover captured-position-to-view,
@@ -193,6 +227,31 @@ namespace dxvk {
     // DXBC reflection (RDEF): names of bound resources and constant-buffer
     // variables, parsed once at creation. Null when the shader shipped with
     // reflection stripped, which callers must tolerate.
+    // Vertex shader forces SV_Position.z == w (depth 1): far-plane sky geometry.
+    const std::string& GetPositionWriteSummary() const {
+      return m_positionWriteSummary;
+    }
+
+    /// SV_Position.w is written from an immediate: screen-space output
+    /// (post-process triangles, UI quads), never 3D scene geometry.
+    bool WritesScreenSpacePosition() const {
+      return m_writesScreenSpacePosition;
+    }
+
+    /// The vertex shader evaluates sin/cos, i.e. animates its vertices over
+    /// time (foliage wind, waves, cloth). Such meshes change every frame.
+    bool AnimatesVertices() const {
+      return m_animatesVertices;
+    }
+
+    const D3D11CameraRelativeWorldBinding& GetCameraRelativeWorldBinding() const {
+      return m_cameraRelativeWorld;
+    }
+
+    bool WritesPositionAtFarPlane() const {
+      return m_writesPositionAtFarPlane;
+    }
+
     const DxbcRdef* GetReflection() const {
       return m_reflection.ptr();
     }
@@ -240,6 +299,56 @@ namespace dxvk {
                                     std::string& semanticName,
                                     uint32_t& semanticIndex,
                                     uint32_t& componentIndex) const;
+
+    // How this pixel shader decodes a sampled texture, proven from its DXBC
+    // dataflow (documentation/engine_knowledge/METHODS.md, Materials):
+    // normalEncoding is the NormalEncoding value of a "sample * 2 - 1"
+    // decode (0 none, 2 RGB, 3 XY, 4 DXT5nm .wy, 5 XY swapped .yx);
+    // smoothnessChannel is the texture channel used as "1 - x" (smoothness
+    // turned into roughness), or -1.
+    struct TextureDecode {
+      uint8_t normalEncoding = 0;
+      int8_t  smoothnessChannel = -1;
+    };
+
+    TextureDecode GetTextureDecode(uint32_t resourceSlot) const {
+      return resourceSlot < m_textureDecodes.size() ? m_textureDecodes[resourceSlot] : TextureDecode();
+    }
+
+    // A legacy cubemap reflection added by this pixel shader: the TextureCube
+    // slot, the constant (cb slot, register, component) scaling the sample,
+    // up to two 2D texture channels masking it; and the Creation deferred
+    // G-buffer envmap word (cb[gbufferReg].x / 255 written to a target).
+    // -1 slots mean none.
+    struct EnvmapReflection {
+      int8_t   cubeSlot = -1;
+      int8_t   scaleCb = -1;
+      uint16_t scaleReg = 0;
+      uint8_t  scaleComponent = 0;
+      int8_t   maskSlot[2] = { -1, -1 };
+      int8_t   maskChannel[2] = { -1, -1 };
+      int8_t   gbufferCb = -1;
+      uint16_t gbufferReg = 0;
+    };
+
+    const EnvmapReflection& GetEnvmapReflection() const {
+      return m_envmapReflection;
+    }
+
+    // The pixel-shader input that multiplies a texture sample (the vertex
+    // colour), with its component count (3 or 4). Pixel shaders only.
+    bool GetVertexColorSemantic(std::string& semanticName, uint32_t& semanticIndex, uint32_t& components) const {
+      if (!m_vertexColorSemantic.valid)
+        return false;
+      semanticName = m_vertexColorSemantic.semanticName;
+      semanticIndex = m_vertexColorSemantic.semanticIndex;
+      components = m_vertexColorComponents;
+      return true;
+    }
+
+    // Components (3 or 4) of this capture stage's float output with the given
+    // semantic, or 0 when it has none.
+    uint32_t ResolvePositionCaptureColor(const std::string& semanticName, uint32_t semanticIndex) const;
 
     bool HasCompleteSampledResourceProfile() const {
       return m_sampledResourceProfileComplete;
@@ -290,9 +399,14 @@ namespace dxvk {
 
     // Lazily compiles the pure stream-output GS used to capture the game VS's
     // shader-computed pre-projection POSITIONn.xyz stream.
+    // colorComponents > 0 also captures the colorSemantic output (3 or 4
+    // floats) after position and texcoord.
     Rc<DxvkShader> GetPositionCaptureShader(const std::string& texcoordSemanticName,
                                             uint32_t texcoordSemanticIndex,
-                                            uint32_t texcoordComponentIndex) const;
+                                            uint32_t texcoordComponentIndex,
+                                            const std::string& colorSemanticName = std::string(),
+                                            uint32_t colorSemanticIndex = 0,
+                                            uint32_t colorComponents = 0) const;
 
   private:
 
@@ -303,6 +417,11 @@ namespace dxvk {
     // container overwrites these. The fallback is the highest model D3D11 can
     // legally express (SM 5.1 at FL 12_x). SM 6.x is DXIL and exists only on
     // D3D12 - no D3D11 device, real or wrapped, can report or consume it.
+    bool     m_writesPositionAtFarPlane = false;
+    bool     m_writesScreenSpacePosition = false;
+    bool     m_animatesVertices = false;
+    D3D11CameraRelativeWorldBinding m_cameraRelativeWorld;
+    std::string m_positionWriteSummary;
     uint32_t m_shaderModelMajor = 5;
     uint32_t m_shaderModelMinor = 1;
 
@@ -321,6 +440,10 @@ namespace dxvk {
     std::array<bool,
       D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT> m_sampledResourceSlots = {};
     bool m_sampledResourceProfileComplete = false;
+    std::array<TextureDecode, D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT> m_textureDecodes = {};
+    D3D11SampledTexcoordSemantic m_vertexColorSemantic;
+    uint32_t m_vertexColorComponents = 0;
+    EnvmapReflection m_envmapReflection;
 
     D3D11PositionTransformBinding m_positionTransform;
     D3D11ConstantBufferDependencyProfile m_constantBufferDependencies;

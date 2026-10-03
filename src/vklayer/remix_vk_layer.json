@@ -1,0 +1,17 @@
+{
+  "file_format_version": "1.2.0",
+  "layer": {
+    "name": "VK_LAYER_NV_remix_dx11",
+    "type": "GLOBAL",
+    "library_path": ".\\remix_vk_layer.dll",
+    "api_version": "1.4.309",
+    "implementation_version": "1",
+    "description": "RTX Remix (DX11 fork) native Vulkan front end: path traces Vulkan games whose folder holds Remix's d3d11.dll and a Remix config",
+    "functions": {
+      "vkNegotiateLoaderLayerInterfaceVersion": "vkNegotiateLoaderLayerInterfaceVersion"
+    },
+    "disable_environment": {
+      "DISABLE_REMIX_VK_LAYER": "1"
+    }
+  }
+}

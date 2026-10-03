@@ -981,6 +981,7 @@ namespace dxvk {
 
     // Track this texture to make a linear table for this frame
     textureIndexOut = m_textureCache.track(inputTexture);
+    markTextureUsed(textureIndexOut);
 
     const Rc<ManagedTexture>& tex = m_textureCache.at(textureIndexOut).getManagedTexture();
     if (tex == nullptr) {
@@ -1014,9 +1015,53 @@ namespace dxvk {
     if (textureIndex >= m_textureCache.getTotalCount()) {
       return;
     }
+    markTextureUsed(textureIndex);
     const Rc<ManagedTexture>& tex = m_textureCache.at(textureIndex).getManagedTexture();
     if (tex != nullptr) {
       tex->m_frameLastUsed = m_device->getCurrentFrameId();
+    }
+  }
+
+  void RtxTextureManager::markTextureUsed(uint32_t textureIndex) {
+    if (textureIndex >= m_textureLastUsedFrame.size()) {
+      m_textureLastUsedFrame.resize(textureIndex + 1, 0u);
+    }
+    m_textureLastUsedFrame[textureIndex] = m_device->getCurrentFrameId();
+  }
+
+  // The texture table holds a strong reference to every game texture any
+  // material ever sampled, and only drops them on a full scene reset. Games
+  // that stream textures (open worlds, level streaming) release theirs as the
+  // player moves, but this reference kept each one resident, so game texture
+  // VRAM only ever grew. Release game textures no surface has referenced for a
+  // while: if the game still owns one, a later draw simply re-tracks it; if
+  // the game released it, its memory is actually freed. Surface materials are
+  // cached by content (including texture index), so a reused index can only
+  // ever map to a material describing that same new texture.
+  void RtxTextureManager::releaseUnusedGameTextures() {
+    const uint32_t releaseFrames = RtxOptions::TextureManager::gameTextureReleaseFrames();
+    if (releaseFrames == 0) {
+      return;
+    }
+
+    const uint32_t curframe = m_device->getCurrentFrameId();
+    if ((curframe % 30u) != 0u) {
+      return;
+    }
+
+    auto& table = m_textureCache.getObjectTable();
+    const uint32_t count = std::min<uint32_t>(uint32_t(table.size()), uint32_t(m_textureLastUsedFrame.size()));
+    for (uint32_t i = 0; i < count; ++i) {
+      const TextureRef& ref = table[i];
+      // Replacement (managed) textures have their own streaming and demotion.
+      if (!ref.isValid() || ref.getManagedTexture() != nullptr) {
+        continue;
+      }
+      if (curframe - m_textureLastUsedFrame[i] <= releaseFrames) {
+        continue;
+      }
+      const TextureRef released = ref;
+      m_textureCache.free(released);
     }
   }
 
@@ -1031,6 +1076,7 @@ namespace dxvk {
     }
 
     m_textureCache.clear();
+    m_textureLastUsedFrame.clear();
   }
 
   void RtxTextureManager::requestHotReload(const Rc<ManagedTexture>& tex) {
@@ -1172,6 +1218,8 @@ namespace dxvk {
 
       garbageCollection(gpuAccessedMips_safeToReadOnHost);
     }
+
+    releaseUnusedGameTextures();
   }
 
   bool SamplerFeedback::associate(uint16_t stampWithList, uint16_t stampToAdd) {

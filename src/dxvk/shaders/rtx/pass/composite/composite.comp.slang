@@ -565,6 +565,11 @@ void main(uint2 threadIndex : SV_DispatchThreadID, uint2 localIndex : SV_GroupTh
 
   vec4 particleLayerOutput;
   vec4 finalOutput = compositeResult(pixelCoordinate, geometryFlags, primaryLinearViewZ, primaryMiss, particleLayerOutput);
+  // A non-finite pixel here is copied into the accumulation buffer, the
+  // upscaler/denoiser history and the exposure histogram, all of which feed
+  // back into later frames; a single bad surface could blacken the view for
+  // good. Clamp it out at the source.
+  finalOutput = sanitize(finalOutput, 0.f);
 
   FinalOutput[pixelCoordinate] = accumulate(pixelCoordinate, finalOutput, cb.accumulationArgs, true, AccumulatedFinalOutput);
   

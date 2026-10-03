@@ -153,6 +153,19 @@ public:
   // Returns the number of live BLAS objects
   static uint32_t getBlasCount();
 
+  // Per-frame BLAS memory breakdown (diagnostics for the VRAM census).
+  struct BlasFrameStats {
+    uint32_t dynamicCount = 0;
+    uint64_t dynamicPrims = 0;
+    uint64_t dynamicBytes = 0;
+    uint32_t mergedCount = 0;
+    uint64_t mergedPrims = 0;
+    uint64_t mergedBytes = 0;
+    uint32_t poolCount = 0;
+    uint64_t poolBytes = 0;
+  };
+  const BlasFrameStats& getBlasFrameStats() const { return m_blasFrameStats; }
+
   uint32_t getSurfaceCount() const { return m_reorderedSurfaces.size(); }
   const std::vector<RtInstance*>& getOrderedInstances() const { return m_reorderedSurfaces; }
 
@@ -214,6 +227,7 @@ private:
   std::vector<uint32_t> m_reorderedSurfacesPrimitiveIDPrefixSumLastFrame;     // Exclusive prefix sum for last frame's surface primitive count array
   std::vector<VkAccelerationStructureInstanceKHR> m_mergedInstances[Tlas::Count];
   std::vector<Rc<PooledBlas>> m_blasPool;
+  BlasFrameStats m_blasFrameStats;
 
   // GPU-driven PointInstancer culling batches, recorded per frame in mergeInstancesIntoBlas
   std::vector<PointInstancerBatch> m_pointInstancerBatches;

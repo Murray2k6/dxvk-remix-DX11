@@ -69,6 +69,17 @@ public:
 
 protected:
   BufferRefTable<RaytraceBuffer> m_bufferCache;
+
+  struct PendingDecal {
+    Matrix4 worldToDecal;
+    uint32_t axis = 2;
+    TextureRef texture;
+    Rc<DxvkSampler> sampler;
+  };
+  std::vector<PendingDecal> m_pendingDecals;
+  Rc<DxvkBuffer> m_decalBuffer;
+  uint32_t m_decalBufferIndex = 0;
+  uint32_t m_decalCount = 0;
   BufferRefTable<Rc<DxvkSampler>> m_materialSamplerCache;
 
   struct SurfaceMaterialHashFn {
@@ -222,6 +233,17 @@ public:
                     uint16_t samplerFeedbackStamp = SAMPLER_FEEDBACK_INVALID);
   [[nodiscard]] SamplerIndex trackSampler(Rc<DxvkSampler> sampler);
 
+  // DX11 projected decals (documentation/engine_knowledge/METHODS.md, Decals):
+  // a decal box projected onto whatever surface lies inside it, applied at
+  // shading time. worldToDecal maps the box to the unit cube [-0.5, 0.5];
+  // axis is the projection axis.
+  void addProjectedDecal(const Matrix4& worldToDecal, uint32_t axis,
+                         const TextureRef& texture, const Rc<DxvkSampler>& sampler);
+  uint32_t getDecalBufferIndex() const { return m_decalBufferIndex; }
+  uint32_t getDecalCount() const { return m_decalCount; }
+  // Uploads the frame's decals (prepareSceneData).
+  void prepareProjectedDecals(Rc<RtxContext> ctx);
+
   std::optional<XXH64_hash_t> findLegacyTextureHashByObjectPickingValue(uint32_t objectPickingValue);
   std::vector<ObjectPickingValue> gatherObjectPickingValuesByTextureHash(XXH64_hash_t texHash);
 
@@ -276,7 +298,8 @@ private:
                                                  uint32_t* out_indexInCache = nullptr);
   RtTranslucentSurfaceMaterial createTranslucentSurfaceMaterial(const TranslucentMaterialData& translucentMaterialData,
                                                                 uint32_t samplerIndex,
-                                                                bool hasTexcoords);
+                                                                bool hasTexcoords,
+                                                                uint8_t normalEncoding = 0);
   Rc<DxvkSampler> getOrCreateExternalSampler();
 
   // Updates ref counts for new buffers

@@ -1083,6 +1083,11 @@ void RtxContext::endFrame(std::uint64_t cachedReflexFrameId, Rc<DxvkImage> targe
     m_rtState.vertexCaptureCB = vertexCaptureCB;
   }
 
+  void RtxContext::addProjectedDecal(const Matrix4& worldToDecal, uint32_t axis,
+                                     const TextureRef& texture, const Rc<DxvkSampler>& sampler) {
+    getSceneManager().addProjectedDecal(worldToDecal, axis, texture, sampler);
+  }
+
   void RtxContext::addLights(const Dx11LightDesc* pLights, const uint32_t numLights) {
     for (uint32_t i = 0; i < numLights; i++) {
       getSceneManager().addLight(pLights[i]);
@@ -1557,6 +1562,8 @@ void RtxContext::endFrame(std::uint64_t cachedReflexFrameId, Rc<DxvkImage> targe
     constants.wboitEnergyLossCompensation = RtxOptions::wboitEnergyLossCompensation();
     constants.wboitDepthWeightTuning = RtxOptions::wboitDepthWeightTuning();
     constants.wboitEnabled = RtxOptions::wboitEnabled();
+    constants.decalBufferIndex = getSceneManager().getDecalBufferIndex();
+    constants.decalCount = getSceneManager().getDecalCount();
 
     constants.eyeArgs.enableEyes = RtxOptions::Eye::enable();
     constants.eyeArgs.normalBendingEyeball = RtxOptions::Eye::eyeballSphereOffset();
@@ -2396,6 +2403,10 @@ void RtxContext::endFrame(std::uint64_t cachedReflexFrameId, Rc<DxvkImage> targe
   }
 
   void RtxContext::flushCommandList() {
+    flushCommandListWithSync(VK_NULL_HANDLE, VK_NULL_HANDLE);
+  }
+
+  void RtxContext::flushCommandListWithSync(VkSemaphore waitSync, VkSemaphore wakeSync) {
     ScopedCpuProfileZone();
 
     // flush the residue
@@ -2403,8 +2414,8 @@ void RtxContext::endFrame(std::uint64_t cachedReflexFrameId, Rc<DxvkImage> targe
 
     m_device->submitCommandList(
       this->endRecording(),
-      VK_NULL_HANDLE,
-      VK_NULL_HANDLE,
+      waitSync,
+      wakeSync,
       m_submitContainsInjectRtx,
       m_cachedReflexFrameId);
     

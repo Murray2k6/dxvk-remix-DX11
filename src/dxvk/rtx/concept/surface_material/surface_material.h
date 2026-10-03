@@ -100,10 +100,14 @@ struct OpaqueSurfaceMaterial
   // 26
   uint16_t samplerFeedbackStamp;
 
+  // 27: normal map encoding (0 octahedral, 1 tangent RGB OpenGL, 2 tangent RGB
+  // DirectX, 3 two-channel XY DirectX, 4 DXT5nm DirectX)
+  uint16_t normalEncoding;
+
   // Todo: Fixed function blend state info here in the future (Actually this should go on a Legacy Material, or some sort of non-PBR Legacy Surface)
 
   // padding (to keep size matching with MemoryPolymorphicSurfaceMaterial)
-  uint16_t data[5];
+  uint16_t data[4];
 
   bool hasValidDisplacement() {
     return flags & OPAQUE_SURFACE_MATERIAL_FLAG_HAS_DISPLACEMENT;
@@ -134,8 +138,11 @@ struct TranslucentSurfaceMaterial
   // 14-16
   f16vec3 emissiveColorConstant;
 
+  // 17: normal map encoding (NormalEncoding; 0 = Remix octahedral)
+  uint16_t normalEncoding;
+
   // padding (to keep size matching with MemoryPolymorphicSurfaceMaterial)
-  uint16_t data[15];
+  uint16_t data[14];
 };
 
 struct RayPortalSurfaceMaterial

@@ -82,6 +82,8 @@ dxvk_src = files([
   'dxvk_descriptor.h',
   'dxvk_device.cpp',
   'dxvk_device.h',
+  'dxvk_device_import.cpp',
+  'dxvk_device_import.h',
   'dxvk_device_filter.cpp',
   'dxvk_device_filter.h',
   'dxvk_device_info.h',

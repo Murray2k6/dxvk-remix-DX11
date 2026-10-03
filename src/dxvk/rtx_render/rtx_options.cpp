@@ -399,6 +399,20 @@ namespace dxvk {
     // Code-driven changes for graphics preset (automatically routes to User layer when preset is Custom)
     RtxOptionLayerTarget layerTarget(RtxOptionEditTarget::Derived);
 
+    // Low-memory mode follows the VRAM size for every preset. It used to be
+    // set only when the preset was Auto, so an 8 GB card with an explicit
+    // preset ran full-size caches and BLAS builds and paged VRAM to system
+    // memory. Derived layer: an explicit rtx.lowMemoryGpu still wins.
+    VkDeviceSize vidMemSize = 0;
+    {
+      const VkPhysicalDeviceMemoryProperties memProps = device->adapter()->memoryProperties();
+      for (uint32_t i = 0; i < memProps.memoryHeapCount; i++) {
+        if (memProps.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)
+          vidMemSize = std::max(vidMemSize, memProps.memoryHeaps[i].size);
+      }
+      RtxOptions::lowMemoryGpu.setDeferred(vidMemSize != 0 && vidMemSize <= 8ull * 1024 * 1024 * 1024);
+    }
+
     // Handle Automatic Graphics Preset (From configuration/default)
 
     if (RtxOptions::graphicsPreset() == GraphicsPreset::Auto) {
@@ -452,23 +466,10 @@ namespace dxvk {
         RtxOptions::taauPreset.setDeferred(TaauPreset::Performance);
       }
 
-      // figure out how much vidmem we have
-      VkPhysicalDeviceMemoryProperties memProps = device->adapter()->memoryProperties();
-      VkDeviceSize vidMemSize = 0;
-      for (uint32_t i = 0; i < memProps.memoryTypeCount; i++) {
-        if (memProps.memoryTypes[i].propertyFlags == VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) {
-          vidMemSize = memProps.memoryHeaps[memProps.memoryTypes[i].heapIndex].size;
-          break;
-        }
-      }
-
       // for 8GB GPUs we lower the quality even further.
-      if (vidMemSize <= 8ull * 1024 * 1024 * 1024) {
+      if (vidMemSize != 0 && vidMemSize <= 8ull * 1024 * 1024 * 1024) {
         Logger::info("8GB GPU detected, lowering quality setting.");
         preferredDefault = (GraphicsPreset)std::clamp((int)preferredDefault + 1, (int) GraphicsPreset::Medium, (int) GraphicsPreset::Low);
-        RtxOptions::lowMemoryGpu.setDeferred(true);
-      } else {
-        RtxOptions::lowMemoryGpu.setDeferred(false);
       }
 
       // graphicsPreset itself should go to User layer, not Quality layer

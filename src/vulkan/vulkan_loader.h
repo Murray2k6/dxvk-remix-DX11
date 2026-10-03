@@ -50,10 +50,16 @@ namespace dxvk::vk {
    * called for a specific instance.
    */
   struct InstanceLoader : public RcObject {
-    InstanceLoader(bool owned, VkInstance instance);
+    // getInstanceProcAddr: optional dispatch source for an imported instance.
+    // A Vulkan layer front end passes the next layer's vkGetInstanceProcAddr
+    // so Remix's own calls do not re-enter the layer chain from the top.
+    InstanceLoader(bool owned, VkInstance instance,
+      PFN_vkGetInstanceProcAddr getInstanceProcAddr = nullptr);
     PFN_vkVoidFunction sym(const char* name) const;
     VkInstance instance() const { return m_instance; }
+    PFN_vkGetInstanceProcAddr getInstanceProcAddr() const { return m_getInstanceProcAddr; }
   protected:
+    const PFN_vkGetInstanceProcAddr m_getInstanceProcAddr;
     const VkInstance m_instance;
     const bool       m_owned;
   };
@@ -66,7 +72,8 @@ namespace dxvk::vk {
    * specific device.
    */
   struct DeviceLoader : public RcObject {
-    DeviceLoader(bool owned, VkInstance instance, VkDevice device);
+    DeviceLoader(bool owned, VkInstance instance, VkDevice device,
+      PFN_vkGetDeviceProcAddr getDeviceProcAddr = nullptr);
     PFN_vkVoidFunction sym(const char* name) const;
     VkDevice device() const { return m_device; }
   protected:
@@ -99,7 +106,8 @@ namespace dxvk::vk {
    * are independent of any Vulkan devices.
    */
   struct InstanceFn : InstanceLoader {
-    InstanceFn(bool owned, VkInstance instance);
+    InstanceFn(bool owned, VkInstance instance,
+      PFN_vkGetInstanceProcAddr getInstanceProcAddr = nullptr);
     ~InstanceFn();
     
     VULKAN_FN(vkCreateDevice);
@@ -186,7 +194,8 @@ namespace dxvk::vk {
    * This ensures that no slow dispatch code is executed.
    */
   struct DeviceFn : DeviceLoader {
-    DeviceFn(bool owned, VkInstance instance, VkDevice device);
+    DeviceFn(bool owned, VkInstance instance, VkDevice device,
+      PFN_vkGetDeviceProcAddr getDeviceProcAddr = nullptr);
     ~DeviceFn();
     
     VULKAN_FN(vkDestroyDevice);

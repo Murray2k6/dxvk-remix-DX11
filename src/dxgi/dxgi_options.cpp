@@ -46,7 +46,11 @@ namespace dxvk {
     // refresh rate untouched.
     this->overrideRefreshRate = config.getOption<bool>("dxgi.overrideRefreshRate", true);
 
-    this->emulateFullscreen = config.getOption<bool>("dxgi.emulateFullscreen", false);
+    // Default ON: the exclusive-mode display switch deadlocked several titles
+    // (Fallout 4 at "Setting display mode", Dragon Age Inquisition during the
+    // exclusive swapchain recreate) and Remix composites into a borderless window
+    // anyway. Set dxgi.emulateFullscreen = False to restore real mode switches.
+    this->emulateFullscreen = config.getOption<bool>("dxgi.emulateFullscreen", true);
   }
   
 }

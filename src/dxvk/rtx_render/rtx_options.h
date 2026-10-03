@@ -336,7 +336,31 @@ namespace dxvk {
     RTX_OPTION("rtx", float, significanceCullingMinScreenFraction, 0.0003f, "Performance: minimum projected on-screen size (object world-size / camera distance, an angular fraction) below which significanceCulling drops an instance. 0.0003 is sub-pixel even at 4K; raise for more aggressive culling, lower (or 0) to keep everything.");
     RTX_OPTION("rtx", uint32_t, maxInstanceSubmissions, 100000u, "Performance: hard cap on the number of (non-culled) main-camera scene instances submitted to the path tracer per frame. Default 100000 effectively means no cap; lower it to bound worst-case instance counts in pathological scenes.");
     RTX_OPTION("rtx", bool, forceInjection, true, "DX11: forces Remix injection for draws even when normal heuristics would skip them. Default ON so games path-trace instead of falling back to rasterization whenever a real camera or a previous scene exists; camera-less pure-UI frames still pass through (injecting those would render black menus).");
-    RTX_OPTION("rtx", bool, dx11StrongerDenoising, false, "Apply heavier NRD tuning to DX11 captures: longer temporal history, anti-firefly filtering, and an additional ReLAX spatial-filter iteration. This costs GPU time and can increase ghosting. Disabled uses the selected NRD preset; enable per game only when the additional smoothing is useful.");
+    RTX_OPTION("rtx", bool, dx11StrongerDenoising, true, "Apply heavier NRD tuning to DX11 captures: longer temporal history, anti-firefly filtering, and an additional ReLAX spatial-filter iteration. DX11 captures are noisier than native Remix (approximate cameras and motion), so this is on by default; disable per game in rtx.conf if temporal ghosting is objectionable.");
+    RTX_OPTION("rtx", bool, dx11ExactWorldTransforms, true, "DX11: place meshes with the game's own world matrix when the vertex shader is proven (from its bytecode) to compute ViewProj * camera-relative world * position, instead of re-capturing them every frame. Exact placement and motion, and static meshes keep their acceleration structures.");
+    RTX_OPTION("rtx", bool, dx11ImportTiledLights, true, "DX11: import the game's point lights from a tiled/clustered deferred light buffer read by a compute pass (Fallout 4, Skyrim SE and similar engines draw no light volumes for them).");
+    RTX_OPTION("rtx", float, dx11TiledLightIntensity, 25.0f, "DX11: multiplier applied to the linear colour of imported tiled-deferred lights.");
+    RTX_OPTION("rtx", uint32_t, dx11TiledLightMaxPerFrame, 256, "DX11: maximum number of tiled-deferred lights imported per frame.");
+    RTX_OPTION("rtx", bool, dx11AutoClassifyDecalsAndParticles, true, "DX11: classify untagged draws from their state - blended depth-biased overlays become decals, blended additive/soft/vertex-coloured overlays become particles. Both stay path traced. Manual texture tags take precedence.");
+    RTX_OPTION("rtx", bool, dx11CaptureIndirectDraws, true, "DX11: capture Draw(Indexed)InstancedIndirect draws (GPU-driven rendering) by replaying the same indirect draw through post-VS capture into a NaN-prefilled buffer; the arguments are never read on the CPU.");
+    RTX_OPTION("rtx", uint32_t, dx11IndirectCaptureVertices, 196608, "DX11: capture capacity in vertices for one indirect draw (all instances). Output beyond it is not captured; unused capacity stays inactive.");
+    RTX_OPTION("rtx", bool, dx11CaptureGeometryShaders, true, "DX11: capture draws whose geometry shader emits triangles (GPU particles, point-sprite expansion, rain, fur shells) by recompiling the game's GS with stream output on SV_Position.");
+    RTX_OPTION("rtx", uint32_t, dx11GeometryShaderCaptureVerticesPerInput, 6, "DX11: capture budget of output vertices per input vertex for geometry-shader draws (a point sprite emits a 4-vertex strip = 6 list vertices).");
+    RTX_OPTION("rtx", bool, dx11CaptureTessellation, true, "DX11: capture tessellated draws (HS + DS) from the domain shader's SV_Position into a NaN-prefilled buffer, so tessellated terrain, water and displaced meshes are path traced.");
+    RTX_OPTION("rtx", uint32_t, dx11TessellationTrianglesPerPatch, 128, "DX11: capture budget of triangles per tessellated patch. Output beyond it is not captured; unused capacity stays inactive.");
+    RTX_OPTION("rtx", bool, dx11ProjectedDecalsAtShading, true, "DX11: deferred/DBuffer decal boxes are applied at shading time onto every surface inside the box (decal records read in the material interaction), instead of being flattened to a quad on the box's centre plane.");
+    RTX_OPTION("rtx", bool, dx11AutoTerrainBlend, true, "DX11: tag splat-blended terrain draws (an opaque, depth-writing draw whose pixel shader samples four or more mipmapped colour layers: Creation LandscapeTexture1to4, Unity splats, UE landscape layers) as Terrain, so the terrain baker replays the game's own blending into the terrain cascades.");
+    RTX_OPTION("rtx", bool, dx11Lift2DLayers, true, "DX11: path trace 2D games. In a process that has never drawn a perspective 3D scene, orthographic/screen-space sprite draws become emissive matte planes at their layer depth (draw order), placed so they project exactly onto their raster pixels, instead of passing the frame through to raster.");
+    RTX_OPTION("rtx", uint32_t, dx11Lift2DMinFrames, 120, "DX11: consecutive 2D-only frames before 2D lifting starts in an engine not known to be 2D (avoids lifting a 3D game's startup menus).");
+    RTX_OPTION("rtx", bool, dx11InferNormalMaps, true, "DX11: use the game's own tangent-space normal map (two-channel BC5/R8G8, or an RGB map the shader reflection names normal/bump) for path-traced shading, decoded by its encoding.");
+    RTX_OPTION("rtx", bool, dx11DetectPlayerBody, true, "DX11: give skinned meshes that surround the camera (the player's own body in first person) the third-person player model category, hiding them from camera rays while keeping their shadows and reflections.");
+    RTX_OPTION("rtx", float, dx11PlayerBodyRadius, 48.0f, "DX11: horizontal radius (scene units) around the camera inside which a skinned mesh counts as the player's body.");
+    RTX_OPTION("rtx", float, dx11PlayerBodyBelowEye, 180.0f, "DX11: how far below the camera (scene units) the player's body may extend.");
+    RTX_OPTION("rtx", float, dx11PlayerBodyAboveEye, 40.0f, "DX11: how far above the camera (scene units) the player's body may extend.");
+    RTX_OPTION("rtx", bool, dx11SkipCameraCenteredModels, true, "DX11: skip meshes whose origin the game places at the camera every frame (sky domes, cloud and star shells, weather cones). In the ray-traced scene they are closed shells around the player; Remix renders the sky itself.");
+    RTX_OPTION("rtx", float, dx11CameraCenteredRadius, 4.0f, "DX11: how close (view-space units) a mesh origin must be to the camera to count as camera-centred for rtx.dx11SkipCameraCenteredModels.");
+    RTX_OPTION("rtx", bool, dx11RefractiveSurfacesAsWater, true, "DX11: draws whose pixel shader refracts a copy of the rendered scene (water, glass) are path traced as a translucent material instead of an opaque surface showing the game's rasterized scene copy.");
+    RTX_OPTION("rtx", float, dx11RefractiveSurfaceDepth, 200.0f, "DX11: transmittance measurement distance, in scene units, of the translucent material given to refractive surfaces (larger = clearer water).");
     RTX_OPTION("rtx", bool, useCBufferWorldMatrices, false, "DX11: derives world/view matrices from constant buffers when true.");
     RTX_OPTION("rtx", bool, enableUnrealTextureFixes, false, "DX11: applies generic albedo texture-selection reinforcement (boost strong-albedo mipmapped textures, demote scene/intermediate surfaces). Removed from the default path (it could promote the wrong texture to albedo); set true to re-enable per game.");
     RTX_OPTION("rtx", bool, enableSource2Fixes, false, "DX11: applies Source 2 engine specific fixes when true.");
@@ -441,8 +465,9 @@ namespace dxvk {
                "Colour and intensity are NOT recoverable from the volume geometry; they come from rtx.dx11.deferredLightVolumeColor and rtx.dx11.deferredLightVolumeIntensity. Off by default: on a forward-rendered game the heuristic has nothing correct to find, and a wrong light is worse than none.");
     RTX_OPTION("rtx.dx11", uint, deferredLightVolumeMaxPrimitives, 2048,
                "Largest primitive count still considered a light volume. Light volumes are low-poly stand-ins (a unit sphere or cone); world meshes are far denser, so this separates them. Raise it if lights are being missed, lower it if world geometry is being eaten.");
-    RTX_OPTION("rtx.dx11", float, deferredLightVolumeMinRange, 1.0f,
-               "Smallest world-space range (the volume's scale) accepted as a light. Rejects degenerate or unscaled volumes that would otherwise produce a light with no reach.");
+    RTX_OPTION("rtx.dx11", float, deferredLightVolumeMinRange, 16.0f,
+               "Smallest world-space range (the volume's scale) accepted as a light. Rejects degenerate or unscaled volumes that would otherwise produce a light with no reach. "
+               "The old 1.0 default accepted unscaled effect/particle meshes (Fallout 4: hundreds of range-1 'lights' stacked on one spot, flashing like explosions).");
     RTX_OPTION("rtx.dx11", float, deferredLightVolumeRadiusScale, 0.05f,
                "Emitter radius as a fraction of the light's range. The volume gives the range the light reaches, not the size of the bulb; this derives a plausible physical emitter size from it. Larger values give softer shadows.");
     RTX_OPTION("rtx.dx11", float, deferredLightVolumeIntensity, 1.0f,
@@ -520,16 +545,16 @@ namespace dxvk {
                  "When set to true shaders will be automatically recompiled when any shader file is updated (saved for instance) in addition to the usual manual recompilation trigger.\n"
                  "This option is mainly meant for development use and should not be set for user-facing operation.");
 
-      RTX_OPTION_ENV("rtx.shader", bool, prewarmAllVariants, false, "RTX_PREWARM_ALL_VARIANTS",
-                     "Compile all supported Remix variants instead of only the configured path-tracing variants. This can consume substantial CPU time and memory; disabled variants compile asynchronously when selected.");
+      RTX_OPTION_ENV("rtx.shader", bool, prewarmAllVariants, true, "RTX_PREWARM_ALL_VARIANTS",
+                     "Compile every supported Remix shader variant in the background, so no variant compiles on first use (which kept frames on raster while it built). Runs on the bounded background compiler without a window or a boot wait; compiled pipelines persist to rtx-remix/cache. Disable only to reduce first-run CPU load.");
       RTX_OPTION_ENV("rtx.shader", bool, prewarmOnBoot, true, "DXVK_REMIX_PREWARM",
                      "Register the configured path-tracing variants with the bounded asynchronous compiler during startup.");
       RTX_OPTION("rtx.shader", bool, waitForPrewarmOnBoot, false,
                  "Wait for selected boot shaders before game initialization. Disabled by default so the application can create its window and remain responsive while pipelines compile.");
       RTX_OPTION("rtx.shader", uint, maxBootPrewarmWaitSeconds, 45,
                  "Maximum boot wait when waitForPrewarmOnBoot is enabled. Remaining pipelines continue asynchronously; 0 hands off immediately. Shutdown discards unused queued prewarms and waits only for active driver work.");
-      RTX_OPTION("rtx.shader", bool, showPrewarmDialog, true,
-                 "Show shader prewarm progress while the configured pipeline set is being compiled.");
+      RTX_OPTION("rtx.shader", bool, showPrewarmDialog, false,
+                 "Show a separate native window with shader prewarm progress. Off by default: precompilation is part of Remix and reports progress in the in-game overlay (rtx.shader.enableAsyncCompilationUI), so no extra window appears.");
       RTX_OPTION_ENV("rtx.shader", bool, enableAsyncCompilation, true, "RTX_ENABLE_ASYNC_COMPILATION",
                  "When set to true shader compilation (especially that of prewarming) will be done asynchronously rather than blocking.\n"
                  "Typically shader prewarming with async finalization is done to attempt to compile all required shader variants before they are used, often by overlapping this work with a startup sequence (e.g. a game's loading screen). Often times however this prewarming takes longer than the time available, or an application may not have a startup sequence to begin with and immediately begin using Remix shaders.\n"
@@ -1330,6 +1355,9 @@ namespace dxvk {
       RTX_OPTION_ENV("rtx.texturemanager", bool, samplerFeedbackEnable, true, "DXVK_TEXTURES_SAMPLER_FEEDBACK_ENABLE",
                  "Enable texture sampler feedback. If true, a texture prioritization logic considers the amount of mip-levels that was sampled by a GPU while rendering a scene."
                  "(For example, if a texture is in the distance, it will have a lower priority compared to a texture rendered just in front of the camera).");
+      RTX_OPTION("rtx.texturemanager", uint32_t, gameTextureReleaseFrames, 120,
+                 "Frames a game texture may go unreferenced by any surface before Remix drops its reference to it, so textures "
+                 "the game has streamed out are actually freed from VRAM. 0 keeps every game texture until a scene reset.");
       RTX_OPTION_FLAG_ENV("rtx.texturemanager", bool, neverDowngradeTextures, false, RtxOptionFlags::NoSave, "DXVK_TEXTURES_NEVER_DOWNGRADE", 
                  "Debug option to forcibly prevent uploading lower resolution data, if the texture already has been promoted to a high resolution.");
       RTX_OPTION("rtx.texturemanager", int, stagingBufferSizeMiB, 96,
@@ -1432,9 +1460,10 @@ namespace dxvk {
 
     RTX_OPTION("rtx", SkyMode, skyMode, SkyMode::SkyboxRasterization,
                "Sky rendering mode. SkyboxRasterization uses traditional skybox rasterization, PhysicalAtmosphere uses Hillaire atmospheric scattering.");
-    RTX_OPTION("rtx", bool, skyAutoPhysicalAtmosphereFallback, false,
+    RTX_OPTION("rtx", bool, skyAutoPhysicalAtmosphereFallback, true,
                "Use the physical atmosphere when the requested rasterized sky cannot be reprojected to a cubemap. "
-               "Disabled by default so SkyboxRasterization preserves the game sky. Set skyMode=PhysicalAtmosphere to select Numos explicitly.");
+               "The DX11 path never fills the sky probe, so without this every GI/reflection miss samples an empty (black) sky. "
+               "Only applies while the probe is unavailable. Set False to keep the rasterized sky regardless, or skyMode=PhysicalAtmosphere to select Numos explicitly.");
 
     // Atmosphere parameters
     RTX_OPTION("rtx.atmosphere", float, sunSize, 0.545f, "Size of sun disc in degrees.");

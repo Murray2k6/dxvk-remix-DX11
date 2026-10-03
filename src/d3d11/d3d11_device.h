@@ -774,7 +774,16 @@ namespace dxvk {
       const Rc<DxvkAdapter>&    pDxvkAdapter,
             D3D_FEATURE_LEVEL   FeatureLevel,
             UINT                FeatureFlags);
-    
+
+    // On an imported DxvkDevice (d3d11_vk_frontend.cpp).
+    D3D11DXGIDevice(
+            IDXGIAdapter*       pAdapter,
+      const Rc<DxvkInstance>&   pDxvkInstance,
+      const Rc<DxvkAdapter>&    pDxvkAdapter,
+      const Rc<DxvkDevice>&     pImportedDevice,
+            D3D_FEATURE_LEVEL   FeatureLevel,
+            UINT                FeatureFlags);
+
     ~D3D11DXGIDevice();
     
     HRESULT STDMETHODCALLTYPE QueryInterface(
@@ -850,6 +859,10 @@ namespace dxvk {
       SharedDeviceLease(const Rc<DxvkInstance>& instance,
                         const Rc<DxvkAdapter>& adapter,
                         D3D_FEATURE_LEVEL featureLevel);
+      // A DxvkDevice running on the game's VkDevice (DX12 / Vulkan front
+      // ends). It becomes the process's shared device, so later D3D11
+      // devices in the process run on it as well.
+      explicit SharedDeviceLease(const Rc<DxvkDevice>& importedDevice);
       ~SharedDeviceLease();
       SharedDeviceLease(const SharedDeviceLease&) = delete;
       SharedDeviceLease& operator=(const SharedDeviceLease&) = delete;

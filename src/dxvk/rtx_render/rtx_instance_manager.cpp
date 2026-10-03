@@ -63,19 +63,17 @@ namespace dxvk {
     return dot(cross(x, y), z) < 0;
   }
 
+  // True when the shader must not gamma-decode the texture: sRGB views (decoded by the
+  // hardware) and float/HDR formats (stored linear). The surface flags keep their
+  // "IsSrgb" names, but they mean "already linear on sample".
   static bool isTextureRefSrgb(const TextureRef& textureRef) {
-    auto formatIsSrgb = [](VkFormat format) {
-      const DxvkFormatInfo* formatInfo = imageFormatInfo(format);
-      return formatInfo != nullptr && formatInfo->flags.test(DxvkFormatFlag::ColorSpaceSrgb);
-    };
-
     if (const DxvkImageView* imageView = textureRef.getImageView()) {
-      return formatIsSrgb(imageView->info().format);
+      return imageFormatSamplesLinear(imageView->info().format);
     }
 
     const Rc<ManagedTexture>& managedTexture = textureRef.getManagedTexture();
     if (managedTexture != nullptr) {
-      return formatIsSrgb(managedTexture->imageCreateInfo().format);
+      return imageFormatSamplesLinear(managedTexture->imageCreateInfo().format);
     }
 
     return false;
@@ -1058,7 +1056,7 @@ namespace dxvk {
 
         // Surface meta data
         currentInstance.surface.isEmissive = false;
-        currentInstance.surface.isMatte = false;
+        currentInstance.surface.isMatte = drawCall.getMaterialData().isLiftedSprite;
         currentInstance.surface.colorSource = drawCall.getMaterialData().colorSource;
         currentInstance.surface.alphaSource = drawCall.getMaterialData().alphaSource;
         currentInstance.surface.modulateVertexColor = drawCall.getMaterialData().modulateVertexColor;

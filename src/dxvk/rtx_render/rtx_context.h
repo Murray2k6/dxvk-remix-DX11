@@ -132,6 +132,8 @@ namespace dxvk {
       * \param [in] numLights: number of lights
       */
     void addLights(const Dx11LightDesc* pLights, const uint32_t numLights);
+    void addProjectedDecal(const Matrix4& worldToDecal, uint32_t axis,
+                           const TextureRef& texture, const Rc<DxvkSampler>& sampler);
 
     void clearRenderTarget(const Rc<DxvkImageView>& imageView, VkImageAspectFlags clearAspects, VkClearValue clearValue);
     void clearImageView(const Rc<DxvkImageView>& imageView, VkOffset3D offset, VkExtent3D extent, VkImageAspectFlags aspect, VkClearValue value);
@@ -142,6 +144,12 @@ namespace dxvk {
     static void blitImageHelper(Rc<DxvkContext> ctx, const Rc<DxvkImage>& srcImage, const Rc<DxvkImage>& dstImage, VkFilter filter);
 
     virtual void flushCommandList() override;
+
+    // flushCommandList with binary semaphores: the submission waits on
+    // waitSync and signals wakeSync (either may be VK_NULL_HANDLE). The DX12 /
+    // Vulkan front end uses it to order Remix's frame between the game's
+    // rendering and the game's present.
+    void flushCommandListWithSync(VkSemaphore waitSync, VkSemaphore wakeSync);
 
     SceneManager& getSceneManager();
     Resources& getResourceManager();

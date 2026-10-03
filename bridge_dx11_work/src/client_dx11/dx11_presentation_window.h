@@ -170,8 +170,16 @@ namespace dx11_capture {
         return reinterpret_cast<LRESULT>(state->ensureOnThread(reinterpret_cast<HWND>(wparam)));
       if (state && message == Visibility) {
         const bool show = state->m_wantedVisible.load() && IsWindow(state->m_child);
-        if (IsWindow(state->m_child))
-          ShowWindow(state->m_child, show ? SW_SHOWNOACTIVATE : SW_HIDE);
+        if (IsWindow(state->m_child)) {
+          if (show) {
+            // Raise above any sibling the game created after us so its native
+            // output cannot be composited over the ray-traced image.
+            SetWindowPos(state->m_child, HWND_TOP, 0, 0, 0, 0,
+              SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_SHOWWINDOW);
+          } else {
+            ShowWindow(state->m_child, SW_HIDE);
+          }
+        }
         state->m_visible.store(show);
         return show == state->m_wantedVisible.load();
       }

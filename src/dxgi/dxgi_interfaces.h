@@ -355,7 +355,68 @@ IWineDXGISwapChainFactory : public IUnknown {
 };
 
 
+/**
+ * \brief DXVK 2.x swap chain interfaces, as vkd3d-proton implements them
+ *
+ * vkd3d-proton's D3D12 command queue creates its presenter through
+ * \c IDXGIVkSwapChainFactory (include/vkd3d_swapchain_factory.idl there),
+ * not the older \c IWineDXGISwapChainFactory. Vtable order must match it
+ * exactly. \c IDXGIVkSwapChain2x is DXVK 2.x's \c IDXGIVkSwapChain, renamed
+ * here because this branch's \c IDXGIVkSwapChain is the older layout.
+ */
+struct DXGI_VK_HDR_METADATA {
+  DXGI_HDR_METADATA_TYPE Type;
+  union {
+    DXGI_HDR_METADATA_HDR10 HDR10;
+  };
+};
+
+MIDL_INTERFACE("1e7895a1-1bc3-4f9c-a670-290a4bc9581a")
+IDXGIVkSurfaceFactory : public IUnknown {
+  virtual VkResult STDMETHODCALLTYPE CreateSurface(
+          VkInstance                Instance,
+          VkPhysicalDevice          Adapter,
+          VkSurfaceKHR*             pSurface) = 0;
+};
+
+MIDL_INTERFACE("e4a9059e-b569-46ab-8de7-501bd2bc7f7a")
+IDXGIVkSwapChain2x : public IUnknown {
+  virtual HRESULT STDMETHODCALLTYPE GetDesc(DXGI_SWAP_CHAIN_DESC1* pDesc) = 0;
+  virtual HRESULT STDMETHODCALLTYPE GetAdapter(REFIID riid, void** ppvObject) = 0;
+  virtual HRESULT STDMETHODCALLTYPE GetDevice(REFIID riid, void** ppDevice) = 0;
+  virtual HRESULT STDMETHODCALLTYPE GetImage(UINT BufferId, REFIID riid, void** ppBuffer) = 0;
+  virtual UINT STDMETHODCALLTYPE GetImageIndex() = 0;
+  virtual UINT STDMETHODCALLTYPE GetFrameLatency() = 0;
+  virtual HANDLE STDMETHODCALLTYPE GetFrameLatencyEvent() = 0;
+  virtual HRESULT STDMETHODCALLTYPE ChangeProperties(
+    const DXGI_SWAP_CHAIN_DESC1*    pDesc,
+    const UINT*                     pNodeMasks,
+          IUnknown* const*          ppPresentQueues) = 0;
+  virtual HRESULT STDMETHODCALLTYPE SetPresentRegion(const RECT* pRegion) = 0;
+  virtual HRESULT STDMETHODCALLTYPE SetGammaControl(UINT NumControlPoints, const DXGI_RGB* pControlPoints) = 0;
+  virtual HRESULT STDMETHODCALLTYPE SetFrameLatency(UINT MaxLatency) = 0;
+  virtual HRESULT STDMETHODCALLTYPE Present(
+          UINT                      SyncInterval,
+          UINT                      PresentFlags,
+    const DXGI_PRESENT_PARAMETERS*  pPresentParameters) = 0;
+  virtual UINT STDMETHODCALLTYPE CheckColorSpaceSupport(DXGI_COLOR_SPACE_TYPE ColorSpace) = 0;
+  virtual HRESULT STDMETHODCALLTYPE SetColorSpace(DXGI_COLOR_SPACE_TYPE ColorSpace) = 0;
+  virtual HRESULT STDMETHODCALLTYPE SetHDRMetaData(const DXGI_VK_HDR_METADATA* pMetaData) = 0;
+};
+
+MIDL_INTERFACE("e7d6c3ca-23a0-4e08-9f2f-ea5231df6633")
+IDXGIVkSwapChainFactory : public IUnknown {
+  virtual HRESULT STDMETHODCALLTYPE CreateSwapChain(
+          IDXGIVkSurfaceFactory*    pSurfaceFactory,
+    const DXGI_SWAP_CHAIN_DESC1*    pDesc,
+          IDXGIVkSwapChain2x**      ppSwapChain) = 0;
+};
+
+
 #ifdef _MSC_VER
+struct __declspec(uuid("1e7895a1-1bc3-4f9c-a670-290a4bc9581a")) IDXGIVkSurfaceFactory;
+struct __declspec(uuid("e4a9059e-b569-46ab-8de7-501bd2bc7f7a")) IDXGIVkSwapChain2x;
+struct __declspec(uuid("e7d6c3ca-23a0-4e08-9f2f-ea5231df6633")) IDXGIVkSwapChainFactory;
 struct __declspec(uuid("907bf281-ea3c-43b4-a8e4-9f231107b4ff")) IDXGIDXVKAdapter;
 struct __declspec(uuid("92a5d77b-b6e1-420a-b260-fdd701272827")) IDXGIDXVKDevice;
 struct __declspec(uuid("c06a236f-5be3-448a-8943-89c611c0c2c1")) IDXGIVkMonitorInfo;
@@ -366,6 +427,9 @@ struct __declspec(uuid("5546cf8c-77e7-4341-b05d-8d4d5000e77d")) IDXGIVkInteropSu
 struct __declspec(uuid("104001a6-7f36-4957-b932-86ade9567d91")) IDXGIVkSwapChain;
 struct __declspec(uuid("53cb4ff0-c25a-4164-a891-0e83db0a7aac")) IWineDXGISwapChainFactory;
 #else
+__CRT_UUID_DECL(IDXGIVkSurfaceFactory,     0x1e7895a1,0x1bc3,0x4f9c,0xa6,0x70,0x29,0x0a,0x4b,0xc9,0x58,0x1a);
+__CRT_UUID_DECL(IDXGIVkSwapChain2x,        0xe4a9059e,0xb569,0x46ab,0x8d,0xe7,0x50,0x1b,0xd2,0xbc,0x7f,0x7a);
+__CRT_UUID_DECL(IDXGIVkSwapChainFactory,   0xe7d6c3ca,0x23a0,0x4e08,0x9f,0x2f,0xea,0x52,0x31,0xdf,0x66,0x33);
 __CRT_UUID_DECL(IDXGIDXVKAdapter,          0x907bf281,0xea3c,0x43b4,0xa8,0xe4,0x9f,0x23,0x11,0x07,0xb4,0xff);
 __CRT_UUID_DECL(IDXGIDXVKDevice,           0x92a5d77b,0xb6e1,0x420a,0xb2,0x60,0xfd,0xf7,0x01,0x27,0x28,0x27);
 __CRT_UUID_DECL(IDXGIVkMonitorInfo,        0xc06a236f,0x5be3,0x448a,0x89,0x43,0x89,0xc6,0x11,0xc0,0xc2,0xc1);

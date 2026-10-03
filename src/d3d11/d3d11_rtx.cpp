@@ -16,6 +16,10 @@
 #include "../../include/remix/emulator_draw_abi.h"
 #include "d3d11_camera_resolver.h"
 #include "d3d11_rtx_index_range.h"
+#include "d3d11_engine_profile.h"
+#include "d3d11_light_decode.h"
+#include "../dxvk/dxvk_scoped_annotation.h"
+#include "../util/util_once.h"
 
 #include "../dxvk/imgui/dxvk_imgui.h"
 #include "../dxvk/rtx_render/rtx_context.h"
@@ -26,6 +30,9 @@
 #include "../dxvk/rtx_render/rtx_light_manager.h"
 #include "../dxvk/rtx_render/rtx_matrix_helpers.h"
 #include "../dxvk/rtx_render/rtx_option_manager.h"
+#include "../dxvk/rtx_render/rtx_debug_view.h"
+#include "../dxvk/rtx_render/rtx_auto_exposure.h"
+#include "../dxvk/rtx_render/rtx_tone_mapping.h"
 #include "../util/util_filesys.h"
 
 #include <cstring>
@@ -38,6 +45,7 @@
 #include <vector>
 #include <set>
 #include <filesystem>
+#include <fstream>
 #include <mutex>
 #include <optional>
 #include <cstdio>
@@ -51,6 +59,125 @@ void RemixReassertCrashSignatureFilter();
 namespace dxvk {
 
   namespace {
+
+    // First-person/viewmodel passes draw into a reserved slice of the depth
+    // range (FO4, Void stencil hands). A viewport with MinDepth == MaxDepth is
+    // NOT that - it pins every fragment to one depth (REDengine sky at 0).
+    bool isReservedDepthViewport(const D3D11_VIEWPORT& vp) {
+      return vp.MaxDepth < 0.5f && (vp.MaxDepth - vp.MinDepth) > 1.0e-6f;
+    }
+
+    // Rows (out.c = dot(rows[c], in)) of a shader-proven position matrix,
+    // whichever form the shader used: dp4 rows read directly, or mul/mad
+    // columns transposed. Same element layout callers always memcpy'd.
+    bool readBindingRows(const D3D11PositionTransformMatrixBinding& binding,
+                         const D3D11ConstantBufferBinding& cb, Vector4 (&rows)[4]) {
+      if (cb.buffer == nullptr)
+        return false;
+      const uint8_t* ptr = reinterpret_cast<const uint8_t*>(cb.buffer->GetMappedSlice().mapPtr);
+      if (ptr == nullptr)
+        return false;
+      const size_t bufferSize = cb.buffer->Desc()->ByteWidth;
+      const size_t base = size_t(cb.constantOffset) * 16u;
+      const size_t end = cb.constantCount > 0
+        ? std::min(base + size_t(cb.constantCount) * 16u, bufferSize) : bufferSize;
+      Vector4 regs[4];
+      for (uint32_t i = 0; i < 4; ++i) {
+        const uint32_t reg = binding.constantRegisters[i];
+        if (reg == UINT32_MAX) {
+          // Row form: synthetic `mov w, 1` row. Column form: no translation.
+          regs[i] = binding.columns ? Vector4(0.0f, 0.0f, 0.0f, 0.0f) : Vector4(0.0f, 0.0f, 0.0f, 1.0f);
+          continue;
+        }
+        const size_t offset = base + size_t(reg) * 16u;
+        if (offset + 16u > end)
+          return false;
+        std::memcpy(regs[i].data, ptr + offset, 16u);
+      }
+      for (uint32_t r = 0; r < 4; ++r) {
+        rows[r] = binding.columns
+          ? Vector4(regs[0][r], regs[1][r], regs[2][r], regs[3][r])
+          : regs[r];
+        for (uint32_t c = 0; c < 4; ++c)
+          if (!std::isfinite(rows[r][c]))
+            return false;
+      }
+      if (binding.columns && binding.affineW)
+        rows[3] = Vector4(0.0f, 0.0f, 0.0f, 1.0f);
+      return true;
+    }
+
+    // Factor a perspective ViewProj (column-vector Matrix4, M[col][row]) into
+    // P * V with V rigid. Engines that upload only a ViewProj (CRYENGINE
+    // CV_ViewProjZeroMatr, Dying Light, Mad Max, REDengine VS) have no
+    // standalone projection for the scan to find. Clip w = s * forward . p,
+    // so the w row gives the forward axis; x and y rows minus their forward
+    // component give right/up and the focal scales; the z row must be a pure
+    // multiple of forward (plus the depth offset). Returns false unless V's
+    // rotation comes out orthonormal.
+    bool factorViewProjection(const Matrix4& vp, Matrix4& outP, Matrix4& outV) {
+      auto row = [&](uint32_t r) { return Vector3(vp[0][r], vp[1][r], vp[2][r]); };
+      const Vector3 r3 = row(3);
+      const float s = length(r3);
+      if (!std::isfinite(s) || s < 1.0e-6f)
+        return false;
+      const Vector3 f = r3 * (1.0f / s);
+      const float tf = vp[3][3] / s;
+
+      auto split = [&](uint32_t r, Vector3& axis, float& scale, float& shear, float& t) {
+        const Vector3 v = row(r);
+        shear = dot(v, f);
+        const Vector3 u = v - f * shear;
+        scale = length(u);
+        if (!std::isfinite(scale) || scale < 1.0e-6f)
+          return false;
+        axis = u * (1.0f / scale);
+        t = (vp[3][r] - shear * tf) / scale;
+        return true;
+      };
+      Vector3 right, up;
+      float sx, sy, kx, ky, tx, ty;
+      if (!split(0, right, sx, kx, tx) || !split(1, up, sy, ky, ty))
+        return false;
+      if (std::abs(dot(right, up)) > 0.02f)
+        return false;
+      const Vector3 r2 = row(2);
+      const float pz = dot(r2, f);
+      if (length(r2 - f * pz) > 1.0e-3f * std::max(length(r2), 1.0f))
+        return false;
+
+      outV = Matrix4();
+      const Vector3 axes[3] = { right, up, f };
+      const float trans[3] = { tx, ty, tf };
+      for (uint32_t r = 0; r < 3; ++r) {
+        outV[0][r] = axes[r].x;
+        outV[1][r] = axes[r].y;
+        outV[2][r] = axes[r].z;
+        outV[3][r] = trans[r];
+      }
+      outP = Matrix4();
+      outP[0][0] = sx; outP[2][0] = kx;
+      outP[1][1] = sy; outP[2][1] = ky;
+      outP[2][2] = pz; outP[3][2] = vp[3][2] - pz * tf;
+      outP[2][3] = s;  outP[3][3] = 0.0f;
+      for (uint32_t c = 0; c < 4; ++c)
+        for (uint32_t r = 0; r < 4; ++r)
+          if (!std::isfinite(outP[c][r]) || !std::isfinite(outV[c][r]))
+            return false;
+      return true;
+    }
+
+    // Geometry forced onto the far plane through the viewport depth range:
+    // MinDepth == MaxDepth == far (0 with reversed Z, 1 with standard Z).
+    // REDengine draws its sky dome this way (engine_knowledge, group A).
+    bool isFarClampedViewport(const D3D11_VIEWPORT& vp, D3D11_COMPARISON_FUNC depthFunc,
+                              bool engineReversedZ) {
+      if (std::abs(vp.MaxDepth - vp.MinDepth) > 1.0e-6f)
+        return false;
+      const bool reversed = engineReversedZ
+        || depthFunc == D3D11_COMPARISON_GREATER || depthFunc == D3D11_COMPARISON_GREATER_EQUAL;
+      return (reversed && vp.MinDepth <= 1.0e-6f) || (!reversed && vp.MinDepth >= 1.0f - 1.0e-6f);
+    }
 
     // Shared by ordinary and instanced capture admission. Individual replay
     // submissions are smaller; this bounds the complete draw's allocation.
@@ -885,9 +1012,14 @@ namespace dxvk {
       // default path, but it must NOT inject scene draws without a real camera
       // - that renders black. Camera-less frames pass through to the game's
       // raster so the screen is never black.
+      // A camera alone is not a scene: game menus (e.g. Fallout 4's main menu)
+      // keep a valid camera while drawing only screen-space UI. Injecting then
+      // replaced the menu with an empty grey/black RT frame. Require scene
+      // geometry this frame unless the Remix UI is open.
       if (RtxOptions::forceInjection()) {
         const bool remixUiOpen = RtxOptions::showUI() != UIType::None;
-        return remixUiOpen || hasValidCamera || previousSceneAvailable;
+        return remixUiOpen
+          || (hasGameSceneDraws && (hasValidCamera || previousSceneAvailable));
       }
 
       // First-time RTX injection needs a real scene camera. Otherwise loading
@@ -898,6 +1030,8 @@ namespace dxvk {
     }
 
   }
+
+  static std::atomic<XXH64_hash_t> s_centerPickHash { 0 };
 
   static uint32_t getTextureUiFeatureFlagsForView(const Rc<DxvkImageView>& imageView) {
     uint32_t textureFeatureFlags = ImGUI::kTextureFlagsDefault;
@@ -1146,15 +1280,449 @@ namespace dxvk {
       !m_midFrameRtxInjected || m_forceRasterPassThroughThisFrame;
   }
 
+  // Tiled / clustered deferred renderers (Fallout 4, Skyrim SE, many UE4-era
+  // engines) never draw their point lights; a compute pass reads the frame's
+  // light list from a CPU-written structured buffer and shades every tile.
+  // With no draw to recover them from, this runtime had no game lights at all
+  // and night scenes were lit by the fallback light alone. The buffer is
+  // identified by shape (dynamic, CPU-written, 48-byte elements: flags,
+  // view-space position, radius, linear colour, shadow data) and validated per
+  // entry, so non-light data in a same-sized buffer is rejected.
+  // Sun direction from the game's own shadow cascades. Every engine with a
+  // directional shadow renders the scene with an orthographic light
+  // ViewProj into a depth-only target; that matrix's depth row is the sun's
+  // direction of travel (negated under reversed Z). Only draws whose VS
+  // transform is proven (world stage, then ViewProj) are used, so the matrix
+  // read is the light's, not an object's.
+  void D3D11Rtx::LearnSunFromShadowDraw() {
+    if (m_abDisableEngineKnowledge || m_context->m_state.vs.shader == nullptr)
+      return;
+    const D3D11CommonShader* vs = m_context->m_state.vs.shader->GetCommonShader();
+    Vector4 rows[4];
+    bool have = false;
+    const D3D11CameraRelativeWorldBinding& wb = vs->GetCameraRelativeWorldBinding();
+    if (wb.valid && wb.viewProjSlot < D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT) {
+      D3D11PositionTransformMatrixBinding vpBinding;
+      vpBinding.constantBufferSlot = wb.viewProjSlot;
+      for (uint32_t r = 0; r < 4; ++r)
+        vpBinding.constantRegisters[r] = wb.viewProjRegister + r;
+      have = readBindingRows(vpBinding, m_context->m_state.vs.constantBuffers[wb.viewProjSlot], rows);
+    } else if (const D3D11PositionTransformBinding* pb = vs->GetPositionTransformBinding()) {
+      if (pb->matrixCount == 2u && pb->matrices[1].constantBufferSlot < D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT)
+        have = readBindingRows(pb->matrices[1],
+          m_context->m_state.vs.constantBuffers[pb->matrices[1].constantBufferSlot], rows);
+    }
+    if (!have)
+      return;
+    // Orthographic: clip w is the constant 1.
+    if (std::abs(rows[3].x) + std::abs(rows[3].y) + std::abs(rows[3].z) > 1.0e-4f
+     || std::abs(rows[3].w - 1.0f) > 1.0e-3f)
+      return;
+    Vector3 d(rows[2].x, rows[2].y, rows[2].z);
+    const float len = length(d);
+    if (!std::isfinite(len) || len < 1.0e-8f)
+      return;
+    d = d * (1.0f / len);
+    if (D3D11DepthStencilState* ds = m_context->m_state.om.dsState) {
+      D3D11_DEPTH_STENCIL_DESC desc;
+      ds->GetDesc(&desc);
+      if (desc.DepthFunc == D3D11_COMPARISON_GREATER || desc.DepthFunc == D3D11_COMPARISON_GREATER_EQUAL)
+        d = Vector3(0.0f) - d;
+    }
+    for (auto& vote : m_sunVotes) {
+      if (dot(vote.direction, d) > 0.999f) {
+        ++vote.count;
+        return;
+      }
+    }
+    if (m_sunVotes.size() < 8u)
+      m_sunVotes.push_back({ d, 1u });
+  }
+
+  void D3D11Rtx::ApplyLearnedSunDirection() {
+    const SunVote* best = nullptr;
+    for (const auto& vote : m_sunVotes)
+      if (best == nullptr || vote.count > best->count)
+        best = &vote;
+    // The cascades are the frame's largest orthographic depth pass; a handful
+    // of draws (rain occlusion, map captures) must not steer the sun.
+    // Only meaningful when the RT world has the game's world axes: an exact
+    // eye (camera-relative engines) or a confirmed world-space view.
+    const bool gameWorldAxes = m_eyeOffset != SIZE_MAX || (m_viewConfirmed && !m_viewCameraRelative);
+    if (gameWorldAxes && best != nullptr && best->count >= 16u
+     && (!m_sunDirectionValid || dot(best->direction, m_sunDirection) < 0.99996f)) {
+      m_sunDirection = best->direction;
+      m_sunDirectionValid = true;
+      // Default layer: never written to the user's config, and a direction
+      // the user sets there still wins.
+      LightManager::fallbackLightDirectionObject().setDeferred(m_sunDirection, RtxOptionLayer::getDefaultLayer());
+      static uint32_t s_sunLogs = 0;
+      if (s_sunLogs++ < 8u)
+        Logger::info(str::format("[D3D11Rtx][sun] direction from shadow cascades: (",
+          m_sunDirection.x, ",", m_sunDirection.y, ",", m_sunDirection.z, ") draws=", best->count));
+    }
+    m_sunVotes.clear();
+  }
+
+  // UE4.2x/UE5 ForwardLocalLightBuffer (LightGridCommon.ush): a typed
+  // Buffer<float4>, 6 float4 per local light - PositionAndInvRadius
+  // (translated world), ColorAndFalloffExponent, DirectionAndShadowMask,
+  // SpotAnglesAndSourceRadiusPacked, Tangent..., RectBarnDoor... It holds
+  // every local light of the view, bound to forward/translucent PS and the
+  // clustered-deferred CS. Positions are camera-relative (translated world).
+  bool D3D11Rtx::ImportTypedLightBuffer(const D3D11ShaderResourceBindings& views) {
+    ScopedCpuProfileZoneN("D3D11Rtx::ImportTypedLightBuffer");
+    const uint32_t frame = m_context->m_device->getCurrentFrameId();
+    if (m_tiledLightImportFrame == frame)
+      return false;
+    for (uint32_t slot = 0; slot < views.views.size(); ++slot) {
+      D3D11ShaderResourceView* srv = views.views[slot].ptr();
+      if (srv == nullptr || srv->GetResourceType() != D3D11_RESOURCE_DIMENSION_BUFFER)
+        continue;
+      D3D11_SHADER_RESOURCE_VIEW_DESC viewDesc;
+      srv->GetDesc(&viewDesc);
+      if (viewDesc.Format != DXGI_FORMAT_R32G32B32A32_FLOAT)
+        continue;
+      Com<ID3D11Resource> resource;
+      srv->GetResource(&resource);
+      auto* buffer = static_cast<D3D11Buffer*>(resource.ptr());
+      D3D11_BUFFER_DESC desc;
+      buffer->GetDesc(&desc);
+      if (desc.Usage != D3D11_USAGE_DYNAMIC || (desc.CPUAccessFlags & D3D11_CPU_ACCESS_WRITE) == 0
+       || desc.ByteWidth < 96u)
+        continue;
+      const auto* bytes = reinterpret_cast<const uint8_t*>(buffer->GetMappedSlice().mapPtr);
+      if (bytes == nullptr)
+        continue;
+
+      const auto& camera = m_context->m_device->getCommon()->getSceneManager()
+        .getCameraManager().getCamera(CameraType::Main);
+      if (!camera.isValid(frame) && !camera.isValid(frame - 1u))
+        return false;
+      D3D11LightDecodeView decodeView;
+      decodeView.cameraWorld = camera.getViewToWorld(false) * Vector4d(0.0, 0.0, 0.0, 1.0);
+      decodeView.intensityScale = RtxOptions::dx11TiledLightIntensity();
+      decodeView.maxLights = RtxOptions::dx11TiledLightMaxPerFrame();
+      const uint32_t lightCount = desc.ByteWidth / 96u;
+      std::vector<Dx11LightDesc> lights;
+      if (!D3D11DecodeUnrealLocalLights(bytes, desc.ByteWidth, decodeView, lights))
+        continue;
+      m_tiledLightImportFrame = frame;
+      m_submitRejectStats.tiledLightsImported += uint32_t(lights.size());
+      static uint32_t s_typedLightLogs = 0;
+      if (s_typedLightLogs++ < 4u)
+        Logger::info(str::format("[D3D11Rtx][typed-lights] ", GetD3D11EngineProfile().name(),
+          " light buffer t", slot, ": imported ", lights.size(), " of ", lightCount));
+      m_context->EmitCs([cLights = std::move(lights)](DxvkContext* ctx) {
+        static_cast<RtxContext*>(ctx)->addLights(cLights.data(), uint32_t(cLights.size()));
+      });
+      return true;
+    }
+    return false;
+  }
+
+  // Katana Engine clustered lights (D3D11DecodeKatanaClusterLights): the
+  // deferred lighting pass (a full-screen PS, or its CS form) binds
+  // tCllLightPositions / tCllLightAttributes, found by their reflection
+  // names, which Katana's shipped shaders keep.
+  bool D3D11Rtx::ImportKatanaClusterLights(const D3D11ShaderResourceBindings& views, const D3D11CommonShader* shader) {
+    ScopedCpuProfileZoneN("D3D11Rtx::ImportKatanaClusterLights");
+    const uint32_t frame = m_context->m_device->getCurrentFrameId();
+    if (shader == nullptr || m_tiledLightImportFrame == frame)
+      return false;
+    const DxbcRdef* rdef = shader->GetReflection();
+    if (rdef == nullptr || !rdef->isValid())
+      return false;
+
+    uint32_t positionsSlot = UINT32_MAX, attributesSlot = UINT32_MAX, spotSlot = UINT32_MAX;
+    for (const auto& binding : rdef->resourceBindings()) {
+      if (binding.name == "tCllLightPositions")     positionsSlot = binding.bindPoint;
+      if (binding.name == "tCllLightAttributes")    attributesSlot = binding.bindPoint;
+      if (binding.name == "tCllSptLightAttributes") spotSlot = binding.bindPoint;
+    }
+    const bool hasPoints = positionsSlot < views.views.size() && attributesSlot < views.views.size();
+    const bool hasSpots = spotSlot < views.views.size();
+    if (!hasPoints && !hasSpots)
+      return false;
+
+    // CPU-written buffer bytes behind a typed buffer SRV, from its first element.
+    auto viewBytes = [](D3D11ShaderResourceView* srv, uint32_t& stride, size_t& size) -> const uint8_t* {
+      if (srv == nullptr || srv->GetResourceType() != D3D11_RESOURCE_DIMENSION_BUFFER)
+        return nullptr;
+      D3D11_SHADER_RESOURCE_VIEW_DESC viewDesc;
+      srv->GetDesc(&viewDesc);
+      switch (viewDesc.Format) {
+        case DXGI_FORMAT_R32G32B32A32_FLOAT: stride = 16u; break;
+        case DXGI_FORMAT_R32G32B32_FLOAT:    stride = 12u; break;
+        default: return nullptr;
+      }
+      Com<ID3D11Resource> resource;
+      srv->GetResource(&resource);
+      auto* buffer = static_cast<D3D11Buffer*>(resource.ptr());
+      D3D11_BUFFER_DESC desc;
+      buffer->GetDesc(&desc);
+      const auto* bytes = reinterpret_cast<const uint8_t*>(buffer->GetMappedSlice().mapPtr);
+      const size_t first = size_t(viewDesc.Buffer.FirstElement) * stride;
+      if (bytes == nullptr || first >= desc.ByteWidth)
+        return nullptr;
+      size = std::min(size_t(viewDesc.Buffer.NumElements) * stride, size_t(desc.ByteWidth) - first);
+      return bytes + first;
+    };
+
+    D3D11LightDecodeView decodeView;
+    decodeView.intensityScale = RtxOptions::dx11TiledLightIntensity();
+    decodeView.maxLights = RtxOptions::dx11TiledLightMaxPerFrame();
+
+    std::vector<Dx11LightDesc> lights;
+    uint32_t points = 0, spots = 0;
+
+    if (hasPoints) {
+      uint32_t positionsStride = 0, attributesStride = 0;
+      size_t positionsSize = 0, attributesSize = 0;
+      const uint8_t* positions = viewBytes(views.views[positionsSlot].ptr(), positionsStride, positionsSize);
+      const uint8_t* attributes = viewBytes(views.views[attributesSlot].ptr(), attributesStride, attributesSize);
+      if (positions != nullptr && attributes != nullptr && positionsStride == 16u)
+        points = D3D11DecodeKatanaClusterLights(positions, positionsSize, attributes, attributesSize,
+                                                attributesStride, decodeView, lights);
+    }
+
+    if (hasSpots && lights.size() < decodeView.maxLights) {
+      uint32_t spotStride = 0;
+      size_t spotSize = 0;
+      const uint8_t* spotBytes = viewBytes(views.views[spotSlot].ptr(), spotStride, spotSize);
+      D3D11LightDecodeView spotView = decodeView;
+      spotView.maxLights = decodeView.maxLights - uint32_t(lights.size());
+      spots = D3D11DecodeKatanaClusterSpotLights(spotBytes, spotSize, spotStride, spotView, lights);
+    }
+
+    if (lights.empty())
+      return false;
+
+    m_tiledLightImportFrame = frame;
+    m_submitRejectStats.tiledLightsImported += uint32_t(lights.size());
+    static uint32_t s_katanaLightLogs = 0;
+    if (s_katanaLightLogs++ < 4u)
+      Logger::info(str::format("[D3D11Rtx][katana-lights] points t", positionsSlot, "/t", attributesSlot,
+        ": ", points, ", spots t", spotSlot, ": ", spots));
+    m_context->EmitCs([cLights = std::move(lights)](DxvkContext* ctx) {
+      static_cast<RtxContext*>(ctx)->addLights(cLights.data(), uint32_t(cLights.size()));
+    });
+    return true;
+  }
+
+  // Tiled-light layouts and the Frostbite / HDRP spot form live in
+  // d3d11_light_decode.cpp, shared with the DX12 / Vulkan front end.
+
+  // Frostbite 3 tiled lighting (cryengine_frostbite.md): cbPunctualLightInfo
+  // holds g_lightInfoPunctual[128] of BaseLightInfo, 96 B each: pos 0,
+  // invSqrAttenuationRadius 12, color 16, matrixForward 32, angleScale 80,
+  // angleOffset 84. Positions are camera-relative (Frostbite renders camera
+  // relative); colour is pre-exposed, so only its ratio and the range are used.
+  // Skyrim SE forward lights (creation_source2_gamemaker.md; Nukem9
+  // BSLightingShader.cpp): the Lighting PS PerGeometry cbuffer (b2) holds
+  // NumLightNumShadowLight (c0.x), PointLightPosition[7] (c1-c7: camera-relative
+  // xyz, radius in w) and PointLightColor[7] (c8-c14). Each draw carries the
+  // lights touching it; the frame's set is deduplicated by position + colour.
+  void D3D11Rtx::CollectSkyrimDrawLights() {
+    static const bool s_skyrimSE = [] {
+      wchar_t path[MAX_PATH] = {};
+      GetModuleFileNameW(nullptr, path, MAX_PATH);
+      std::wstring exe = std::filesystem::path(path).filename().wstring();
+      std::transform(exe.begin(), exe.end(), exe.begin(), ::towlower);
+      return exe == L"skyrimse.exe" || exe == L"skyrimvr.exe";
+    }();
+    if (!s_skyrimSE)
+      return;
+    const auto& cb = m_context->m_state.ps.constantBuffers[2];
+    constexpr size_t kBytes = 15u * 16u;
+    if (cb.buffer == nullptr || cb.buffer->Desc()->ByteWidth < size_t(cb.constantOffset) * 16u + kBytes)
+      return;
+    const auto* bytes = reinterpret_cast<const uint8_t*>(cb.buffer->GetMappedSlice().mapPtr);
+    if (bytes == nullptr)
+      return;
+    float h[60];
+    std::memcpy(h, bytes + size_t(cb.constantOffset) * 16u, sizeof(h));
+    const float count = h[0];
+    if (!std::isfinite(count) || count < 1.0f || count > 7.0f || count != std::floor(count))
+      return;
+
+    const uint32_t frame = m_context->m_device->getCurrentFrameId();
+    const auto& camera = m_context->m_device->getCommon()->getSceneManager()
+      .getCameraManager().getCamera(CameraType::Main);
+    if (!camera.isValid(frame) && !camera.isValid(frame - 1u))
+      return;
+    const Vector4d eye = camera.getViewToWorld(false) * Vector4d(0.0, 0.0, 0.0, 1.0);
+    const float scale = RtxOptions::dx11TiledLightIntensity();
+    for (uint32_t i = 0; i < uint32_t(count) && m_frameDrawLights.size() < RtxOptions::dx11TiledLightMaxPerFrame(); ++i) {
+      const float* p = h + 4u + 4u * i;
+      const float* c = h + 32u + 4u * i;
+      const float maxColor = std::max(c[0], std::max(c[1], c[2]));
+      bool valid = std::isfinite(p[3]) && p[3] > 1.0f && p[3] < 1.0e5f
+        && std::isfinite(maxColor) && maxColor > 1.0e-4f && maxColor < 100.0f
+        && c[0] >= 0.0f && c[1] >= 0.0f && c[2] >= 0.0f;
+      for (uint32_t k = 0; k < 3 && valid; ++k)
+        valid = std::isfinite(p[k]) && std::abs(p[k]) < 1.0e6f;
+      if (!valid)
+        continue;
+      auto snap = [](double v) { return float(std::round(v * 2.0) * 0.5); };
+      const float px = snap(eye.x + p[0]), py = snap(eye.y + p[1]), pz = snap(eye.z + p[2]);
+      const int32_t key[6] = { int32_t(px), int32_t(py), int32_t(pz),
+        int32_t(c[0] * 255.0f), int32_t(c[1] * 255.0f), int32_t(c[2] * 255.0f) };
+      if (!m_frameDrawLightKeys.insert(XXH3_64bits(key, sizeof(key))).second)
+        continue;
+      const float brightness = std::min(std::max(maxColor * scale, 1.0e-3f), 1.0e4f);
+      m_frameDrawLights.push_back(Dx11LightStateApi::makePoint(px, py, pz,
+        c[0] / maxColor, c[1] / maxColor, c[2] / maxColor, p[3] * std::sqrt(brightness)));
+    }
+  }
+
+  bool D3D11Rtx::ImportFrostbitePunctualLights() {
+    const auto& cs = m_context->m_state.cs;
+    const uint32_t frame = m_context->m_device->getCurrentFrameId();
+    constexpr uint32_t kStride = 96u;
+    for (uint32_t slot = 0; slot < D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT; ++slot) {
+      const auto& cb = cs.constantBuffers[slot];
+      if (cb.buffer == nullptr || cb.buffer->Desc()->ByteWidth < cb.constantOffset * 16u + kStride * 8u)
+        continue;
+      const auto* bytes = reinterpret_cast<const uint8_t*>(cb.buffer->GetMappedSlice().mapPtr);
+      if (bytes == nullptr)
+        continue;
+      bytes += size_t(cb.constantOffset) * 16u;
+      const size_t available = cb.buffer->Desc()->ByteWidth - cb.constantOffset * 16u;
+
+      const auto& camera = m_context->m_device->getCommon()->getSceneManager()
+        .getCameraManager().getCamera(CameraType::Main);
+      if (!camera.isValid(frame) && !camera.isValid(frame - 1u))
+        return false;
+
+      D3D11LightDecodeView decodeView;
+      decodeView.cameraWorld = camera.getViewToWorld(false) * Vector4d(0.0, 0.0, 0.0, 1.0);
+      decodeView.intensityScale = RtxOptions::dx11TiledLightIntensity();
+      decodeView.maxLights = RtxOptions::dx11TiledLightMaxPerFrame();
+
+      std::vector<Dx11LightDesc> lights;
+      if (!D3D11DecodeFrostbitePunctualLights(bytes, available, decodeView, lights))
+        continue;
+      m_tiledLightImportFrame = frame;
+      m_submitRejectStats.tiledLightsImported += uint32_t(lights.size());
+      m_context->EmitCs([cLights = std::move(lights)](DxvkContext* ctx) {
+        static_cast<RtxContext*>(ctx)->addLights(cLights.data(), uint32_t(cLights.size()));
+      });
+      return true;
+    }
+    return false;
+  }
+
+  void D3D11Rtx::OnDispatch() {
+    ScopedCpuProfileZoneN("D3D11Rtx::OnDispatch");
+    if (!RtxOptions::dx11ImportTiledLights() || GetD3D11EngineProfile().chromiumHelperProcess)
+      return;
+    const uint32_t frame = m_context->m_device->getCurrentFrameId();
+    if (m_tiledLightImportFrame == frame)
+      return;
+
+    // The engine's documented layout; engines without one keep the original
+    // shape-validated FO4 layout, which rejects non-light data per entry.
+    const D3D11EngineProfile& engine = GetD3D11EngineProfile();
+    if (!m_abDisableEngineKnowledge
+     && engine.family() == D3D11EngineFamily::Unreal
+     && ImportTypedLightBuffer(m_context->m_state.cs.shaderResources))
+      return;
+    if (!m_abDisableEngineKnowledge && engine.family() == D3D11EngineFamily::Katana) {
+      if (m_context->m_state.cs.shader != nullptr)
+        ImportKatanaClusterLights(m_context->m_state.cs.shaderResources, m_context->m_state.cs.shader->GetCommonShader());
+      return;
+    }
+    D3D11TiledLightLayout wanted = engine.facts->lights;
+    if (!m_abDisableEngineKnowledge && wanted == D3D11TiledLightLayout::Frostbite96) {
+      ImportFrostbitePunctualLights();
+      return;
+    }
+    if (wanted == D3D11TiledLightLayout::None || m_abDisableEngineKnowledge)
+      wanted = engine.family() == D3D11EngineFamily::Unknown || engine.family() == D3D11EngineFamily::Creation
+        ? D3D11TiledLightLayout::Creation48 : D3D11TiledLightLayout::None;
+    const uint32_t kStride = D3D11TiledLightStride(wanted);
+    const bool requireDynamic = D3D11TiledLightRequiresDynamic(wanted);
+    if (kStride == 0u)
+      return;
+
+    const auto& cs = m_context->m_state.cs;
+    for (uint32_t slot = 0; slot < cs.shaderResources.views.size(); ++slot) {
+      D3D11ShaderResourceView* srv = cs.shaderResources.views[slot].ptr();
+      if (srv == nullptr || srv->GetResourceType() != D3D11_RESOURCE_DIMENSION_BUFFER)
+        continue;
+      Com<ID3D11Resource> resource;
+      srv->GetResource(&resource);
+      auto* buffer = static_cast<D3D11Buffer*>(resource.ptr());
+      D3D11_BUFFER_DESC desc;
+      buffer->GetDesc(&desc);
+      if (desc.StructureByteStride != kStride
+       || (requireDynamic && (desc.Usage != D3D11_USAGE_DYNAMIC
+                           || (desc.CPUAccessFlags & D3D11_CPU_ACCESS_WRITE) == 0))
+       || desc.ByteWidth < kStride * (requireDynamic ? 8u : 1u) || (desc.ByteWidth % kStride) != 0u)
+        continue;
+      const auto* bytes = reinterpret_cast<const uint8_t*>(buffer->GetMappedSlice().mapPtr);
+      if (bytes == nullptr) {
+        ONCE(Logger::info(str::format("[D3D11Rtx][tiled-lights] ", engine.name(),
+          " light buffer (stride ", kStride, ") at t", slot, " is not CPU-visible; lights not imported")));
+        continue;
+      }
+
+      const auto& camera = m_context->m_device->getCommon()->getSceneManager()
+        .getCameraManager().getCamera(CameraType::Main);
+      if (!camera.isValid(frame) && !camera.isValid(frame - 1u))
+        return;
+      D3D11LightDecodeView decodeView;
+      decodeView.viewToWorld = camera.getViewToWorld(false);
+      decodeView.cameraWorld = decodeView.viewToWorld * Vector4d(0.0, 0.0, 0.0, 1.0);
+      decodeView.intensityScale = RtxOptions::dx11TiledLightIntensity();
+      decodeView.maxLights = RtxOptions::dx11TiledLightMaxPerFrame();
+
+      const uint32_t entryCount = desc.ByteWidth / kStride;
+      std::vector<Dx11LightDesc> lights;
+      lights.reserve(64);
+      std::vector<Vector3> sunDirections;
+      float sample[3][12] = {};
+      uint32_t sampled = 0;
+      D3D11DecodeTiledLights(wanted, bytes, desc.ByteWidth, decodeView, lights, &sunDirections, sample, &sampled);
+
+      // CRYENGINE's sun entry outweighs the shadow-cascade votes.
+      for (const Vector3& sunDir : sunDirections)
+        m_sunVotes.push_back({ sunDir, 1000u });
+
+      if (lights.empty())
+        continue;
+
+      m_tiledLightImportFrame = frame;
+      const size_t importedCount = lights.size();
+      m_submitRejectStats.tiledLightsImported += uint32_t(importedCount);
+      m_context->EmitCs([cLights = std::move(lights)](DxvkContext* ctx) {
+        static_cast<RtxContext*>(ctx)->addLights(cLights.data(), uint32_t(cLights.size()));
+      });
+
+      static uint32_t s_lastTiledLog = 0;
+      if (frame >= s_lastTiledLog + 600u) {
+        s_lastTiledLog = frame;
+        const Vector3 forward = camera.getDirection(false);
+        std::string raw;
+        for (uint32_t s = 0; s < sampled; ++s)
+          raw += str::format(" [pos=(", sample[s][1], ",", sample[s][2], ",", sample[s][3], ") r=", sample[s][4],
+                             " c=(", sample[s][5], ",", sample[s][6], ",", sample[s][7], ")]");
+        Logger::info(str::format("[D3D11Rtx][tiled-lights] frame=", frame, " imported=",
+          importedCount, " slot=t", slot, " entries=", entryCount,
+          " camFwd=(", forward.x, ",", forward.y, ",", forward.z, ")", raw));
+      }
+      return;
+    }
+  }
+
   bool D3D11Rtx::OnDrawAuto() {
     BeginNativeRasterDrawRouting();
     auto* buffer = m_context->m_state.ia.vertexBuffers[0].buffer.ptr();
     if (buffer != nullptr && buffer->GetSOCounter().defined()) {
-      // The stream-output count is GPU-produced. Until capture can consume
-      // that count in command order, preserve the native frame instead of
-      // replacing this otherwise unrepresented draw with a partial RT scene.
-      m_forceRasterPassThroughThisFrame = true;
-      m_allowNativeRasterForCurrentDraw = true;
+      // The stream-output count is GPU-produced and cannot be captured in
+      // command order. Leave only this draw out of the RT scene; forcing the
+      // whole frame to raster turned every SO-using title into a raster game.
     }
     return m_allowNativeRasterForCurrentDraw;
   }
@@ -1194,11 +1762,10 @@ namespace dxvk {
      || sizeof(D3D11_DRAW_INSTANCED_INDIRECT_ARGS) > byteWidth - argumentOffset)
       return m_allowNativeRasterForCurrentDraw;
 
-    // A mapped allocation is not a synchronized argument snapshot: queued
-    // CopyResource, CopyStructureCount, or UAV writes can still change it.
-    // Keep the GPU draw native without adding a CPU/GPU readback stall.
-    m_forceRasterPassThroughThisFrame = true;
-    m_allowNativeRasterForCurrentDraw = true;
+    // The arguments are GPU-written (culling, compaction), so they never reach
+    // the CPU: capture replays this exact indirect draw on the GPU into a
+    // NaN-prefilled buffer of fixed capacity (METHODS.md, indirect draws).
+    SubmitIndirectDraw(argumentBuffer, argumentOffset, false);
     return m_allowNativeRasterForCurrentDraw;
   }
 
@@ -1213,9 +1780,178 @@ namespace dxvk {
      || sizeof(D3D11_DRAW_INDEXED_INSTANCED_INDIRECT_ARGS) > byteWidth - argumentOffset)
       return m_allowNativeRasterForCurrentDraw;
 
-    m_forceRasterPassThroughThisFrame = true;
-    m_allowNativeRasterForCurrentDraw = true;
+    // See OnDrawInstancedIndirect.
+    SubmitIndirectDraw(argumentBuffer, argumentOffset, true);
     return m_allowNativeRasterForCurrentDraw;
+  }
+
+  // A draw that samples a known offscreen UI target and renders into the
+  // presented image is the UI composite: place the path-traced frame right
+  // before it so the HUD lands on top. Runs before any draw rejection, since
+  // composites are fullscreen passes the scene filters drop.
+  bool D3D11Rtx::TryInjectAtUiComposite() {
+    if (m_offscreenUiTargets.empty() || m_midFrameRtxInjected || m_abDisableEngineKnowledge
+     || m_submitRejectStats.realSceneAccepted == 0u || m_lastBackbufferImage == nullptr)
+      return false;
+    auto* rtv0 = m_context->m_state.om.renderTargetViews[0].ptr();
+    Rc<DxvkImageView> targetView = rtv0 != nullptr ? rtv0->GetImageView() : nullptr;
+    if (targetView == nullptr || targetView->image().ptr() != m_lastBackbufferImage)
+      return false;
+    bool samplesUi = false;
+    const auto& views = m_context->m_state.ps.shaderResources.views;
+    for (uint32_t slot = 0; slot < views.size() && !samplesUi; ++slot) {
+      if (views[slot] == nullptr || views[slot]->GetResourceType() != D3D11_RESOURCE_DIMENSION_TEXTURE2D)
+        continue;
+      Rc<DxvkImageView> view = views[slot]->GetImageView();
+      samplesUi = view != nullptr && std::find(m_offscreenUiTargets.begin(), m_offscreenUiTargets.end(),
+                                               view->image().ptr()) != m_offscreenUiTargets.end();
+    }
+    if (!samplesUi)
+      return false;
+    Rc<DxvkImage> target = targetView->image();
+    m_context->EmitCs([target](DxvkContext* ctx) {
+      static_cast<RtxContext*>(ctx)->injectRTX(0, target);
+    });
+    m_midFrameRtxInjected = true;
+    m_rasterUiSeenThisFrame = true;
+    m_allowNativeRasterForCurrentDraw = true;
+    static uint32_t s_compositeLogs = 0;
+    if (s_compositeLogs++ < 8u)
+      Logger::info("[D3D11Rtx][ui-layer] queued RTX before the offscreen-UI composite onto the back buffer");
+    return true;
+  }
+
+  // --- 2D lift (rtx.dx11.lift2DLayers) ---
+  // A 2D game has no geometry to trace: every draw is a textured quad in an
+  // orthographic or pre-transformed screen space. Each such draw is captured
+  // post-VS like any other and its clip position is lifted onto a plane at a
+  // depth set by draw order (painter's order: later = nearer). Every plane is
+  // scaled by its own depth, so it projects onto exactly the pixels the game
+  // rasterized: the path-traced image matches the raster one, and the layers
+  // still shadow and light each other (documentation/engine_knowledge/
+  // frameworks_2d_web.md, section 12).
+  namespace {
+    constexpr float    kLift2DNear   = 100.0f;
+    constexpr float    kLift2DFar    = 1100.0f;
+    constexpr uint32_t kLift2DLayers = 16384u;
+    constexpr float    kLift2DFovY   = 1.04719755f;  // 60 degrees; any FOV projects exactly
+  }
+
+  // The draw writes an orthographic clip position: the w row of its clip
+  // matrix has no x/y/z term. `perspective` is the opposite proof.
+  void D3D11Rtx::ClassifyClipProjection(bool& orthographic, bool& perspective) const {
+    orthographic = false;
+    perspective = false;
+    if (m_context->m_state.vs.shader == nullptr)
+      return;
+    const D3D11CommonShader* vs = m_context->m_state.vs.shader->GetCommonShader();
+    const D3D11PositionTransformBinding* binding = vs != nullptr ? vs->GetPositionTransformBinding() : nullptr;
+    if (binding == nullptr || !binding->valid || binding->matrixCount < 1u)
+      return;
+    const D3D11PositionTransformMatrixBinding& clip = binding->matrices[binding->matrixCount - 1u];
+    if (clip.constantBufferSlot >= D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT)
+      return;
+    Vector4 rows[4];
+    if (!readBindingRows(clip, m_context->m_state.vs.constantBuffers[clip.constantBufferSlot], rows))
+      return;
+    const Vector4& w = rows[3];
+    if (!std::isfinite(w.x) || !std::isfinite(w.y) || !std::isfinite(w.z) || !std::isfinite(w.w))
+      return;
+    const float xyz = std::abs(w.x) + std::abs(w.y) + std::abs(w.z);
+    perspective = xyz > 1.0e-6f;
+    orthographic = !perspective && std::abs(w.w) > 1.0e-6f;
+  }
+
+  // Lifted layers are the image the game presents: the back buffer, or the
+  // offscreen target the game composites onto it (GameMaker's
+  // application_surface, render-to-texture playfields). Other targets
+  // (light/shadow surfaces, glyph caches) are inputs, not the scene.
+  bool D3D11Rtx::IsLift2DTarget() const {
+    auto* rtv = m_context->m_state.om.renderTargetViews[0].ptr();
+    Rc<DxvkImageView> view = rtv != nullptr ? rtv->GetImageView() : nullptr;
+    if (view == nullptr)
+      return false;
+    const DxvkImage* image = view->image().ptr();
+    if (m_lastBackbufferImage == nullptr)
+      return true;  // first frame: nothing to compare against yet
+    return image == m_lastBackbufferImage || image == m_lift2DSceneTarget;
+  }
+
+  // The draw samples only render targets (a post-process or the composite of
+  // an offscreen playfield onto the back buffer). Never lifted: it re-shows
+  // the layers already lifted. Returns the largest sampled target.
+  const DxvkImage* D3D11Rtx::Lift2DSampledRenderTarget(bool& samplesOnlyRenderTargets) const {
+    samplesOnlyRenderTargets = false;
+    const DxvkImage* largest = nullptr;
+    uint32_t largestArea = 0, sampled = 0, renderTargets = 0;
+    const D3D11CommonShader* ps = m_context->m_state.ps.shader != nullptr
+      ? m_context->m_state.ps.shader->GetCommonShader() : nullptr;
+    const auto& views = m_context->m_state.ps.shaderResources.views;
+    for (uint32_t slot = 0; slot < views.size(); ++slot) {
+      D3D11ShaderResourceView* srv = views[slot].ptr();
+      if (srv == nullptr || srv->GetResourceType() != D3D11_RESOURCE_DIMENSION_TEXTURE2D)
+        continue;
+      if (ps != nullptr && ps->HasCompleteSampledResourceProfile() && !ps->SamplesResourceSlot(slot))
+        continue;
+      Rc<DxvkImageView> view = srv->GetImageView();
+      if (view == nullptr)
+        continue;
+      ++sampled;
+      if ((srv->GetResourceDesc().BindFlags & D3D11_BIND_RENDER_TARGET) == 0)
+        continue;
+      ++renderTargets;
+      const VkExtent3D e = view->image()->info().extent;
+      if (e.width * e.height > largestArea) {
+        largestArea = e.width * e.height;
+        largest = view->image().ptr();
+      }
+    }
+    samplesOnlyRenderTargets = sampled > 0 && renderTargets == sampled;
+    return largest;
+  }
+
+  Matrix4 D3D11Rtx::Lift2DProjection() const {
+    float aspect = 16.0f / 9.0f;
+    auto* rtv = m_context->m_state.om.renderTargetViews[0].ptr();
+    Rc<DxvkImageView> view = rtv != nullptr ? rtv->GetImageView() : nullptr;
+    if (m_lastBackbufferImage != nullptr) {
+      const VkExtent3D e = m_lastBackbufferImage->info().extent;
+      aspect = float(e.width) / float(std::max(e.height, 1u));
+    } else if (view != nullptr) {
+      const VkExtent3D e = view->image()->info().extent;
+      aspect = float(e.width) / float(std::max(e.height, 1u));
+    }
+    // Same form as the viewport fallback camera (LH, +Z forward).
+    const float nearZ  = 1.0f;
+    const float farZ   = 4.0f * kLift2DFar;
+    const float yScale = 1.0f / std::tan(kLift2DFovY * 0.5f);
+    const float xScale = yScale / aspect;
+    const float Q      = farZ / (farZ - nearZ);
+    return Matrix4(
+      Vector4(xScale, 0.0f,   0.0f,       0.0f),
+      Vector4(0.0f,   yScale, 0.0f,       0.0f),
+      Vector4(0.0f,   0.0f,   Q,          1.0f),
+      Vector4(0.0f,   0.0f,  -nearZ * Q,  0.0f));
+  }
+
+  void D3D11Rtx::SubmitIndirectDraw(ID3D11Buffer* argumentBuffer, UINT argumentOffset, bool indexed) {
+    if (!RtxOptions::dx11CaptureIndirectDraws() || m_abDisableEngineKnowledge
+     || GetD3D11EngineProfile().chromiumHelperProcess)
+      return;
+    ScopedCpuProfileZoneN("D3D11Rtx::SubmitIndirectDraw");
+    auto* buffer = static_cast<D3D11Buffer*>(argumentBuffer);
+    m_indirectReplay.active = true;
+    m_indirectReplay.indexed = indexed;
+    // The same whole-buffer slice D3D11 binds for its own draw (SetDrawBuffers),
+    // so the DXVK binding state stays what the D3D11 layer expects.
+    m_indirectReplay.args = buffer->GetBufferSlice();
+    m_indirectReplay.offset = argumentOffset;
+    m_indirectReplay.identity = XXH3_64bits_withSeed(&argumentOffset, sizeof(argumentOffset),
+      uint64_t(reinterpret_cast<uintptr_t>(buffer)));
+    // Capacity in vertices; the vertex-pulled admission path supplies the
+    // placeholder stream and makes capture the only position source.
+    SubmitDraw(false, RtxOptions::dx11IndirectCaptureVertices(), 0, 0, nullptr, 0, 1, true);
+    m_indirectReplay.active = false;
   }
 
   void D3D11Rtx::ResetCommandListState() {
@@ -1245,11 +1981,118 @@ namespace dxvk {
       }
     }
     ++m_forceInjectionProbePhase;
+    m_prevFrameStarvedCaptures = m_starvedCapturesThisFrame;
+    m_starvedCapturesThisFrame = 0;
+
+    // Per-frame counters as Tracy plots, so every runtime decision can be read
+    // against frame time in a capture (zero cost when Tracy is compiled out).
+    {
+      const SubmitRejectStats& s = m_submitRejectStats;
+      ProfilerPlotValueI64("dx11 draws total", s.total);
+      ProfilerPlotValueI64("dx11 draws scene", s.sceneAccepted);
+      ProfilerPlotValueI64("dx11 exact world", s.exactWorldTransform);
+      ProfilerPlotValueI64("dx11 exact rebased", s.exactWorldRebased);
+      ProfilerPlotValueI64("dx11 position captured", s.positionCaptured);
+      ProfilerPlotValueI64("dx11 position budget rejected", s.positionCaptureBudgetRejected);
+      ProfilerPlotValueI64("dx11 duplicate pass skipped", s.duplicatePassSkipped);
+      ProfilerPlotValueI64("dx11 light-prepass geometry skipped", s.lightPrepassGeometrySkipped);
+      ProfilerPlotValueI64("dx11 depth-only skipped", s.depthOnlySkipped);
+      ProfilerPlotValueI64("dx11 tiled lights imported", s.tiledLightsImported);
+      ProfilerPlotValueI64("dx11 vertex-pulled world draws", s.noLayoutWorldCandidate);
+      ProfilerPlotValueI64("dx11 vertex-pulled admitted", s.vertexPulledAdmitted);
+      ProfilerPlotValueI64("dx11 projected decals", s.projectedDecals);
+    }
+    // 2D lift: decided for this frame from the frames before it. A process
+    // that has drawn a perspective 3D scene never lifts (its orthographic
+    // draws are UI). Otherwise lifting starts after dx11Lift2DMinFrames
+    // 2D-only frames, or after one in an engine known to draw in 2D, and
+    // stays on until a perspective scene appears.
+    {
+      const SubmitRejectStats& s = m_submitRejectStats;
+      ProfilerPlotValueI64("dx11 2d lifted", s.lift2DAccepted);
+      ProfilerPlotValueI64("dx11 2d candidates", s.lift2DCandidates);
+      if (m_perspectiveSceneThisFrame > 0u)
+        m_seenPerspectiveScene = true;
+      const bool twoDOnlyFrame = m_perspectiveSceneThisFrame == 0u && s.lift2DCandidates > 0u;
+      m_lift2DStreak = twoDOnlyFrame ? m_lift2DStreak + 1u : 0u;
+      const D3D11EngineFamily family = GetD3D11EngineProfile().family();
+      const bool known2D = family == D3D11EngineFamily::GameMaker || family == D3D11EngineFamily::Framework2D;
+      const uint32_t needed = known2D ? 1u : std::max(RtxOptions::dx11Lift2DMinFrames(), 1u);
+      const bool wasLifting = m_lift2DFrame;
+      m_lift2DFrame = RtxOptions::dx11Lift2DLayers() && !m_abDisableEngineKnowledge
+        && !m_seenPerspectiveScene && (m_lift2DStreak >= needed || wasLifting);
+      if (m_lift2DFrame != wasLifting) {
+        Logger::info(str::format("[D3D11Rtx][2d-lift] ", m_lift2DFrame ? "started" : "stopped",
+          " (engine=", GetD3D11EngineProfile().name(), " streak=", m_lift2DStreak,
+          " perspectiveSeen=", m_seenPerspectiveScene ? 1 : 0, ")"));
+      }
+      SetLift2DPresentation(m_lift2DFrame);
+      m_perspectiveSceneThisFrame = 0;
+      m_lift2DLayer = 0;
+      m_prevFrameSceneTargetWidth = m_frameSceneTargetWidth;
+      m_frameSceneTargetWidth = 0;
+
+      // Scene units: Remix renders in centimetres (light falloff, ray
+      // offsets, volumetrics, atmosphere). Default layer, so a value in the
+      // user's config still wins.
+      static bool s_sceneScaleApplied = false;
+      if (!s_sceneScaleApplied && !m_abDisableEngineKnowledge) {
+        s_sceneScaleApplied = true;
+        const float unitsPerCm = GetD3D11EngineUnitsPerCentimetre(family);
+        if (unitsPerCm > 0.0f) {
+          RtxOptions::sceneScaleObject().setDeferred(unitsPerCm, RtxOptionLayer::getDefaultLayer());
+          Logger::info(str::format("[D3D11Engine] scene scale ", unitsPerCm, " game units per cm (",
+            GetD3D11EngineProfile().name(), ")"));
+        }
+      }
+      m_lift2DSceneTarget = m_lift2DSceneTargetNext;
+      m_lift2DSceneTargetNext = nullptr;
+    }
+    ApplyLearnedSunDirection();
+    m_passKeysThisFrame.clear();
+    m_meshKeysThisFrame.clear();
+    std::swap(m_equalPassKeysPrevFrame, m_equalPassKeysThisFrame);
+    m_equalPassKeysThisFrame.clear();
     m_submitRejectStats = {};
     m_rasterUiSeenThisFrame = false;
     m_midFrameRtxInjected = false;
     m_forceRasterPassThroughThisFrame = false;
     m_allowNativeRasterForCurrentDraw = true;
+
+    // Testing aid: while "dx11-raster-compare.flag" exists beside the game
+    // executable, frames pass through as the game's own raster image, so the
+    // same pose can be screenshotted raster vs path traced. Polled, not per frame.
+    {
+      static bool s_rasterCompare = false;
+      static uint32_t s_rasterComparePoll = 0;
+      if ((s_rasterComparePoll++ % 30u) == 0u) {
+        s_rasterCompare = std::filesystem::exists("dx11-raster-compare.flag");
+        // A/B switch for profiling a fix with and without it in one build.
+        m_abDisableExactWorld = std::filesystem::exists("dx11-ab-no-exact-world.flag");
+        // A/B switch for the engine-knowledge features (pass dedupe, engine
+        // light layouts) so Tracy can compare them in one build.
+        m_abDisableEngineKnowledge = std::filesystem::exists("dx11-ab-no-engine-knowledge.flag");
+        // Testing aid: "dx11-debugview.flag" holding a DEBUG_VIEW_* index
+        // selects that Remix debug view; removing the file turns it off.
+        // Leaves the user's config files untouched.
+        static uint32_t s_flagDebugView = 0;
+        uint32_t wanted = 0;
+        if (std::ifstream flag { "dx11-debugview.flag" }) {
+          flag >> wanted;
+        }
+        if (wanted != s_flagDebugView) {
+          s_flagDebugView = wanted;
+          m_context->m_device->getCommon()->metaDebugView().debugViewIdx.setDeferred(wanted);
+          Logger::info(str::format("[D3D11Rtx] debug view set from flag file: ", wanted));
+        }
+      }
+      if (s_rasterCompare)
+        m_forceRasterPassThroughThisFrame = true;
+    }
+
+    // Chromium helper processes show their own raster frames (see SubmitDraw).
+    if (GetD3D11EngineProfile().chromiumHelperProcess)
+      m_forceRasterPassThroughThisFrame = true;
   }
 
   // DX11_V280_TEXCOORD_CAPTURE: engine-agnostic recovery of texture
@@ -1280,6 +2123,7 @@ namespace dxvk {
   bool D3D11Rtx::TryCaptureTexcoordsViaStreamOut(
       DrawCallState& dcs, RasterGeometry& geo,
       bool indexed, UINT count, UINT start, INT base) {
+    ScopedCpuProfileZoneN("D3D11Rtx::TryCaptureTexcoordsViaStreamOut");
     // Kill switch for field diagnosis; capture is otherwise always available.
     static const bool s_disabled = env::getEnvVar("DXVK_REMIX_TEXCOORD_CAPTURE") == "0";
     if (s_disabled)
@@ -1547,6 +2391,7 @@ namespace dxvk {
       UINT replayFirstInstance,
       UINT replayInstanceCount,
       bool requireIndexedFlatten) {
+    ScopedCpuProfileZoneN("D3D11Rtx::TryCapturePositionsViaStreamOut");
     static const bool s_disabled = env::getEnvVar("DXVK_REMIX_POSITION_CAPTURE") == "0";
     // Keep the existing developer-menu control authoritative. Previously the
     // checkbox disabled terrain vertex capture but this path ignored it and
@@ -1565,9 +2410,24 @@ namespace dxvk {
     if (!m_context->m_device->features().extTransformFeedback.transformFeedback)
       return false;
 
-    if (m_context->m_state.gs.shader != nullptr
-     || m_context->m_state.hs.shader != nullptr
-     || m_context->m_state.ds.shader != nullptr)
+    // Tessellated draws (HS + DS, no GS): capture the domain shader's
+    // SV_Position with a triangle-input capture GS (METHODS.md). The output
+    // count is GPU-determined, so the buffer is NaN-prefilled to a capacity
+    // and unwritten triangles stay inactive in the BLAS.
+    const D3D11CommonShader* commonDs = m_context->m_state.ds.shader != nullptr
+      ? m_context->m_state.ds.shader->GetCommonShader() : nullptr;
+    const bool tessellated = m_context->m_state.gs.shader == nullptr
+      && m_context->m_state.hs.shader != nullptr && commonDs != nullptr
+      && commonDs->HasPositionCaptureCandidate() && RtxOptions::dx11CaptureTessellation();
+    // Geometry-shader draws: the game's GS, recompiled with XFB, is the
+    // capture stage (its triangles are what the rasterizer received).
+    const D3D11CommonShader* commonGs = m_context->m_state.gs.shader != nullptr
+      ? m_context->m_state.gs.shader->GetCommonShader() : nullptr;
+    const bool gsCapture = commonGs != nullptr && commonGs->HasPositionCaptureCandidate()
+      && m_context->m_state.hs.shader == nullptr && m_context->m_state.ds.shader == nullptr
+      && RtxOptions::dx11CaptureGeometryShaders() && !m_indirectReplay.active;
+    if ((m_context->m_state.gs.shader != nullptr && !gsCapture)
+     || ((m_context->m_state.hs.shader != nullptr || m_context->m_state.ds.shader != nullptr) && !tessellated))
       return false;
 
     for (const auto& soTarget : m_context->m_state.so.targets) {
@@ -1576,7 +2436,15 @@ namespace dxvk {
     }
 
     DxvkInputAssemblyState restoreIa = { VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, VK_FALSE, 0 };
-    switch (m_context->m_state.ia.primitiveTopology) {
+    uint32_t patchControlPoints = 0;
+    if (tessellated) {
+      const uint32_t topology = uint32_t(m_context->m_state.ia.primitiveTopology);
+      if (topology < uint32_t(D3D_PRIMITIVE_TOPOLOGY_1_CONTROL_POINT_PATCHLIST)
+       || topology > uint32_t(D3D_PRIMITIVE_TOPOLOGY_32_CONTROL_POINT_PATCHLIST))
+        return false;
+      patchControlPoints = topology - uint32_t(D3D_PRIMITIVE_TOPOLOGY_1_CONTROL_POINT_PATCHLIST) + 1u;
+      restoreIa = { VK_PRIMITIVE_TOPOLOGY_PATCH_LIST, VK_FALSE, patchControlPoints };
+    } else switch (m_context->m_state.ia.primitiveTopology) {
       case D3D_PRIMITIVE_TOPOLOGY_POINTLIST:
         restoreIa = { VK_PRIMITIVE_TOPOLOGY_POINT_LIST, VK_FALSE, 0 };
         break;
@@ -1644,21 +2512,33 @@ namespace dxvk {
     // Indexed strips cannot be flattened by merely preserving index order,
     // since strip parity/restart state would be lost; reject that uncommon path
     // rather than constructing an invalid RT geometry domain.
-    if (indexed && !triangleList)
+    if (indexed && !triangleList && !tessellated && !gsCapture)
+      return false;
+    // Indirect replay: an indexed indirect draw is replayed as an indexed
+    // point stream (one output vertex per index), which needs a triangle list.
+    const bool indirectReplay = m_indirectReplay.active;
+    if (indirectReplay && (tessellated || (m_indirectReplay.indexed && !triangleList)))
       return false;
 
-    const bool flattenIndexed = indexed && triangleList;
+    const bool flattenIndexed = indexed && triangleList && !tessellated && !gsCapture;
     if (requireIndexedFlatten && !flattenIndexed)
       return false;
 
-    const uint32_t verticesPerInstance = flattenIndexed ? count : geo.vertexCount;
+    // GPU-sized output (tessellation, GS amplification): a budgeted capacity;
+    // the real count is only known on the GPU and the excess stays NaN.
+    const uint32_t tessPatches = tessellated && patchControlPoints > 0u ? count / patchControlPoints : 0u;
+    const uint32_t verticesPerInstance = tessellated
+      ? uint32_t(std::min<uint64_t>(uint64_t(tessPatches) * RtxOptions::dx11TessellationTrianglesPerPatch() * 3u,
+                                    kMaxPositionCaptureVerticesPerDraw))
+      : gsCapture
+      ? uint32_t(std::min<uint64_t>(uint64_t(count) * RtxOptions::dx11GeometryShaderCaptureVerticesPerInput(),
+                                    kMaxPositionCaptureVerticesPerDraw))
+      : (flattenIndexed ? count : geo.vertexCount);
     const uint64_t totalVertexCount =
       uint64_t(verticesPerInstance) * uint64_t(replayInstanceCount);
     if (verticesPerInstance == 0 || totalVertexCount == 0
-     || (multiInstanceCapture && (!triangleList || verticesPerInstance % 3u != 0u))
+     || (multiInstanceCapture && !tessellated && !gsCapture && (!triangleList || verticesPerInstance % 3u != 0u))
      || totalVertexCount > kMaxPositionCaptureVerticesPerDraw) {
-      m_forceRasterPassThroughThisFrame = true;
-      m_allowNativeRasterForCurrentDraw = true;
       return false;
     }
     const uint32_t vertexCount = uint32_t(totalVertexCount);
@@ -1666,11 +2546,13 @@ namespace dxvk {
     if (m_context->m_state.vs.shader == nullptr)
       return false;
     const D3D11CommonShader* commonVs = m_context->m_state.vs.shader->GetCommonShader();
-    if (commonVs == nullptr || !commonVs->HasPositionCaptureCandidate())
+    if (commonVs == nullptr || (!tessellated && !gsCapture && !commonVs->HasPositionCaptureCandidate()))
       return false;
+    // The stage whose SV_Position reaches the rasterizer.
+    const D3D11CommonShader* captureStage = tessellated ? commonDs : gsCapture ? commonGs : commonVs;
 
     const bool capturesHomogeneousClip =
-      commonVs->IsPositionCaptureHomogeneousClipSpace();
+      captureStage->IsPositionCaptureHomogeneousClipSpace();
     const uint32_t positionBytes = capturesHomogeneousClip ? 16u : 12u;
     std::string requestedTexcoordName;
     uint32_t requestedTexcoordIndex = 0;
@@ -1697,20 +2579,71 @@ namespace dxvk {
     // repeatedly reset the device even though the position-only variant of the
     // same application VS was valid. Untextured geometry still captures exact
     // positions and gets albedo from its real vertex color or TFactor policy.
+    // The UV is resolved against the stage that feeds the pixel shader: the
+    // VS, or the DS / GS whose outputs the capture records (tessellated
+    // terrain and water, GS particles).
     const bool captureIncludesTexcoord = dcs.materialData.usesTexture()
       && hasPsSampledTexcoord
-      && commonVs->ResolvePositionCaptureTexcoord(
+      && captureStage->ResolvePositionCaptureTexcoord(
            requestedTexcoordName, requestedTexcoordIndex,
            requestedTexcoordComponent,
            captureTexcoordName, captureTexcoordIndex,
            captureTexcoordComponent);
+    // Vertex colour: the pixel-shader input that multiplies the texture
+    // (D3D11CommonShader::GetVertexColorSemantic), when the capture stage
+    // writes it. Captured beside position, so flattened, instanced,
+    // tessellated and GS draws keep the colour the IA stream cannot give them.
+    std::string captureColorName;
+    uint32_t captureColorIndex = 0;
+    uint32_t captureColorComponents = 0;
+    {
+      std::string psColorName;
+      uint32_t psColorIndex = 0, psColorComponents = 0;
+      if (commonPs != nullptr && commonPs->GetVertexColorSemantic(psColorName, psColorIndex, psColorComponents)) {
+        const uint32_t written = captureStage->ResolvePositionCaptureColor(psColorName, psColorIndex);
+        if (written >= 3u) {
+          captureColorName = psColorName;
+          captureColorIndex = psColorIndex;
+          captureColorComponents = std::min(written, std::max(psColorComponents, 3u));
+        }
+      }
+    }
+    const bool captureIncludesColor = captureColorComponents >= 3u;
+    const uint32_t captureColorOffset = positionBytes + (captureIncludesTexcoord ? 8u : 0u);
+
     const uint32_t captureStride = positionBytes
-      + (captureIncludesTexcoord ? 8u : 0u);
+      + (captureIncludesTexcoord ? 8u : 0u)
+      + captureColorComponents * 4u;
     const VkDeviceSize captureBytes =
       VkDeviceSize(vertexCount) * captureStride;
     Matrix4 capturedClipToPosition;
     bool capturedClipUsesWDepth = false;
-    if (capturesHomogeneousClip) {
+    if (m_lift2DDraw && !capturesHomogeneousClip)
+      return false;
+    if (m_lift2DDraw) {
+      // 2D lift: NDC (x/w, y/w) onto the plane at this layer's depth Z,
+      // scaled by Z so the synthetic camera (Lift2DProjection) projects it
+      // back onto exactly the same pixels:
+      //   position = (x/w * Z / P00, y/w * Z / P11, Z)
+      // Linear in clip with the divide by w done by the interleaver.
+      const Matrix4& liftProjection = dcs.transformData.viewToProjection;
+      const float Z = m_lift2DDepth;
+      const float sx = Z / liftProjection[0][0];
+      const float sy = Z / liftProjection[1][1];
+      capturedClipToPosition[0] = Vector4(sx,   0.0f, 0.0f, 0.0f);
+      capturedClipToPosition[1] = Vector4(0.0f, sy,   0.0f, 0.0f);
+      capturedClipToPosition[2] = Vector4(0.0f, 0.0f, 0.0f, 0.0f);
+      capturedClipToPosition[3] = Vector4(0.0f, 0.0f, Z,    1.0f);
+      // Same scene convention as the clip-W replacement camera below: LH,
+      // Y-up, +Z forward.
+      const RtxOptionLayer* derived = RtxOptionLayer::getDerivedLayer();
+      RtxOptions::leftHandedCoordinateSystemObject().setDeferred(true, derived);
+      RtxOptions::zUpObject().setDeferred(false, derived);
+      RtCamera::correctProjectionYFlipObject().setDeferred(
+        projectionYFlipOverride() ? projectionYFlip() : false, derived);
+      if (!std::isfinite(sx) || !std::isfinite(sy))
+        return false;
+    } else if (capturesHomogeneousClip) {
       // Exact SV_Position is already the complete result of the game's vertex
       // transform.  Reconstruct the position directly in the replacement
       // camera's view-space world.  Do NOT also apply objectToView here: that
@@ -1719,7 +2652,11 @@ namespace dxvk {
       // meshes into the giant camera-enclosing slabs seen in the RT G-buffer.
       // inverse(P) * clip followed by the homogeneous divide is sufficient and
       // is valid for every game whose raster projection was recovered.
-      const Matrix4 inverseProjection = inverse(dcs.transformData.viewToProjection);
+      // Jittered projection of this draw when known (see ExtractTransforms):
+      // differs from viewToProjection only by the TAA sub-pixel offset.
+      const Matrix4& rasterProjection = m_drawJitteredProjectionValid
+        ? m_drawJitteredProjection : dcs.transformData.viewToProjection;
+      const Matrix4 inverseProjection = inverse(rasterProjection);
       capturedClipToPosition = inverseProjection;
       // Optimized Unity and other engine shaders frequently expose only a
       // combined object-to-clip transform. A viewport-derived replacement
@@ -1755,6 +2692,94 @@ namespace dxvk {
               replacementYFlip ? "flipped (manual override)" : "unflipped"));
         }
       }
+      // Reserved-depth passes. inverse(P) recovers position from clip.z, so
+      // every draw must share the world's clip.z encoding. First-person arms
+      // and weapons are drawn with their own projection (a closer near plane)
+      // into a reserved depth range; through the world's inverse they came
+      // out many times too large and wrapped around the camera. For any
+      // perspective projection clip.z = a * clip.w + b, and the shader's own
+      // clip matrix exposes a and b in its z and w rows.
+      // Skinned first-person arms have no single readable clip matrix, so the
+      // mapping learned from any readable draw in the reserved range is reused
+      // for every draw in it (the pass shares one projection).
+      if (!capturedClipUsesWDepth) {
+        static float s_worldDepthA = 0.0f, s_worldDepthB = 0.0f;
+        static float s_reservedDepthA = 0.0f, s_reservedDepthB = 0.0f;
+        const auto& vp = m_context->m_state.rs.viewports[0];
+        const bool reservedDepthPass = isReservedDepthViewport(vp);
+
+        float a = 0.0f, b = 0.0f;
+        bool ownMapping = false;
+        const D3D11PositionTransformBinding* depthBinding = commonVs->GetPositionTransformBinding();
+        if (depthBinding != nullptr && depthBinding->matrixCount >= 1u) {
+          const D3D11PositionTransformMatrixBinding& clipMatrix =
+            depthBinding->matrices[depthBinding->matrixCount - 1u];
+          const bool slotValid = clipMatrix.constantBufferSlot < D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT;
+          const auto& cb = m_context->m_state.vs.constantBuffers[slotValid ? clipMatrix.constantBufferSlot : 0u];
+          Vector4 clipRows[4];
+          if (slotValid && readBindingRows(clipMatrix, cb, clipRows)) {
+            {
+              const float* zRow = clipRows[2].data;
+              const float* wRow = clipRows[3].data;
+              const float wwDot = wRow[0] * wRow[0] + wRow[1] * wRow[1] + wRow[2] * wRow[2];
+              if (std::isfinite(wwDot) && wwDot > 1.0e-12f) {
+                a = (zRow[0] * wRow[0] + zRow[1] * wRow[1] + zRow[2] * wRow[2]) / wwDot;
+                b = zRow[3] - a * wRow[3];
+                float residual = 0.0f;
+                for (uint32_t c = 0; c < 3; ++c)
+                  residual += std::abs(zRow[c] - a * wRow[c]);
+                // Only a perspective z row (a multiple of the w row plus a
+                // constant) describes a depth mapping.
+                ownMapping = std::isfinite(a) && std::isfinite(b)
+                  && std::abs(a) > 1.0e-6f && std::abs(b) > 1.0e-6f
+                  && residual <= 1.0e-3f * std::sqrt(wwDot);
+              }
+            }
+          }
+        }
+
+        if (ownMapping) {
+          if (reservedDepthPass) {
+            s_reservedDepthA = a;
+            s_reservedDepthB = b;
+          } else {
+            s_worldDepthA = a;
+            s_worldDepthB = b;
+          }
+        } else if (reservedDepthPass && s_reservedDepthB != 0.0f) {
+          a = s_reservedDepthA;
+          b = s_reservedDepthB;
+        }
+
+        // The world's own encoding is the reference: world draws keep
+        // inverse(P) unchanged. A reserved-depth draw has its clip.z
+        // re-expressed in the world encoding first. Per vertex
+        // 1 = (z - a*w) / b, so
+        //   z' = aRef*w + bRef = (bRef/b) z + (aRef - bRef*a/b) w
+        // which is linear in clip and folds into the matrix.
+        if (reservedDepthPass && b != 0.0f && s_worldDepthB != 0.0f) {
+          Matrix4 remap;  // identity
+          remap[2][2] = s_worldDepthB / b;
+          remap[3][2] = s_worldDepthA - s_worldDepthB * a / b;
+          const Matrix4 drawInverse = inverseProjection * remap;
+          bool finite = true;
+          for (uint32_t column = 0; column < 4; ++column)
+            for (uint32_t row = 0; row < 4; ++row)
+              finite &= std::isfinite(drawInverse[column][row]);
+          if (finite) {
+            capturedClipToPosition = drawInverse;
+            static uint32_t s_depthMapLogs = 0;
+            if (s_depthMapLogs < 12u) {
+              ++s_depthMapLogs;
+              Logger::info(str::format("[D3D11Rtx] reserved-depth pass remapped to world depth encoding: vs=0x",
+                std::hex, commonVs->GetBytecodeHash(), std::dec, " a=", a, " b=", b,
+                ownMapping ? " (own)" : " (shared)",
+                " worldA=", s_worldDepthA, " worldB=", s_worldDepthB,
+                " vpDepth=", vp.MinDepth, "-", vp.MaxDepth));
+            }
+          }
+        }
+      }
       for (uint32_t column = 0; column < 4; ++column) {
         for (uint32_t row = 0; row < 4; ++row) {
           if (!std::isfinite(capturedClipToPosition[column][row]))
@@ -1763,8 +2788,9 @@ namespace dxvk {
       }
     }
 
-    Rc<DxvkShader> captureGs = commonVs->GetPositionCaptureShader(
-      captureTexcoordName, captureTexcoordIndex, captureTexcoordComponent);
+    Rc<DxvkShader> captureGs = captureStage->GetPositionCaptureShader(
+      captureTexcoordName, captureTexcoordIndex, captureTexcoordComponent,
+      captureColorName, captureColorIndex, captureColorComponents);
     if (captureGs == nullptr)
       return false;
 
@@ -1817,7 +2843,22 @@ namespace dxvk {
         }
       }
     } else {
-      captureInputSlots.fill(true);
+      // No input layout: the VS cannot read any vertex buffer (it pulls from
+      // SRVs by SV_VertexID), so stale bound VBs are not part of the draw.
+      captureInputSlots.fill(false);
+    }
+
+    // Vertex-pulled draws are distinguished by the SRVs the VS reads, not by
+    // vertex buffers; fold them into the contract and storage identities.
+    uint64_t vsResourceIdentity = 0;
+    if (m_context->m_state.ia.inputLayout == nullptr) {
+      const auto& views = m_context->m_state.vs.shaderResources.views;
+      for (uint32_t slot = 0; slot < views.size(); ++slot) {
+        if (views[slot] == nullptr)
+          continue;
+        vsResourceIdentity ^= (uint64_t(reinterpret_cast<uintptr_t>(views[slot].ptr())) + slot)
+          * 0x9e3779b97f4a7c15ull + (vsResourceIdentity << 6) + (vsResourceIdentity >> 2);
+      }
     }
 
     // Hash only the constant registers that DXBC dataflow proved feed the
@@ -2150,7 +3191,8 @@ namespace dxvk {
     // The dependency fingerprint above covers homogeneous capture only.
     // A profiled pre-projection output can still deform through any VS input,
     // constant or sampled resource even when skinning was not recognized.
-    const bool captureMustReplayEveryFrame = !capturesHomogeneousClip
+    // Adaptive tessellation changes with the camera: always replay.
+    const bool captureMustReplayEveryFrame = !capturesHomogeneousClip || tessellated || indirectReplay || gsCapture
       || capturedSkinnedPositions
       || (capturesHomogeneousClip && !hasHomogeneousTransformStateIdentity);
     // View-space vertices bake placement into the BLAS, so the draw cache must
@@ -2230,26 +3272,11 @@ namespace dxvk {
           return false;
         const auto& cb = m_context->m_state.vs.constantBuffers[
           matrixBinding.constantBufferSlot];
-        if (cb.buffer == nullptr)
+        Vector4 rows[4];
+        if (!readBindingRows(matrixBinding, cb, rows))
           return false;
-
-        const auto mapped = cb.buffer->GetMappedSlice();
-        const uint8_t* ptr = reinterpret_cast<const uint8_t*>(mapped.mapPtr);
-        const size_t bufferSize = cb.buffer->Desc()->ByteWidth;
-        const size_t bindingBase = size_t(cb.constantOffset) * 16u;
-        const size_t bindingEnd = cb.constantCount > 0
-          ? std::min(bindingBase + size_t(cb.constantCount) * 16u, bufferSize)
-          : bufferSize;
-        if (ptr == nullptr || bindingBase >= bindingEnd)
-          return false;
-
-        for (uint32_t row = 0; row < 4; ++row) {
-          const size_t offset = bindingBase
-            + size_t(matrixBinding.constantRegisters[row]) * 16u;
-          if (offset + 16u > bindingEnd || offset + 16u > bufferSize)
-            return false;
-          std::memcpy(matrix[row].data, ptr + offset, 16u);
-        }
+        for (uint32_t row = 0; row < 4; ++row)
+          matrix[row] = rows[row];
         return finiteMatrix(matrix);
       };
       auto affineScore = [&](const Matrix4& candidate) -> float {
@@ -2396,8 +3423,15 @@ namespace dxvk {
       mixOutputIdentity(captureTexcoordIndex);
       mixOutputIdentity(captureTexcoordComponent);
     }
+    if (captureIncludesColor) {
+      mixOutputIdentity(XXH3_64bits(captureColorName.data(), captureColorName.size()));
+      mixOutputIdentity(captureColorIndex);
+      mixOutputIdentity(captureColorComponents);
+    }
     mixOutputIdentity(usedShaderProvenCaptureTransform ? 0x50524f56454eull : 0x46414c4c4241434bull);
     mixOutputIdentity(capturedClipUsesWDepth ? 0x574445505448ull : 0x4d4154524958ull);
+    if (vsResourceIdentity != 0)
+      mixOutputIdentity(vsResourceIdentity);
     for (uint32_t slot = 0; slot < D3D11_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT; ++slot) {
       if (!captureInputSlots[slot])
         continue;
@@ -2494,20 +3528,22 @@ namespace dxvk {
          || it->second.lastUsedFrame < oldest->second.lastUsedFrame)
           oldest = it;
       }
-      if (oldest == m_positionCaptureCache.end()) {
-        m_forceRasterPassThroughThisFrame = true;
-        m_allowNativeRasterForCurrentDraw = true;
+      if (oldest == m_positionCaptureCache.end())
         return false;
-      }
       m_positionCaptureCacheBytes -= oldest->second.capacity;
       m_positionCaptureCache.erase(oldest);
+      ++m_submitRejectStats.posCacheEvicted;
       existing = m_positionCaptureCache.find(cacheKey);
     }
 
+    if (existing == m_positionCaptureCache.end())
+      ++m_submitRejectStats.posCacheNew;
     PositionCaptureEntry& entry = existing != m_positionCaptureCache.end()
       ? existing->second
       : m_positionCaptureCache.emplace(cacheKey, PositionCaptureEntry()).first->second;
     if (entry.contractIdentity != captureContractIdentity) {
+      if (existing != m_positionCaptureCache.end())
+        ++m_submitRejectStats.posCacheContractReset;
       entry.contractIdentity = captureContractIdentity;
       entry.lastCapturedFrame = ~0u;
       entry.hasTransformStateIdentity = false;
@@ -2553,7 +3589,53 @@ namespace dxvk {
         : (!capturesHomogeneousClip || transformStateMatches));
     entry.lastUsedFrame = curFrame;
 
-    if (!captureIsCurrent) {
+    bool reuseStaleCapture = false;
+    // Capture fairness. Camera-relative engines (Fallout 4) change every
+    // draw's transform state each frame, so every capture asks for a replay
+    // and the draws that come first in the frame used the whole budget on
+    // replays, every frame. Draws later in the frame were refused with no
+    // earlier capture to fall back on, and were missing from the RT scene
+    // permanently (which ones depended on draw order, so switching to first
+    // person dropped geometry third person had). A world-anchored capture
+    // stores its own clip-to-world pairing, so a static mesh served from a
+    // recent capture stays exactly where it was. While draws were starved
+    // last frame, such meshes skip the replay and leave the budget to the
+    // never-captured draws; skinned meshes always replay.
+    if (!captureIsCurrent
+     && haveReusableCapture
+     && entry.hasCanonicalCapturedToWorld
+     && !capturedSkinnedPositions
+     // Blended overlays (particles, effects) animate and face the camera;
+     // an old capture of them is wrong, so they always replay.
+     && !dcs.materialData.blendMode.enableBlending
+     // Wind-swayed foliage and other shader-animated meshes change every
+     // frame; serving them from an older capture made bushes jump between
+     // sway phases (smearing, bogus motion vectors, spikes).
+     && !commonVs->AnimatesVertices()
+     && m_prevFrameStarvedCaptures > 0u
+     && entry.lastCapturedFrame != ~0u
+     && curFrame - entry.lastCapturedFrame <= 120u) {
+      // A stored capture is placed with the eye position of its own frame.
+      // That is exact once the engine's eye position is known; with only the
+      // geometry-solved estimate (which lags and under-travels) a capture
+      // taken before the camera moved lands off by the estimate's error -
+      // walls in front of the camera after walking. Reuse it then only if the
+      // camera has not moved since it was taken.
+      bool placementStillValid = m_eyeOffset != SIZE_MAX;
+      if (!placementStillValid) {
+        const Matrix4 currentViewToWorld = inverse(originalWorldToView);
+        const Vector3 eyeNow(currentViewToWorld[3][0], currentViewToWorld[3][1], currentViewToWorld[3][2]);
+        const Vector3 eyeThen(entry.canonicalCapturedToWorld[3][0], entry.canonicalCapturedToWorld[3][1],
+                              entry.canonicalCapturedToWorld[3][2]);
+        const float eyeMoved = length(eyeNow - eyeThen);
+        placementStillValid = std::isfinite(eyeMoved) && eyeMoved < 4.0f;
+      }
+      if (placementStillValid) {
+        reuseStaleCapture = true;
+        ++m_submitRejectStats.posCacheStaleReuse;
+      }
+    }
+    if (!captureIsCurrent && !reuseStaleCapture) {
       const bool needsNewCaptureBuffer = !haveUsableBuffer;
       const bool totalBudgetExhausted =
         m_positionCapturesThisFrame >= kMaxCapturesPerFrame;
@@ -2621,15 +3703,22 @@ namespace dxvk {
             " base=", base,
             " cameraRelative=", dcs.transformData.cameraRelativeView ? 1 : 0));
         }
-        // The dependency state changed: an older capture is not evidence of
-        // the current mesh, even when its producing camera is known. Keep the
-        // entry for a later retry, but present the complete native frame.
-        m_forceRasterPassThroughThisFrame = true;
-        m_allowNativeRasterForCurrentDraw = true;
-        return false;
+        // A budget-refused draw is pending, not absent: keep the cache entry
+        // for next frame's retry. Without a previous capture only this draw is
+        // missing this frame. With one, reuse it - its clip-to-position pair is
+        // stored in the entry and the hash below is seeded with the frame that
+        // produced the bytes, so the BLAS is reused instead of rebuilt.
+        // Presenting the whole native frame here sent any scene with more than
+        // a budget's worth of moving draws back to rasterization.
+        if (!haveReusableCapture) {
+          ++m_starvedCapturesThisFrame;
+          return false;
+        }
+        reuseStaleCapture = true;
+        ++m_submitRejectStats.posCacheStaleReuse;
       }
 
-      if (!haveUsableBuffer) {
+      if (!reuseStaleCapture && !haveUsableBuffer) {
         DxvkBufferCreateInfo info;
         info.size   = desiredCapacity;
         info.usage  = VK_BUFFER_USAGE_TRANSFORM_FEEDBACK_BUFFER_BIT_EXT
@@ -2649,8 +3738,6 @@ namespace dxvk {
         if (newBuffer == nullptr) {
           if (entry.buffer == nullptr)
             m_positionCaptureCache.erase(cacheKey);
-          m_forceRasterPassThroughThisFrame = true;
-          m_allowNativeRasterForCurrentDraw = true;
           return false;
         }
         m_positionCaptureCacheBytes += desiredCapacity - entry.capacity;
@@ -2660,7 +3747,7 @@ namespace dxvk {
         entry.hasCapturedClipToPosition = false;
       }
 
-      {
+      if (!reuseStaleCapture) {
       // Transform feedback is the sole writer and the following BLAS build is
       // the consumer. Reuse the dedicated device-local allocation and let
       // DxvkContext insert the write/read barriers. Calling allocSlice() here
@@ -2799,7 +3886,55 @@ namespace dxvk {
                          cStartIndex = start,
                          cBaseVertex = base,
                          cStride = captureStride,
+                         cTessellated = tessellated || gsCapture,
+                         cGameGs = gsCapture ? commonGs->GetShader() : Rc<DxvkShader>(),
+                         cIndexed = indexed,
+                         cDrawCount = count,
+                         cIndirect = indirectReplay,
+                         cIndirectIndexed = m_indirectReplay.indexed,
+                         cIndirectArgs = m_indirectReplay.args,
+                         cIndirectOffset = m_indirectReplay.offset,
                          cForceSubmissionBoundary = forceCaptureSubmissionBoundary](DxvkContext* ctx) {
+        if (cIndirect) {
+          // GPU-driven draw: replay the same indirect arguments as a point
+          // stream into a NaN-prefilled buffer; XFB stops at capacity and the
+          // unwritten tail stays inactive in the BLAS.
+          ctx->clearBuffer(cBuf.buffer(), cBuf.offset(), cBuf.length(), 0x7fc00000u);
+          const DxvkInputAssemblyState pointIa = { VK_PRIMITIVE_TOPOLOGY_POINT_LIST, VK_FALSE, 0 };
+          ctx->bindShader(VK_SHADER_STAGE_GEOMETRY_BIT, cGs);
+          ctx->setInputAssemblyState(pointIa);
+          ctx->bindXfbBuffer(0, cBuf, DxvkBufferSlice());
+          ctx->bindDrawBuffers(cIndirectArgs, DxvkBufferSlice());
+          if (cIndirectIndexed)
+            ctx->drawIndexedIndirect(cIndirectOffset, 1, sizeof(VkDrawIndexedIndirectCommand));
+          else
+            ctx->drawIndirect(cIndirectOffset, 1, sizeof(VkDrawIndirectCommand));
+          ctx->bindXfbBuffer(0, DxvkBufferSlice(), DxvkBufferSlice());
+          ctx->bindShader(VK_SHADER_STAGE_GEOMETRY_BIT, nullptr);
+          ctx->setInputAssemblyState(cRestoreIa);
+          if (cForceSubmissionBoundary)
+            ctx->DxvkContext::flushCommandList();
+          return;
+        }
+        if (cTessellated) {
+          // GPU-sized output: prefill with NaN (inactive triangles), replay the
+          // original patch-list draw once through VS/HS/DS + capture GS.
+          ctx->clearBuffer(cBuf.buffer(), cBuf.offset(), cBuf.length(), 0x7fc00000u);
+          ctx->bindShader(VK_SHADER_STAGE_GEOMETRY_BIT, cGs);
+          ctx->setInputAssemblyState(cRestoreIa);
+          ctx->bindXfbBuffer(0, cBuf, DxvkBufferSlice());
+          if (cIndexed)
+            ctx->drawIndexed(cDrawCount, cInstanceCount, cStartIndex, cBaseVertex, cFirstInstance);
+          else
+            ctx->draw(cDrawCount, cInstanceCount, cFirst, cFirstInstance);
+          ctx->bindXfbBuffer(0, DxvkBufferSlice(), DxvkBufferSlice());
+          // A captured game GS goes back in place for the game's own draw;
+          // the D3D11 layer believes it is still bound.
+          ctx->bindShader(VK_SHADER_STAGE_GEOMETRY_BIT, cGameGs);
+          if (cForceSubmissionBoundary)
+            ctx->DxvkContext::flushCommandList();
+          return;
+        }
         const DxvkInputAssemblyState pointIa = { VK_PRIMITIVE_TOPOLOGY_POINT_LIST, VK_FALSE, 0 };
         ctx->bindShader(VK_SHADER_STAGE_GEOMETRY_BIT, cGs);
         ctx->setInputAssemblyState(pointIa);
@@ -2878,6 +4013,32 @@ namespace dxvk {
         // very motion the solve is measuring.
         entry.capturedViewRotationToWorld = viewRotationToWorld(originalWorldToView);
         entry.hasCapturedViewRotationToWorld = true;
+
+        // Temporary diagnostic: game camera forward vs Remix camera forward.
+        {
+          static uint32_t s_lastYawLogFrame = 0;
+          const uint32_t yawFrame = m_context->m_device->getCurrentFrameId();
+          if (yawFrame >= s_lastYawLogFrame + 20u) {
+            s_lastYawLogFrame = yawFrame;
+            const Matrix4& v = originalWorldToView;
+            const Vector3 gameForward(v[0][2], v[1][2], v[2][2]);
+            const Vector3 gameRight(v[0][0], v[1][0], v[2][0]);
+            const auto& camera = m_context->m_device->getCommon()->getSceneManager()
+              .getCameraManager().getCamera(CameraType::Main);
+            const Vector3 remixForward = camera.getDirection(false);
+            const Vector3 remixRight = camera.getRight(false);
+            const float det3 =
+                v[0][0] * (v[1][1] * v[2][2] - v[2][1] * v[1][2])
+              - v[1][0] * (v[0][1] * v[2][2] - v[2][1] * v[0][2])
+              + v[2][0] * (v[0][1] * v[1][2] - v[1][1] * v[0][2]);
+            Logger::info(str::format("[D3D11Rtx][yaw] frame=", yawFrame,
+              " gameFwd=(", gameForward.x, ",", gameForward.y, ",", gameForward.z, ")",
+              " gameRight=(", gameRight.x, ",", gameRight.y, ",", gameRight.z, ")",
+              " remixFwd=(", remixForward.x, ",", remixForward.y, ",", remixForward.z, ")",
+              " remixRight=(", remixRight.x, ",", remixRight.y, ",", remixRight.z, ")",
+              " viewDet=", det3));
+          }
+        }
       } else if (capturesHomogeneousClip) {
         entry.hasCanonicalCapturedToWorld = false;
         entry.hasCapturedViewRotationToWorld = false;
@@ -2902,6 +4063,34 @@ namespace dxvk {
       QueueCameraAnchorSample(entry, cacheKey);
     }
 
+    // First person: the game still draws the player's full third-person body
+    // (for shadows and reflections) with the eye inside its head. Path traced,
+    // that body is a shell around the camera that smears across the whole
+    // view. Skinned meshes in the main depth range are probed (readback next
+    // frame); one surrounding the camera is given Remix's player-model
+    // category, which hides it from camera rays while keeping its shadow and
+    // reflection. First-person arms use the reserved depth range and are
+    // never probed.
+    {
+      const bool skinnedMesh = geo.blendWeightBuffer.defined() && geo.blendIndicesBuffer.defined();
+      const bool reservedDepthPass = m_context->m_state.rs.numViewports > 0
+        && isReservedDepthViewport(m_context->m_state.rs.viewports[0]);
+      if (RtxOptions::dx11DetectPlayerBody() && skinnedMesh && !reservedDepthPass && capturesHomogeneousClip) {
+        if (entry.lastCapturedFrame == curFrame && entry.hasCapturedViewRotationToWorld) {
+          uint32_t& lastProbe = m_playerProbeLastFrame[cacheKey];
+          if (lastProbe == 0u || curFrame >= lastProbe + 15u) {
+            lastProbe = curFrame;
+            QueueCameraAnchorSample(entry, cacheKey, false, true);
+          }
+        }
+        const auto found = m_playerBodyKeys.find(cacheKey);
+        if (found != m_playerBodyKeys.end() && curFrame <= found->second + 60u)
+          dcs.setCategory(InstanceCategories::ThirdPersonPlayerModel, true);
+      }
+      if (m_playerProbeLastFrame.size() > 8192u)
+        m_playerProbeLastFrame.clear();
+    }
+
     if (capturesHomogeneousClip) {
       // Never combine clip coordinates from an earlier capture with the
       // current frame's inverse projection. That mismatch is a moving box/
@@ -2909,7 +4098,10 @@ namespace dxvk {
       // the paired matrix stored with the captured buffer.
       if (!entry.hasCapturedClipToPosition)
         return false;
-      capturedClipToPosition = entry.capturedClipToPosition;
+      // A lifted 2D layer's matrix holds only this frame's layer depth; clip
+      // is NDC, so it is valid for any capture of the draw.
+      if (!m_lift2DDraw)
+        capturedClipToPosition = entry.capturedClipToPosition;
       capturedClipUsesWDepth = entry.capturedClipUsesWDepth;
 
       if (entry.hasCanonicalCapturedToWorld) {
@@ -2941,7 +4133,22 @@ namespace dxvk {
       geo.texcoordBuffer = capturedTexcoords;
       dcs.geometryData.texcoordBuffer = capturedTexcoords;
     }
-    if (flattenIndexed || multiInstanceCapture) {
+    // Captured vertex colour (float RGB / RGBA): the interleaver packs it
+    // into the BGRA8 word Remix's shaders read. The pixel shader multiplies
+    // its texture by this input, so it tints the albedo.
+    const RasterBuffer capturedColors = captureIncludesColor
+      ? RasterBuffer(
+          DxvkBufferSlice(entry.buffer, 0, captureBytes),
+          captureColorOffset, captureStride,
+          captureColorComponents == 4u ? VK_FORMAT_R32G32B32A32_SFLOAT : VK_FORMAT_R32G32B32_SFLOAT)
+      : RasterBuffer();
+    if (tessellated || gsCapture) {
+      // The captured stream is the rasterizer's triangle list, whatever the
+      // draw's input topology (patches, points expanded by a GS).
+      geo.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+      dcs.geometryData.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    }
+    if (flattenIndexed || multiInstanceCapture || tessellated || gsCapture) {
       // XFB emitted one compact vertex stream containing every selected
       // instance. The original one-instance index/attribute streams cannot be
       // applied to that appended domain. TEXCOORD is the exception: it was
@@ -2958,6 +4165,12 @@ namespace dxvk {
         geo.texcoordBuffer = RasterBuffer();
         dcs.geometryData.texcoordBuffer = RasterBuffer();
       }
+    }
+    if (captureIncludesColor) {
+      geo.color0Buffer = capturedColors;
+      dcs.geometryData.color0Buffer = capturedColors;
+      dcs.materialData.modulateVertexColor = true;
+      dcs.materialData.isVertexColorBakedLighting = false;
     }
     geo.postVsPositionIsHomogeneousClip = capturesHomogeneousClip;
     dcs.geometryData.postVsPositionIsHomogeneousClip = capturesHomogeneousClip;
@@ -3085,6 +4298,19 @@ namespace dxvk {
         dcs.transformData.cameraRelativeView = true;
       }
       dcs.transformData.exactReplacementCamera = true;
+
+      // Once the game's real view is confirmed, a draw that does not carry it
+      // (identity view) belongs to one of the game's other cameras - Pip-Boy,
+      // menus, inventory preview, render-to-texture. It must not steer the
+      // main RT camera: when such a draw came first in a frame it won the
+      // camera's first-touch and the scene was viewed from the origin with an
+      // identity rotation (the frame then fell back to raster, and the camera
+      // appeared not to update). The draw itself is left untouched.
+      if (m_viewConfirmed && !m_viewCameraRelative
+       && isIdentityExact(dcs.transformData.worldToView)) {
+        dcs.allowMainCameraUpdate = false;
+        ++m_submitRejectStats.otherCameraNoSteer;
+      }
       // The geometry and camera now form one exact replacement coordinate
       // system. Treat it as a real camera even when the projection was derived
       // from the viewport; the old fallback marker would make EndFrame reject
@@ -3150,6 +4376,7 @@ namespace dxvk {
   }
 
   void D3D11Rtx::SweepPositionCaptureCache(uint32_t currentFrame) {
+    ScopedCpuProfileZoneN("D3D11Rtx::SweepPositionCaptureCache");
     static constexpr uint32_t     kEvictAfterFrames = 120u;
     static constexpr VkDeviceSize kMaxCacheBytes    = 384ull << 20;
 
@@ -3183,7 +4410,9 @@ namespace dxvk {
   }
 
   void D3D11Rtx::QueueCameraAnchorSample(const PositionCaptureEntry& entry,
-                                         uint64_t meshKey, bool viewSpaceCamera) {
+                                         uint64_t meshKey, bool viewSpaceCamera,
+                                         bool playerProbe) {
+    ScopedCpuProfileZoneN("D3D11Rtx::QueueCameraAnchorSample");
     const uint32_t currentFrame = m_context->m_device->getCurrentFrameId();
     if (m_cameraAnchorLastConsumedFrame == currentFrame || entry.buffer == nullptr
      || !entry.hasCapturedClipToPosition || entry.capturedStride < sizeof(float) * 4u
@@ -3222,7 +4451,8 @@ namespace dxvk {
     if (batch.requests.size() >= kCameraAnchorMaxSampleMeshes)
       return;
     for (const auto& request : batch.requests) {
-      if (request.meshKey == meshKey && request.viewSpaceCamera == viewSpaceCamera)
+      if (request.meshKey == meshKey && request.viewSpaceCamera == viewSpaceCamera
+       && request.playerProbe == playerProbe)
         return;
     }
 
@@ -3260,6 +4490,9 @@ namespace dxvk {
     request.clipToPosition = entry.capturedClipToPosition;
     request.clipUsesWDepth = entry.capturedClipUsesWDepth;
     request.viewSpaceCamera = viewSpaceCamera;
+    request.playerProbe = playerProbe;
+    request.capturedToWorld = entry.canonicalCapturedToWorld;
+    request.hasCapturedToWorld = entry.hasCanonicalCapturedToWorld;
     request.vertexCount = sampleVertices;
     request.stride = entry.capturedStride;
     batch.requests.push_back(request);
@@ -3281,6 +4514,7 @@ namespace dxvk {
   }
 
   void D3D11Rtx::ConsumeCameraAnchorSamples() {
+    ScopedCpuProfileZoneN("D3D11Rtx::ConsumeCameraAnchorSamples");
     const uint32_t currentFrame = m_context->m_device->getCurrentFrameId();
     if (m_cameraAnchorLastConsumedFrame == currentFrame)
       return;
@@ -3311,6 +4545,14 @@ namespace dxvk {
         float viewSamples[kCameraAnchorSampleVertices * 3u] = {};
         Vector3 offsetSum(0.0f, 0.0f, 0.0f);
         uint32_t sampled = 0;
+        // Player-body probe: every sampled vertex must lie in a body-sized
+        // column around the eye (world-oriented offsets: horizontal radius,
+        // feet below, head at eye height).
+        bool insideBodyColumn = true;
+        const float bodyRadius = RtxOptions::dx11PlayerBodyRadius();
+        const float bodyBelow = RtxOptions::dx11PlayerBodyBelowEye();
+        const float bodyAbove = RtxOptions::dx11PlayerBodyAboveEye();
+        const bool zUp = RtxOptions::zUp();
         for (uint32_t vertex = 0; vertex < request.vertexCount; ++vertex) {
           float clip[4];
           std::memcpy(clip, slot + size_t(vertex) * request.stride, sizeof(clip));
@@ -3323,11 +4565,51 @@ namespace dxvk {
           if (!request.viewSpaceCamera) {
             const Vector4 offset = request.viewRotationToWorld * Vector4(viewPosition, 1.0f);
             offsetSum += Vector3(offset.x, offset.y, offset.z);
+            if (request.playerProbe) {
+              const float up = zUp ? offset.z : offset.y;
+              const float h0 = offset.x;
+              const float h1 = zUp ? offset.y : offset.z;
+              insideBodyColumn &= (h0 * h0 + h1 * h1) <= bodyRadius * bodyRadius
+                               && up >= -bodyBelow && up <= bodyAbove;
+            }
           }
           ++sampled;
         }
         if (sampled != request.vertexCount)
           continue;
+
+        // Temporary diagnostic: the world position the renderer gives one
+        // fixed static mesh. If the anchoring is right it never moves.
+        if (!request.playerProbe && !request.viewSpaceCamera && request.hasCapturedToWorld && sampled > 0) {
+          static uint64_t s_trackedKey = 0;
+          static uint32_t s_lastTrackLog = 0;
+          if (s_trackedKey == 0)
+            s_trackedKey = request.meshKey;
+          if (request.meshKey == s_trackedKey && currentFrame >= s_lastTrackLog + 30u) {
+            s_lastTrackLog = currentFrame;
+            const Vector4 world = request.capturedToWorld
+              * Vector4(viewSamples[0], viewSamples[1], viewSamples[2], 1.0f);
+            Logger::info(str::format("[D3D11Rtx][anchor-check] frame=", currentFrame, " key=0x", std::hex,
+              request.meshKey, std::dec, " world=(", world.x, ",", world.y, ",", world.z, ")",
+              " exactEye=", m_eyeOffset != SIZE_MAX ? 1 : 0));
+          }
+        }
+
+        if (request.playerProbe) {
+          if (insideBodyColumn) {
+            const bool newlyFound = m_playerBodyKeys.find(request.meshKey) == m_playerBodyKeys.end();
+            m_playerBodyKeys[request.meshKey] = currentFrame;
+            static uint32_t s_playerBodyLogs = 0;
+            if (newlyFound && s_playerBodyLogs < 16u) {
+              ++s_playerBodyLogs;
+              Logger::info(str::format("[D3D11Rtx] Player body around camera -> ThirdPersonPlayerModel: key=0x",
+                std::hex, request.meshKey, std::dec));
+            }
+          } else {
+            m_playerBodyKeys.erase(request.meshKey);
+          }
+          continue;
+        }
 
         if (request.viewSpaceCamera) {
           if (RtxOptions::estimateViewSpaceCameraMotion() && !isKnownEmulatorHostProcess()) {
@@ -3351,7 +4633,8 @@ namespace dxvk {
 
   void D3D11Rtx::SubmitInstancedDraw(bool indexed, UINT count, UINT start, INT base,
                                        UINT instanceCount, UINT startInstance) {
-    if (instanceCount == 0 || count == 0)
+    ScopedCpuProfileZoneN("D3D11Rtx::SubmitInstancedDraw");
+    if (instanceCount == 0 || count == 0 || GetD3D11EngineProfile().chromiumHelperProcess)
       return;
     if (instanceCount == 1) {
       SubmitDraw(indexed, count, start, base, nullptr, startInstance, 1u, true);
@@ -3387,16 +4670,17 @@ namespace dxvk {
     if (canCaptureExactInstances) {
       // Preserve one original instanced draw. Splitting and changing
       // StartInstanceLocation resets SV_InstanceID for each batch and advances
-      // divisor-based IA streams by the wrong number of elements. Until an
-      // exact draw fits the capture limits, retain the complete native frame.
+      // divisor-based IA streams by the wrong number of elements. A draw that
+      // exceeds the exact capture limits falls through to the per-instance
+      // layout path below instead of turning the whole frame into raster.
       static constexpr UINT kMaxExactInstancesPerDraw = 4096u;
       const UINT requestedLimit = std::max(1u, RtxOptions::maxInstanceSubmissions());
       if (instanceCount > std::min(requestedLimit, kMaxExactInstancesPerDraw)
-        || uint64_t(instanceCount) * count > kMaxPositionCaptureVerticesPerDraw) {
-        m_forceRasterPassThroughThisFrame = true;
-        m_allowNativeRasterForCurrentDraw = true;
-        return;
-      }
+        || uint64_t(instanceCount) * count > kMaxPositionCaptureVerticesPerDraw)
+        canCaptureExactInstances = false;
+    }
+
+    if (canCaptureExactInstances) {
 
       static uint32_t sExactInstanceLogCount = 0;
       if (sExactInstanceLogCount++ < 12u) {
@@ -3417,7 +4701,9 @@ namespace dxvk {
     // using semantics like INSTANCETRANSFORM, WORLD, I, INST, or TEXCOORD at high indices.
     auto* layout = m_context->m_state.ia.inputLayout.ptr();
     if (!layout) {
-      SubmitDraw(indexed, count, start, base);
+      // Vertex-pulled instancing (SV_InstanceID into SRV records): replay
+      // every instance exactly through capture.
+      SubmitDraw(indexed, count, start, base, nullptr, startInstance, instanceCount, true);
       return;
     }
 
@@ -4127,6 +5413,303 @@ namespace dxvk {
     return buffer;
   }
 
+  const D3D11Rtx::CameraSeed* D3D11Rtx::ResolveCameraSeed() {
+    if (m_abDisableEngineKnowledge || m_context->m_state.vs.shader == nullptr)
+      return nullptr;
+    const D3D11CommonShader* vs = m_context->m_state.vs.shader->GetCommonShader();
+    // Keyed by bytecode: a destroyed shader's address can be reused.
+    auto cached = m_cameraSeedCache.find(vs->GetBytecodeHash());
+    if (cached != m_cameraSeedCache.end())
+      return cached->second.valid ? &cached->second : nullptr;
+
+    ScopedCpuProfileZoneN("D3D11Rtx::ResolveCameraSeed");
+    CameraSeed seed;
+    for (auto& o : seed.offsets)
+      o = -1;
+    auto has = [&](D3D11CameraField f) { return seed.offsets[size_t(f)] >= 0; };
+
+    // 1. Reflection names (engines that keep RDEF: CRYENGINE, Frostbite,
+    //    Dunia, Disrupt, Katana, Fox, Phyre, dev builds of Unity/UE, ...).
+    const DxbcRdef* rdef = vs->GetReflection();
+    if (rdef != nullptr && rdef->isValid()) {
+      size_t ruleCount = 0;
+      const D3D11CameraNameRule* rules = GetCameraNameRules(ruleCount);
+      for (const auto& cb : rdef->constantBuffers()) {
+        uint32_t slot = UINT32_MAX;
+        for (const auto& binding : rdef->resourceBindings())
+          if (binding.kind == DxbcResourceKind::CBuffer && binding.name == cb.name)
+            slot = binding.bindPoint;
+        if (slot == UINT32_MAX)
+          continue;
+        for (const auto& var : cb.variables) {
+          for (size_t r = 0; r < ruleCount; ++r) {
+            if (var.name != rules[r].name)
+              continue;
+            const size_t f = size_t(rules[r].field);
+            if (seed.offsets[f] >= 0)
+              break;
+            const bool isEye = rules[r].field == D3D11CameraField::Eye
+                            || rules[r].field == D3D11CameraField::NegEye
+                            || rules[r].field == D3D11CameraField::EyeTile
+                            || rules[r].field == D3D11CameraField::EyeLow;
+            if (isEye) {
+              if (seed.eyeSlot == UINT32_MAX || seed.eyeSlot == slot) {
+                seed.eyeSlot = slot;
+                seed.offsets[f] = int32_t(var.offset);
+              }
+            } else if (seed.slot == UINT32_MAX || seed.slot == slot) {
+              seed.slot = slot;
+              seed.offsets[f] = int32_t(var.offset);
+            }
+            break;
+          }
+        }
+      }
+      if (seed.slot != UINT32_MAX)
+        seed.source = "rdef names";
+    }
+
+    // 2. Documented register layout of a reflection-stripped engine.
+    if (seed.slot == UINT32_MAX) {
+      const D3D11EngineFamily family = GetD3D11EngineProfile().family();
+      size_t layoutCount = 0;
+      const D3D11CameraRegisterLayout* layouts = GetCameraRegisterLayouts(layoutCount);
+      for (size_t i = 0; i < layoutCount; ++i) {
+        if (layouts[i].family != family)
+          continue;
+        seed.slot = uint32_t(layouts[i].slot);
+        seed.eyeSlot = layouts[i].eyeSlot >= 0 ? uint32_t(layouts[i].eyeSlot) : seed.slot;
+        for (size_t f = 0; f < size_t(D3D11CameraField::Count); ++f)
+          seed.offsets[f] = layouts[i].offsets[f];
+        seed.source = layouts[i].source;
+        break;
+      }
+    }
+    if (seed.eyeSlot == UINT32_MAX)
+      seed.eyeSlot = seed.slot;
+
+    seed.valid = seed.slot != UINT32_MAX
+      && (has(D3D11CameraField::Proj) || has(D3D11CameraField::ViewProj)
+       || has(D3D11CameraField::RelViewProj));
+    if (seed.valid) {
+      static uint32_t s_seedLogs = 0;
+      if (s_seedLogs++ < 16u) {
+        std::string fields;
+        static const char* kNames[] = { "View", "Proj", "ViewProj", "InvView", "InvViewProj",
+                                        "Eye", "NegEye", "RelView", "RelViewProj", "PrevViewProj",
+                                        "EyeTile", "EyeLow" };
+        static_assert(std::size(kNames) == size_t(D3D11CameraField::Count), "camera field names");
+        for (size_t f = 0; f < size_t(D3D11CameraField::Count); ++f)
+          if (seed.offsets[f] >= 0)
+            fields += str::format(" ", kNames[f], "@", seed.offsets[f]);
+        Logger::info(str::format("[D3D11Rtx][camera-seed] vs=", vs->GetName(), " source=", seed.source,
+          " cb", seed.slot, " eyeCb", seed.eyeSlot, fields));
+      }
+    }
+    CameraSeed& stored = m_cameraSeedCache[vs->GetBytecodeHash()];
+    stored = seed;
+    return stored.valid ? &stored : nullptr;
+  }
+
+  bool D3D11Rtx::ComputeDrawPassKey(bool indexed, UINT count, UINT start, INT base,
+                                    UINT firstInstance,
+                                    const RasterBuffer& positionBuffer,
+                                    const RasterBuffer& indexBuffer, uint64_t positionIdentity,
+                                    uint64_t& key, uint64_t& meshKey) const {
+    ScopedCpuProfileZoneN("D3D11Rtx::ComputeDrawPassKey");
+    if (m_context->m_state.vs.shader == nullptr || !positionBuffer.defined())
+      return false;
+    const D3D11CommonShader* vs = m_context->m_state.vs.shader->GetCommonShader();
+
+    uint64_t h = 0x50415353u;
+    auto mix = [&h](uint64_t v) { h ^= v + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2); };
+    // Geometry: the exact buffer ranges this draw reads. Physical slices are
+    // the right identity here - within one frame a re-draw reads the same ones.
+    // Vertex-pulled draws have only a per-draw placeholder stream; their
+    // identity (VS, range, pulled SRVs) stands in for it.
+    if (positionIdentity != 0) {
+      mix(positionIdentity);
+    } else {
+      mix(uint64_t(reinterpret_cast<uintptr_t>(positionBuffer.buffer().ptr())));
+      mix(positionBuffer.offset());
+      mix(positionBuffer.stride());
+    }
+    mix(indexed ? 1u : 0u);
+    mix(count);
+    mix(start);
+    mix(uint64_t(int64_t(base)));
+    mix(uint64_t(m_context->m_state.ia.primitiveTopology));
+    if (indexed && indexBuffer.defined()) {
+      mix(uint64_t(reinterpret_cast<uintptr_t>(indexBuffer.buffer().ptr())));
+      mix(indexBuffer.offset());
+    }
+    // Camera-independent identity of the mesh range, stable across frames.
+    meshKey = h;
+
+    // Which object this is: UE GPUScene, Unity DOTS and other instance-stream
+    // engines draw the same mesh range many times, distinguished only by
+    // StartInstanceLocation or a per-instance vertex stream.
+    mix(firstInstance);
+    for (uint32_t slot = 0; slot < D3D11_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT; ++slot) {
+      const auto& vb = m_context->m_state.ia.vertexBuffers[slot];
+      if (vb.buffer == nullptr)
+        continue;
+      mix(slot);
+      mix(uint64_t(reinterpret_cast<uintptr_t>(vb.buffer.ptr())));
+      mix(vb.offset);
+    }
+
+    // Placement: only the constants that feed SV_Position, so per-light or
+    // per-pass constants (light matrices, pass flags) do not split a re-draw
+    // of the same mesh from its first pass.
+    auto hashRegs = [&](uint32_t slot, uint32_t firstReg, uint32_t regCount) {
+      if (slot >= D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT)
+        return false;
+      const auto& cb = m_context->m_state.vs.constantBuffers[slot];
+      if (cb.buffer == nullptr)
+        return false;
+      const auto* ptr = reinterpret_cast<const uint8_t*>(cb.buffer->GetMappedSlice().mapPtr);
+      const size_t size = cb.buffer->Desc()->ByteWidth;
+      const size_t begin = size_t(cb.constantOffset) * 16u + size_t(firstReg) * 16u;
+      const size_t bytes = size_t(regCount) * 16u;
+      if (ptr == nullptr || begin + bytes > size)
+        return false;
+      h = XXH3_64bits_withSeed(ptr + begin, bytes, h);
+      return true;
+    };
+
+    const D3D11CameraRelativeWorldBinding& world = vs->GetCameraRelativeWorldBinding();
+    if (world.valid) {
+      return hashRegs(world.worldSlot, world.worldRegister, 3u)
+          && hashRegs(world.cameraSlot, world.eyeRegister, 1u)
+          && hashRegs(world.viewProjSlot, world.viewProjRegister, 4u)
+          && (key = h, true);
+    }
+    if (const D3D11PositionTransformBinding* binding = vs->GetPositionTransformBinding()) {
+      for (uint32_t m = 0; m < binding->matrixCount; ++m) {
+        const auto& mb = binding->matrices[m];
+        for (uint32_t row = 0; row < 4u; ++row) {
+          const uint32_t reg = mb.constantRegisters[row];
+          if (reg != UINT32_MAX && !hashRegs(mb.constantBufferSlot, reg, 1u))
+            return false;
+        }
+      }
+      key = h;
+      return true;
+    }
+    // No proven transform: hash every constant the shader reads. Conservative -
+    // a per-light constant then keeps the passes apart, never merges two meshes.
+    const D3D11ConstantBufferDependencyProfile& deps = vs->GetConstantBufferDependencyProfile();
+    if (!deps.complete)
+      return false;
+    // Vertex pulling / per-instance records in SRVs (FO4 precombines read
+    // t5..t8) place geometry outside the constants, so the views are identity.
+    const auto& vsViews = m_context->m_state.vs.shaderResources.views;
+    for (uint32_t slot = 0; slot < vsViews.size(); ++slot) {
+      if (vsViews[slot] != nullptr) {
+        mix(slot);
+        mix(uint64_t(reinterpret_cast<uintptr_t>(vsViews[slot].ptr())));
+      }
+    }
+    for (const auto& dep : deps.dependencies) {
+      if (dep.wholeBuffer) {
+        if (dep.slot >= D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT)
+          return false;
+        const auto& cb = m_context->m_state.vs.constantBuffers[dep.slot];
+        if (cb.buffer == nullptr)
+          return false;
+        const size_t size = cb.buffer->Desc()->ByteWidth;
+        const size_t base16 = size_t(cb.constantOffset) * 16u;
+        const size_t end = cb.constantCount > 0
+          ? std::min(base16 + size_t(cb.constantCount) * 16u, size) : size;
+        if (end <= base16 || !hashRegs(dep.slot, 0u, uint32_t(std::min<size_t>((end - base16) / 16u, 4096u))))
+          return false;
+      } else if (!hashRegs(dep.slot, dep.constantRegister, 1u)) {
+        return false;
+      }
+    }
+    key = h;
+    return true;
+  }
+
+  bool D3D11Rtx::RebaseIndexedVertexRange(DrawCallState& dcs, uint32_t indexCount,
+                                          const D3D11Buffer* idxShadowSource,
+                                          VkDeviceSize idxShadowOffset) {
+    ScopedCpuProfileZoneN("D3D11Rtx::RebaseIndexedVertexRange");
+    RasterGeometry& geo = dcs.geometryData;
+    const RasterBuffer& ib = geo.indexBuffer;
+    const bool is32 = ib.indexType() == VK_INDEX_TYPE_UINT32;
+    const uint32_t idxStride = is32 ? 4u : 2u;
+    if (indexCount == 0 || geo.vertexCount == 0)
+      return false;
+
+    const void* src = ib.mapPtr(0);
+    if (src == nullptr && idxShadowSource != nullptr)
+      src = idxShadowSource->GetIndexShadow(idxShadowOffset, VkDeviceSize(indexCount) * idxStride);
+    if (src == nullptr)
+      return false;
+
+    const bool restart = geo.topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP;
+    const uint32_t restartValue = is32 ? 0xFFFFFFFFu : 0xFFFFu;
+    auto readIndex = [&](uint32_t i) {
+      if (is32) { uint32_t v; std::memcpy(&v, static_cast<const uint8_t*>(src) + size_t(i) * 4u, 4u); return v; }
+      uint16_t v; std::memcpy(&v, static_cast<const uint8_t*>(src) + size_t(i) * 2u, 2u); return uint32_t(v);
+    };
+
+    uint32_t minIndex = UINT32_MAX, maxIndex = 0;
+    for (uint32_t i = 0; i < indexCount; ++i) {
+      const uint32_t v = readIndex(i);
+      if (restart && v == restartValue)
+        continue;
+      minIndex = std::min(minIndex, v);
+      maxIndex = std::max(maxIndex, v);
+    }
+    if (minIndex == UINT32_MAX || maxIndex >= geo.vertexCount)
+      return false;
+    // Not worth a copy when almost nothing would be saved.
+    if (minIndex < 64u) {
+      geo.vertexCount = maxIndex + 1u;
+      return true;
+    }
+
+    const VkDeviceSize idxBytes = VkDeviceSize(indexCount) * idxStride;
+    Rc<DxvkBuffer> dst = AcquireHostVisibleHelperBuffer(idxBytes, "d3d11 rtx rebased indices");
+    uint8_t* out = dst != nullptr ? static_cast<uint8_t*>(dst->mapPtr(0)) : nullptr;
+    if (out == nullptr)
+      return false;
+    for (uint32_t i = 0; i < indexCount; ++i) {
+      const uint32_t v = readIndex(i);
+      const uint32_t r = (restart && v == restartValue) ? v : v - minIndex;
+      if (is32) std::memcpy(out + size_t(i) * 4u, &r, 4u);
+      else { const uint16_t r16 = uint16_t(r); std::memcpy(out + size_t(i) * 2u, &r16, 2u); }
+    }
+
+    // Every per-vertex stream moves forward by minIndex elements; streams that
+    // share one buffer stay interleaved because each moves by its own stride.
+    const uint32_t span = maxIndex - minIndex + 1u;
+    auto shift = [&](RasterBuffer& buf) {
+      if (!buf.defined() || buf.stride() == 0)
+        return;
+      const VkDeviceSize skip = VkDeviceSize(minIndex) * buf.stride();
+      if (skip >= buf.length())
+        return;
+      buf = RasterBuffer(buf.subSlice(skip, buf.length() - skip),
+                         buf.offsetFromSlice(), buf.stride(), buf.vertexFormat());
+    };
+    shift(geo.positionBuffer);
+    shift(geo.normalBuffer);
+    shift(geo.texcoordBuffer);
+    shift(geo.color0Buffer);
+    shift(geo.blendWeightBuffer);
+    shift(geo.blendIndicesBuffer);
+
+    geo.indexBuffer = RasterBuffer(DxvkBufferSlice(dst, 0, idxBytes), 0, idxStride, ib.indexType());
+    geo.vertexCount = span;
+    ++m_submitRejectStats.exactWorldRebased;
+    m_submitRejectStats.exactWorldVerticesSaved += minIndex;
+    return true;
+  }
+
   void D3D11Rtx::RecycleHelperBuffers() {
     // A retired buffer is reusable once this pool holds the only reference
     // and the GPU has retired all command lists that touched it.
@@ -4763,7 +6346,9 @@ namespace dxvk {
   }
 
   DrawCallTransforms D3D11Rtx::ExtractTransforms() {
+    ScopedCpuProfileZoneN("D3D11Rtx::ExtractTransforms");
     ScopedPhaseTimer phaseTimer(m_framePhaseExtractNs);
+    m_drawJitteredProjectionValid = false;
 
     DrawCallTransforms transforms;
     bool projectionWasFlippedY = false;
@@ -5037,6 +6622,36 @@ namespace dxvk {
       }
     }
 
+    // --- PROJECTION: engine camera knowledge ---
+    // The bound VS's camera constants are known (RDEF names, or the engine's
+    // documented register layout). A seeded projection that classifies as a
+    // perspective matrix replaces whatever the heuristic scan latched onto -
+    // shadow, reflection and previous-frame projections can outscore it.
+    const CameraSeed* cameraSeed = ResolveCameraSeed();
+    if (cameraSeed != nullptr && cameraSeed->slot < D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT
+     && cameraSeed->offsets[size_t(D3D11CameraField::Proj)] >= 0) {
+      const auto& seedCb = (*stageCbs[0])[cameraSeed->slot];
+      const uint8_t* seedPtr = seedCb.buffer != nullptr
+        ? reinterpret_cast<const uint8_t*>(seedCb.buffer->GetMappedSlice().mapPtr) : nullptr;
+      if (seedPtr != nullptr) {
+        const size_t seedOff = size_t(seedCb.constantOffset) * 16u
+          + size_t(cameraSeed->offsets[size_t(D3D11CameraField::Proj)]);
+        if (seedOff + 64u <= seedCb.buffer->Desc()->ByteWidth
+         && (projSlot != cameraSeed->slot || projOffset != seedOff || projStage != 0)) {
+          const int cls = classifyPerspective(readCbMatrix(seedPtr, seedOff, seedCb.buffer->Desc()->ByteWidth));
+          if (cls > 0) {
+            projSlot = m_projSlot = cameraSeed->slot;
+            projOffset = m_projOffset = seedOff;
+            projStage = m_projStage = 0;
+            m_columnMajor = cls == 2;
+            if (m_cameraSeedProjLocks++ < 8u)
+              Logger::info(str::format("[D3D11Rtx][camera-seed] projection pinned: ", cameraSeed->source,
+                " cb", cameraSeed->slot, " offset=", seedOff, cls == 2 ? " (column-major)" : ""));
+          }
+        }
+      }
+    }
+
     // --- PROJECTION: first-draw scan (cache miss) ---
     // Single pass across all stages â€” classifyPerspective handles both layouts.
     if (projSlot == UINT32_MAX) {
@@ -5131,6 +6746,16 @@ namespace dxvk {
         rawProjNormalized = proj;
         haveRawProjNormalized = true;
 
+        // The projection this draw was actually rasterized with, jitter
+        // included, in the same canonical orientation as the stripped one.
+        // Capture unprojects SV_Position with it: the stripped matrix would
+        // offset every captured vertex by the frame's sub-pixel jitter.
+        {
+          bool jfx = false, jfy = false;
+          m_drawJitteredProjection = canonicalizeProjectionOrientation(proj, &jfx, &jfy);
+          m_drawJitteredProjectionValid = isFiniteMatrix(m_drawJitteredProjection);
+        }
+
         // Strip TAA jitter â€” Remix does its own TAA.
         proj[2][0] = 0.0f;
         proj[2][1] = 0.0f;
@@ -5160,6 +6785,84 @@ namespace dxvk {
       }
     }
 
+    // --- VIEWPROJ-ONLY CAMERA (engine knowledge) ---
+    // The seed names a ViewProj but no Projection: factor it. A camera-
+    // relative ViewProj (translation removed) takes its eye from the seed.
+    bool seededViewValid = false;
+    Matrix4 seededView;
+    if (cameraSeed != nullptr && cameraSeed->offsets[size_t(D3D11CameraField::Proj)] < 0
+     && cameraSeed->slot < D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT) {
+      const bool relative = cameraSeed->offsets[size_t(D3D11CameraField::ViewProj)] < 0;
+      const int32_t vpField = cameraSeed->offsets[size_t(relative ? D3D11CameraField::RelViewProj
+                                                                  : D3D11CameraField::ViewProj)];
+      const auto& vpCb = (*stageCbs[0])[cameraSeed->slot];
+      const uint8_t* vpPtr = vpCb.buffer != nullptr
+        ? reinterpret_cast<const uint8_t*>(vpCb.buffer->GetMappedSlice().mapPtr) : nullptr;
+      const size_t vpOff = size_t(vpCb.constantOffset) * 16u + size_t(std::max(vpField, 0));
+      if (vpField >= 0 && vpPtr != nullptr && vpOff + 64u <= vpCb.buffer->Desc()->ByteWidth) {
+        const Matrix4 raw = readCbMatrix(vpPtr, vpOff, vpCb.buffer->Desc()->ByteWidth);
+        Matrix4 P, V;
+        bool factored = factorViewProjection(raw, P, V);
+        if (!factored)
+          factored = factorViewProjection(transpose(raw), P, V);
+        if (factored && relative) {
+          // Absolute eye from the seed: V translation = -R * eye.
+          factored = false;
+          const int32_t eyeField = cameraSeed->offsets[size_t(D3D11CameraField::Eye)];
+          const int32_t negField = cameraSeed->offsets[size_t(D3D11CameraField::NegEye)];
+          const int32_t field = eyeField >= 0 ? eyeField : negField;
+          if (field >= 0 && cameraSeed->eyeSlot < D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT) {
+            const auto& eyeCb = (*stageCbs[0])[cameraSeed->eyeSlot];
+            const uint8_t* eyePtr = eyeCb.buffer != nullptr
+              ? reinterpret_cast<const uint8_t*>(eyeCb.buffer->GetMappedSlice().mapPtr) : nullptr;
+            const size_t eyeOff = size_t(eyeCb.constantOffset) * 16u + size_t(field);
+            if (eyePtr != nullptr && eyeOff + 12u <= eyeCb.buffer->Desc()->ByteWidth) {
+              float e[3];
+              std::memcpy(e, eyePtr + eyeOff, sizeof(e));
+              const uint32_t eyeBytes = eyeCb.buffer->Desc()->ByteWidth;
+              auto readPart = [&](D3D11CameraField part, float (&out)[3]) {
+                const int32_t f = cameraSeed->offsets[size_t(part)];
+                const size_t off = size_t(eyeCb.constantOffset) * 16u + size_t(std::max(f, 0));
+                if (f < 0 || off + 12u > eyeBytes)
+                  return false;
+                std::memcpy(out, eyePtr + off, sizeof(out));
+                return std::isfinite(out[0]) && std::isfinite(out[1]) && std::isfinite(out[2]);
+              };
+              // UE 5.4+ DoubleFloat: High + Low, in the base field's convention.
+              float low[3];
+              if (readPart(D3D11CameraField::EyeLow, low))
+                for (uint32_t c = 0; c < 3; ++c) e[c] += low[c];
+              if (eyeField < 0) { e[0] = -e[0]; e[1] = -e[1]; e[2] = -e[2]; }
+              // UE 5.0-5.3: both relative forms drop the view tile offset.
+              float tile[3];
+              if (readPart(D3D11CameraField::EyeTile, tile))
+                for (uint32_t c = 0; c < 3; ++c) e[c] += tile[c] * 2097152.0f;
+              if (std::isfinite(e[0]) && std::isfinite(e[1]) && std::isfinite(e[2])) {
+                for (uint32_t r = 0; r < 3; ++r)
+                  V[3][r] = -(V[0][r] * e[0] + V[1][r] * e[1] + V[2][r] * e[2]);
+                factored = true;
+              }
+            }
+          }
+        }
+        if (factored) {
+          rawProjNormalized = P;
+          haveRawProjNormalized = true;
+          m_drawJitteredProjection = P;
+          m_drawJitteredProjectionValid = true;
+          P[2][0] = 0.0f;  // strip TAA jitter, as for scanned projections
+          P[2][1] = 0.0f;
+          transforms.viewToProjection = P;
+          seededView = V;
+          seededViewValid = true;
+          if (m_cameraSeedVpFactored++ < 8u)
+            Logger::info(str::format("[D3D11Rtx][camera-seed] view-projection factored into P*V: ",
+              cameraSeed->source, relative ? " (camera-relative, eye from seed)" : "",
+              " P00=", P[0][0], " P11=", P[1][1]));
+        }
+      }
+    }
+
     // --- FALLBACK PROJECTION ---
     // If no perspective matrix was found in any cbuffer, synthesize one from
     // the viewport. This keeps path tracing viable for games, emulators, and
@@ -5170,7 +6873,7 @@ namespace dxvk {
     // Only synthesise a fallback projection when exactly one viewport is
     // bound.  Shadow cascade / cube face / split-screen passes bind multiple
     // viewports and must never drive the main camera.
-    if (projSlot == UINT32_MAX && singleSceneViewport) {
+    if (projSlot == UINT32_MAX && singleSceneViewport && !seededViewValid) {
       const auto& vp = m_context->m_state.rs.viewports[0];
       if (vp.Width > 0.0f && vp.Height > 0.0f) {
         float targetWidth = vp.Width;
@@ -5406,6 +7109,13 @@ namespace dxvk {
       }
     }
 
+    // A view factored from the engine's ViewProj is exact; nothing to scan.
+    if (seededViewValid) {
+      transforms.worldToView = seededView;
+      transforms.cameraRelativeView = false;
+      viewCacheHit = true;
+    }
+
     // --- VIEW CONFIRMATION AGAINST A STORED VIEWPROJ (DX11_V260_PRECISE_CAMERA) ---
     // The rigid-body test alone cannot tell the main camera view from shadow-
     // light views, mirror/reflection cameras, bone matrices, or a stored
@@ -5501,14 +7211,91 @@ namespace dxvk {
             }
           }
 
+          // Camera-relative engines (Fallout 4, Skyrim SE) upload a view with no
+          // translation but a ViewProj that still carries the camera position,
+          // so the full comparison above never matches and the location stayed
+          // unconfirmed. Without translation a view and its transpose (the
+          // camera-to-world rotation) are equally rigid, and the unconfirmed
+          // scan kept the transposed one: the RT camera turned opposite to the
+          // game and view-space captures swung around with the player. Only the
+          // rotation-dependent part of the product decides orientation, so
+          // compare just that: columns 0-2 of P*V, or rows 0-2 of V*P.
+          //
+          // The comparison is PER ELEMENT. A tolerance relative to the largest
+          // element (the projection's depth terms, or a camera translation in
+          // the thousands) accepted a view AND its transpose, and whichever the
+          // scan reached first was locked - so the RT camera turned the right
+          // way in one session and mirrored in the next. Both orientations are
+          // now scored and the location is locked only when one wins clearly.
+          auto elementError = [](const Matrix4& a, const Matrix4& b, int rowsOrCols, bool compareColumns) -> float {
+            float worst = 0.0f;
+            for (int i = 0; i < rowsOrCols; ++i) {
+              for (int j = 0; j < 4; ++j) {
+                const float av = compareColumns ? a[i][j] : a[j][i];
+                const float bv = compareColumns ? b[i][j] : b[j][i];
+                if (!std::isfinite(av) || !std::isfinite(bv))
+                  return 1.0e30f;
+                worst = std::max(worst, std::abs(av - bv) / (0.05f + std::abs(bv)));
+              }
+            }
+            return worst;
+          };
+          (void)matricesNearlyEqual;
+
+          // Best (lowest) error per candidate over every ViewProj block and
+          // both composition orders; the rotation-only forms tolerate a
+          // camera position present only in the ViewProj.
+          float candError[8];
+          bool candRotationOnly[8] = {};
+          for (uint32_t ci = 0; ci < candCount; ++ci) {
+            candError[ci] = 1.0e30f;
+            for (uint32_t vi = 0; vi < vpCount; ++vi) {
+              if (cands[ci].offset == vps[vi].offset) continue;
+              const Matrix4& stored = vps[vi].m;
+              const Matrix4 pv = rawProjNormalized * cands[ci].view;
+              const Matrix4 vp = cands[ci].view * rawProjNormalized;
+              const float full = std::min(elementError(pv, stored, 4, true), elementError(vp, stored, 4, true));
+              const float rot = std::min(elementError(pv, stored, 3, true), elementError(vp, stored, 3, false));
+              if (full < candError[ci]) { candError[ci] = full; candRotationOnly[ci] = false; }
+              if (rot < candError[ci]) { candError[ci] = rot; candRotationOnly[ci] = true; }
+            }
+          }
+
+          uint32_t bestCand = UINT32_MAX;
+          for (uint32_t ci = 0; ci < candCount; ++ci)
+            if (bestCand == UINT32_MAX || candError[ci] < candError[bestCand])
+              bestCand = ci;
+          // The same storage read the other way (view vs camera-to-world) must
+          // lose clearly, or orientation is not established yet.
+          float partnerError = 1.0e30f;
+          if (bestCand != UINT32_MAX) {
+            for (uint32_t ci = 0; ci < candCount; ++ci)
+              if (ci != bestCand && cands[ci].offset == cands[bestCand].offset)
+                partnerError = std::min(partnerError, candError[ci]);
+          }
+          const bool unambiguous = bestCand != UINT32_MAX
+            && candError[bestCand] <= 0.05f
+            && partnerError >= std::max(0.25f, 5.0f * candError[bestCand]);
+
+          static uint32_t s_viewScoreLogs = 0;
+          if (candCount > 0 && vpCount > 0 && s_viewScoreLogs < 6u
+           && (unambiguous || curFrame > 600u)) {
+            ++s_viewScoreLogs;
+            std::string scores;
+            for (uint32_t ci = 0; ci < candCount; ++ci)
+              scores += str::format(" ", cands[ci].offset, cands[ci].inverted ? "i" : "", "=", candError[ci],
+                                    candRotationOnly[ci] ? "(rot)" : "");
+            Logger::info(str::format("[D3D11Rtx] View orientation scores:", scores,
+              unambiguous ? " -> locked" : " -> ambiguous, not locked"));
+          }
+
           bool locked = false;
-          for (uint32_t vi = 0; vi < vpCount && !locked; ++vi) {
-            const Matrix4& stored = vps[vi].m;
-            const size_t off = vps[vi].offset;
-              for (uint32_t ci = 0; ci < candCount && !locked; ++ci) {
-                if (cands[ci].offset == off) continue;
-                if (matricesNearlyEqual(cands[ci].view * rawProjNormalized, stored)
-                 || matricesNearlyEqual(rawProjNormalized * cands[ci].view, stored)) {
+          if (unambiguous) {
+            {
+                const uint32_t ci = bestCand;
+                const size_t off = cands[ci].offset;
+                const bool rotationMatch = candRotationOnly[ci];
+                {
                   transforms.worldToView = cands[ci].view;
                   m_viewStage = projStage;
                   m_viewSlot = projSlot;
@@ -5527,10 +7314,25 @@ namespace dxvk {
                       kStageNames[projStage], " slot=", projSlot,
                       " viewOff=", cands[ci].offset, " vpOff=", off,
                       cands[ci].inverted ? " [stored as camera-to-world]" : "",
-                      cands[ci].columnMajor ? " [column-major]" : " [row-major]"));
+                      cands[ci].columnMajor ? " [column-major]" : " [row-major]",
+                      rotationMatch ? " [rotation-only: camera-relative view]" : ""));
                   }
                 }
               }
+          }
+
+          // Report once why confirmation failed, so a game that still cannot
+          // confirm its view says which blocks were tried.
+          static uint32_t s_viewConfirmMissLogs = 0;
+          if (!locked && candCount > 0 && s_viewConfirmMissLogs < 2u && curFrame > 600u) {
+            ++s_viewConfirmMissLogs;
+            std::string candList, vpList;
+            for (uint32_t ci = 0; ci < candCount; ++ci)
+              candList += str::format(" ", cands[ci].offset, cands[ci].inverted ? "i" : "", cands[ci].columnMajor ? "c" : "r");
+            for (uint32_t vi = 0; vi < vpCount; ++vi)
+              vpList += str::format(" ", vps[vi].offset);
+            Logger::info(str::format("[D3D11Rtx] View not confirmed: stage=", kStageNames[projStage],
+              " slot=", projSlot, " projOff=", projOffset, " viewCandidates=[", candList, " ] viewProjBlocks=[", vpList, " ]"));
           }
         }
       }
@@ -5837,7 +7639,7 @@ namespace dxvk {
     // camera, and repeated projection constants. Skyrim SE's b12 PerFrame block
     // is one example, but the validation is based entirely on matrix coherence.
     bool cameraRelativeBlockValidated = false;
-    if (haveRawProjNormalized
+    if (haveRawProjNormalized && !seededViewValid
      && projSlot != UINT32_MAX
      && projStage >= 0 && projStage < kNumStages
      && projOffset >= 64) {
@@ -5992,13 +7794,14 @@ namespace dxvk {
 
         const Matrix4& projection = transforms.viewToProjection;
 
-        if (!yFlipOverrideEnabled) {
-          m_yFlipVotes += projectionWasFlippedY ? 1 : -1;
-          if (!m_yFlipSettled && std::abs(m_yFlipVotes) >= kVoteThreshold) {
-            m_yFlipSettled = true;
-            const bool yFlip = m_yFlipVotes > 0;
-            RtCamera::correctProjectionYFlipObject().setDeferred(yFlip, RtxOptionLayer::getDerivedLayer());
-          }
+        // The projection handed to the camera was already canonicalized to
+        // +Y above (canonicalizeProjectionOrientation). Voting
+        // correctProjectionYFlip on from the raw sign negated [1][1] a second
+        // time in RtCamera and rendered those games upside-down. Only the
+        // explicit user override may set that option.
+        if (!yFlipOverrideEnabled && !m_yFlipSettled) {
+          m_yFlipVotes = projectionWasFlippedY ? 1 : -1;
+          m_yFlipSettled = true;
         }
 
         DecomposeProjectionParams dpp;
@@ -6061,7 +7864,7 @@ namespace dxvk {
         m_axisLogged = true;
         Logger::info(str::format("[D3D11Rtx] Axis detection settled: ",
           m_lhVotes > 0 ? "LH" : "RH",
-          m_yFlipVotes > 0 ? " Y-flipped" : "",
+          m_yFlipVotes > 0 ? " Y-flipped(canonicalized)" : "",
           m_zUpVotes > 0 ? " Z-up" : " Y-up",
           m_columnMajor ? " col-major" : " row-major",
           " (proj stage=", kStageNames[std::max(0, m_projStage)],
@@ -6212,6 +8015,27 @@ namespace dxvk {
         if (translationLenSq > 1e-6f)
           score += 0.5f;
 
+        // World + inverse pair: Unity's UnityPerDraw starts with
+        // unity_ObjectToWorld followed by unity_WorldToObject (unity.md), and
+        // other engines pack per-object matrices the same way. A matrix whose
+        // next 64 bytes are its inverse is a proven world matrix, even in
+        // stripped shaders whose cbuffer slots the compiler assigned.
+        if (stageIdx >= 0 && stageIdx < kNumStages && slot < D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT) {
+          const auto& cb = (*stageCbs[stageIdx])[slot];
+          const uint8_t* ptr = cb.buffer != nullptr
+            ? reinterpret_cast<const uint8_t*>(cb.buffer->GetMappedSlice().mapPtr) : nullptr;
+          if (ptr != nullptr && off + 128u <= cb.buffer->Desc()->ByteWidth) {
+            const Matrix4 next = readMatrix(ptr, off + 64u, cb.buffer->Desc()->ByteWidth);
+            const Matrix4 product = candidate * next;
+            float deviation = 0.0f;
+            for (int c = 0; c < 4; ++c)
+              for (int r = 0; r < 4; ++r)
+                deviation += std::abs(product[c][r] - (c == r ? 1.0f : 0.0f));
+            if (std::isfinite(deviation) && deviation < 1.0e-2f)
+              score += 6.0f;
+          }
+        }
+
         return score;
       };
 
@@ -6310,7 +8134,10 @@ namespace dxvk {
                   Matrix4 candidateObjectToWorld = viewInv * candidateObjectToView;
                   if (!isWorldCandidate(candidateObjectToWorld)) continue;
 
-                  const float score = scoreWorldCandidate(si, slot, off, candidateObjectToWorld) + 2.5f;
+                  // No bonus: every affine location is also scored as a raw
+                  // world matrix with identical location bonuses. A bonus here
+                  // made V^-1*W beat a genuine world W, gluing objects to the eye.
+                  const float score = scoreWorldCandidate(si, slot, off, candidateObjectToWorld);
                   if (score > bestDerivedWorldScore) {
                     bestDerivedWorldScore = score;
                     bestDerivedWorldCandidate = candidateObjectToWorld;
@@ -6338,7 +8165,10 @@ namespace dxvk {
         }
 
         static bool s_worldLogged = false;
-        if (bestDerivedWorldSlot != UINT32_MAX && bestDerivedWorldScore >= bestRawWorldScore) {
+        // Ties go to the raw world matrix; the derived (model-view) reading is
+        // used only when it is strictly better or no raw world exists.
+        if (bestDerivedWorldSlot != UINT32_MAX
+         && (bestRawWorldSlot == UINT32_MAX || bestDerivedWorldScore > bestRawWorldScore)) {
           transforms.objectToWorld = bestDerivedWorldCandidate;
           found = true;
 
@@ -6419,31 +8249,13 @@ namespace dxvk {
             return false;
 
           const auto& cb = m_context->m_state.vs.constantBuffers[matrixBinding.constantBufferSlot];
-          if (cb.buffer == nullptr)
+          // Row form reads registers as rows (a synthetic `mov w, 1` row
+          // when only three exist); column form transposes mul/mad columns.
+          Vector4 rows[4];
+          if (!readBindingRows(matrixBinding, cb, rows))
             return false;
-
-          const auto mapped = cb.buffer->GetMappedSlice();
-          const uint8_t* ptr = reinterpret_cast<const uint8_t*>(mapped.mapPtr);
-          if (ptr == nullptr)
-            return false;
-
-          const size_t bufferSize = cb.buffer->Desc()->ByteWidth;
-          const auto [bindingBase, bindingEnd] = cbRange(cb);
-          for (uint32_t row = 0; row < 4; ++row) {
-            const uint32_t shaderRegister = matrixBinding.constantRegisters[row];
-            if (shaderRegister == UINT32_MAX) {
-              // A three-row affine transform commonly ends with `mov w, 1`.
-              // Preserve that exact homogeneous row without reading a
-              // nonexistent fourth constant register.
-              shaderMatrix[row] = Vector4(0.0f, 0.0f, 0.0f, 1.0f);
-              continue;
-            }
-
-            const size_t offset = bindingBase + size_t(shaderRegister) * 16u;
-            if (offset + 16u > bindingEnd || offset + 16u > bufferSize)
-              return false;
-            std::memcpy(shaderMatrix[row].data, ptr + offset, 16u);
-          }
+          for (uint32_t row = 0; row < 4; ++row)
+            shaderMatrix[row] = rows[row];
           return isFiniteMatrix(shaderMatrix);
         };
 
@@ -6452,26 +8264,18 @@ namespace dxvk {
           matricesReadable &= readShaderMatrix(binding->matrices[i], shaderMatrices[i]);
 
         if (matricesReadable) {
-          // DXBC dp4 constants are normally stored as row vectors while
-          // Matrix4 stores columns. Test both representations. For a proven
-          // two-stage shader chain, preserve application order A then B, but
-          // also test the reversed multiplication needed by row-vector
-          // conventions. The affine factor test below rejects bad variants.
+          // The binding is proven from DXBC dp4 dataflow: shader register i
+          // holds mathematical row i, so the Matrix4 (columns) is the transpose
+          // of the copied registers, and a two-stage chain applies A then B
+          // (clip = B * A). This matches the capture path. Trying untransposed
+          // and reversed orders and keeping whichever looked most affine picked
+          // plausible but spatially wrong transforms.
           std::vector<Matrix4> shaderObjectToClipCandidates;
           if (binding->matrixCount == 1u) {
-            shaderObjectToClipCandidates.push_back(shaderMatrices[0]);
             shaderObjectToClipCandidates.push_back(transpose(shaderMatrices[0]));
           } else {
-            const std::array<Matrix4, 2> first = {
-              shaderMatrices[0], transpose(shaderMatrices[0]) };
-            const std::array<Matrix4, 2> second = {
-              shaderMatrices[1], transpose(shaderMatrices[1]) };
-            for (const Matrix4& a : first) {
-              for (const Matrix4& b : second) {
-                shaderObjectToClipCandidates.push_back(b * a);
-                shaderObjectToClipCandidates.push_back(a * b);
-              }
-            }
+            shaderObjectToClipCandidates.push_back(
+              transpose(shaderMatrices[1]) * transpose(shaderMatrices[0]));
           }
 
           if (!shaderObjectToClipCandidates.empty()) {
@@ -6483,11 +8287,9 @@ namespace dxvk {
             const Matrix4 inverseProjection = inverse(replacementProjection);
             if (isFiniteMatrix(inverseProjection)) {
               std::vector<Matrix4> candidates;
-              candidates.reserve(shaderObjectToClipCandidates.size() * 2u);
-              for (const Matrix4& shaderObjectToClip : shaderObjectToClipCandidates) {
+              candidates.reserve(shaderObjectToClipCandidates.size());
+              for (const Matrix4& shaderObjectToClip : shaderObjectToClipCandidates)
                 candidates.push_back(inverseProjection * shaderObjectToClip);
-                candidates.push_back(transpose(shaderObjectToClip * inverseProjection));
-              }
 
               auto affineScore = [](const Matrix4& candidate) -> float {
                 if (!isFiniteMatrix(candidate))
@@ -6537,13 +8339,29 @@ namespace dxvk {
 
                 if (bestScore > -1.0e20f) {
                 transforms.objectToView = bestObjectToView;
-                // Full DX11 replacement camera: the RT world is view space,
-                // its camera is identity, and every draw carries the complete
-                // shader-proven model-view transform. Do not mix game-specific
-                // world/view layouts between shaders.
-                transforms.objectToWorld = bestObjectToView;
-                transforms.worldToView = Matrix4();
-                transforms.cameraRelativeView = true;
+                // When a real world-space view is confirmed for this session,
+                // keep it: objectToWorld = inverse(view) * provenModelView.
+                // Collapsing to an identity camera here made the RT world move
+                // with the eye (breaking free camera, world-space caches and
+                // denoiser history) and mixed two world spaces in one frame,
+                // since draws without a proven binding still carry the real view.
+                const bool keepConfirmedWorldView = m_viewConfirmed
+                  && !m_viewCameraRelative
+                  && !transforms.cameraRelativeView
+                  && !isIdentityExact(transforms.worldToView)
+                  && isFiniteMatrix(transforms.worldToView);
+                const Matrix4 viewToWorld = keepConfirmedWorldView
+                  ? inverse(transforms.worldToView) : Matrix4();
+                if (keepConfirmedWorldView && isFiniteMatrix(viewToWorld)) {
+                  transforms.objectToWorld = viewToWorld * bestObjectToView;
+                } else {
+                  // Full DX11 replacement camera: the RT world is view space,
+                  // its camera is identity, and every draw carries the complete
+                  // shader-proven model-view transform.
+                  transforms.objectToWorld = bestObjectToView;
+                  transforms.worldToView = Matrix4();
+                  transforms.cameraRelativeView = true;
+                }
                 // A synthesized projection is trustworthy once an exact
                 // shader clip transform factors into a finite affine model-view.
                 transforms.usedViewportFallbackProjection = false;
@@ -6675,6 +8493,20 @@ namespace dxvk {
           }
         }
       }
+
+      // Reduced secondary views (half-resolution reflection and environment
+      // passes, EGO's env-map pass) keep the output aspect and pass the 50%
+      // extent test. Their camera is not the main one, so unprojected into the
+      // main camera's space they become ghost geometry. A reduced target is
+      // secondary when last frame's scene went into a clearly larger one;
+      // a dynamic-resolution main target is itself that largest one.
+      if (!transforms.offscreenRenderTarget && !m_abDisableEngineKnowledge
+       && m_prevFrameSceneTargetWidth > 0u
+       && renderTargetWidth < 0.75f * float(m_lastOutputExtent.width)
+       && renderTargetWidth < 0.8f * float(m_prevFrameSceneTargetWidth)) {
+        transforms.offscreenRenderTarget = true;
+        ++m_submitRejectStats.secondaryViewSkipped;
+      }
     }
 
     // Log camera discovery once.
@@ -6751,9 +8583,205 @@ namespace dxvk {
         && std::abs(view[3][1]) < kZeroTranslationEpsilon
         && std::abs(view[3][2]) < kZeroTranslationEpsilon;
 
+      // Engine camera knowledge: the seed names the eye (or PreViewTranslation
+      // style -eye) in the projection's cbuffer, so the exact eye is known
+      // without a layout signature or movement votes.
+      if (m_cameraAnchorViewTranslationFree && m_eyeOffset == SIZE_MAX && cameraSeed != nullptr
+       && projStage == 0 && projSlot == cameraSeed->eyeSlot) {
+        const int32_t eyeField = cameraSeed->offsets[size_t(D3D11CameraField::Eye)];
+        const int32_t negField = cameraSeed->offsets[size_t(D3D11CameraField::NegEye)];
+        const int32_t field = eyeField >= 0 ? eyeField : negField;
+        const auto& seedEyeCb = (*stageCbs[0])[projSlot];
+        const uint8_t* seedEyePtr = seedEyeCb.buffer != nullptr
+          ? reinterpret_cast<const uint8_t*>(seedEyeCb.buffer->GetMappedSlice().mapPtr) : nullptr;
+        const size_t seedEyeOff = size_t(seedEyeCb.constantOffset) * 16u + size_t(std::max(field, 0));
+        // The lock follows one float3 per frame. A UE large-world eye is that
+        // float3 only while the view tile is zero (within ~21 km of the
+        // origin); a DoubleFloat low part is below a millimetre and ignored.
+        bool tileZero = true;
+        const int32_t tileField = cameraSeed->offsets[size_t(D3D11CameraField::EyeTile)];
+        const size_t tileOff = size_t(seedEyeCb.constantOffset) * 16u + size_t(std::max(tileField, 0));
+        if (tileField >= 0 && seedEyePtr != nullptr && tileOff + 12u <= seedEyeCb.buffer->Desc()->ByteWidth) {
+          float t[3];
+          std::memcpy(t, seedEyePtr + tileOff, sizeof(t));
+          tileZero = t[0] == 0.0f && t[1] == 0.0f && t[2] == 0.0f;
+        }
+        if (tileZero && field >= 0 && seedEyePtr != nullptr && seedEyeOff + 12u <= seedEyeCb.buffer->Desc()->ByteWidth) {
+          float e[3];
+          std::memcpy(e, seedEyePtr + seedEyeOff, sizeof(e));
+          const float sign = eyeField >= 0 ? 1.0f : -1.0f;
+          const Vector3 exact(sign * e[0], sign * e[1], sign * e[2]);
+          const bool worldEye = std::isfinite(exact.x) && std::isfinite(exact.y) && std::isfinite(exact.z)
+            && std::abs(exact.x) + std::abs(exact.y) + std::abs(exact.z) > 1.0f;
+          if (worldEye) {
+            m_eyeOffset = seedEyeOff;
+            m_eyeNegated = eyeField < 0;
+            m_eyeSignatureChecked = true;
+            m_eyeOriginShift = m_cameraTrackingState->worldAnchor.hasPosition()
+              ? m_cameraTrackingState->worldAnchor.position() - exact
+              : Vector3(0.0f) - exact;
+            for (auto& cached : m_positionCaptureCache) {
+              cached.second.lastCapturedFrame = ~0u;
+              cached.second.hasCanonicalCapturedToWorld = false;
+              cached.second.hasCapturedClipToPosition = false;
+              cached.second.hasCapturedViewRotationToWorld = false;
+            }
+            Logger::info(str::format("[D3D11Rtx][world-anchor] exact eye from engine camera knowledge (",
+              cameraSeed->source, ") at cb", projSlot, " offset ", seedEyeOff,
+              m_eyeNegated ? " (stored negated)" : "", ": (", exact.x, ",", exact.y, ",", exact.z, ")"));
+          }
+        }
+      }
+
+      // Structural lock (reverse-engineered from Fallout 4's per-frame camera
+      // buffer, notes in fo4-decomp/MODLOG.md): View at 0 (rotation only),
+      // Projection at 64, ViewProj = P*V at 128, inverse View at 192, with the
+      // world eye position as a float4 at 560 (and the previous frame's at
+      // 576). A buffer that satisfies these exact relations has this layout,
+      // whichever game uploads it, so the eye is known from the first frame
+      // instead of being learned from movement.
+      if (m_cameraAnchorViewTranslationFree && m_eyeOffset == SIZE_MAX && !m_eyeSignatureChecked
+       && projStage >= 0 && projStage < kNumStages && projSlot != UINT32_MAX && projOffset == 64u) {
+        const auto& sigCb = (*stageCbs[projStage])[projSlot];
+        const uint8_t* sigPtr = sigCb.buffer != nullptr
+          ? reinterpret_cast<const uint8_t*>(sigCb.buffer->GetMappedSlice().mapPtr) : nullptr;
+        if (sigPtr != nullptr && sigCb.buffer->Desc()->ByteWidth >= 592u) {
+          float V[16], P[16], VP[16], IV[16];
+          std::memcpy(V, sigPtr + 0, sizeof(V));
+          std::memcpy(P, sigPtr + 64, sizeof(P));
+          std::memcpy(VP, sigPtr + 128, sizeof(VP));
+          std::memcpy(IV, sigPtr + 192, sizeof(IV));
+          // Registers are matrix rows: VP = P * V, and IV * V = I (rotation).
+          bool matches = std::abs(V[0]) + std::abs(V[1]) + std::abs(V[2]) > 0.5f;
+          for (int r = 0; r < 4 && matches; ++r) {
+            for (int c = 0; c < 4 && matches; ++c) {
+              float pv = 0.0f, iv = 0.0f;
+              for (int k = 0; k < 4; ++k) {
+                pv += P[r * 4 + k] * V[k * 4 + c];
+                iv += IV[r * 4 + k] * V[k * 4 + c];
+              }
+              matches = std::abs(pv - VP[r * 4 + c]) <= 1.0e-3f * std::max(1.0f, std::abs(VP[r * 4 + c]));
+              if (r < 3 && c < 3)
+                matches = matches && std::abs(iv - (r == c ? 1.0f : 0.0f)) <= 1.0e-3f;
+            }
+          }
+          float eye[4];
+          std::memcpy(eye, sigPtr + 560, sizeof(eye));
+          matches = matches && eye[3] == 0.0f
+            && std::isfinite(eye[0]) && std::isfinite(eye[1]) && std::isfinite(eye[2]);
+          // Menus fill the same buffer with a zero eye; wait for the world so
+          // the RT origin lands at the player (keeps coordinates small).
+          const bool worldEye = std::abs(eye[0]) + std::abs(eye[1]) + std::abs(eye[2]) > 1.0f;
+          if (!worldEye)
+            matches = false;
+          // Decide once the buffer carries a real view and a world eye.
+          if (worldEye && (std::abs(V[0] - 1.0f) > 1.0e-4f || std::abs(V[5] - 1.0f) > 1.0e-4f))
+            m_eyeSignatureChecked = true;
+          if (matches) {
+            m_eyeOffset = 560u;
+            const Vector3 exact(eye[0], eye[1], eye[2]);
+            // Keep the RT world near the origin for precision, and continuous
+            // with an estimate that may already be in use.
+            m_eyeOriginShift = m_cameraTrackingState->worldAnchor.hasPosition()
+              ? m_cameraTrackingState->worldAnchor.position() - exact
+              : -exact;
+            for (auto& cached : m_positionCaptureCache) {
+              cached.second.lastCapturedFrame = ~0u;
+              cached.second.hasCanonicalCapturedToWorld = false;
+              cached.second.hasCapturedClipToPosition = false;
+              cached.second.hasCapturedViewRotationToWorld = false;
+            }
+            Logger::info(str::format("[D3D11Rtx][world-anchor] camera constants match the Creation Engine "
+              "per-frame layout (view/proj/viewproj/inverse view); exact eye position at offset 560: (",
+              exact.x, ",", exact.y, ",", exact.z, ")"));
+          }
+        }
+      }
+
       if (m_cameraAnchorViewTranslationFree
-       && m_cameraTrackingState->worldAnchor.hasPosition()) {
-        const Vector3& cameraPosition = m_cameraTrackingState->worldAnchor.position();
+       && (m_cameraTrackingState->worldAnchor.hasPosition() || m_eyeOffset != SIZE_MAX)) {
+        Vector3 cameraPosition = m_cameraTrackingState->worldAnchor.hasPosition()
+          ? m_cameraTrackingState->worldAnchor.position() : Vector3(0.0f);
+
+        // Exact eye position. The estimate above is solved from geometry read
+        // back a frame or more late, so whenever the camera moves (turning in
+        // third person orbits it; first person shifts the eye) meshes captured
+        // on different frames were anchored with different errors: smearing,
+        // doubled geometry and dark frames that settled only once the camera
+        // stopped. Camera-relative engines still keep the eye position in
+        // their camera constants for their own shaders. Find the vector that
+        // moves exactly like the estimate, then use it, shifted once so the
+        // world stays where it was.
+        if (projStage >= 0 && projStage < kNumStages && projSlot != UINT32_MAX) {
+          const auto& eyeCb = (*stageCbs[projStage])[projSlot];
+          const uint8_t* eyePtr = eyeCb.buffer != nullptr
+            ? reinterpret_cast<const uint8_t*>(eyeCb.buffer->GetMappedSlice().mapPtr) : nullptr;
+          const size_t eyeBytes = eyePtr != nullptr ? std::min<size_t>(eyeCb.buffer->Desc()->ByteWidth, 4096u) : 0u;
+          auto readVec = [&](size_t off) {
+            float v[3];
+            std::memcpy(v, eyePtr + off, sizeof(v));
+            return Vector3(v[0], v[1], v[2]);
+          };
+          const uint32_t eyeFrame = m_context->m_device->getCurrentFrameId();
+
+          if (m_eyeOffset != SIZE_MAX && eyePtr != nullptr && m_eyeOffset + 12u <= eyeBytes) {
+            const Vector3 stored = readVec(m_eyeOffset);
+            const Vector3 exact = m_eyeNegated ? Vector3(0.0f) - stored : stored;
+            if (std::isfinite(exact.x) && std::isfinite(exact.y) && std::isfinite(exact.z))
+              cameraPosition = exact + m_eyeOriginShift;
+          } else if (eyePtr != nullptr && eyeFrame >= m_eyeLastSampleFrame + 30u) {
+            // Discovery: compare each vec3's motion with the estimate's motion
+            // over the same 30-frame window. Only real movement votes.
+            const size_t count = eyeBytes / 16u;
+            if (m_eyeSamples.size() != count) {
+              m_eyeSamples.assign(count, Vector3(0.0f));
+              m_eyeVotes.assign(count, 0u);
+              m_eyeHaveSample = false;
+            }
+            const Vector3 estimate = m_cameraTrackingState->worldAnchor.position();
+            if (m_eyeHaveSample) {
+              const Vector3 dEstimate = estimate - m_eyeLastEstimate;
+              const float moved = length(dEstimate);
+              if (moved > 10.0f) {
+                for (size_t k = 0; k < count; ++k) {
+                  const Vector3 value = readVec(k * 16u);
+                  const Vector3 dValue = value - m_eyeSamples[k];
+                  // The estimate lags and under-travels (measured ~20% short
+                  // in Fallout 4), so match direction and rough magnitude,
+                  // not exact distance: the game's own value is the truth.
+                  const float valueMoved = length(dValue);
+                  const bool tracks = std::isfinite(value.x) && std::isfinite(value.y) && std::isfinite(value.z)
+                    && valueMoved > 10.0f
+                    && dot(dValue, dEstimate) > 0.9f * valueMoved * moved
+                    && valueMoved > 0.5f * moved && valueMoved < 2.0f * moved;
+                  m_eyeVotes[k] = tracks ? m_eyeVotes[k] + 1u : 0u;
+                  if (m_eyeVotes[k] >= 2u && m_eyeOffset == SIZE_MAX) {
+                    m_eyeOffset = k * 16u;
+                    m_eyeOriginShift = estimate - value;
+                    // Every stored capture was anchored with the (lagging,
+                    // biased) estimate. Mixing those with captures anchored by
+                    // the exact position misplaces geometry, so discard their
+                    // placement and let each mesh be captured again.
+                    for (auto& cached : m_positionCaptureCache) {
+                      cached.second.lastCapturedFrame = ~0u;
+                      cached.second.hasCanonicalCapturedToWorld = false;
+                      cached.second.hasCapturedClipToPosition = false;
+                      cached.second.hasCapturedViewRotationToWorld = false;
+                    }
+                    Logger::info(str::format("[D3D11Rtx][world-anchor] exact eye position found in camera constants: stage=",
+                      kStageNames[projStage], " slot=", projSlot, " offset=", m_eyeOffset,
+                      " value=(", value.x, ",", value.y, ",", value.z, ") - replacing the geometry-solved estimate"));
+                  }
+                }
+              }
+            }
+            for (size_t k = 0; k < count; ++k)
+              m_eyeSamples[k] = readVec(k * 16u);
+            m_eyeLastEstimate = estimate;
+            m_eyeHaveSample = true;
+            m_eyeLastSampleFrame = eyeFrame;
+          }
+        }
 
         // t = -R*P for this column-major layout: t_row = -sum_col V[col][row]*P_col.
         for (uint32_t row = 0; row < 3u; ++row) {
@@ -6771,6 +8799,31 @@ namespace dxvk {
         transforms.objectToWorld[3][0] += cameraPosition.x;
         transforms.objectToWorld[3][1] += cameraPosition.y;
         transforms.objectToWorld[3][2] += cameraPosition.z;
+
+        // Temporary diagnostic: dump the camera constant buffer next to the
+        // estimated eye position, to find where the engine keeps the exact one.
+        {
+          static uint32_t s_lastCbDumpFrame = 0;
+          const uint32_t dumpFrame = m_context->m_device->getCurrentFrameId();
+          if (dumpFrame >= s_lastCbDumpFrame + 300u && projStage >= 0 && projStage < kNumStages
+           && projSlot != UINT32_MAX) {
+            const auto& dumpCb = (*stageCbs[projStage])[projSlot];
+            const uint8_t* dumpPtr = dumpCb.buffer != nullptr
+              ? reinterpret_cast<const uint8_t*>(dumpCb.buffer->GetMappedSlice().mapPtr) : nullptr;
+            if (dumpPtr != nullptr) {
+              s_lastCbDumpFrame = dumpFrame;
+              const size_t dumpBytes = std::min<size_t>(dumpCb.buffer->Desc()->ByteWidth, 1024u);
+              std::string dump;
+              for (size_t off = 0; off + 16 <= dumpBytes; off += 16) {
+                float v[4];
+                std::memcpy(v, dumpPtr + off, sizeof(v));
+                dump += str::format(" ", off, ":", v[0], ",", v[1], ",", v[2], ",", v[3]);
+              }
+              Logger::info(str::format("[D3D11Rtx][camera-cb] frame=", dumpFrame,
+                " estimate=(", cameraPosition.x, ",", cameraPosition.y, ",", cameraPosition.z, ")", dump));
+            }
+          }
+        }
 
         static bool sCameraAnchorLogged = false;
         if (!sCameraAnchorLogged) {
@@ -6950,9 +9003,89 @@ namespace dxvk {
     return future;
   }
 
+  void D3D11Rtx::SetLift2DPresentation(bool lifting, uint32_t source) {
+    static std::mutex s_mutex;
+    static bool s_sources[2] = {};
+    static bool s_locked = false;
+    std::lock_guard<std::mutex> guard(s_mutex);
+
+    s_sources[std::min(source, 1u)] = lifting;
+    lifting = s_sources[0] || s_sources[1];
+
+    if (lifting == s_locked)
+      return;
+
+    s_locked = lifting;
+    const RtxOptionLayer* derived = RtxOptionLayer::getDerivedLayer();
+
+    if (lifting) {
+      DxvkAutoExposure::enabledObject().setDeferred(false, derived);
+      DxvkToneMapping::tonemappingEnabledObject().setDeferred(false, derived);
+      DxvkToneMapping::exposureBiasObject().setDeferred(0.0f, derived);
+      RtxOptions::tonemappingModeObject().setDeferred(TonemappingMode::Global, derived);
+    } else {
+      // The values come off the layer again: whatever was in effect before
+      // (user config, presets) applies to the 3D game that follows.
+      std::lock_guard<std::mutex> lock(RtxOptionImpl::getUpdateMutex());
+      DxvkAutoExposure::enabledObject().disableLayerValue(derived);
+      DxvkToneMapping::tonemappingEnabledObject().disableLayerValue(derived);
+      DxvkToneMapping::exposureBiasObject().disableLayerValue(derived);
+      RtxOptions::tonemappingModeObject().disableLayerValue(derived);
+    }
+
+    Logger::info(str::format("[D3D11Rtx][2d-lift] presentation ", lifting
+      ? "held neutral (auto exposure off, EV 0, no tone curve)" : "released"));
+  }
+
+  Rc<DxvkImageView> D3D11Rtx::ToGreyAlbedoView(const Rc<DxvkImageView>& view) const {
+    if (view == nullptr)
+      return nullptr;
+
+    VkComponentMapping swizzle;
+    switch (view->info().format) {
+      case VK_FORMAT_R8_UNORM:
+      case VK_FORMAT_R8_SRGB:
+      case VK_FORMAT_R16_UNORM:
+      case VK_FORMAT_R16_SFLOAT:
+      case VK_FORMAT_BC4_UNORM_BLOCK:
+        swizzle = { VK_COMPONENT_SWIZZLE_R, VK_COMPONENT_SWIZZLE_R, VK_COMPONENT_SWIZZLE_R, VK_COMPONENT_SWIZZLE_ONE };
+        break;
+      case VK_FORMAT_R8G8_UNORM:
+      case VK_FORMAT_R8G8_SRGB:
+        swizzle = { VK_COMPONENT_SWIZZLE_R, VK_COMPONENT_SWIZZLE_R, VK_COMPONENT_SWIZZLE_R, VK_COMPONENT_SWIZZLE_G };
+        break;
+      default:
+        return nullptr;
+    }
+
+    const uint32_t frame = m_context->m_device->getCurrentFrameId();
+    constexpr uint32_t kUnusedFrames = 120;
+
+    if (frame - m_greyAlbedoPruneFrame >= kUnusedFrames) {
+      m_greyAlbedoPruneFrame = frame;
+      for (auto it = m_greyAlbedoViews.begin(); it != m_greyAlbedoViews.end(); ) {
+        if (frame - it->second.lastFrame >= kUnusedFrames)
+          it = m_greyAlbedoViews.erase(it);
+        else
+          ++it;
+      }
+    }
+
+    auto& entry = m_greyAlbedoViews[view.ptr()];
+    if (entry.view == nullptr) {
+      DxvkImageViewCreateInfo info = view->info();
+      info.swizzle = swizzle;
+      entry.source = view;
+      entry.view = m_context->m_device->createImageView(view->image(), info);
+    }
+    entry.lastFrame = frame;
+    return entry.view;
+  }
+
   void D3D11Rtx::FillMaterialData(
       LegacyMaterialData& mat,
       XXH64_hash_t primaryTextureHashOverride) const {
+    ScopedCpuProfileZoneN("D3D11Rtx::FillMaterialData");
     ScopedPhaseTimer phaseTimer(m_framePhaseMaterialNs);
 
     const auto& ps = m_context->m_state.ps;
@@ -6968,7 +9101,14 @@ namespace dxvk {
     uint32_t textureID = 0;
 
     static uint32_t s_logCount = 0;
-    const bool doLog = (s_logCount < 10);
+    // Log the first draws, plus the first draw of each distinct pixel shader:
+    // the first-10-draws window only ever covered menu quads, never world
+    // materials, so texture-selection failures in the world were invisible.
+    static std::unordered_set<const void*> s_loggedMaterialShaders;
+    bool firstDrawForShader = false;
+    if (commonPs != nullptr && s_loggedMaterialShaders.size() < 200u)
+      firstDrawForShader = s_loggedMaterialShaders.insert(commonPs).second;
+    const bool doLog = (s_logCount < 10) || firstDrawForShader;
 
     auto isColorBlockCompressed = [](DXGI_FORMAT fmt) -> bool {
       return (fmt >= DXGI_FORMAT_BC1_TYPELESS && fmt <= DXGI_FORMAT_BC1_UNORM_SRGB)
@@ -7191,12 +9331,13 @@ namespace dxvk {
       std::string resolvedSemanticName;
       uint32_t resolvedSemanticIndex = 0;
       uint32_t resolvedSemanticComponent = 0;
-      const bool hasProvenGeometryUvContract =
-        commonPs != nullptr
-        && commonVs != nullptr
+      const bool psUvTraced = commonPs != nullptr
         && commonPs->GetSampledTexcoordSemantic(
              slot, sampledSemanticName, sampledSemanticIndex,
-             sampledSemanticComponent)
+             sampledSemanticComponent);
+      const bool hasProvenGeometryUvContract =
+        psUvTraced
+        && commonVs != nullptr
         && commonVs->ResolvePositionCaptureTexcoord(
              sampledSemanticName, sampledSemanticIndex,
              sampledSemanticComponent,
@@ -7274,13 +9415,50 @@ namespace dxvk {
         || rtSizedIntermediate
         || (hasDepthBind && !hasMips)
         || ((hasRtBind || hasUavBind) && isSingleMipLargeTexture && !bc);
+      // The shader's own reflection names its textures when it was not
+      // stripped. A slot named like a normal/specular/mask/environment map is
+      // never the albedo, however colour-like its format (normal maps are often
+      // BC1/BC3/BC7, so format heuristics alone picked them as albedo). A slot
+      // named like a diffuse map is strongly preferred. Unknown or generic
+      // names leave the format-based scoring unchanged.
+      int textureNameRole = 0; // -1 data/normal map, +1 albedo, 0 unknown
+      if (commonPs != nullptr && commonPs->GetReflection() != nullptr) {
+        const DxbcResourceBinding* binding =
+          commonPs->GetReflection()->findBinding(DxbcResourceKind::Texture, slot);
+        if (binding != nullptr && !binding->name.empty()) {
+          std::string lower = binding->name;
+          for (auto& c : lower)
+            c = char(::tolower(static_cast<unsigned char>(c)));
+          static const char* const kDataNames[] = {
+            "normal", "nrm", "bump", "spec", "gloss", "rough", "metal", "mask",
+            "env", "cube", "height", "parallax", "occlusion", "lightmap",
+            "shadow", "depth", "noise", "flow", "dither", "lut", "ramp" };
+          static const char* const kAlbedoNames[] = {
+            "diffuse", "albedo", "basecolor", "base_color", "colormap", "color_map" };
+          for (const char* n : kDataNames)
+            if (lower.find(n) != std::string::npos) { textureNameRole = -1; break; }
+          if (textureNameRole == 0) {
+            for (const char* n : kAlbedoNames)
+              if (lower.find(n) != std::string::npos) { textureNameRole = 1; break; }
+          }
+        }
+      }
+      // A slot the pixel shader unpacks with "*2-1" is a normal map, never
+      // the albedo, whatever its format (stripped engines: Unity, UE, FO4).
+      if (commonPs != nullptr && commonPs->GetTextureDecode(slot).normalEncoding != 0)
+        textureNameRole = -1;
       const bool rejectMaterialCandidate = rejectUnprovenGeometryHash
+        || textureNameRole < 0
         || (!clearAlbedo && (rejectTextureBrowserCandidate
         || likelyIntermediate
         || !albedoFormat
         || dataOrSceneFormat));
 
       int score = 0;
+      if (textureNameRole > 0)
+        score += 30;
+      else if (textureNameRole < 0)
+        score -= 60;
       if (colorBc)                  score += 14;  // Color BC = strong material signal.
       else if (bc)                  score -= 10;  // BC4/BC5/BC6 are masks/normals/HDR, not albedo.
       if (strongAlbedoFormat)       score += 8;
@@ -7288,7 +9466,18 @@ namespace dxvk {
       if (hasMips)                  score += 5;   // Mipmapped = likely content
       if (!matchesRT)               score += 3;   // Different size from RT = likely content
       if (!isCurrentRT)             score += 2;   // Not actively rendering to it
-      score += std::max(0, 16 - (int)slot);       // Prefer lower slots (albedo first)
+      // Albedo is the largest colour texture sampled with UV0, not slot 0
+      // (METHODS.md, Materials): slot order only breaks ties.
+      score += std::max(0, 8 - (int)slot);
+      if (psUvTraced && sampledSemanticIndex == 0)
+        score += 6;
+      {
+        const uint32_t edge = std::max(imgInfo.extent.width, imgInfo.extent.height);
+        uint32_t log2Edge = 0;
+        while ((1u << (log2Edge + 1u)) <= edge && log2Edge < 15u)
+          ++log2Edge;
+        score += std::clamp(int(log2Edge) - 6, 0, 6);   // 128 px: 1 ... 4096 px: 6
+      }
 
       if (dataOrSceneFormat)
         score -= 24;
@@ -7360,13 +9549,15 @@ namespace dxvk {
         !multisampledView &&
         !matchesRT &&
         !hasUavBind &&
-        (fmt == VK_FORMAT_R8G8B8A8_UNORM
-          || fmt == VK_FORMAT_R8G8_UNORM
-          || fmt == VK_FORMAT_R8G8_SNORM
-          || fmt == VK_FORMAT_R16G16_UNORM
-          || fmt == VK_FORMAT_R16G16_SNORM
-          || fmt == VK_FORMAT_R16G16_SFLOAT
-          || fmt == static_cast<VkFormat>(65));
+        // fmt is a DXGI format; this compared it against Vulkan enums, which
+        // never matched the intended formats.
+        (fmt == DXGI_FORMAT_R8G8B8A8_UNORM
+          || fmt == DXGI_FORMAT_R8G8_UNORM
+          || fmt == DXGI_FORMAT_R8G8_SNORM
+          || fmt == DXGI_FORMAT_R16G16_UNORM
+          || fmt == DXGI_FORMAT_R16G16_SNORM
+          || fmt == DXGI_FORMAT_R16G16_FLOAT
+          || fmt == DXGI_FORMAT_R10G10B10A2_UNORM);
 
       const bool likelyAtlasOrHelperTexture =
         !bc &&
@@ -7406,7 +9597,10 @@ namespace dxvk {
           likelyIntermediate ? " [LIKELY-INTERMEDIATE]" : "",
           isCurrentRT ? " [BOUND-RT]" : "",
           matchesRT ? " [RT-SIZED]" : "",
-          hasProvenGeometryUvContract ? " [PROVEN-UV]" : " [NO-PROVEN-UV]",
+          hasProvenGeometryUvContract ? " [PROVEN-UV]"
+            : (psUvTraced ? str::format(" [NO-PROVEN-UV:VS-UNRESOLVED ", sampledSemanticName,
+                                        sampledSemanticIndex, ".", sampledSemanticComponent, "]")
+                          : std::string(" [NO-PROVEN-UV:PS-UNTRACED]")),
           rejectTextureBrowserCandidate ? " [REJECT-BROWSER]" : "",
           rejectMaterialCandidate ? " [REJECT-MATERIAL]" : ""));
       }
@@ -7489,6 +9683,143 @@ namespace dxvk {
       ++textureID;
     }
 
+    // Game normal map (documentation/engine_knowledge/METHODS.md, Materials):
+    // a two-channel BC5/R8G8 texture the PS samples is a tangent-space XY
+    // normal map (z rebuilt); an RGB texture is one only when the shader's
+    // reflection names it so (Skyrim-style RGB normals). Mipped, not a
+    // render target, not the albedo. Remix otherwise decodes normals as
+    // octahedral assets, so the encoding travels with the texture.
+    if (!m_abDisableEngineKnowledge && RtxOptions::dx11InferNormalMaps()) {
+      const DxbcRdef* psReflection = commonPs != nullptr ? commonPs->GetReflection() : nullptr;
+      auto resourceName = [&](uint32_t slot) -> std::string {
+        if (psReflection == nullptr || !psReflection->isValid())
+          return std::string();
+        for (const auto& b : psReflection->resourceBindings())
+          if (b.kind == DxbcResourceKind::Texture && slot >= b.bindPoint && slot < b.bindPoint + std::max(1u, b.bindCount)) {
+            std::string n = b.name;
+            std::transform(n.begin(), n.end(), n.begin(), [](unsigned char c) { return char(std::tolower(c)); });
+            return n;
+          }
+        return std::string();
+      };
+      for (uint32_t slot = 0; slot < D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT; ++slot) {
+        if (slot == mat.colorTextureSlot[0] || slot == mat.colorTextureSlot[1])
+          continue;
+        D3D11ShaderResourceView* srv = ps.shaderResources.views[slot].ptr();
+        if (srv == nullptr || srv->GetResourceType() != D3D11_RESOURCE_DIMENSION_TEXTURE2D)
+          continue;
+        if (hasCompleteSampledResourceProfile && !commonPs->SamplesResourceSlot(slot))
+          continue;
+        D3D11_SHADER_RESOURCE_VIEW_DESC1 nDesc = {};
+        srv->GetDesc1(&nDesc);
+        if (nDesc.ViewDimension != D3D11_SRV_DIMENSION_TEXTURE2D)
+          continue;
+        const D3D11_COMMON_RESOURCE_DESC nRes = srv->GetResourceDesc();
+        if (nRes.BindFlags & (D3D11_BIND_RENDER_TARGET | D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_DEPTH_STENCIL))
+          continue;
+        Rc<DxvkImageView> nView = srv->GetImageView();
+        if (nView == nullptr || nView->image()->info().mipLevels <= 1)
+          continue;
+        // 1. The pixel shader's own dataflow (engine-independent, works on
+        //    stripped shaders): a "*2-1" unpack is a normal map with that
+        //    channel order; "1 - x" of a channel is smoothness.
+        const D3D11CommonShader::TextureDecode decode = commonPs != nullptr
+          ? commonPs->GetTextureDecode(slot) : D3D11CommonShader::TextureDecode();
+        // 2. CRYENGINE's fixed material slots (cryengine_frostbite.md): t1
+        //    normals (BC5 stored .yx), t5 smoothness, t13 emittance.
+        const bool cryFixedSlots = GetD3D11EngineProfile().family() == D3D11EngineFamily::CryEngine;
+        const bool bc5 = nDesc.Format == DXGI_FORMAT_BC5_UNORM || nDesc.Format == DXGI_FORMAT_BC5_SNORM;
+        const std::string n = resourceName(slot);
+        auto has = [&](const char* word) { return n.find(word) != std::string::npos; };
+
+        uint8_t encoding = decode.normalEncoding;
+        if (encoding == 0 && cryFixedSlots && slot == 1u && bc5)
+          encoding = 5;
+        if (encoding == 0) {
+          // 3. Format, then reflection names.
+          switch (nDesc.Format) {
+            case DXGI_FORMAT_BC5_UNORM: case DXGI_FORMAT_R8G8_UNORM:
+              encoding = 3; break;
+            // Signed: sampled in [-1, 1] already (no "* 2 - 1").
+            case DXGI_FORMAT_BC5_SNORM: case DXGI_FORMAT_R8G8_SNORM:
+              encoding = 6; break;
+            case DXGI_FORMAT_BC1_UNORM: case DXGI_FORMAT_BC3_UNORM: case DXGI_FORMAT_BC7_UNORM:
+            case DXGI_FORMAT_R8G8B8A8_UNORM: case DXGI_FORMAT_B8G8R8A8_UNORM:
+              if (has("normal") || has("nrm") || has("bump") || has("ddn"))
+                encoding = 2;
+              break;
+            default: break;
+          }
+        }
+        if (encoding != 0 && !mat.normalTexture.isValid()) {
+          mat.normalTexture = TextureRef(nView);
+          mat.normalEncoding = encoding;
+          // CRYENGINE "_ddna" and similar keep smoothness in the normal map's
+          // alpha; the dataflow proves it when the shader inverts it.
+          if (decode.smoothnessChannel >= 0 && !mat.roughnessTexture.isValid()) {
+            mat.roughnessTexture = TextureRef(nView);
+            mat.roughnessChannel = uint8_t(decode.smoothnessChannel);
+            mat.roughnessIsSmoothness = true;
+          }
+          continue;
+        }
+
+        if (decode.smoothnessChannel >= 0 && !mat.roughnessTexture.isValid()) {
+          mat.roughnessTexture = TextureRef(nView);
+          mat.roughnessChannel = uint8_t(decode.smoothnessChannel);
+          mat.roughnessIsSmoothness = true;
+          continue;
+        }
+        if (cryFixedSlots && n.empty()) {
+          if (slot == 5u && !mat.roughnessTexture.isValid()) {
+            mat.roughnessTexture = TextureRef(nView);
+            mat.roughnessIsSmoothness = true;
+            continue;
+          }
+          if (slot == 13u && !mat.emissiveTexture.isValid()) {
+            mat.emissiveTexture = TextureRef(nView);
+            continue;
+          }
+        }
+
+        // 4. Maps the reflection names, with their documented channel
+        //    layouts: Unity HDRP mask map (R metallic, A smoothness), Unity
+        //    Standard metallic-gloss map (R metallic, A smoothness), Unreal
+        //    ORM (G roughness, B metallic).
+        if (n.empty())
+          continue;
+        const bool unityMask = has("maskmap") || has("metallicgloss");
+        const bool orm = (has("_orm") || has("occlusionroughness")
+          || (n.size() >= 3 && n.compare(n.size() - 3, 3, "orm") == 0)) && !has("normal");
+        if (unityMask && !mat.metallicTexture.isValid()) {
+          mat.metallicTexture = TextureRef(nView);
+          mat.metallicChannel = 0;
+          if (!mat.roughnessTexture.isValid()) {
+            mat.roughnessTexture = TextureRef(nView);
+            mat.roughnessChannel = 3;
+            mat.roughnessIsSmoothness = true;
+          }
+        } else if (orm && !mat.metallicTexture.isValid()) {
+          mat.metallicTexture = TextureRef(nView);
+          mat.metallicChannel = 2;
+          if (!mat.roughnessTexture.isValid()) {
+            mat.roughnessTexture = TextureRef(nView);
+            mat.roughnessChannel = 1;
+          }
+        } else if (!mat.roughnessTexture.isValid() && has("rough")) {
+          mat.roughnessTexture = TextureRef(nView);
+        } else if (!mat.roughnessTexture.isValid() && (has("smoothness") || has("gloss"))) {
+          mat.roughnessTexture = TextureRef(nView);
+          mat.roughnessIsSmoothness = true;
+        } else if (!mat.metallicTexture.isValid() && (has("metallic") || has("metalness"))) {
+          mat.metallicTexture = TextureRef(nView);
+        } else if (!mat.emissiveTexture.isValid()
+                && (has("emissive") || has("emission") || has("glow") || has("illum") || has("emittance"))) {
+          mat.emissiveTexture = TextureRef(nView);
+        }
+      }
+    }
+
     // Last resort: pick the best candidate even if it's an active RT.
     if (!pickedAny && pickCount > 0) {
       auto& c = picks[0];
@@ -7509,6 +9840,101 @@ namespace dxvk {
       }
     }
 
+    // Legacy cubemap reflections (Bethesda envmaps: Skyrim, Fallout 4 and the
+    // other Creation titles; any engine that adds "cube * strength * mask"):
+    // the game adds an untinted reflection over a dark diffuse, which path
+    // traces near-black unless the surface becomes a reflector. Strength is
+    // the constant the PS scales the cube sample by; the mask is the 2D
+    // channel it multiplies in (fo4-decomp MODLOG.md, "Envmap materials").
+    if (commonPs != nullptr && !m_abDisableEngineKnowledge) {
+      const D3D11CommonShader::EnvmapReflection& env = commonPs->GetEnvmapReflection();
+      auto readCb = [&](int8_t slot, uint16_t reg, Vector4& v) -> bool {
+        if (slot < 0 || slot >= int8_t(D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT))
+          return false;
+        const auto& cb = ps.constantBuffers[uint32_t(slot)];
+        if (cb.buffer == nullptr)
+          return false;
+        const auto* bytes = reinterpret_cast<const uint8_t*>(cb.buffer->GetMappedSlice().mapPtr);
+        if (bytes == nullptr)
+          return false;
+        const size_t size = cb.buffer->Desc()->ByteWidth;
+        const size_t base = size_t(cb.constantOffset) * 16u;
+        const size_t end = cb.constantCount > 0 ? std::min(base + size_t(cb.constantCount) * 16u, size) : size;
+        const size_t offset = base + size_t(reg) * 16u;
+        if (offset + 16u > end)
+          return false;
+        std::memcpy(v.data, bytes + offset, 16u);
+        return true;
+      };
+      auto boundView = [&](int32_t slot) -> Rc<DxvkImageView> {
+        if (slot < 0 || uint32_t(slot) >= ps.shaderResources.views.size())
+          return nullptr;
+        D3D11ShaderResourceView* srv = ps.shaderResources.views[uint32_t(slot)].ptr();
+        if (srv == nullptr || srv->GetResourceType() == D3D11_RESOURCE_DIMENSION_BUFFER)
+          return nullptr;
+        return srv->GetImageView();
+      };
+
+      float strength = 0.0f;
+      Rc<DxvkImageView> maskView;
+      uint8_t maskChannel = 0;
+      Rc<DxvkImageView> smoothnessView;
+      uint8_t smoothnessChannel = 0;
+
+      Vector4 v;
+      if (env.cubeSlot >= 0 && boundView(env.cubeSlot) != nullptr
+       && readCb(env.scaleCb, env.scaleReg, v)) {
+        // Forward envmaps (BSLightingShader / BSEffectShader): the cube is
+        // sampled in this draw.
+        strength = v[env.scaleComponent];
+        // The mask: a non-normal-map channel first (FO4 envmap mask t7.r,
+        // spec map t2.r), else the normal map's alpha (Skyrim's specular mask).
+        for (uint32_t pass = 0; pass < 2 && maskView == nullptr; ++pass) {
+          for (uint32_t i = 0; i < 2 && maskView == nullptr; ++i) {
+            const int32_t slot = env.maskSlot[i];
+            if (slot < 0 || env.maskChannel[i] < 0)
+              continue;
+            const bool normalMap = commonPs->GetTextureDecode(uint32_t(slot)).normalEncoding != 0;
+            if (normalMap != (pass == 1))
+              continue;
+            maskView = boundView(slot);
+            maskChannel = uint8_t(env.maskChannel[i]);
+          }
+        }
+      } else if (env.gbufferCb >= 0 && GetD3D11EngineProfile().family() == D3D11EngineFamily::Creation
+              && readCb(env.gbufferCb, env.gbufferReg, v)) {
+        // Creation deferred pre-pass: E = (cubemap index + 1, wet blend,
+        // envmap scale, wet scale); dry strength is E.z when E.y != 0. The
+        // composite scales the reflection by 3 x spec (t2.r x cb[0].y).
+        if (v.x >= 1.0f && v.y != 0.0f) {
+          Vector4 scales;
+          const float specScale = readCb(env.gbufferCb, 0, scales) && scales.y > 0.0f && scales.y <= 10.0f
+            ? scales.y : 1.0f;
+          strength = 3.0f * specScale * v.z;
+          maskView = boundView(2);
+          maskChannel = 0;
+          smoothnessView = maskView;
+          smoothnessChannel = 1;
+        }
+      }
+
+      if (std::isfinite(strength) && strength > 1.0e-3f) {
+        mat.untintedReflection = true;
+        mat.reflectionStrength = std::min(strength, 4.0f);
+        if (maskView != nullptr) {
+          mat.metallicTexture = TextureRef(maskView);
+          mat.metallicChannel = maskChannel;
+        } else {
+          mat.metallicTexture = TextureRef();
+        }
+        if (smoothnessView != nullptr && !mat.roughnessTexture.isValid()) {
+          mat.roughnessTexture = TextureRef(smoothnessView);
+          mat.roughnessChannel = smoothnessChannel;
+          mat.roughnessIsSmoothness = true;
+        }
+      }
+    }
+
     // A draw with no real game texture stays genuinely untextured. It remains
     // full path-traced geometry and uses the legacy material's constant/vertex
     // albedo path, but receives no synthetic image and therefore no invented
@@ -7517,7 +9943,9 @@ namespace dxvk {
 
     if (doLog) {
       Logger::info(str::format("[D3D11Rtx] FillMaterialData draw #", s_logCount,
-        " picked ", textureID, " of ", pickCount, " candidate(s)"));
+        " picked ", textureID, " of ", pickCount, " candidate(s)",
+        " ps=", commonPs != nullptr ? commonPs->GetName() : std::string("none"),
+        " completeSampledProfile=", hasCompleteSampledResourceProfile ? 1 : 0));
       // Count every logged draw, not just draws that picked a texture.
       // Previously the counter only advanced when pickCount > 0, so in
       // deferred engines where most draws reject all candidates the 10-draw
@@ -7525,6 +9953,15 @@ namespace dxvk {
       // tens of thousands of str::format + log writes on the draw hot path
       // (a measurable CPU bottleneck and 30k+ line logs).
       ++s_logCount;
+    }
+
+    // Grey-scale (R8, BC4) and grey + alpha (R8G8) albedo would read as red /
+    // red-green; the game's shader uses .r as the colour. Same image, so the
+    // texture hash (tagging, replacements) is unchanged.
+    if (textureID > 0) {
+      Rc<DxvkImageView> grey = ToGreyAlbedoView(mat.colorTextures[0].getImageViewRc());
+      if (grey != nullptr)
+        mat.colorTextures[0] = TextureRef(grey);
     }
 
     if (textureID > 0 && primaryTextureHashOverride != 0)
@@ -7632,6 +10069,59 @@ namespace dxvk {
       }
     }
 
+    // --- Material tint constant ---
+    // Many engines multiply the albedo texture by a colour constant (Unity
+    // _Color/_BaseColor, CRYENGINE MatDifColor, Source 2 g_vColorTint). When
+    // the PS reflection names one, its value multiplies albedo through the
+    // texture-factor path; without the name nothing is guessed.
+    if (!m_abDisableEngineKnowledge && !mat.isTextureFactorBlend
+     && m_context->m_state.ps.shader != nullptr) {
+      const D3D11CommonShader* tintPs = m_context->m_state.ps.shader->GetCommonShader();
+      const DxbcRdef* rdef = tintPs != nullptr ? tintPs->GetReflection() : nullptr;
+      static constexpr const char* kTintNames[] = {
+        "_Color", "_BaseColor", "_TintColor", "_MainColor", "MatDifColor",
+        "g_vColorTint", "TintColor", "DiffuseColor", "BaseColor",
+      };
+      bool tinted = false;
+      for (uint32_t c = 0; rdef != nullptr && rdef->isValid() && !tinted && c < rdef->constantBuffers().size(); ++c) {
+        const DxbcConstantBufferInfo& cbInfo = rdef->constantBuffers()[c];
+        uint32_t slot = UINT32_MAX;
+        for (const auto& b : rdef->resourceBindings())
+          if (b.kind == DxbcResourceKind::CBuffer && b.name == cbInfo.name)
+            slot = b.bindPoint;
+        if (slot >= D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT)
+          continue;
+        for (const auto& var : cbInfo.variables) {
+          if (!var.used || var.size < 12u
+           || std::find_if(std::begin(kTintNames), std::end(kTintNames),
+                [&](const char* n) { return var.name == n; }) == std::end(kTintNames))
+            continue;
+          const auto& cb = m_context->m_state.ps.constantBuffers[slot];
+          const uint8_t* ptr = cb.buffer != nullptr
+            ? reinterpret_cast<const uint8_t*>(cb.buffer->GetMappedSlice().mapPtr) : nullptr;
+          const size_t at = size_t(cb.constantOffset) * 16u + var.offset;
+          if (ptr == nullptr || at + 16u > cb.buffer->Desc()->ByteWidth)
+            break;
+          float v[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
+          std::memcpy(v, ptr + at, var.size >= 16u ? 16u : 12u);
+          bool plausible = true;
+          for (uint32_t i = 0; i < 3; ++i)
+            plausible &= std::isfinite(v[i]) && v[i] >= 0.0f && v[i] <= 8.0f;
+          const bool white = std::abs(v[0] - 1.0f) + std::abs(v[1] - 1.0f) + std::abs(v[2] - 1.0f) < 1.0e-3f;
+          if (plausible && !white) {
+            // Alpha only fades blended surfaces; on opaque ones it is often
+            // unused or carries other data.
+            const float alpha = mat.blendMode.enableBlending && std::isfinite(v[3])
+              ? std::clamp(v[3], 0.0f, 1.0f) : 1.0f;
+            mat.blendConstant = Vector4(v[0], v[1], v[2], alpha);
+            mat.isTextureFactorBlend = true;
+          }
+          tinted = true;
+          break;
+        }
+      }
+    }
+
     // --- Alpha test, the DX10/11/12 way ---
     // D3D10 removed the fixed-function alpha test entirely; nothing in the
     // depth-stencil object expresses it (the previous stencil-func heuristic
@@ -7652,6 +10142,126 @@ namespace dxvk {
       }
     }
 
+    // --- Refractive surfaces (water, glass) ---
+    // D3D11 engines draw water as world geometry whose pixel shader samples a
+    // copy of the already-rendered scene (the refraction buffer) next to a
+    // tiling content texture (the wave normal map). Taken as a legacy opaque
+    // material, that surface shows the game's rasterized scene copy stretched
+    // over it. The path tracer refracts and reflects for real, so hand these
+    // draws to Remix as a translucent water material instead. Light volumes
+    // and other additive passes sample render targets too, but blend
+    // additively; depth-only and fullscreen passes never reach here.
+    mat.isRefractiveSurface = false;
+    if (RtxOptions::dx11RefractiveSurfacesAsWater()
+     && hasCompleteSampledResourceProfile
+     && !(commonVs != nullptr && commonVs->WritesScreenSpacePosition())
+     && mat.blendMode.colorDstFactor != VK_BLEND_FACTOR_ONE) {
+      bool depthTested = true;
+      if (D3D11DepthStencilState* dsState = m_context->m_state.om.dsState) {
+        D3D11_DEPTH_STENCIL_DESC dsDesc;
+        dsState->GetDesc(&dsDesc);
+        depthTested = dsDesc.DepthEnable != FALSE;
+      }
+
+      uint32_t rt0Width = 0, rt0Height = 0;
+      std::array<DxvkImage*, D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT> boundTargets = {};
+      for (uint32_t rt = 0; rt < D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT; ++rt) {
+        auto* rtv = m_context->m_state.om.renderTargetViews[rt].ptr();
+        if (rtv == nullptr || rtv->GetImageView() == nullptr)
+          continue;
+        boundTargets[rt] = rtv->GetImageView()->image().ptr();
+        if (rt == 0) {
+          rt0Width  = boundTargets[rt]->info().extent.width;
+          rt0Height = boundTargets[rt]->info().extent.height;
+        }
+      }
+
+      bool samplesSceneCopy = false;
+      bool samplesTilingContent = false;
+      Rc<DxvkImageView> contentView;
+      uint32_t contentSlot = kInvalidResourceSlot;
+      for (uint32_t slot = 0; depthTested && rt0Width > 0
+           && slot < D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT; ++slot) {
+        D3D11ShaderResourceView* srv = ps.shaderResources.views[slot].ptr();
+        if (srv == nullptr || !commonPs->SamplesResourceSlot(slot)
+         || srv->GetResourceType() != D3D11_RESOURCE_DIMENSION_TEXTURE2D)
+          continue;
+        Rc<DxvkImageView> view = srv->GetImageView();
+        if (view == nullptr)
+          continue;
+
+        const auto& info = view->image()->info();
+        bool isBoundTarget = false;
+        for (DxvkImage* target : boundTargets)
+          isBoundTarget |= target == view->image().ptr();
+        if (isBoundTarget)
+          continue;
+
+        const D3D11_COMMON_RESOURCE_DESC resourceDesc = srv->GetResourceDesc();
+        const bool rtBind    = (resourceDesc.BindFlags & D3D11_BIND_RENDER_TARGET) != 0;
+        const bool depthBind = (resourceDesc.BindFlags & D3D11_BIND_DEPTH_STENCIL) != 0;
+
+        // The scene copy: a single-mip colour render target at least half the
+        // size of the target being drawn into (refraction is often half-res).
+        if (rtBind && !depthBind && info.mipLevels == 1
+         && info.extent.width * 2 >= rt0Width && info.extent.height * 2 >= rt0Height)
+          samplesSceneCopy = true;
+
+        // Authored content: mip-mapped, never a render target. The first one
+        // (the wave/normal map) identifies the water surface.
+        if (!rtBind && !depthBind && info.mipLevels > 1 && !samplesTilingContent) {
+          samplesTilingContent = true;
+          contentView = view;
+          contentSlot = slot;
+        }
+      }
+
+      mat.isRefractiveSurface = samplesSceneCopy && samplesTilingContent;
+
+      // Key the water material on its authored texture. The generic picker
+      // may have chosen the refraction copy (a render target): hidden from the
+      // Remix texture list and unstable as a hash, so water could not be
+      // found or tagged. The authored texture is stable and always listed.
+      if (mat.isRefractiveSurface && contentView != nullptr) {
+        mat.colorTextures[0] = TextureRef(contentView);
+        mat.colorTextureSlot[0] = contentSlot;
+        if (primaryTextureHashOverride != 0)
+          mat.colorTextures[0].setImageHashOverride(primaryTextureHashOverride);
+        const XXH64_hash_t contentHash = mat.colorTextures[0].getImageHash();
+        if (contentHash != 0)
+          ImGUI::AddTexture(contentHash, contentView, ImGUI::kTextureFlagsDefault);
+
+        // The wave map is the water's normal map: the translucent material
+        // decodes it by the encoding the shader's own unpack proves, else by
+        // its format (two-channel XY, or RGB).
+        uint8_t waterEncoding = commonPs->GetTextureDecode(contentSlot).normalEncoding;
+        if (waterEncoding == 0) {
+          D3D11_SHADER_RESOURCE_VIEW_DESC1 waterDesc = {};
+          ps.shaderResources.views[contentSlot]->GetDesc1(&waterDesc);
+          switch (waterDesc.Format) {
+            case DXGI_FORMAT_BC5_UNORM: case DXGI_FORMAT_R8G8_UNORM:
+              waterEncoding = 3; break;
+            case DXGI_FORMAT_BC5_SNORM: case DXGI_FORMAT_R8G8_SNORM:
+              waterEncoding = 6; break;
+            default:
+              waterEncoding = 2; break;
+          }
+        }
+        mat.normalTexture = TextureRef(contentView);
+        mat.normalEncoding = waterEncoding;
+      }
+
+      if (mat.isRefractiveSurface) {
+        static fast_unordered_set s_loggedRefractiveShaders;
+        const XXH64_hash_t psHash = commonPs->GetBytecodeHash();
+        if (s_loggedRefractiveShaders.insert(psHash).second) {
+          Logger::info(str::format(
+            "[D3D11Rtx] Refractive surface -> Remix translucent water: ps=0x", std::hex, psHash, std::dec,
+            " blend=", mat.blendMode.enableBlending ? 1 : 0));
+        }
+      }
+    }
+
     // Preserve the game's real sampled albedo and alpha contract. Texture
     // categorization and replacements key on this same live TextureRef/hash;
     // replacing the combiner with opaque-white TFactor made every path-traced
@@ -7667,6 +10277,9 @@ namespace dxvk {
                              UINT replayFirstInstance,
                              UINT replayInstanceCount,
                              bool requireExactPositionCapture) {
+    ScopedCpuProfileZoneN("D3D11Rtx::SubmitDraw");
+    if (TryInjectAtUiComposite())
+      return;  // the composite itself stays a raster draw over the RT frame
     // Time the whole submission path for this draw. Scoped so every early-out
     // below is still measured - a draw that is expensive to *reject* costs the
     // frame just as much as one that is expensive to accept, and the rejection
@@ -7696,6 +10309,18 @@ namespace dxvk {
       const decltype(drawCpuScopeExit)& fn;
       ~ScopeGuard() { fn(); }
     } drawCpuGuard { drawCpuScopeExit };
+
+    // Chromium renderer / utility processes never draw the game: no work.
+    if (GetD3D11EngineProfile().chromiumHelperProcess)
+      return;
+
+    // Katana's clustered lights are bound to its full-screen deferred
+    // lighting pass, which is rejected as a composite further down.
+    if (!m_abDisableEngineKnowledge && RtxOptions::dx11ImportTiledLights()
+     && GetD3D11EngineProfile().family() == D3D11EngineFamily::Katana
+     && m_tiledLightImportFrame != m_context->m_device->getCurrentFrameId()
+     && m_context->m_state.ps.shader != nullptr)
+      ImportKatanaClusterLights(m_context->m_state.ps.shaderResources, m_context->m_state.ps.shader->GetCommonShader());
 
     if (m_pGeometryWorkers == nullptr) {
       const bool isDeferredContext = m_context->GetType() == D3D11_DEVICE_CONTEXT_DEFERRED;
@@ -7824,16 +10449,43 @@ namespace dxvk {
     // Only triangle topologies are raytraceable. Skip points, lines, patch lists, etc.
     // This check is first: it costs a single comparison before any other state is read.
     const D3D11_PRIMITIVE_TOPOLOGY d3dTopology = m_context->m_state.ia.primitiveTopology;
+    // Patch lists with HS + DS bound produce triangles; they are captured from
+    // the domain shader's output (TryCapturePositionsViaStreamOut). Their
+    // control-point cage must never reach the BLAS, so capture is mandatory.
+    const bool tessellatedDraw = RtxOptions::dx11CaptureTessellation() && !m_abDisableEngineKnowledge
+      && d3dTopology >= D3D11_PRIMITIVE_TOPOLOGY_1_CONTROL_POINT_PATCHLIST
+      && d3dTopology <= D3D11_PRIMITIVE_TOPOLOGY_32_CONTROL_POINT_PATCHLIST
+      && m_context->m_state.hs.shader != nullptr && m_context->m_state.ds.shader != nullptr
+      && m_context->m_state.gs.shader == nullptr;
+    // A geometry shader that emits triangles turns points/lines/triangles into
+    // the triangles the rasterizer sees (particles, rain, fur shells); the
+    // recompiled game GS is captured, so its input topology does not matter.
+    const bool geometryShaderDraw = RtxOptions::dx11CaptureGeometryShaders() && !m_abDisableEngineKnowledge
+      && m_context->m_state.gs.shader != nullptr
+      && m_context->m_state.hs.shader == nullptr && m_context->m_state.ds.shader == nullptr
+      && m_context->m_state.gs.shader->GetCommonShader()->HasPositionCaptureCandidate()
+      && (d3dTopology == D3D11_PRIMITIVE_TOPOLOGY_POINTLIST || d3dTopology == D3D11_PRIMITIVE_TOPOLOGY_LINELIST
+       || d3dTopology == D3D11_PRIMITIVE_TOPOLOGY_LINESTRIP || d3dTopology == D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST
+       || d3dTopology == D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
     if (d3dTopology != D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST &&
-        d3dTopology != D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP) {
+        d3dTopology != D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP && !tessellatedDraw && !geometryShaderDraw) {
       ++m_submitRejectStats.nonTriangleTopology;
       return;
+    }
+    if (tessellatedDraw) {
+      requireExactPositionCapture = true;
+      ++m_submitRejectStats.tessellatedAdmitted;
+    }
+    if (geometryShaderDraw) {
+      requireExactPositionCapture = true;
+      ++m_submitRejectStats.geometryShaderAdmitted;
     }
 
     // Skip depth-only passes: no pixel shader means depth prepass or shadow map.
     // Most engines draw opaque geometry twice â€” once for depth prepass (PS == null)
     // and once for the color pass (PS != null) with the same vertices.
     if (m_context->m_state.ps.shader == nullptr) {
+      LearnSunFromShadowDraw();
       ++m_submitRejectStats.noPixelShader;
       return;
     }
@@ -7864,8 +10516,89 @@ namespace dxvk {
     // other" corruption. A depth-only draw can never contribute visible color;
     // the color pass provides the one true copy, so nothing visible is lost.
     if (!hasColorRenderTarget) {
+      LearnSunFromShadowDraw();
       ++m_submitRejectStats.depthOnlySkipped;
       return;
+    }
+
+    // Colour targets bound but every write mask zero: occlusion-query boxes,
+    // stencil-marking volumes (explosion/effect volumes, portals) and depth
+    // prepasses drawn with colour writes disabled. They are invisible in the
+    // game and must not become solid RT geometry.
+    if (D3D11BlendState* blendState = m_context->m_state.om.cbState) {
+      D3D11_BLEND_DESC1 blendDesc = {};
+      blendState->GetDesc1(&blendDesc);
+      bool writesAnyColor = false;
+      for (uint32_t rt = 0; rt < D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT; ++rt) {
+        if (omState.renderTargetViews[rt].ptr() == nullptr)
+          continue;
+        const auto& target = blendDesc.RenderTarget[blendDesc.IndependentBlendEnable ? rt : 0];
+        if (target.RenderTargetWriteMask != 0) {
+          writesAnyColor = true;
+          break;
+        }
+      }
+      if (!writesAnyColor) {
+        LearnSunFromShadowDraw();
+        ++m_submitRejectStats.depthOnlySkipped;
+        return;
+      }
+    }
+
+    // Far-plane geometry (sky domes, skyboxes, sun/moon/cloud layers): the
+    // vertex shader writes SV_Position.z from .w, pinning depth to 1. Deferred
+    // renderers draw it after the world from the same camera, so Remix's
+    // sky heuristics miss it and it became a solid shell around the player.
+    // The sky comes from Remix's atmosphere instead; never submit these.
+    if (m_context->m_state.vs.shader != nullptr) {
+      const D3D11CommonShader* skyVs = m_context->m_state.vs.shader->GetCommonShader();
+      if (skyVs != nullptr && skyVs->WritesPositionAtFarPlane()) {
+        ++m_submitRejectStats.farPlaneSkySkipped;
+        return;
+      }
+
+    }
+
+    // Screen-space passes: the vertex shader writes SV_Position.w as a
+    // constant, so its vertices are already screen positions (full-screen
+    // post-process triangles, UI quads). Taken as scene geometry such a
+    // triangle became a camera-filling plane; one that samples the scene copy
+    // was even turned into translucent water, greying out the whole
+    // path-traced view. They are rejected after UI routing below (UI quads
+    // must still reach it). Emulator post-transform draws are excluded: their
+    // positions are screen space by design and carry their own camera.
+    const bool screenSpaceVsDraw = !authenticatedEmulatorDraw
+      && m_context->m_state.vs.shader != nullptr
+      && m_context->m_state.vs.shader->GetCommonShader() != nullptr
+      && m_context->m_state.vs.shader->GetCommonShader()->WritesScreenSpacePosition();
+
+    // 2D lift (see Lift2DProjection): an orthographic or screen-space draw of
+    // a 2D game becomes a layer of the path-traced scene. Decided here, before
+    // the screen-space rejections below, which a lifted draw bypasses.
+    bool clipOrthographic = false, clipPerspective = false;
+    if (!authenticatedEmulatorDraw)
+      ClassifyClipProjection(clipOrthographic, clipPerspective);
+    const bool ortho2DDraw = screenSpaceVsDraw || clipOrthographic;
+    bool lift2D = false;
+    bool lift2DComposite = false;
+    m_lift2DDraw = false;
+    if (ortho2DDraw && !m_seenPerspectiveScene) {
+      ++m_submitRejectStats.lift2DCandidates;
+      bool samplesOnlyRenderTargets = false;
+      const DxvkImage* sampledTarget = Lift2DSampledRenderTarget(samplesOnlyRenderTargets);
+      auto* rtv0 = m_context->m_state.om.renderTargetViews[0].ptr();
+      Rc<DxvkImageView> rtv0View = rtv0 != nullptr ? rtv0->GetImageView() : nullptr;
+      const bool intoBackbuffer = rtv0View != nullptr && m_lastBackbufferImage != nullptr
+        && rtv0View->image().ptr() == m_lastBackbufferImage;
+      if (samplesOnlyRenderTargets) {
+        // The composite of an offscreen playfield (or a post effect): it shows
+        // layers that are lifted where they were drawn. Learn the playfield.
+        lift2DComposite = true;
+        if (intoBackbuffer && sampledTarget != nullptr)
+          m_lift2DSceneTargetNext = sampledTarget;
+      } else {
+        lift2D = m_lift2DFrame && IsLift2DTarget();
+      }
     }
 
     // Skip trivially small draws (< 3 elements = 0 triangles).
@@ -7889,14 +10622,174 @@ namespace dxvk {
       stencilEnabled  = dsDesc.StencilEnable != FALSE;
     }
 
+    // Far-plane sky pinned through the viewport depth range (MinDepth ==
+    // MaxDepth == far) instead of through the vertex shader.
+    if (m_context->m_state.rs.numViewports > 0 && zEnable
+     && isFarClampedViewport(m_context->m_state.rs.viewports[0], depthComparison,
+          GetD3D11EngineProfile().facts->depth == D3D11DepthConvention::Reversed)) {
+      ++m_submitRejectStats.farPlaneSkySkipped;
+      return;
+    }
+
     // Skip fullscreen quad / postprocess draws: depth disabled + 6 or fewer
     // elements (a fullscreen triangle or quad) + no depth write.
     // Only skip if BOTH depth test and write are off â€” some engines do
     // "depth off, write on" for sky or "depth on, write off" for decals.
-    if (!zEnable && !zWriteEnable && count <= 6) {
+    // Temporary sky diagnostic: one line per distinct vertex shader with how it
+    // writes SV_Position.zw and the depth/viewport state it draws with.
+    if (m_context->m_state.vs.shader != nullptr) {
+      static fast_unordered_set s_loggedPositionWriters;
+      static uint32_t s_positionWriterLogs = 0;
+      const D3D11CommonShader* diagVs = m_context->m_state.vs.shader->GetCommonShader();
+      if (diagVs != nullptr && s_positionWriterLogs < 400
+       && s_loggedPositionWriters.insert(diagVs->GetBytecodeHash()).second) {
+        ++s_positionWriterLogs;
+        const auto& vp = m_context->m_state.rs.viewports[0];
+        Logger::info(str::format("[D3D11Rtx][pos-writer] vs=0x", std::hex, diagVs->GetBytecodeHash(),
+          " ps=0x", m_context->m_state.ps.shader != nullptr ? m_context->m_state.ps.shader->GetCommonShader()->GetBytecodeHash() : 0ull,
+          std::dec, " count=", count, " zEnable=", zEnable ? 1 : 0, " zWrite=", zWriteEnable ? 1 : 0,
+          " zFunc=", uint32_t(depthComparison), " vpDepth=", vp.MinDepth, "-", vp.MaxDepth,
+          " farPlane=", diagVs->WritesPositionAtFarPlane() ? 1 : 0, " writes:", diagVs->GetPositionWriteSummary()));
+      }
+    }
+
+    // Far-plane geometry, runtime form: engines that transform position with
+    // a constant-buffer matrix (dp4 per clip component) pin the sky to the far
+    // plane by uploading a projection whose z row equals its w row (z/w = 1),
+    // or whose z row is zero under reversed-Z. The vertex shader alone cannot
+    // show that, so read the clip-producing matrix's z and w rows from the
+    // bound constants. Compared per component, so an infinite-far projection
+    // (z and w rows differ only by the near-plane term) is never mistaken
+    // for sky.
+    if (m_context->m_state.vs.shader != nullptr) {
+      const D3D11CommonShader* clipVs = m_context->m_state.vs.shader->GetCommonShader();
+      const D3D11PositionTransformBinding* clipBinding =
+        clipVs != nullptr ? clipVs->GetPositionTransformBinding() : nullptr;
+      if (clipBinding != nullptr && clipBinding->valid && clipBinding->matrixCount >= 1u) {
+        const D3D11PositionTransformMatrixBinding& clipMatrix =
+          clipBinding->matrices[clipBinding->matrixCount - 1u];
+        const uint32_t zReg = clipMatrix.constantRegisters[2];
+        const uint32_t wReg = clipMatrix.constantRegisters[3];
+        // Row form needs two distinct real rows; column form always yields both.
+        const bool rowsUsable = clipMatrix.columns
+          || (zReg != UINT32_MAX && wReg != UINT32_MAX && zReg != wReg);
+        if (clipMatrix.constantBufferSlot < D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT && rowsUsable) {
+          const auto& cb = m_context->m_state.vs.constantBuffers[clipMatrix.constantBufferSlot];
+          Vector4 clipRows[4];
+          if (readBindingRows(clipMatrix, cb, clipRows)) {
+            {
+              const float* zRow = clipRows[2].data;
+              const float* wRow = clipRows[3].data;
+              bool zEqualsW = true, zIsZero = true, wNonZero = false;
+              for (uint32_t c = 0; c < 4; ++c) {
+                const float tolerance = 2.0e-5f * std::max(std::abs(wRow[c]), 1.0f);
+                zEqualsW &= std::isfinite(zRow[c]) && std::abs(zRow[c] - wRow[c]) <= tolerance;
+                zIsZero  &= std::abs(zRow[c]) <= 1.0e-7f;
+                wNonZero |= std::abs(wRow[c]) > 1.0e-6f;
+              }
+              const bool reversedDepth = depthComparison == D3D11_COMPARISON_GREATER
+                                      || depthComparison == D3D11_COMPARISON_GREATER_EQUAL;
+              if (wNonZero && (zEqualsW || (zIsZero && reversedDepth))) {
+                ++m_submitRejectStats.farPlaneSkySkipped;
+                return;
+              }
+              static uint32_t s_clipRowLogs = 0;
+              if (!zWriteEnable && count > 64 && s_clipRowLogs < 40) {
+                ++s_clipRowLogs;
+                Logger::info(str::format("[D3D11Rtx][clip-rows] vs=0x", std::hex, clipVs->GetBytecodeHash(), std::dec,
+                  " count=", count, " z=(", zRow[0], ",", zRow[1], ",", zRow[2], ",", zRow[3],
+                  ") w=(", wRow[0], ",", wRow[1], ",", wRow[2], ",", wRow[3], ")"));
+              }
+            }
+          }
+        }
+      }
+    }
+
+    // Camera-centred models (sky domes, cloud/star shells, weather cones):
+    // engines draw the sky as an ordinary mesh whose origin is placed at the
+    // eye every frame, so it surrounds the player at any distance. In the
+    // ray-traced scene that mesh is a closed shell around the camera that
+    // blocks every ray (and shows up stretched in every reflection), while
+    // Remix supplies the real sky itself. The object origin's clip position
+    // is the translation column of the shader's own object-to-clip
+    // transform; an origin at the eye has clip x, y and w all ~0.
+    // First-person passes (reserved depth range) are also eye-anchored and
+    // are excluded.
+    if (RtxOptions::dx11SkipCameraCenteredModels()
+     && m_context->m_state.vs.shader != nullptr
+     && m_context->m_state.rs.numViewports > 0
+     && !isReservedDepthViewport(m_context->m_state.rs.viewports[0])) {
+      const D3D11CommonShader* domeVs = m_context->m_state.vs.shader->GetCommonShader();
+      const D3D11PositionTransformBinding* domeBinding =
+        domeVs != nullptr ? domeVs->GetPositionTransformBinding() : nullptr;
+      if (domeBinding != nullptr && domeBinding->matrixCount >= 1u && domeBinding->matrixCount <= 2u) {
+        auto readRows = [&](const D3D11PositionTransformMatrixBinding& binding, Vector4 (&rows)[4]) {
+          if (binding.constantBufferSlot >= D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT)
+            return false;
+          const auto& cb = m_context->m_state.vs.constantBuffers[binding.constantBufferSlot];
+          return readBindingRows(binding, cb, rows);
+        };
+
+        Vector4 m0[4], m1[4];
+        bool readable = readRows(domeBinding->matrices[0], m0);
+        Vector4 originClip(m0[0].w, m0[1].w, m0[2].w, m0[3].w);
+        if (readable && domeBinding->matrixCount == 2u) {
+          readable = readRows(domeBinding->matrices[1], m1);
+          if (readable)
+            originClip = Vector4(dot(m1[0], originClip), dot(m1[1], originClip),
+                                 dot(m1[2], originClip), dot(m1[3], originClip));
+        }
+
+        // Only perspective transforms qualify (w row carries view depth);
+        // screen-space and orthographic passes have a constant w.
+        Vector4 wRow = domeBinding->matrixCount == 2u ? m1[3] : m0[3];
+        const bool perspective = readable
+          && (std::abs(wRow.x) + std::abs(wRow.y) + std::abs(wRow.z)) > 1.0e-6f;
+        if (perspective) {
+          const float radius = RtxOptions::dx11CameraCenteredRadius();
+          const bool centredOnEye = std::abs(originClip.x) <= radius
+                                 && std::abs(originClip.y) <= radius
+                                 && std::abs(originClip.w) <= radius;
+          static fast_unordered_set s_loggedDomeShaders;
+          if ((centredOnEye || (!zWriteEnable && count >= 300u))
+           && s_loggedDomeShaders.size() < 64u
+           && s_loggedDomeShaders.insert(domeVs->GetBytecodeHash() ^ (centredOnEye ? 1ull : 0ull)).second) {
+            Logger::info(str::format("[D3D11Rtx][sky-model] vs=0x", std::hex, domeVs->GetBytecodeHash(), std::dec,
+              " count=", count, " zWrite=", zWriteEnable ? 1 : 0,
+              " originClip=(", originClip.x, ",", originClip.y, ",", originClip.z, ",", originClip.w, ")",
+              centredOnEye ? " -> camera-centred, skipped" : ""));
+          }
+          if (centredOnEye) {
+            ++m_submitRejectStats.cameraCenteredSkipped;
+            return;
+          }
+        }
+      }
+    }
+
+    if (!zEnable && !zWriteEnable && count <= 6 && !lift2D) {
       ++m_submitRejectStats.fullscreenPostFx;
       return;
     }
+
+    // Draws whose positions never come from the input assembler as floats:
+    // vertex pulling through SRVs (no layout) or quantized integer POSITION
+    // decompressed in the VS. Positions come from post-VS capture only.
+    bool vertexPulled = false;
+    auto vertexPulledDrawEligible = [&]() {
+      if (m_abDisableEngineKnowledge || !zEnable || count <= 6u)
+        return false;
+      if (m_context->m_state.vs.shader == nullptr
+       || !m_context->m_state.vs.shader->GetCommonShader()->HasPositionCaptureCandidate())
+        return false;
+      if (m_context->m_state.gs.shader != nullptr || m_context->m_state.hs.shader != nullptr
+       || m_context->m_state.ds.shader != nullptr)
+        return false;
+      const auto topology = m_context->m_state.ia.primitiveTopology;
+      return topology == D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST
+         || (!indexed && topology == D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+    };
 
     D3D11InputLayout* layout = m_context->m_state.ia.inputLayout.ptr();
     if (!layout) {
@@ -7927,10 +10820,51 @@ namespace dxvk {
         return;
       }
       ++m_submitRejectStats.noInputLayout;
-      return;
+      // Vertex-pulled world geometry (FO4 precombines read t5..t8 by
+      // SV_VertexID; ACU, Apex, Chrome do the same) vs fullscreen passes,
+      // which also have no layout. Counted and logged so the capture path for
+      // the former can be sized from data.
+      if (zEnable && zWriteEnable && count > 6u) {
+        ++m_submitRejectStats.noLayoutWorldCandidate;
+        static std::unordered_set<std::string> s_loggedPulledVs;
+        const std::string vsName = m_context->m_state.vs.shader != nullptr
+          ? m_context->m_state.vs.shader->GetCommonShader()->GetName() : std::string("none");
+        if (s_loggedPulledVs.size() < 32u && s_loggedPulledVs.insert(vsName).second) {
+          uint32_t vsSrvs = 0;
+          for (const auto& view : m_context->m_state.vs.shaderResources.views)
+            vsSrvs += view != nullptr ? 1u : 0u;
+          Logger::info(str::format("[D3D11Rtx][vertex-pulled] vs=", vsName, " count=", count,
+            " indexed=", indexed ? 1 : 0, " instances=", replayInstanceCount,
+            " vsSRVs=", vsSrvs, " topology=", uint32_t(m_context->m_state.ia.primitiveTopology)));
+        }
+      }
+      // Vertex-pulled world geometry has no IA positions, but its VS still
+      // writes the exact SV_Position. Admit it with post-VS capture as the
+      // only position source (a synthetic placeholder stream below carries
+      // its identity until capture replaces it).
+      if (!vertexPulledDrawEligible())
+        return;
+      vertexPulled = true;
+      requireExactPositionCapture = true;
+      --m_submitRejectStats.noInputLayout;
+      ++m_submitRejectStats.vertexPulledAdmitted;
     }
 
-    const auto& semantics = layout->GetRtxSemantics();
+    // Indirect draws: the CPU knows neither the vertex range nor the counts,
+    // so positions come from capture only, whatever the input layout holds.
+    if (m_indirectReplay.active && !vertexPulled) {
+      if (!vertexPulledDrawEligible()) {
+        ++m_submitRejectStats.indirectRejected;
+        return;
+      }
+      vertexPulled = true;
+      requireExactPositionCapture = true;
+    }
+    if (m_indirectReplay.active)
+      ++m_submitRejectStats.indirectAdmitted;
+
+    static const std::vector<D3D11RtxSemantic> kNoSemantics;
+    const auto& semantics = layout != nullptr ? layout->GetRtxSemantics() : kNoSemantics;
 
     if (!m_authenticatedEmulatorHost
      && RtxOptions::Emulator::enableIntegration()
@@ -7946,15 +10880,34 @@ namespace dxvk {
       return;
     }
 
-    if (semantics.empty()) {
+    if (semantics.empty() && !vertexPulled) {
       ++m_submitRejectStats.noSemantics;
       return;
     }
 
-    const D3D11RtxSemantic* posSem = selectBestSemantic(semantics, scorePositionSemantic);
-    const D3D11RtxSemantic* tcSem  = selectBestSemantic(semantics, scoreTexcoordSemantic, { posSem });
+    // Quantized POSITION (Dunia/Disrupt int4 + _MeshDecompression, Anvil
+    // fixed-point): the position scorer drops non-float formats and would
+    // otherwise take a float TEXCOORD for the position. The VS decodes it, so
+    // post-VS capture is the only exact position source.
+    const D3D11RtxSemantic* quantizedPosition = nullptr;
+    if (!vertexPulled && !pcsx2PostTransformDraw) {
+      for (const D3D11RtxSemantic& s : semantics) {
+        if (s.index == 0 && semanticNameStartsWith(s, "POSITION") && !isPositionFormat(s.format)
+         && s.format != VK_FORMAT_R16G16B16A16_SFLOAT && s.format != VK_FORMAT_R16G16_SFLOAT)
+          quantizedPosition = &s;
+      }
+      if (quantizedPosition != nullptr && vertexPulledDrawEligible()) {
+        vertexPulled = true;
+        requireExactPositionCapture = true;
+        ++m_submitRejectStats.vertexPulledAdmitted;
+      }
+    }
+
+    const D3D11RtxSemantic* posSem = vertexPulled ? nullptr
+      : selectBestSemantic(semantics, scorePositionSemantic);
+    const D3D11RtxSemantic* tcSem  = selectBestSemantic(semantics, scoreTexcoordSemantic, { posSem, quantizedPosition });
     if (!tcSem)
-      tcSem = selectBestSemantic(semantics, scoreTexcoordFallbackSemantic, { posSem });
+      tcSem = selectBestSemantic(semantics, scoreTexcoordFallbackSemantic, { posSem, quantizedPosition });
 
     auto findSemantic = [&](const char* name, uint32_t index) -> const D3D11RtxSemantic* {
       for (const D3D11RtxSemantic& semantic : semantics) {
@@ -8014,7 +10967,7 @@ namespace dxvk {
     const D3D11RtxSemantic* bwSem  = selectBestSemantic(semantics, scoreBlendWeightSemantic, { posSem, tcSem, nrmSem, colSem });
     const D3D11RtxSemantic* biSem  = selectBestSemantic(semantics, scoreBlendIndexSemantic, { posSem, tcSem, nrmSem, colSem, bwSem });
 
-    if (!posSem) {
+    if (!posSem && !vertexPulled) {
       ++m_submitRejectStats.noPositionSemantic;
       return;
     }
@@ -8027,7 +10980,15 @@ namespace dxvk {
     // Those draws are valid 3D content and participate in world-space lighting,
     // so they depth-test against the scene. Only reject 2D-position draws that
     // ALSO have depth testing off â€” which is the unambiguous HUD / overlay case.
-    if (posSem->format == VK_FORMAT_R32G32_SFLOAT && !zEnable) {
+    // In a 2D game these are its sprites: lift them (the composite of an
+    // offscreen playfield stays out, see above).
+    if (posSem != nullptr && posSem->format == VK_FORMAT_R32G32_SFLOAT && !zEnable
+     && !lift2D && m_lift2DFrame && !lift2DComposite && IsLift2DTarget()) {
+      lift2D = true;
+      if (!ortho2DDraw)
+        ++m_submitRejectStats.lift2DCandidates;
+    }
+    if (posSem != nullptr && posSem->format == VK_FORMAT_R32G32_SFLOAT && !zEnable && !lift2D) {
       ++m_submitRejectStats.position2D;
       return;
     }
@@ -8061,10 +11022,66 @@ namespace dxvk {
       return RasterBuffer(slice, sem->byteOffset, vb.stride, sem->format);
     };
 
-    RasterBuffer posBuffer = makeVertexBuffer(posSem);
-    if (!posBuffer.defined()) {
-      ++m_submitRejectStats.noPositionBuffer;
-      return;
+    RasterBuffer posBuffer;
+    uint64_t vertexPulledIdentity = 0;
+    if (vertexPulled) {
+      // Placeholder position stream: capture replaces it before anything
+      // reaches the BLAS (requireExactPositionCapture). Its first vertex
+      // carries this draw's identity so geometry hashes stay distinct: the
+      // VS, the draw range, the instance, the index buffer and the SRVs the VS
+      // pulls vertices from.
+      uint64_t id = m_context->m_state.vs.shader->GetCommonShader()->GetBytecodeHash();
+      auto mixId = [&id](uint64_t v) { id ^= v + 0x9e3779b97f4a7c15ull + (id << 6) + (id >> 2); };
+      mixId(count); mixId(start); mixId(uint64_t(int64_t(base))); mixId(replayFirstInstance);
+      mixId(indexed ? 1u : 0u);
+      if (m_indirectReplay.active) {
+        mixId(m_indirectReplay.identity);
+        if (m_indirectReplay.indexed) {
+          const auto& ib = m_context->m_state.ia.indexBuffer;
+          mixId(uint64_t(reinterpret_cast<uintptr_t>(ib.buffer.ptr())));
+          mixId(ib.offset);
+        }
+        for (uint32_t slot = 0; slot < D3D11_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT; ++slot) {
+          const auto& vb = m_context->m_state.ia.vertexBuffers[slot];
+          if (vb.buffer != nullptr) { mixId(uint64_t(reinterpret_cast<uintptr_t>(vb.buffer.ptr()))); mixId(vb.offset); }
+        }
+      }
+      if (indexed) {
+        const auto& ib = m_context->m_state.ia.indexBuffer;
+        mixId(uint64_t(reinterpret_cast<uintptr_t>(ib.buffer.ptr())));
+        mixId(ib.offset);
+      }
+      const auto& vsViews = m_context->m_state.vs.shaderResources.views;
+      for (uint32_t slot = 0; slot < vsViews.size(); ++slot)
+        if (vsViews[slot] != nullptr) { mixId(slot); mixId(uint64_t(reinterpret_cast<uintptr_t>(vsViews[slot].ptr()))); }
+      if (quantizedPosition != nullptr) {
+        const auto& vb = m_context->m_state.ia.vertexBuffers[quantizedPosition->inputSlot];
+        mixId(uint64_t(reinterpret_cast<uintptr_t>(vb.buffer.ptr())));
+        mixId(vb.offset);
+        mixId(vb.stride);
+      }
+      vertexPulledIdentity = id;
+
+      const uint32_t placeholderVertices = std::max(1u, std::min<uint32_t>(count, kMaxHashedVertices));
+      const VkDeviceSize placeholderBytes = VkDeviceSize(placeholderVertices) * 12u;
+      Rc<DxvkBuffer> placeholder = AcquireHostVisibleHelperBuffer(placeholderBytes, "d3d11 rtx vertex-pulled identity");
+      float* p = placeholder != nullptr ? reinterpret_cast<float*>(placeholder->mapPtr(0)) : nullptr;
+      if (p == nullptr) {
+        ++m_submitRejectStats.noPositionBuffer;
+        return;
+      }
+      std::memset(p, 0, size_t(placeholderBytes));
+      // Finite floats (21-bit integers), never NaN.
+      p[0] = float(uint32_t(id) & 0x1FFFFFu);
+      p[1] = float(uint32_t(id >> 21) & 0x1FFFFFu);
+      p[2] = float(uint32_t(id >> 42) & 0x1FFFFFu);
+      posBuffer = RasterBuffer(DxvkBufferSlice(placeholder, 0, placeholderBytes), 0, 12u, VK_FORMAT_R32G32B32_SFLOAT);
+    } else {
+      posBuffer = makeVertexBuffer(posSem);
+      if (!posBuffer.defined()) {
+        ++m_submitRejectStats.noPositionBuffer;
+        return;
+      }
     }
     RasterBuffer emulatorDepthBuffer = makeVertexBuffer(emulatorDepthSem);
     RasterBuffer emulatorQBuffer = makeVertexBuffer(emulatorQSem);
@@ -8110,14 +11127,34 @@ namespace dxvk {
       // it into the albedo modulate tinted surfaces with garbage - part of
       // the "wrong colors" corruption. Real float4 vertex colors are named
       // COLOR in practice, so nothing legitimate is lost.
+      // Float RGB, 10:10:10:2 and 11:11:10 colours are COLOR-named only too:
+      // those formats also store normals and tangents.
       const bool wideColor = (cf == VK_FORMAT_R32G32B32A32_SFLOAT
+                           || cf == VK_FORMAT_R32G32B32_SFLOAT
                            || cf == VK_FORMAT_R16G16B16A16_UNORM
-                           || cf == VK_FORMAT_R16G16B16A16_SFLOAT)
+                           || cf == VK_FORMAT_R16G16B16A16_SFLOAT
+                           || cf == VK_FORMAT_A2B10G10R10_UNORM_PACK32
+                           || cf == VK_FORMAT_B10G11R11_UFLOAT_PACK32)
                           && semanticNameStartsWith(*colSem, "COLOR");
       if (packedByteColor || wideColor) {
         colBuffer = makeVertexBuffer(colSem);
       }
     }
+
+    // Indexed triangle-list draws whose vertex shader has a provable position
+    // output are captured post-VS and flattened: the capture replaces the IA
+    // vertex domain, discarding COLOR0 and IA object-space bounds. CPU work
+    // that only feeds those (format conversion, bounds sampling) is skipped.
+    const D3D11CommonShader* flattenCaptureVs = m_context->m_state.vs.shader != nullptr
+      ? m_context->m_state.vs.shader->GetCommonShader() : nullptr;
+    const bool drawWillBeFlattenCaptured = indexed
+      && m_context->m_state.ia.primitiveTopology == D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST
+      && useVertexCapture()
+      && m_context->m_device->features().extTransformFeedback.transformFeedback
+      && m_context->m_state.gs.shader == nullptr
+      && m_context->m_state.hs.shader == nullptr
+      && m_context->m_state.ds.shader == nullptr
+      && flattenCaptureVs != nullptr && flattenCaptureVs->HasPositionCaptureCandidate();
 
     RasterBuffer idxBuffer;
     // DX11_V319_INDEX_SHADOW: CPU-side copy of the index data for this draw,
@@ -8238,7 +11275,15 @@ namespace dxvk {
     bool indexRangeCpuVisible = false;
     bool indexRangeExact = !indexed;
     bool usedWholeVertexBufferFallback = false;
-    if (!indexed) {
+    if (vertexPulled) {
+      // Capture replays the game's own draw: non-indexed emits `count`
+      // vertices, indexed is flattened to one vertex per index. Nothing reads
+      // the placeholder beyond its identity vertices.
+      drawVertexCount = count;
+      hashCount = std::min(count, maxVBVertices);
+      indexRangeExact = !indexed;
+      usedWholeVertexBufferFallback = indexed;
+    } else if (!indexed) {
       // Non-indexed: relative vertices [0, count) after the start offset.
       if (count > maxVBVertices) {
         ++m_submitRejectStats.vertexRangeRejected;
@@ -8568,7 +11613,8 @@ namespace dxvk {
         buf = RasterBuffer(DxvkBufferSlice(copy, 0, bytes), buf.offsetFromSlice(), stride, buf.vertexFormat());
       };
 
-      snapshotVertexBuffer(posBuffer);
+      if (!vertexPulled)
+        snapshotVertexBuffer(posBuffer);
       snapshotVertexBuffer(nrmBuffer);
       snapshotVertexBuffer(tcBuffer);
       snapshotVertexBuffer(colBuffer);
@@ -8798,10 +11844,13 @@ namespace dxvk {
        && geo.color0Buffer.vertexFormat() != VK_FORMAT_B8G8R8A8_UNORM) {
         const VkFormat colFmt = geo.color0Buffer.vertexFormat();
         const uint32_t colElemBytes =
-            colFmt == VK_FORMAT_R8G8B8A8_UNORM      ? 4u
-          : colFmt == VK_FORMAT_R16G16B16A16_UNORM  ? 8u
-          : colFmt == VK_FORMAT_R16G16B16A16_SFLOAT ? 8u
-          : colFmt == VK_FORMAT_R32G32B32A32_SFLOAT ? 16u
+            colFmt == VK_FORMAT_R8G8B8A8_UNORM           ? 4u
+          : colFmt == VK_FORMAT_A2B10G10R10_UNORM_PACK32 ? 4u
+          : colFmt == VK_FORMAT_B10G11R11_UFLOAT_PACK32  ? 4u
+          : colFmt == VK_FORMAT_R16G16B16A16_UNORM       ? 8u
+          : colFmt == VK_FORMAT_R16G16B16A16_SFLOAT      ? 8u
+          : colFmt == VK_FORMAT_R32G32B32_SFLOAT         ? 12u
+          : colFmt == VK_FORMAT_R32G32B32A32_SFLOAT      ? 16u
           : 0u;
 
         bool colorConverted = false;
@@ -8813,11 +11862,96 @@ namespace dxvk {
           ? geo.color0Buffer.length() - srcSliceOff
           : 0;
 
-        if (colElemBytes != 0 && srcBase != nullptr && srcStride > 0
+        // Non-DYNAMIC streams keep their contents between frames, so convert
+        // once and reuse. DYNAMIC buffers are renamed or appended every frame
+        // and are always converted. Entries are refreshed every
+        // kColorConvertRefreshFrames to bound staleness from rare in-place
+        // UpdateSubresource/CopyResource writes.
+        // Indexed triangle-list draws whose vertex shader can be captured are
+        // flattened by the post-VS capture, which discards COLOR0 (the IA
+        // vertex domain no longer matches). Converting it first only burned
+        // CPU - over 100 ms per frame in Fallout 4, where whole shared vertex
+        // buffers were read back over PCIe for every draw.
+        if (drawWillBeFlattenCaptured)
+          srcBase = nullptr;
+
+        static constexpr uint32_t kColorConvertRefreshFrames = 300u;
+        static constexpr VkDeviceSize kMaxColorConvertCacheBytes = 128ull << 20;
+        const uint32_t colorFrame = m_context->m_device->getCurrentFrameId();
+        const bool colorCacheable = colSem != nullptr
+          && m_context->m_state.ia.vertexBuffers[colSem->inputSlot].buffer != nullptr
+          && m_context->m_state.ia.vertexBuffers[colSem->inputSlot].buffer->Desc()->Usage
+               != D3D11_USAGE_DYNAMIC;
+        uint64_t colorKey = 0;
+        if (colorCacheable && srcBase != nullptr) {
+          const uint64_t keyParts[5] = {
+            uint64_t(reinterpret_cast<uintptr_t>(geo.color0Buffer.buffer().ptr())),
+            uint64_t(reinterpret_cast<uintptr_t>(srcBase)),
+            uint64_t(srcStride), uint64_t(drawVertexCount), uint64_t(colFmt) };
+          colorKey = XXH3_64bits(keyParts, sizeof(keyParts));
+        }
+        if (colorKey != 0) {
+          auto cached = m_colorConvertCache.find(colorKey);
+          if (cached != m_colorConvertCache.end()
+           && colorFrame - cached->second.convertedFrame < kColorConvertRefreshFrames) {
+            cached->second.lastUsedFrame = colorFrame;
+            geo.color0Buffer = RasterBuffer(DxvkBufferSlice(cached->second.buffer, 0, cached->second.size),
+                                            0, 4u, VK_FORMAT_B8G8R8A8_UNORM);
+            colBuffer = geo.color0Buffer;
+            colorConverted = true;
+          }
+        }
+
+        if (!colorConverted && colElemBytes != 0 && srcBase != nullptr && srcStride > 0
          && drawVertexCount > 0 && drawVertexCount <= kMaxFormatConvertVertices) {
           const VkDeviceSize dstSize = VkDeviceSize(drawVertexCount) * 4u;
-          Rc<DxvkBuffer> dst = AcquireHostVisibleHelperBuffer(dstSize, "d3d11 rtx color0 to bgra");
+          Rc<DxvkBuffer> dst;
+          if (colorKey != 0) {
+            // Bound the cache: drop entries unused for a while, then oldest.
+            if (m_colorConvertCacheBytes + dstSize > kMaxColorConvertCacheBytes) {
+              for (auto it = m_colorConvertCache.begin(); it != m_colorConvertCache.end();) {
+                if (colorFrame - it->second.lastUsedFrame > 2u) {
+                  m_colorConvertCacheBytes -= it->second.size;
+                  it = m_colorConvertCache.erase(it);
+                } else {
+                  ++it;
+                }
+              }
+            }
+            if (m_colorConvertCacheBytes + dstSize <= kMaxColorConvertCacheBytes) {
+              // Always convert into a fresh buffer: the previous one may still
+              // be read by in-flight GPU work; DXVK keeps it alive until then.
+              auto existing = m_colorConvertCache.find(colorKey);
+              if (existing != m_colorConvertCache.end()) {
+                m_colorConvertCacheBytes -= existing->second.size;
+                m_colorConvertCache.erase(existing);
+              }
+              {
+                DxvkBufferCreateInfo info;
+                info.size   = dstSize;
+                info.usage  = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT
+                            | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT;
+                info.stages = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT;
+                info.access = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT;
+                dst = m_context->m_device->createBuffer(info,
+                  VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                  DxvkMemoryStats::Category::RTXBuffer, "d3d11 rtx cached color0");
+              }
+            }
+          }
+          const bool storeInCache = dst != nullptr;
+          if (dst == nullptr)
+            dst = AcquireHostVisibleHelperBuffer(dstSize, "d3d11 rtx color0 to bgra");
           uint8_t* out = dst != nullptr ? reinterpret_cast<uint8_t*>(dst->mapPtr(0)) : nullptr;
+          if (out != nullptr && storeInCache) {
+            auto& entry = m_colorConvertCache[colorKey];
+            if (entry.buffer == nullptr)
+              m_colorConvertCacheBytes += dstSize;
+            entry.buffer = dst;
+            entry.size = dstSize;
+            entry.convertedFrame = colorFrame;
+            entry.lastUsedFrame = colorFrame;
+          }
           if (out != nullptr) {
             auto toByte = [](float c) -> uint8_t {
               if (!std::isfinite(c)) c = 1.0f;
@@ -8848,6 +11982,40 @@ namespace dxvk {
                   case VK_FORMAT_R32G32B32A32_SFLOAT: {
                     const float* f = reinterpret_cast<const float*>(src);
                     r = toByte(f[0]); g = toByte(f[1]); b = toByte(f[2]); a = toByte(f[3]);
+                    break;
+                  }
+                  case VK_FORMAT_R32G32B32_SFLOAT: {
+                    const float* f = reinterpret_cast<const float*>(src);
+                    r = toByte(f[0]); g = toByte(f[1]); b = toByte(f[2]);
+                    break;
+                  }
+                  case VK_FORMAT_A2B10G10R10_UNORM_PACK32: {
+                    // DXGI R10G10B10A2: R bits 0-9, G 10-19, B 20-29, A 30-31.
+                    uint32_t w;
+                    std::memcpy(&w, src, sizeof(w));
+                    r = uint8_t((w & 1023u) >> 2);
+                    g = uint8_t(((w >> 10) & 1023u) >> 2);
+                    b = uint8_t(((w >> 20) & 1023u) >> 2);
+                    a = uint8_t(((w >> 30) & 3u) * 85u);
+                    break;
+                  }
+                  case VK_FORMAT_B10G11R11_UFLOAT_PACK32: {
+                    // DXGI R11G11B10_FLOAT: R 11 bits (6e5m) at 0, G 11 at 11,
+                    // B 10 bits (5e5m) at 22; no sign.
+                    uint32_t w;
+                    std::memcpy(&w, src, sizeof(w));
+                    auto smallFloat = [](uint32_t v, uint32_t mantissaBits) {
+                      const uint32_t e = v >> mantissaBits;
+                      const uint32_t m = v & ((1u << mantissaBits) - 1u);
+                      if (e == 0u)
+                        return std::ldexp(float(m), -14 - int(mantissaBits));
+                      if (e == 31u)
+                        return m ? 0.0f : 65504.0f;
+                      return std::ldexp(1.0f + float(m) / float(1u << mantissaBits), int(e) - 15);
+                    };
+                    r = toByte(smallFloat(w & 2047u, 6u));
+                    g = toByte(smallFloat((w >> 11) & 2047u, 6u));
+                    b = toByte(smallFloat((w >> 22) & 1023u, 5u));
                     break;
                   }
                   default:
@@ -8882,7 +12050,12 @@ namespace dxvk {
     // BoundingBox() leaves it untouched unless a futureBoundingBox was scheduled,
     // so setting it here is sufficient. Fail-safe: an unmapped/unsupported/empty
     // position buffer leaves the bbox invalid, which keeps the instance.
-    if (RtxOptions::needsMeshBoundingBox() && posBuffer.stride() > 0 && drawVertexCount > 0) {
+    // Flattened captures replace the IA vertex domain with post-VS positions in
+    // a different space; IA object-space bounds do not describe them. Skip the
+    // sampling (missing bounds are treated as "keep") - it read ~1000 mapped
+    // vertices per draw over PCIe on the game's render thread.
+    if (RtxOptions::needsMeshBoundingBox() && posBuffer.stride() > 0 && drawVertexCount > 0
+     && !drawWillBeFlattenCaptured && !vertexPulled) {
       const VkFormat posFmt = posBuffer.vertexFormat();
       const uint32_t elemBytes = positionElementBytes(posFmt);
       const uint8_t* posBase = elemBytes > 0
@@ -8906,7 +12079,35 @@ namespace dxvk {
         float mx[3] = { -std::numeric_limits<float>::max(), -std::numeric_limits<float>::max(), -std::numeric_limits<float>::max() };
         bool anyValid = false;
         uint32_t sampledVerts = 0;
-        for (uint32_t i = 0; i < sampleCount; ++i) {
+
+        // Bounds of non-DYNAMIC vertex data do not change between frames.
+        // Sampling them every frame read ~1000 vertices per draw from mapped
+        // (PCIe) memory - tens of ms per frame at Fallout 4's ~9600 draws.
+        const bool boundsCacheable = posSem != nullptr
+          && m_context->m_state.ia.vertexBuffers[posSem->inputSlot].buffer != nullptr
+          && m_context->m_state.ia.vertexBuffers[posSem->inputSlot].buffer->Desc()->Usage
+               != D3D11_USAGE_DYNAMIC;
+        uint64_t boundsKey = 0;
+        if (boundsCacheable) {
+          const uint64_t keyParts[5] = {
+            uint64_t(reinterpret_cast<uintptr_t>(posBuffer.buffer().ptr())),
+            uint64_t(reinterpret_cast<uintptr_t>(posBase)),
+            uint64_t(stride), uint64_t(drawVertexCount), uint64_t(posFmt) };
+          boundsKey = XXH3_64bits(keyParts, sizeof(keyParts));
+        }
+        bool boundsFromCache = false;
+        if (boundsKey != 0) {
+          auto cached = m_boundsCache.find(boundsKey);
+          if (cached != m_boundsCache.end()) {
+            const BoundsCacheEntry& e = cached->second;
+            for (int c = 0; c < 3; ++c) { mn[c] = e.mn[c]; mx[c] = e.mx[c]; }
+            anyValid = e.anyValid;
+            sampledVerts = e.sampledVerts;
+            boundsFromCache = true;
+          }
+        }
+
+        for (uint32_t i = 0; !boundsFromCache && i < sampleCount; ++i) {
           const uint32_t v = (sampleCount >= drawVertexCount || sampleCount <= 1)
             ? i
             : static_cast<uint32_t>(uint64_t(i) * uint64_t(drawVertexCount - 1) / uint64_t(sampleCount - 1));
@@ -8931,6 +12132,14 @@ namespace dxvk {
         // memory). Feeding them to the BLAS renders exploded spikes and risks a
         // GPU hang, so drop the draw. Requiring ALL samples to be garbage keeps
         // this fail-safe for meshes with sparse NaN padding.
+        if (boundsKey != 0 && !boundsFromCache) {
+          if (m_boundsCache.size() >= 65536u)
+            m_boundsCache.clear();
+          BoundsCacheEntry& e = m_boundsCache[boundsKey];
+          for (int c = 0; c < 3; ++c) { e.mn[c] = mn[c]; e.mx[c] = mx[c]; }
+          e.anyValid = anyValid;
+          e.sampledVerts = sampledVerts;
+        }
         if (sampledVerts >= 16 && !anyValid) {
           ++m_submitRejectStats.poisonedPositions;
           return;
@@ -9284,6 +12493,23 @@ namespace dxvk {
     dcs.transformData    = ExtractTransforms();
     dcs.futureSkinningData = futureSkinningData;
 
+    // A lifted 2D layer is placed by its captured clip position alone (see
+    // TryCapturePositionsViaStreamOut): identity world and view, and the
+    // synthetic 2D camera every lifted layer shares.
+    if (lift2D) {
+      DrawCallTransforms& t = dcs.transformData;
+      t.objectToWorld = Matrix4();
+      t.objectToView = Matrix4();
+      t.worldToView = Matrix4();
+      t.viewToProjection = Lift2DProjection();
+      t.usedViewportFallbackProjection = true;
+      t.cameraRelativeView = false;
+      t.exactReplacementCamera = true;
+      t.offscreenRenderTarget = false;
+      t.instancesToObject.reset();
+      dcs.allowMainCameraUpdate = true;
+    }
+
     if (pcsx2PostTransformDraw) {
       // The reconstructed buffer above is canonical view space. worldToView
       // carries the published or estimated guest camera pose and objectToWorld
@@ -9349,6 +12575,31 @@ namespace dxvk {
       dcs.transformData.objectToView = dcs.transformData.objectToWorld;
       if (!isIdentityExact(dcs.transformData.worldToView))
         dcs.transformData.objectToView = dcs.transformData.worldToView * dcs.transformData.objectToWorld;
+    }
+
+    // Mirrored views (planar water/mirror reflection passes: Glacier mirrors,
+    // FC4 water reflection, CRYENGINE $WaterVolumeRefl) can pass the extent
+    // gate at half resolution. Their view has the opposite handedness of the
+    // main camera, whose sign is learned from many scene draws first (some
+    // engines' main view is itself det -1, e.g. Fallout 4).
+    if (!m_abDisableEngineKnowledge && !dcs.transformData.offscreenRenderTarget
+     && !isIdentityExact(dcs.transformData.worldToView)) {
+      const Matrix4& v = dcs.transformData.worldToView;
+      const float det = v[0][0] * (v[1][1] * v[2][2] - v[2][1] * v[1][2])
+                      - v[1][0] * (v[0][1] * v[2][2] - v[2][1] * v[0][2])
+                      + v[2][0] * (v[0][1] * v[1][2] - v[1][1] * v[0][2]);
+      if (std::isfinite(det) && std::abs(det) > 0.5f) {
+        const int sign = det > 0.0f ? 1 : -1;
+        if (m_mainViewDetSign == 0) {
+          uint32_t& same = sign > 0 ? m_viewDetPositiveVotes : m_viewDetNegativeVotes;
+          const uint32_t other = sign > 0 ? m_viewDetNegativeVotes : m_viewDetPositiveVotes;
+          if (++same >= 256u && other * 16u < same)
+            m_mainViewDetSign = sign;
+        } else if (sign != m_mainViewDetSign) {
+          dcs.transformData.offscreenRenderTarget = true;
+          ++m_submitRejectStats.mirroredViewSkipped;
+        }
+      }
     }
 
     // Reflection/probe/cubemap passes must remain native offscreen work. Their
@@ -9767,7 +13018,7 @@ namespace dxvk {
       }
     }
 
-    if (!renderDocAttached
+    if (!lift2D && !renderDocAttached
       && (allowViewportFallbackScreenSpaceReject || !dcs.transformData.usedViewportFallbackProjection)
       && isLikelyScreenSpaceCompositePass()) {
       ++m_submitRejectStats.compositeSkip;
@@ -9790,7 +13041,7 @@ namespace dxvk {
     // is precisely what startup/menu frames need. Composite heuristics remain
     // camera-gated above, but UI must not be admitted as the first fake scene.
     const bool likelyScreenSpaceUiPass =
-      !renderDocAttached && isLikelyScreenSpaceUiPass();
+      !lift2D && !renderDocAttached && isLikelyScreenSpaceUiPass();
     if (likelyScreenSpaceUiPass) {
       static uint32_t sScreenSpaceUiSkipLogCount = 0;
       if (sScreenSpaceUiSkipLogCount < 8) {
@@ -9871,6 +13122,77 @@ namespace dxvk {
       && (emulatorMetadata->flags & remix::emulator::DrawFlagTextured) != 0;
     FillMaterialData(dcs.materialData,
       texturedEmulatorDraw ? emulatorMetadata->guestTextureHash : 0);
+    dcs.materialData.isLiftedSprite = lift2D;
+
+    // Refracting water: Remix's animated-water layering (two scrolling
+    // samples of the wave normal map) replaces the motion the game's pixel
+    // shader gave it, which a captured surface no longer has.
+    if (dcs.materialData.isRefractiveSurface && dcs.materialData.normalTexture.isValid())
+      dcs.setCategory(InstanceCategories::AnimatedWater, true);
+
+    // Splat-blended terrain (METHODS.md, Terrain layer blending): the PS
+    // blends several colour layers, so any single texture Remix picks is one
+    // layer. Tagged Terrain, the baker replays the game's own blend into the
+    // terrain cascades. Opaque, depth-writing world geometry only.
+    if (RtxOptions::dx11AutoTerrainBlend() && !m_abDisableEngineKnowledge && !lift2D
+     && zEnable && zWriteEnable && !dcs.testCategoryFlags(InstanceCategories::Terrain)
+     && m_context->m_state.ps.shader != nullptr) {
+      bool blending = false;
+      if (D3D11BlendState* bs = m_context->m_state.om.cbState) {
+        D3D11_BLEND_DESC1 bd;
+        bs->GetDesc1(&bd);
+        blending = bd.RenderTarget[0].BlendEnable != FALSE;
+      }
+      const D3D11CommonShader* terrainPs = m_context->m_state.ps.shader->GetCommonShader();
+      uint32_t colourLayers = 0;
+      for (uint32_t slot = 0; !blending && terrainPs != nullptr
+           && slot < D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT; ++slot) {
+        D3D11ShaderResourceView* srv = m_context->m_state.ps.shaderResources.views[slot].ptr();
+        if (srv == nullptr || !terrainPs->SamplesResourceSlot(slot)
+         || terrainPs->GetTextureDecode(slot).normalEncoding != 0)
+          continue;
+        D3D11_SHADER_RESOURCE_VIEW_DESC1 sd = {};
+        srv->GetDesc1(&sd);
+        if (sd.ViewDimension != D3D11_SRV_DIMENSION_TEXTURE2D)
+          continue;
+        switch (sd.Format) {
+          case DXGI_FORMAT_BC1_UNORM: case DXGI_FORMAT_BC1_UNORM_SRGB:
+          case DXGI_FORMAT_BC3_UNORM: case DXGI_FORMAT_BC3_UNORM_SRGB:
+          case DXGI_FORMAT_BC7_UNORM: case DXGI_FORMAT_BC7_UNORM_SRGB:
+          case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB: case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
+            break;
+          default:
+            continue;
+        }
+        if ((srv->GetResourceDesc().BindFlags & (D3D11_BIND_RENDER_TARGET | D3D11_BIND_UNORDERED_ACCESS)) != 0)
+          continue;
+        Rc<DxvkImageView> view = srv->GetImageView();
+        if (view == nullptr || view->image()->info().mipLevels <= 1 || view->image()->info().extent.width < 64u)
+          continue;
+        ++colourLayers;
+      }
+      if (colourLayers >= 4u) {
+        dcs.setCategory(InstanceCategories::Terrain, true);
+        ++m_submitRejectStats.autoTerrain;
+      }
+    }
+
+    // Engines draw a water surface in more than one pass over the same planes
+    // (depth/fog prepass, then the refracting surface). Only the refracting
+    // pass becomes Remix water; a non-refracting draw of the same surface
+    // texture is that companion pass and would put an opaque copy of the
+    // water over the translucent one.
+    {
+      const XXH64_hash_t surfaceHash = dcs.materialData.getColorTexture().getImageHash();
+      if (surfaceHash != kEmptyHash) {
+        if (dcs.materialData.isRefractiveSurface) {
+          m_refractiveSurfaceTextures.insert(surfaceHash);
+        } else if (m_refractiveSurfaceTextures.count(surfaceHash) != 0) {
+          ++m_submitRejectStats.waterCompanionSkipped;
+          return;
+        }
+      }
+    }
 
     // The DX11 bridge builds its LegacyMaterialData directly from the bound
     // SRVs, unlike the original D3D11 path.  Category evaluation therefore has
@@ -9880,6 +13202,75 @@ namespace dxvk {
     // sky, ignore, player-model, decal, particle, and UI tagging were all
     // observable no-ops.
     dcs.setupCategoriesForTexture();
+
+    // --- Automatic decal / particle classification ---
+    // Remix only knows decals and particles through manual texture tags, so
+    // untagged ones arrived as ordinary opaque geometry: decals z-fought the
+    // surface under them, deferred decal boxes became solid boxes, and
+    // particles were hard-edged quads in the BVH. Classify from the draw's own
+    // state; any manual tag on the texture wins (categories already set).
+    bool decalVolumeCandidate = false;
+    if (RtxOptions::dx11AutoClassifyDecalsAndParticles() && dcs.getCategoryFlags().raw() == 0u && !lift2D) {
+      bool blending = false;
+      bool additive = false;
+      if (D3D11BlendState* blendState = m_context->m_state.om.cbState) {
+        D3D11_BLEND_DESC1 blendDesc;
+        blendState->GetDesc1(&blendDesc);
+        blending = blendDesc.RenderTarget[0].BlendEnable != FALSE;
+        additive = blending && blendDesc.RenderTarget[0].DestBlend == D3D11_BLEND_ONE;
+      }
+
+      float depthBias = 0.0f;
+      D3D11_CULL_MODE cullMode = D3D11_CULL_BACK;
+      if (D3D11RasterizerState* classifyRs = m_context->m_state.rs.state) {
+        const auto* rsDesc = classifyRs->Desc();
+        depthBias = std::abs(float(rsDesc->DepthBias)) + std::abs(rsDesc->SlopeScaledDepthBias);
+        cullMode = rsDesc->CullMode;
+      }
+
+      // Does the pixel shader read the depth buffer (soft particles, deferred
+      // decals and volumes)?
+      bool samplesDepthBuffer = false;
+      if (m_context->m_state.ps.shader != nullptr) {
+        const D3D11CommonShader* classifyPs = m_context->m_state.ps.shader->GetCommonShader();
+        for (uint32_t slot = 0; slot < D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT && !samplesDepthBuffer; ++slot) {
+          D3D11ShaderResourceView* srv = m_context->m_state.ps.shaderResources.views[slot].ptr();
+          if (srv == nullptr || (classifyPs != nullptr && classifyPs->HasCompleteSampledResourceProfile()
+                                 && !classifyPs->SamplesResourceSlot(slot)))
+            continue;
+          samplesDepthBuffer = (srv->GetResourceDesc().BindFlags & D3D11_BIND_DEPTH_STENCIL) != 0;
+        }
+      }
+
+      const bool overlay = zEnable && !zWriteEnable;
+      // A small blended box that reads scene depth is a deferred/DBuffer
+      // decal (UE DBuffer, Unity URP/HDRP, CRYENGINE DeferredDecalVolume,
+      // Frostbite mainGBufferDecal). It cannot be ray traced as a box; it is
+      // projected onto its surface below once its placement is exact.
+      const bool boxSized = count <= 36u;
+      if (overlay && samplesDepthBuffer && boxSized && blending && !additive) {
+        decalVolumeCandidate = true;
+        ++m_submitRejectStats.volumeBoxSkipped;
+      }
+      // Engines whose decals re-draw the G-buffer MRTs (Stingray, Katana,
+      // CRYENGINE OVERLAYS, Frostbite, Fox, UE): a blended, no-depth-write,
+      // non-additive draw into two or more render targets is a decal layer.
+      uint32_t boundTargets = 0;
+      for (const auto& rtv : m_context->m_state.om.renderTargetViews)
+        boundTargets += rtv != nullptr ? 1u : 0u;
+      const bool gbufferDecal = GetD3D11EngineProfile().facts->decalsInGBuffer
+        && overlay && blending && !additive && boundTargets >= 2u && !samplesDepthBuffer;
+      if (decalVolumeCandidate) {
+        dcs.setCategory(InstanceCategories::DecalDynamic, true);
+        ++m_submitRejectStats.autoDecals;
+      } else if (overlay && blending && (depthBias > 0.0f || gbufferDecal) && !additive) {
+        dcs.setCategory(InstanceCategories::DecalDynamic, true);
+        ++m_submitRejectStats.autoDecals;
+      } else if (overlay && blending && (additive || samplesDepthBuffer || colSem != nullptr)) {
+        dcs.setCategory(InstanceCategories::Particle, true);
+        ++m_submitRejectStats.autoParticles;
+      }
+    }
 
     const XXH64_hash_t categorizedTextureHash =
       dcs.materialData.getColorTexture().getImageHash();
@@ -9949,6 +13340,24 @@ namespace dxvk {
       const bool realSceneBeforeUi = m_submitRejectStats.realSceneAccepted > 0u;
       const bool stablePreviousScene = sceneManager.isPreviousFrameSceneAvailable();
 
+      // Offscreen UI target (Scaleform/HUD render targets, FO4 kUI): the UI
+      // is drawn into its own texture and composited onto the back buffer
+      // later. Injecting here wrote the RT frame into the UI texture; forcing
+      // pass-through dropped RT for the frame. Keep the UI raster, remember
+      // the target, and inject at the composite draw that samples it
+      // (METHODS.md, UI composition).
+      if (!m_abDisableEngineKnowledge && uiTarget != nullptr && m_lastBackbufferImage != nullptr
+       && uiTarget.ptr() != m_lastBackbufferImage) {
+        if (m_offscreenUiTargets.size() < 8u
+         && std::find(m_offscreenUiTargets.begin(), m_offscreenUiTargets.end(), uiTarget.ptr()) == m_offscreenUiTargets.end()) {
+          m_offscreenUiTargets.push_back(uiTarget.ptr());
+          Logger::info(str::format("[D3D11Rtx][ui-layer] offscreen UI target ",
+            uiTargetExtent.width, "x", uiTargetExtent.height, " (", classifier,
+            "): RT is injected at its composite onto the back buffer"));
+        }
+        return;
+      }
+
       // Current-frame scene submissions and this injection are emitted to the
       // same command stream in order. Requiring isPreviousFrameSceneAvailable
       // here is both unnecessary and racy: the CPU draw thread can reach the
@@ -9981,6 +13390,10 @@ namespace dxvk {
         // UI appeared before a trustworthy 3D scene (menus, startup logos,
         // loading screens), or on a helper target. Preserve the complete
         // raster frame instead of overwriting it with stale/partial RTX.
+        // A 2D game being lifted has no other scene: its frame stays path
+        // traced, and this draw (into a helper target) is only an input.
+        if (m_lift2DFrame)
+          return;
         m_forceRasterPassThroughThisFrame = true;
 
         static uint32_t sUiLayerPassThroughLogCount = 0;
@@ -10016,6 +13429,31 @@ namespace dxvk {
       }
     }
 
+    // rtx.orthographicIsUI (frameworks_2d_web.md, injection recommendation
+    // 3): once a game has drawn a perspective scene, an orthographic draw
+    // (constant clip w) that writes no depth is HUD or menu content and stays
+    // on the UI layer. A 2D playfield drawn orthographically is lifted
+    // instead (lift2D, decided earlier), orthographic depth passes (shadow
+    // cascades) write depth, and texture-hash world categories win.
+    if (orthographicIsUI() && clipOrthographic && !lift2D && m_seenPerspectiveScene && !zWriteEnable
+     && !dcs.testCategoryFlags(InstanceCategories::WorldUI)
+     && !dcs.testCategoryFlags(InstanceCategories::WorldMatte)
+     && !dcs.testCategoryFlags(InstanceCategories::Particle)
+     && !dcs.testCategoryFlags(InstanceCategories::Beam)) {
+      ++m_submitRejectStats.orthographicUi;
+      routeRasterUiLayer("orthographic");
+      return;
+    }
+
+    // Screen-space vertex output (see screenSpaceVsDraw) never becomes scene
+    // geometry; anything that was UI has been routed above.
+    if (screenSpaceVsDraw && !lift2D
+     && !dcs.testCategoryFlags(InstanceCategories::WorldUI)
+     && !dcs.testCategoryFlags(InstanceCategories::WorldMatte)) {
+      ++m_submitRejectStats.screenSpaceVsSkipped;
+      return;
+    }
+
     const uint32_t tinyFallbackPrimitiveCount = dcs.geometryData.calculatePrimitiveCount();
     const bool tinyFallbackHasSceneDepthSignal =
       dcs.zEnable && (dcs.zWriteEnable || dcs.maxZ >= 0.99f);
@@ -10026,7 +13464,7 @@ namespace dxvk {
       tinyFallbackPrimitiveCount <= 2u &&
       !tinyFallbackHasSceneDepthSignal;
 
-    if (tinyFallbackMicroRaster && !likelyScreenSpaceUiPass) {
+    if (tinyFallbackMicroRaster && !likelyScreenSpaceUiPass && !lift2D) {
       static uint32_t sTinyFallbackMicroRasterLogCount = 0;
       if (sTinyFallbackMicroRasterLogCount < 16u) {
         ++sTinyFallbackMicroRasterLogCount;
@@ -10247,7 +13685,7 @@ namespace dxvk {
       return transientInputCount == significantInputCount;
     };
 
-    if (!renderDocAttached && isLikelyTransientScreenSpacePass()) {
+    if (!lift2D && !renderDocAttached && isLikelyTransientScreenSpacePass()) {
       ++m_submitRejectStats.screenSpaceGarbageSkip;
       static uint32_t sScreenSpaceGarbageSkipLogCount = 0;
       if (sScreenSpaceGarbageSkipLogCount < 12) {
@@ -10467,7 +13905,8 @@ namespace dxvk {
         // for indexed flattening, guarantees both attributes use the same
         // expanded vertex order.
         deferTexcoordRecoveryToPositionCapture = true;
-      } else if (TryCaptureTexcoordsViaStreamOut(dcs, geo, indexed, count, start, base)) {
+      } else if (!(vertexPulled && indexed)  // flattened replay: different vertex domain
+              && TryCaptureTexcoordsViaStreamOut(dcs, geo, indexed, count, start, base)) {
         ++m_submitRejectStats.texcoordCaptured;
       } else {
         applyMissingTexcoordFallback();
@@ -10503,6 +13942,102 @@ namespace dxvk {
           dcs.zWriteEnable ? 1 : 0));
       }
       return;
+    }
+
+    // Engine knowledge (documentation/engine_knowledge): many engines draw a
+    // mesh more than once per frame - Unity's additive ForwardAdd pass per
+    // light, UE/Dawn velocity re-draws, light-prepass engines (CRYENGINE 3,
+    // Northlight, MT Framework, Foundation, Deus Ex HR) that lay down a thin
+    // G-buffer and then re-draw with depth EQUAL for the material. Every extra
+    // copy becomes coincident RT geometry (z-fighting, doubled BLAS and
+    // capture cost). Keep exactly one: the first, unless a depth-EQUAL opaque
+    // material pass is known to follow, in which case that one carries the
+    // real material and the geometry pass is left out.
+    // UE binds its whole local-light list to forward/translucent pixel
+    // shaders; one successful read per frame imports all of them.
+    if (!m_abDisableEngineKnowledge && RtxOptions::dx11ImportTiledLights()
+     && GetD3D11EngineProfile().family() == D3D11EngineFamily::Unreal
+     && m_tiledLightImportFrame != m_context->m_device->getCurrentFrameId()
+     && (m_drawCallID & 7u) == 0u)
+      ImportTypedLightBuffer(m_context->m_state.ps.shaderResources);
+    if (!m_abDisableEngineKnowledge && RtxOptions::dx11ImportTiledLights()
+     && GetD3D11EngineProfile().family() == D3D11EngineFamily::Creation)
+      CollectSkyrimDrawLights();
+
+    uint64_t passKey = 0;
+    uint64_t meshKey = 0;
+    bool havePassKey = false;
+    bool isOpaqueEqualMaterialPass = false;
+    if (!m_abDisableEngineKnowledge && instanceTransform == nullptr && replayInstanceCount <= 1u && !lift2D) {
+      havePassKey = ComputeDrawPassKey(indexed, count, start, base, replayFirstInstance,
+                                       posBuffer, idxBuffer, vertexPulledIdentity, passKey, meshKey);
+      if (!havePassKey) {
+        ++m_submitRejectStats.passKeyUnavailable;
+      } else {
+        bool blendEnabled = false;
+        bool additiveBlend = false;
+        if (D3D11BlendState* blendState = m_context->m_state.om.cbState) {
+          D3D11_BLEND_DESC1 blendDesc = {};
+          blendState->GetDesc1(&blendDesc);
+          const auto& rt0 = blendDesc.RenderTarget[0];
+          blendEnabled = rt0.BlendEnable;
+          // ForwardAdd / light accumulation: dst += src.
+          additiveBlend = blendEnabled && rt0.DestBlend == D3D11_BLEND_ONE
+            && (rt0.SrcBlend == D3D11_BLEND_ONE || rt0.SrcBlend == D3D11_BLEND_SRC_ALPHA);
+        }
+        // Material pass after a geometry/depth pass: depth test against the
+        // laid-down depth (EQUAL, or LESS/GREATER_EQUAL with reversed Z), no
+        // depth write, opaque. Recorded BEFORE the duplicate check - it shares
+        // the geometry pass's key, so recording only accepted draws meant it
+        // was never seen and the albedo-less geometry copy won permanently.
+        isOpaqueEqualMaterialPass = zEnable && !zWriteEnable && !blendEnabled
+          && (depthComparison == D3D11_COMPARISON_EQUAL
+           || depthComparison == D3D11_COMPARISON_LESS_EQUAL
+           || depthComparison == D3D11_COMPARISON_GREATER_EQUAL);
+        const D3D11EngineProfile& engine = GetD3D11EngineProfile();
+        const bool lightPrepassPossible = engine.family() == D3D11EngineFamily::Unknown
+          || (engine.facts->multiPass & (D3D11MultiPassLightPrepass | D3D11MultiPassDepthPrepass)) != 0u;
+        if (isOpaqueEqualMaterialPass && lightPrepassPossible)
+          m_equalPassKeysThisFrame.insert(meshKey);
+
+        // Velocity pass: every bound colour target is two-channel (motion
+        // vectors). It re-draws meshes with previous-frame matrices or bones,
+        // so its pass key differs; the mesh itself is already in the scene.
+        bool velocityOnlyTargets = false;
+        {
+          const auto& rtvs = m_context->m_state.om.renderTargetViews;
+          uint32_t bound = 0, twoChannel = 0;
+          for (const auto& rtv : rtvs) {
+            if (rtv == nullptr)
+              continue;
+            ++bound;
+            D3D11_RENDER_TARGET_VIEW_DESC rtvDesc;
+            rtv->GetDesc(&rtvDesc);
+            switch (rtvDesc.Format) {
+              case DXGI_FORMAT_R16G16_FLOAT: case DXGI_FORMAT_R16G16_UNORM:
+              case DXGI_FORMAT_R16G16_SNORM: case DXGI_FORMAT_R32G32_FLOAT:
+                ++twoChannel; break;
+              default: break;
+            }
+          }
+          velocityOnlyTargets = bound > 0u && twoChannel == bound;
+        }
+
+        // Alpha-blended re-draws of the same mesh are material layers
+        // (CRYENGINE OVERLAYS terrain layers, blend shells), not copies of
+        // it; they keep their own path (decal/layer classification).
+        const bool redrawIsCopy = !blendEnabled || additiveBlend;
+        if ((redrawIsCopy && m_passKeysThisFrame.count(passKey) != 0u)
+         || (velocityOnlyTargets && m_meshKeysThisFrame.count(meshKey) != 0u)) {
+          ++m_submitRejectStats.duplicatePassSkipped;
+          return;
+        }
+        if (lightPrepassPossible && zWriteEnable && !isOpaqueEqualMaterialPass
+         && m_equalPassKeysPrevFrame.count(meshKey) != 0u) {
+          ++m_submitRejectStats.lightPrepassGeometrySkipped;
+          return;
+        }
+      }
     }
 
     ++m_submitRejectStats.accepted;
@@ -10714,9 +14249,80 @@ namespace dxvk {
           // it. Only an armed capture takes the draw over.
           ++m_deferredLightVolumeCandidatesThisFrame;
 
+          // Real light volumes are distinct lights. Repeated draws at the same
+          // spot with the same reach are one emitter (or not a light at all);
+          // stacking them multiplied the brightness into flashes.
+          bool duplicateLight = false;
+          for (const Vector4& existing : m_deferredLightVolumePositionsThisFrame) {
+            const Vector3 delta(existing.x - lightPosition.x,
+                                existing.y - lightPosition.y,
+                                existing.z - lightPosition.z);
+            if (length(delta) < 0.05f * std::max(existing.w, volumeRange)
+             && std::abs(existing.w - volumeRange) < 0.25f * std::max(existing.w, volumeRange)) {
+              duplicateLight = true;
+              break;
+            }
+          }
+
+          if (lightVolumeArmed && duplicateLight) {
+            // Consume the duplicate volume draw: it is a lighting operator, not
+            // scene geometry, and its light already exists this frame.
+            return;
+          }
+
           if (lightVolumeArmed) {
-          const Vector3 colour = RtxOptions::deferredLightVolumeColor()
-                               * RtxOptions::deferredLightVolumeIntensity();
+          m_deferredLightVolumePositionsThisFrame.push_back(
+            Vector4(lightPosition.x, lightPosition.y, lightPosition.z, volumeRange));
+          Vector3 colour = RtxOptions::deferredLightVolumeColor()
+                         * RtxOptions::deferredLightVolumeIntensity();
+
+          // The light's own colour (METHODS.md, Lights): the volume's PS
+          // constants hold the light position next to its colour (UE
+          // LightPositionAndInvRadius/LightColorAndFalloffExponent, Unity
+          // _LightPos/_LightColor, Fox b3, CE3 light volumes). Find the
+          // register whose xyz is this light's position - absolute or
+          // camera-relative - and take the adjacent non-negative rgb.
+          if (!m_abDisableEngineKnowledge) {
+            const auto& camera = m_context->m_device->getCommon()->getSceneManager()
+              .getCameraManager().getCamera(CameraType::Main);
+            const Vector3 eye = camera.getPosition(false);
+            const Vector3 relative = lightPosition - eye;
+            const float tolerance = std::max(0.01f * volumeRange, 0.05f);
+            bool found = false;
+            for (uint32_t slot = 0; slot < D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT && !found; ++slot) {
+              const auto& cb = m_context->m_state.ps.constantBuffers[slot];
+              if (cb.buffer == nullptr)
+                continue;
+              const auto* ptr = reinterpret_cast<const uint8_t*>(cb.buffer->GetMappedSlice().mapPtr);
+              if (ptr == nullptr)
+                continue;
+              const size_t base = size_t(cb.constantOffset) * 16u;
+              const size_t size = cb.buffer->Desc()->ByteWidth;
+              const size_t end = std::min(size, base + 64u * 16u);
+              for (size_t off = base; off + 32u <= end && !found; off += 16u) {
+                float v[4];
+                std::memcpy(v, ptr + off, sizeof(v));
+                const Vector3 p(v[0], v[1], v[2]);
+                if (length(p - lightPosition) > tolerance && length(p - relative) > tolerance)
+                  continue;
+                for (const int64_t step : { 16, -16 }) {
+                  const int64_t colourOff = int64_t(off) + step;
+                  if (colourOff < int64_t(base) || size_t(colourOff) + 16u > size)
+                    continue;
+                  float c[4];
+                  std::memcpy(c, ptr + colourOff, sizeof(c));
+                  const float maxC = std::max(c[0], std::max(c[1], c[2]));
+                  if (std::isfinite(maxC) && maxC > 1.0e-4f && maxC < 1.0e6f
+                   && c[0] >= 0.0f && c[1] >= 0.0f && c[2] >= 0.0f) {
+                    colour = Vector3(c[0], c[1], c[2]) * (RtxOptions::deferredLightVolumeIntensity() / maxC);
+                    found = true;
+                    ++m_submitRejectStats.lightVolumeColours;
+                    break;
+                  }
+                }
+              }
+            }
+          }
 
           Dx11LightDesc light = Dx11LightStateApi::makePoint(
             lightPosition.x, lightPosition.y, lightPosition.z,
@@ -10785,9 +14391,9 @@ namespace dxvk {
         && !m_hasSeenRealSceneProjection
         && hasSceneDepthSignal
         && primitiveCount >= 32u;
-      const bool isSceneCandidate = hasSceneDepthSignal
+      const bool isSceneCandidate = (lift2D && primitiveCount >= 1u) || (hasSceneDepthSignal
         && primitiveCount >= 1u
-        && ((hasRealProjection && hasViewOrStrongProjection) || strongViewportFallbackScene);
+        && ((hasRealProjection && hasViewOrStrongProjection) || strongViewportFallbackScene));
 
       if (cameraManager.hasSeenRealMainCamera() && !isSceneCandidate) {
         // Bounded admission telemetry for the remaining camera-enclosing slab
@@ -10833,7 +14439,7 @@ namespace dxvk {
              !dcs.zEnable
           || dcs.transformData.usedViewportFallbackProjection
           || (primitiveCount <= 4u && !dcs.materialData.usesTexture());
-        if (rasterOverlayOrHelper) {
+        if (rasterOverlayOrHelper && !lift2D) {
           static uint32_t sRasterOverlaySkipLogCount = 0;
           if (sRasterOverlaySkipLogCount < 96u) {
             ++sRasterOverlaySkipLogCount;
@@ -10870,10 +14476,159 @@ namespace dxvk {
         }
 
         ++m_submitRejectStats.sceneAccepted;
-        if (hasRealProjection && hasViewOrStrongProjection) {
-          ++m_submitRejectStats.realSceneAccepted;
-          m_hasSeenRealSceneProjection = true;
-          m_lastRealCameraFrameId = m_context->m_device->getCurrentFrameId();
+        if (lift2D) {
+          // Lifted 2D layers are a scene of their own, not evidence of a real
+          // game camera (see EndFrame).
+          ++m_submitRejectStats.lift2DAccepted;
+        } else {
+          if (hasRealProjection && hasViewOrStrongProjection) {
+            ++m_submitRejectStats.realSceneAccepted;
+            m_hasSeenRealSceneProjection = true;
+            m_lastRealCameraFrameId = m_context->m_device->getCurrentFrameId();
+          }
+          // A perspective scene ends 2D lifting for good: a game projection
+          // with a perspective w row, or a perspective clip matrix in the VS.
+          const Matrix4& proj = dcs.transformData.viewToProjection;
+          const bool perspectiveProjection = hasRealProjection
+            && std::abs(proj[2][3]) > 1.0e-6f && std::abs(proj[3][3]) < 1.0e-6f;
+          if (perspectiveProjection || clipPerspective)
+            ++m_perspectiveSceneThisFrame;
+          if (auto* sceneRtv = m_context->m_state.om.renderTargetViews[0].ptr()) {
+            Rc<DxvkImageView> sceneView = sceneRtv->GetImageView();
+            if (sceneView != nullptr)
+              m_frameSceneTargetWidth = std::max(m_frameSceneTargetWidth, sceneView->image()->info().extent.width);
+          }
+        }
+      }
+
+      // Temporary diagnostic: describe the draws behind the screen-centre pick.
+      {
+        const XXH64_hash_t probeHash = s_centerPickHash.load();
+        static uint32_t s_probeLogs = 0;
+        static XXH64_hash_t s_lastProbeHash = kEmptyHash;
+        if (probeHash != s_lastProbeHash) {
+          s_lastProbeHash = probeHash;
+          s_probeLogs = 0;
+        }
+        if (probeHash != kEmptyHash && s_probeLogs < 4
+         && dcs.materialData.getColorTexture().getImageHash() == probeHash) {
+          ++s_probeLogs;
+          float probeDepthBias = 0.0f;
+          uint32_t probeCull = 0;
+          if (D3D11RasterizerState* probeRs = m_context->m_state.rs.state) {
+            probeDepthBias = float(probeRs->Desc()->DepthBias) + probeRs->Desc()->SlopeScaledDepthBias;
+            probeCull = uint32_t(probeRs->Desc()->CullMode);
+          }
+          Logger::info(str::format("[D3D11Rtx][center-probe] state: categories=0x", std::hex,
+            dcs.getCategoryFlags().raw(), std::dec,
+            " blend=", dcs.materialData.blendMode.enableBlending ? 1 : 0,
+            " src=", uint32_t(dcs.materialData.blendMode.colorSrcFactor),
+            " dst=", uint32_t(dcs.materialData.blendMode.colorDstFactor),
+            " depthBias=", probeDepthBias, " cull=", probeCull,
+            " alphaTest=", dcs.materialData.alphaTestEnabled ? 1 : 0,
+            " vpDepth=", dcs.minZ, "-", dcs.maxZ));
+          const Matrix4& o2w = dcs.transformData.objectToWorld;
+          const Matrix4& w2v = dcs.transformData.worldToView;
+          const AxisAlignedBoundingBox& box = dcs.geometryData.boundingBox;
+          Logger::info(str::format("[D3D11Rtx][center-probe] tex=0x", std::hex, probeHash,
+            " vs=0x", dcs.programmableVertexShaderBytecodeHash,
+            " ps=0x", m_context->m_state.ps.shader != nullptr ? m_context->m_state.ps.shader->GetCommonShader()->GetBytecodeHash() : 0ull,
+            std::dec, " count=", count, " indexed=", indexed ? 1 : 0,
+            " zWrite=", dcs.zWriteEnable ? 1 : 0, " zEnable=", dcs.zEnable ? 1 : 0,
+            " posStride=", dcs.geometryData.positionBuffer.stride(),
+            " posFmt=", uint32_t(dcs.geometryData.positionBuffer.vertexFormat()),
+            " o2wT=(", o2w[3][0], ",", o2w[3][1], ",", o2w[3][2], ")",
+            " o2wScale=(", length(o2w[0].xyz()), ",", length(o2w[1].xyz()), ",", length(o2w[2].xyz()), ")",
+            " w2vT=(", w2v[3][0], ",", w2v[3][1], ",", w2v[3][2], ")",
+            " box=[", box.minPos.x, ",", box.minPos.y, ",", box.minPos.z, "]-[", box.maxPos.x, ",", box.maxPos.y, ",", box.maxPos.z, "]",
+            " camRel=", dcs.transformData.cameraRelativeView ? 1 : 0,
+            " fallbackProj=", dcs.transformData.usedViewportFallbackProjection ? 1 : 0,
+            " refractive=", dcs.materialData.isRefractiveSurface ? 1 : 0));
+        }
+      }
+    }
+
+    // Exact world transform (reverse-engineered Creation Engine pattern, see
+    // parseCameraRelativeWorldBinding). When the vertex shader is proven to
+    // compute ViewProj * (absolute world with the eye subtracted) * POSITION,
+    // the mesh is placed with the game's own world matrix instead of being
+    // re-captured every frame and anchored with an estimate: placement is
+    // exact, the vertex data is the game's static buffer (so the BLAS is
+    // reused rather than rebuilt), and per-instance motion is the real change
+    // of the world matrix. Requires the camera's exact eye (same buffer and
+    // register the shader subtracts), so world and camera share one origin.
+    bool exactWorldTransform = false;
+    // Diagnostic: report once why a proven shader did not take the exact path.
+    if (m_context->m_state.vs.shader != nullptr
+     && m_context->m_state.vs.shader->GetCommonShader()->GetCameraRelativeWorldBinding().valid) {
+      static uint32_t s_exactGateLogs = 0;
+      const D3D11CameraRelativeWorldBinding& gb = m_context->m_state.vs.shader->GetCommonShader()->GetCameraRelativeWorldBinding();
+      if (s_exactGateLogs < 6u && (instanceTransform != nullptr || requireExactPositionCapture
+          || replayInstanceCount > 1u || m_eyeOffset == SIZE_MAX || m_projStage != 0
+          || gb.cameraSlot != m_projSlot || size_t(gb.eyeRegister) * 16u != m_eyeOffset)) {
+        ++s_exactGateLogs;
+        Logger::info(str::format("[D3D11Rtx][exact-world] gate: instanceT=", instanceTransform != nullptr ? 1 : 0,
+          " requireExact=", requireExactPositionCapture ? 1 : 0, " replayInstances=", replayInstanceCount,
+          " eyeOffset=", m_eyeOffset == SIZE_MAX ? -1 : int64_t(m_eyeOffset), " projStage=", m_projStage,
+          " projSlot=", m_projSlot, " camSlot=", gb.cameraSlot, " eyeReg=", gb.eyeRegister));
+      }
+    }
+    if (RtxOptions::dx11ExactWorldTransforms() && !m_abDisableExactWorld && !lift2D
+     && m_context->m_state.vs.shader != nullptr
+     && instanceTransform == nullptr && !requireExactPositionCapture
+     && replayInstanceCount <= 1u
+     && m_eyeOffset != SIZE_MAX
+     && m_projStage == 0 && m_projSlot != UINT32_MAX) {
+      const D3D11CommonShader* exactVs = m_context->m_state.vs.shader->GetCommonShader();
+      const D3D11CameraRelativeWorldBinding& wb = exactVs->GetCameraRelativeWorldBinding();
+      if (wb.valid && wb.cameraSlot == m_projSlot && size_t(wb.eyeRegister) * 16u == m_eyeOffset
+       && wb.worldSlot < D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT) {
+        const auto& worldCb = m_context->m_state.vs.constantBuffers[wb.worldSlot];
+        const uint8_t* worldPtr = worldCb.buffer != nullptr
+          ? reinterpret_cast<const uint8_t*>(worldCb.buffer->GetMappedSlice().mapPtr) : nullptr;
+        const size_t worldBase = size_t(worldCb.constantOffset) * 16u + size_t(wb.worldRegister) * 16u;
+        if (worldPtr != nullptr && worldBase + 48u <= worldCb.buffer->Desc()->ByteWidth) {
+          float rows[3][4];
+          std::memcpy(rows, worldPtr + worldBase, sizeof(rows));
+          bool finite = true;
+          for (auto& r : rows) for (float v : r) finite &= std::isfinite(v);
+          if (finite) {
+            // Matrix4 is column storage: m[column][row].
+            Matrix4 objectToWorld;
+            for (uint32_t row = 0; row < 3; ++row)
+              for (uint32_t col = 0; col < 4; ++col)
+                objectToWorld[col][row] = rows[row][col];
+            objectToWorld[0][3] = 0.0f; objectToWorld[1][3] = 0.0f;
+            objectToWorld[2][3] = 0.0f; objectToWorld[3][3] = 1.0f;
+            objectToWorld[3][0] += m_eyeOriginShift.x;
+            objectToWorld[3][1] += m_eyeOriginShift.y;
+            objectToWorld[3][2] += m_eyeOriginShift.z;
+            dcs.transformData.objectToWorld = objectToWorld;
+            dcs.transformData.objectToView = dcs.transformData.worldToView * objectToWorld;
+            dcs.transformData.cameraRelativeView = false;
+            dcs.transformData.usedViewportFallbackProjection = false;
+
+            if (wb.hasUvTransform && wb.uvSlot < D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT) {
+              const auto& uvCb = m_context->m_state.vs.constantBuffers[wb.uvSlot];
+              const uint8_t* uvPtr = uvCb.buffer != nullptr
+                ? reinterpret_cast<const uint8_t*>(uvCb.buffer->GetMappedSlice().mapPtr) : nullptr;
+              const size_t uvOff = size_t(uvCb.constantOffset) * 16u + size_t(wb.uvRegister) * 16u;
+              if (uvPtr != nullptr && uvOff + 16u <= uvCb.buffer->Desc()->ByteWidth) {
+                float uv[4];  // xy = offset, zw = scale
+                std::memcpy(uv, uvPtr + uvOff, sizeof(uv));
+                if (std::isfinite(uv[0]) && std::isfinite(uv[1]) && std::isfinite(uv[2]) && std::isfinite(uv[3])) {
+                  Matrix4 uvTransform;
+                  uvTransform[0][0] = uv[2];
+                  uvTransform[1][1] = uv[3];
+                  uvTransform[3][0] = uv[0];
+                  uvTransform[3][1] = uv[1];
+                  dcs.transformData.textureTransform = uvTransform;
+                }
+              }
+            }
+            exactWorldTransform = true;
+            ++m_submitRejectStats.exactWorldTransform;
+          }
         }
       }
     }
@@ -10882,23 +14637,171 @@ namespace dxvk {
     // screen-space, missing-shader, and significance rejection has completed.
     // Replaying rejected draws consumed the old capture budget before real
     // scene geometry and created needless capture-buffer/BLAS pressure.
+    // Projected (deferred / DBuffer / volume) decal: the box only exists to
+    // rasterize the projection; in a ray tracer it would be a solid box. Put
+    // the decal where it lands instead: a quad on the box's projection plane
+    // (thinnest axis, through its centre) with the decal texture across the
+    // box's other two axes, tagged as a decal so Remix layers it onto the
+    // surface. Exact for flat receivers (most bullet holes, blood, posters).
+    // Needs exact placement; without it the box is left out of the RT scene.
+    bool projectedDecal = false;
+    if (decalVolumeCandidate && !vertexPulled) {
+      const bool placementExact = exactWorldTransform
+        || (!dcs.transformData.cameraRelativeView && m_context->m_state.vs.shader != nullptr
+            && m_context->m_state.vs.shader->GetCommonShader()->GetPositionTransformBinding() != nullptr);
+      const RasterBuffer& box = dcs.geometryData.positionBuffer;
+      const VkFormat boxFormat = box.vertexFormat();
+      const uint32_t boxVertices = std::min(dcs.geometryData.vertexCount, 4096u);
+      const uint8_t* boxData = nullptr;
+      if (placementExact && box.defined() && box.stride() >= 12u && boxVertices >= 4u
+       && (boxFormat == VK_FORMAT_R32G32B32_SFLOAT || boxFormat == VK_FORMAT_R32G32B32A32_SFLOAT)) {
+        boxData = reinterpret_cast<const uint8_t*>(box.mapPtr(0));
+        if (boxData == nullptr && posSem != nullptr) {
+          const auto& vb = m_context->m_state.ia.vertexBuffers[posSem->inputSlot];
+          const int64_t first = int64_t(vb.offset) + vertexStartIndex * int64_t(vb.stride);
+          if (vb.buffer != nullptr && first >= 0)
+            boxData = reinterpret_cast<const uint8_t*>(vb.buffer->GetIndexShadow(
+              VkDeviceSize(first), VkDeviceSize(boxVertices) * box.stride()));
+        }
+      }
+      if (boxData != nullptr) {
+        Vector3 lo(FLT_MAX), hi(-FLT_MAX);
+        bool finite = true;
+        for (uint32_t v = 0; v < boxVertices && finite; ++v) {
+          float p[3];
+          std::memcpy(p, boxData + size_t(v) * box.stride() + box.offsetFromSlice(), sizeof(p));
+          finite = std::isfinite(p[0]) && std::isfinite(p[1]) && std::isfinite(p[2]);
+          for (uint32_t c = 0; c < 3; ++c) { lo[c] = std::min(lo[c], p[c]); hi[c] = std::max(hi[c], p[c]); }
+        }
+        const Vector3 extent = hi - lo;
+        if (finite && extent.x > 0.0f && extent.y > 0.0f && extent.z > 0.0f) {
+          // Projection axis = thinnest extent (decal depth); a cube projects along z.
+          uint32_t axis = 2;
+          if (extent.x < extent.y * 0.9f && extent.x < extent.z * 0.9f) axis = 0;
+          else if (extent.y < extent.x * 0.9f && extent.y < extent.z * 0.9f) axis = 1;
+          const uint32_t ua = (axis + 1u) % 3u, va = (axis + 2u) % 3u;
+          // Full projection (METHODS.md, Decals): the box goes to the shading
+          // stage as a decal record and lands on whatever surface lies inside
+          // it, curved or not. worldToDecal = unit box from object box, after
+          // the inverse of this draw's placement in the RT world.
+          if (RtxOptions::dx11ProjectedDecalsAtShading() && dcs.materialData.getColorTexture().isValid()) {
+            Matrix4 boxFromObject;  // identity
+            for (uint32_t c = 0; c < 3; ++c) {
+              boxFromObject[c][c] = 1.0f / extent[c];
+              boxFromObject[3][c] = -0.5f * (lo[c] + hi[c]) / extent[c];
+            }
+            const Matrix4 worldToDecal = boxFromObject * inverse(dcs.transformData.objectToWorld);
+            bool finiteDecal = true;
+            for (uint32_t c = 0; c < 4; ++c)
+              for (uint32_t r = 0; r < 4; ++r)
+                finiteDecal &= std::isfinite(worldToDecal[c][r]);
+            if (finiteDecal) {
+              TextureRef decalTexture = dcs.materialData.getColorTexture();
+              Rc<DxvkSampler> decalSampler = dcs.materialData.getSampler();
+              m_context->EmitCs([worldToDecal, axis, decalTexture, decalSampler](DxvkContext* ctx) {
+                static_cast<RtxContext*>(ctx)->addProjectedDecal(worldToDecal, axis, decalTexture, decalSampler);
+              });
+              ++m_submitRejectStats.projectedDecals;
+              return;
+            }
+          }
+          const float plane = 0.5f * (lo[axis] + hi[axis]);
+          auto corner = [&](float su, float sv, float* out) {
+            Vector3 p;
+            p[axis] = plane;
+            p[ua] = su > 0.5f ? hi[ua] : lo[ua];
+            p[va] = sv > 0.5f ? hi[va] : lo[va];
+            out[0] = p.x; out[1] = p.y; out[2] = p.z;
+            out[3] = su; out[4] = 1.0f - sv;  // D3D UV: v grows downward
+          };
+          const float quad[6][2] = { {0,0}, {1,0}, {1,1}, {0,0}, {1,1}, {0,1} };
+          constexpr VkDeviceSize kQuadBytes = 6u * 20u;
+          Rc<DxvkBuffer> quadBuffer = AcquireHostVisibleHelperBuffer(kQuadBytes, "d3d11 rtx projected decal");
+          float* q = quadBuffer != nullptr ? reinterpret_cast<float*>(quadBuffer->mapPtr(0)) : nullptr;
+          if (q != nullptr) {
+            for (uint32_t i = 0; i < 6; ++i)
+              corner(quad[i][0], quad[i][1], q + i * 5u);
+            RasterGeometry& g = dcs.geometryData;
+            const DxvkBufferSlice slice(quadBuffer, 0, kQuadBytes);
+            g.positionBuffer = RasterBuffer(slice, 0, 20u, VK_FORMAT_R32G32B32_SFLOAT);
+            g.texcoordBuffer = RasterBuffer(slice, 12u, 20u, VK_FORMAT_R32G32_SFLOAT);
+            g.normalBuffer = RasterBuffer();
+            g.color0Buffer = RasterBuffer();
+            g.blendWeightBuffer = RasterBuffer();
+            g.blendIndicesBuffer = RasterBuffer();
+            g.indexBuffer = RasterBuffer();
+            g.indexCount = 0;
+            g.vertexCount = 6;
+            g.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+            g.cullMode = VK_CULL_MODE_NONE;
+            projectedDecal = true;
+            ++m_submitRejectStats.projectedDecals;
+          }
+        }
+      }
+      if (!projectedDecal) {
+        ++m_submitRejectStats.decalVolumeUnresolved;
+        return;
+      }
+    }
+
     const uint32_t captureBudgetRejectsBefore =
       m_submitRejectStats.positionCaptureBudgetRejected;
-    const bool capturedExactPositions = !pcsx2PostTransformDraw
+    // A lifted 2D layer: its depth in painter's order (later = nearer).
+    m_lift2DDraw = lift2D;
+    if (lift2D) {
+      const uint32_t layer = std::min(m_lift2DLayer++, kLift2DLayers - 1u);
+      m_lift2DDepth = kLift2DFar - (kLift2DFar - kLift2DNear) * (float(layer) / float(kLift2DLayers));
+    }
+    const bool capturedExactPositions = !pcsx2PostTransformDraw && !exactWorldTransform
+      && !projectedDecal
       && TryCapturePositionsViaStreamOut(
         dcs, geo, indexed, count, start, base,
         instanceTransform != nullptr, replayFirstInstance, replayInstanceCount,
-        usedWholeVertexBufferFallback);
+        usedWholeVertexBufferFallback && !tessellatedDraw);
     const bool exactCaptureBudgetRejected =
       m_submitRejectStats.positionCaptureBudgetRejected != captureBudgetRejectsBefore;
+    m_lift2DDraw = false;
+    if (lift2D && !capturedExactPositions) {
+      // Without its captured clip position a sprite has no placement.
+      ++m_submitRejectStats.lift2DCaptureFailed;
+      return;
+    }
     if (eyeBoundsRequireExactCapture && !capturedExactPositions) {
       // Preserve a complete native frame instead of submitting uncertain mesh
       // placement or presenting a partially captured world with missing walls.
+      // Drop only this draw: its placement is unverified. A whole native
+      // frame here hid the entire RT scene behind one ambiguous quad.
       ++m_submitRejectStats.collapsedEyeGeometry;
-      m_forceRasterPassThroughThisFrame = true;
-      m_allowNativeRasterForCurrentDraw = true;
       return;
     }
+    // First-person passes (arms, weapon) are drawn into a reserved depth range
+    // with the game's separate first-person camera. They must never steer the
+    // main RT camera: when one wins the frame's first-touch, the whole scene is
+    // viewed through the first-person camera instead of the world camera.
+    if (m_context->m_state.rs.numViewports > 0
+     && isReservedDepthViewport(m_context->m_state.rs.viewports[0])) {
+      dcs.allowMainCameraUpdate = false;
+
+      // Temporary diagnostic: first-person camera vs main camera direction.
+      static uint32_t s_lastFirstPersonLogFrame = 0;
+      const uint32_t fpFrame = m_context->m_device->getCurrentFrameId();
+      if (fpFrame >= s_lastFirstPersonLogFrame + 120u) {
+        s_lastFirstPersonLogFrame = fpFrame;
+        const Matrix4& v = dcs.transformData.worldToView;
+        const auto& mainCamera = m_context->m_device->getCommon()->getSceneManager()
+          .getCameraManager().getCamera(CameraType::Main);
+        const Vector3 mainForward = mainCamera.getDirection(false);
+        Logger::info(str::format("[D3D11Rtx][first-person-camera] frame=", fpFrame,
+          " fpViewRow2=(", v[0][2], ",", v[1][2], ",", v[2][2], ")",
+          " fpViewRow0=(", v[0][0], ",", v[1][0], ",", v[2][0], ")",
+          " fpT=(", v[3][0], ",", v[3][1], ",", v[3][2], ")",
+          " mainFwd=(", mainForward.x, ",", mainForward.y, ",", mainForward.z, ")",
+          " camRel=", dcs.transformData.cameraRelativeView ? 1 : 0,
+          " captured=", capturedExactPositions ? 1 : 0));
+      }
+    }
+
     if (capturedExactPositions) {
       ++m_submitRejectStats.positionCaptured;
       // Exact indexed capture must own one compact vertex per source index and
@@ -10912,14 +14815,18 @@ namespace dxvk {
           dcs.drawCallID,
           " count=", count,
           " capturedVertices=", dcs.geometryData.vertexCount));
-        m_forceRasterPassThroughThisFrame = true;
-        m_allowNativeRasterForCurrentDraw = true;
         return;
       }
     } else if (!pcsx2PostTransformDraw
             && (requireExactPositionCapture
+             || exactCaptureBudgetRejected
              || (dcs.transformData.cameraRelativeView
               && dcs.usesVertexShader))) {
+      // exactCaptureBudgetRejected: capture was the chosen path for this draw
+      // and only the per-frame budget deferred it. Falling back to a guessed
+      // cbuffer transform placed Fallout 4's streamed-in world as huge slabs
+      // stretched around the camera (black RT frame). Leave it out this frame;
+      // a later frame captures it exactly.
       // A camera-relative camera defines the RT world as current view space.
       // IA object-space positions combined with a guessed generic cbuffer
       // matrix do not belong to that world. Submitting them anyway is worse
@@ -10931,9 +14838,8 @@ namespace dxvk {
       // world IS view space. The old instanceTransform==nullptr exemption let
       // exactly those batches through and they are the largest meshes in a
       // Unity/Unreal frame, so they produced the black enclosing box.
+      // Skip only this draw; the rest of the frame remains path traced.
       ++m_submitRejectStats.unsafeCameraRelativeSkipped;
-      m_forceRasterPassThroughThisFrame = true;
-      m_allowNativeRasterForCurrentDraw = true;
       static uint32_t sUnsafeCameraRelativeSkipLogCount = 0;
       if (sUnsafeCameraRelativeSkipLogCount < 32) {
         ++sUnsafeCameraRelativeSkipLogCount;
@@ -10954,22 +14860,32 @@ namespace dxvk {
       return;
     }
 
-    if (deferTexcoordRecoveryToPositionCapture
+    if (deferTexcoordRecoveryToPositionCapture && !projectedDecal
      && !geo.texcoordBuffer.defined()) {
       // Position capture may be unavailable for a safe non-camera-relative
       // draw (budget/capability/profile). Retain coverage by trying the legacy
       // dedicated UV replay before using the explicit flat fallback.
-      if (TryCaptureTexcoordsViaStreamOut(dcs, geo, indexed, count, start, base))
+      if (!(vertexPulled && indexed)
+       && TryCaptureTexcoordsViaStreamOut(dcs, geo, indexed, count, start, base))
         ++m_submitRejectStats.texcoordCaptured;
       else
         applyMissingTexcoordFallback();
+    }
+
+    // Exact-world draws hand Remix the game's own vertex buffer, sized from
+    // vertex 0 up to the highest index. Precombined meshes share one large
+    // buffer, so a draw that uses vertices 50000..52000 copied 52000 vertices
+    // into its Remix geometry buffer - gigabytes across a scene. Rebase the
+    // draw onto the range its indices actually touch.
+    if (exactWorldTransform && indexed && dcs.geometryData.indexBuffer.defined()) {
+      RebaseIndexedVertexRange(dcs, count, idxShadowSource, idxShadowOffset);
     }
 
     DrawParameters params;
     params.instanceCount = 1;
     const bool submitIndexed = indexed && dcs.geometryData.indexBuffer.defined();
     params.vertexCount   = submitIndexed ? 0
-      : (capturedExactPositions ? dcs.geometryData.vertexCount : count);
+      : ((capturedExactPositions || projectedDecal) ? dcs.geometryData.vertexCount : count);
     params.indexCount    = submitIndexed ? count : 0;
     // SubmitDraw already folds StartIndexLocation and BaseVertexLocation (or
     // StartVertexLocation) into RasterBuffer slice offsets above. Reapplying
@@ -10977,6 +14893,19 @@ namespace dxvk {
     // compact capture. The RT-facing buffers always begin at element zero.
     params.firstIndex    = 0;
     params.vertexOffset  = 0;
+
+    if (havePassKey) {
+      m_passKeysThisFrame.insert(passKey);
+      m_meshKeysThisFrame.insert(meshKey);
+    }
+
+    dcs.gameDraw.valid = !m_indirectReplay.active;
+    dcs.gameDraw.indexed = indexed;
+    dcs.gameDraw.count = count;
+    dcs.gameDraw.start = start;
+    dcs.gameDraw.base = base;
+    dcs.gameDraw.firstInstance = replayFirstInstance;
+    dcs.gameDraw.instanceCount = std::max(replayInstanceCount, 1u);
 
     m_context->EmitCs([params, dcs](DxvkContext* ctx) mutable {
       static_cast<RtxContext*>(ctx)->commitGeometryToRT(params, dcs);
@@ -11152,6 +15081,18 @@ namespace dxvk {
   }
 
   void D3D11Rtx::EndFrame(const Rc<DxvkImage>& backbuffer, VkExtent2D remixViewportExtent) {
+    ScopedCpuProfileZoneN("D3D11Rtx::EndFrame");
+    // Remember the presented image: UI drawn anywhere else is an offscreen
+    // UI target that is composited onto it later (see routeRasterUiLayer).
+    m_lastBackbufferImage = backbuffer.ptr();
+    if (!m_frameDrawLights.empty()) {
+      m_submitRejectStats.tiledLightsImported += uint32_t(m_frameDrawLights.size());
+      m_context->EmitCs([cLights = std::move(m_frameDrawLights)](DxvkContext* ctx) {
+        static_cast<RtxContext*>(ctx)->addLights(cLights.data(), uint32_t(cLights.size()));
+      });
+      m_frameDrawLights = {};
+      m_frameDrawLightKeys.clear();
+    }
     // DX11_V301_PERF_LOG: report where the frame's CPU time went in the capture
     // layer. The raytracing passes time themselves and land in the low
     // milliseconds, so when the frame rate is far below what the scene warrants
@@ -11286,6 +15227,10 @@ namespace dxvk {
     m_deferredLightVolumeCandidatesThisFrame = 0;
 
     m_deferredLightVolumesThisFrame = 0;
+    m_deferredLightVolumePositionsThisFrame.clear();
+    // Water textures stay known across frames; bound the set for streaming worlds.
+    if (m_refractiveSurfaceTextures.size() > 4096u)
+      m_refractiveSurfaceTextures.clear();
     m_texcoordCapturesThisFrame = 0;
     m_texcoordCaptureBytesThisFrame = 0;
     m_positionCapturesThisFrame = 0;
@@ -11386,9 +15331,11 @@ namespace dxvk {
     const bool rasterUiSeen = m_rasterUiSeenThisFrame;
     const bool midFrameRtxInjected = m_midFrameRtxInjected;
     const bool forceRasterPassThrough = m_forceRasterPassThroughThisFrame;
-    const uint32_t trustedSceneAcceptedDraws = realSceneAcceptedDraws > 0
+    // Lifted 2D layers are the whole scene of a 2D game (see Lift2DProjection).
+    const uint32_t lift2DAcceptedDraws = m_submitRejectStats.lift2DAccepted;
+    const uint32_t trustedSceneAcceptedDraws = std::max(lift2DAcceptedDraws, realSceneAcceptedDraws > 0
       ? realSceneAcceptedDraws
-      : (m_hasSeenRealSceneProjection ? 0u : sceneAcceptedDraws);
+      : (m_hasSeenRealSceneProjection ? 0u : sceneAcceptedDraws));
     static uint32_t s_endFrameLogCount = 0;
     static uint32_t s_submitSummaryLogCount = 0;
     if (s_endFrameLogCount < 8) {
@@ -11432,9 +15379,13 @@ namespace dxvk {
     static std::chrono::steady_clock::time_point s_lastSubmitSummaryTime {};
     const auto submitSummaryNow = std::chrono::steady_clock::now();
     static const bool logCaptureDiagnostics = env::getEnvVar("DXVK_REMIX_CAPTURE_LOG") == "1";
-    const bool submitSummaryPeriodicDue = logCaptureDiagnostics &&
-      (s_lastSubmitSummaryTime.time_since_epoch().count() == 0
-       || (submitSummaryNow - s_lastSubmitSummaryTime) >= std::chrono::seconds(3));
+    // Steam launches never carry per-launch environment variables, so the
+    // in-world summary is periodic by default (one line every few seconds);
+    // DXVK_REMIX_CAPTURE_LOG=1 only shortens the interval.
+    const bool submitSummaryPeriodicDue =
+      s_lastSubmitSummaryTime.time_since_epoch().count() == 0
+      || (submitSummaryNow - s_lastSubmitSummaryTime)
+           >= std::chrono::seconds(logCaptureDiagnostics ? 3 : 5);
 
     // Budget the burst separately for menu and world so neither starves the
     // other: whichever kind of frame is running, the first few are reported.
@@ -11462,6 +15413,37 @@ namespace dxvk {
         " nonTriangle=", m_submitRejectStats.nonTriangleTopology,
         " noPS=", m_submitRejectStats.noPixelShader,
         " noRT=", m_submitRejectStats.noRenderTarget,
+        " farPlaneSky=", m_submitRejectStats.farPlaneSkySkipped,
+        " waterCompanion=", m_submitRejectStats.waterCompanionSkipped,
+        " cameraCentred=", m_submitRejectStats.cameraCenteredSkipped,
+        " screenSpaceVs=", m_submitRejectStats.screenSpaceVsSkipped,
+        " orthoUi=", m_submitRejectStats.orthographicUi,
+        " volumeBox=", m_submitRejectStats.volumeBoxSkipped,
+        " otherCamNoSteer=", m_submitRejectStats.otherCameraNoSteer,
+        " exactWorld=", m_submitRejectStats.exactWorldTransform,
+        " exactRebased=", m_submitRejectStats.exactWorldRebased,
+        " exactVertsSaved=", m_submitRejectStats.exactWorldVerticesSaved,
+        " engine=", GetD3D11EngineProfile().name(),
+        " dupPassSkipped=", m_submitRejectStats.duplicatePassSkipped,
+        " lppGeomSkipped=", m_submitRejectStats.lightPrepassGeometrySkipped,
+        " passKeyNone=", m_submitRejectStats.passKeyUnavailable,
+        " noLayoutWorld=", m_submitRejectStats.noLayoutWorldCandidate,
+        " vertexPulled=", m_submitRejectStats.vertexPulledAdmitted,
+        " projectedDecals=", m_submitRejectStats.projectedDecals,
+        " tessellated=", m_submitRejectStats.tessellatedAdmitted,
+        " indirect=", m_submitRejectStats.indirectAdmitted,
+        " geometryShader=", m_submitRejectStats.geometryShaderAdmitted,
+        " lightVolumeColours=", m_submitRejectStats.lightVolumeColours,
+        " indirectRejected=", m_submitRejectStats.indirectRejected,
+        " decalUnresolved=", m_submitRejectStats.decalVolumeUnresolved,
+        " mirroredView=", m_submitRejectStats.mirroredViewSkipped,
+        " tiledLights=", m_submitRejectStats.tiledLightsImported,
+        " lift2D=", m_submitRejectStats.lift2DAccepted, "/", m_submitRejectStats.lift2DCandidates,
+        " lift2DCaptureFailed=", m_submitRejectStats.lift2DCaptureFailed,
+        " secondaryView=", m_submitRejectStats.secondaryViewSkipped,
+        " autoTerrain=", m_submitRejectStats.autoTerrain,
+        " autoDecal=", m_submitRejectStats.autoDecals,
+        " autoParticle=", m_submitRejectStats.autoParticles,
         " trivial=", m_submitRejectStats.trivialDraw,
         " fullscreen=", m_submitRejectStats.fullscreenPostFx,
         " noLayout=", m_submitRejectStats.noInputLayout,
@@ -11492,6 +15474,10 @@ namespace dxvk {
         " uvCacheEntries=", m_texcoordCaptureCache.size(),
         " posCacheMiB=", m_positionCaptureCacheBytes >> 20,
         " posCacheEntries=", m_positionCaptureCache.size(),
+        " posCacheNew=", m_submitRejectStats.posCacheNew,
+        " posCacheEvicted=", m_submitRejectStats.posCacheEvicted,
+        " posCacheReset=", m_submitRejectStats.posCacheContractReset,
+        " posCacheStaleReuse=", m_submitRejectStats.posCacheStaleReuse,
         " collapsedEye=", m_submitRejectStats.collapsedEyeGeometry,
         " rasterUi=", rasterUiSeen ? 1 : 0,
         " uiMidInject=", midFrameRtxInjected ? 1 : 0,
@@ -11510,7 +15496,7 @@ namespace dxvk {
     ++m_axisDetectFrame;
 
     const bool allowResizeCameraCarryover = m_resizeTransitionFramesRemaining > 0;
-    m_context->EmitCs([backbuffer, draws, acceptedDraws, sceneAcceptedDraws, realSceneAcceptedDraws, sceneCandidateDraws, trustedSceneAcceptedDraws, allowResizeCameraCarryover, rasterUiSeen, midFrameRtxInjected, forceRasterPassThrough](DxvkContext* ctx) {
+    m_context->EmitCs([backbuffer, draws, acceptedDraws, sceneAcceptedDraws, realSceneAcceptedDraws, sceneCandidateDraws, trustedSceneAcceptedDraws, lift2DAcceptedDraws, allowResizeCameraCarryover, rasterUiSeen, midFrameRtxInjected, forceRasterPassThrough](DxvkContext* ctx) {
       RtxContext* rtx = static_cast<RtxContext*>(ctx);
       const uint32_t fid = rtx->getDevice()->getCurrentFrameId();
       bool camValid = rtx->getSceneManager().getCamera().isValid(fid);
@@ -11601,10 +15587,14 @@ namespace dxvk {
       const bool hasRealView = viewIdentityDeviation > 1.0e-4;
       const bool hasConfirmedCameraRelativeView =
         rtx->getSceneManager().getCameraManager().mainCameraLastUpdateUsedCameraRelativeView();
-      const bool hasRealCamera = camValid && (hasRealView || hasConfirmedCameraRelativeView);
+      // The 2D lift camera is identity by construction (layers are placed in
+      // its view space), not an unresolved game camera.
+      const bool hasRealCamera = camValid && (hasRealView || hasConfirmedCameraRelativeView
+                                              || lift2DAcceptedDraws > 0);
 
       static uint32_t sNoRealViewLogCount = 0;
-      if (camValid && !hasRealView && !hasConfirmedCameraRelativeView && sNoRealViewLogCount < 12) {
+      if (camValid && !hasRealView && !hasConfirmedCameraRelativeView && lift2DAcceptedDraws == 0
+       && sNoRealViewLogCount < 12) {
         ++sNoRealViewLogCount;
         Logger::info(str::format(
           "[D3D11Rtx] Camera has no real view matrix (identity view=origin camera) - passing frame "
@@ -11660,15 +15650,57 @@ namespace dxvk {
   }
 
   void D3D11Rtx::OnPresent(const Rc<DxvkImage>& swapchainImage, VkExtent2D remixViewportExtent) {
+    ScopedCpuProfileZoneN("D3D11Rtx::OnPresent");
     // Same coherent policy as EndFrame — see UpdateTrackedExtents. The HWND
     // client rect is only an occlusion signal and must not drive the
     // renderer; only the present-image extent may trigger resize handling.
     UpdateTrackedExtents(swapchainImage, remixViewportExtent);
 
+    // Temporary diagnostic: periodically pick the object at the screen centre.
+    {
+      static uint32_t s_presents = 0;
+      ++s_presents;
+      if ((s_presents % 120u) == 0u && m_lastOutputExtent.width > 0u) {
+        // Cycle through the centre and four points around it, so an object
+        // covering part of the view is found even when the centre is clear.
+        static const float kPickPoints[6][2] = { { 0.5f, 0.5f }, { 0.75f, 0.3f }, { 0.25f, 0.3f }, { 0.75f, 0.7f }, { 0.25f, 0.7f }, { 0.39f, 0.45f } };
+        const uint32_t pickIndex = (s_presents / 120u) % 6u;
+        const Vector2i center { int32_t(float(m_lastOutputExtent.width) * kPickPoints[pickIndex][0]),
+                                int32_t(float(m_lastOutputExtent.height) * kPickPoints[pickIndex][1]) };
+        m_context->m_device->getCommon()->metaDebugView().ObjectPicking.request(
+          center, center + Vector2i { 1, 1 },
+          [pickIndex](std::vector<ObjectPickingValue>&& values, std::optional<XXH64_hash_t> textureHash) {
+            Logger::info(str::format("[D3D11Rtx][center-probe] point=", pickIndex, " pick values=", values.size(),
+              " value0=", values.empty() ? 0u : uint32_t(values[0]),
+              " textureHash=0x", std::hex, textureHash.value_or(kEmptyHash)));
+            s_centerPickHash.store(textureHash.value_or(kEmptyHash));
+          });
+      }
+    }
+
     m_context->EmitCs([swapchainImage](DxvkContext* ctx) {
       RtxContext* rtx = static_cast<RtxContext*>(ctx);
       rtx->onPresent(swapchainImage);
     });
+  }
+
+  // Camera math shared with the DX12 / Vulkan front end
+  // (d3d11_vk_capture.cpp), so both paths classify and factor matrices the
+  // same way. Declared in d3d11_camera_math.h.
+  int D3D11ClassifyPerspective(const Matrix4& m) {
+    return classifyPerspective(m);
+  }
+
+  bool D3D11FactorViewProjection(const Matrix4& viewProjection, Matrix4& projection, Matrix4& view) {
+    return factorViewProjection(viewProjection, projection, view);
+  }
+
+  Matrix4 D3D11CanonicalizeProjection(const Matrix4& projection, bool* flippedX, bool* flippedY) {
+    return canonicalizeProjectionOrientation(projection, flippedX, flippedY);
+  }
+
+  Matrix4 D3D11ReadMatrix(const uint8_t* ptr, size_t offset, size_t size) {
+    return readCbMatrix(ptr, offset, size);
   }
 
 }

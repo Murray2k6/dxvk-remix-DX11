@@ -165,6 +165,12 @@ namespace dxvk {
       }
     };
     SparseUniqueCache<TextureRef, TextureHashFn, TextureEquality> m_textureCache;
+    // Frame each m_textureCache slot was last referenced by a material, so game
+    // textures the scene stopped using can be released (see releaseUnusedGameTextures).
+    std::vector<uint32_t> m_textureLastUsedFrame;
+
+    void markTextureUsed(uint32_t textureIndex);
+    void releaseUnusedGameTextures();
 
     AsyncRunner*       m_asyncThread;
     AsyncRunner_RTXIO* m_asyncThread_rtxio;

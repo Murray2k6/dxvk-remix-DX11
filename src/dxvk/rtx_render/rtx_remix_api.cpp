@@ -343,6 +343,7 @@ namespace {
           src.getSubsurfaceRadius(),
           src.getSubsurfaceRadiusScale(),
           src.getSubsurfaceMaxSampleRadius(),
+          src.getNormalEncoding(),
           src.getFilterMode(),
           src.getWrapModeU(),
           src.getWrapModeV()
@@ -440,6 +441,7 @@ namespace {
           extSubsurface ? tovec3(extSubsurface->subsurfaceRadius) : Vector3{ 0.5f, 0.5f, 0.5f },
           extSubsurface ? extSubsurface->subsurfaceRadiusScale : 0.f,
           extSubsurface ? extSubsurface->subsurfaceMaxSampleRadius : 0.f,
+          uint8_t(0),  // NormalEncoding: API materials use Remix octahedral normal maps
           info.filterMode,
           info.wrapModeU,
           info.wrapModeV,
@@ -645,6 +647,9 @@ namespace {
     CameraType::Enum categoryToCameraType(remixapi_InstanceCategoryFlags flags) {
       if (flags & REMIXAPI_INSTANCE_CATEGORY_BIT_SKY) {
         return CameraType::Sky;
+      }
+      if (flags & REMIXAPI_INSTANCE_CATEGORY_BIT_VIEW_MODEL) {
+        return CameraType::ViewModel;
       }
       return CameraType::Main;
     }

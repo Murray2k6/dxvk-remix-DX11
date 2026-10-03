@@ -781,8 +781,11 @@ namespace dxvk {
     m_settings.m_libraryDesc = m_library->dispatch.GetLibraryDesc();
 
     const uint32_t frameId = device()->getCurrentFrameId();
-    m_settings.m_resetHistory |= inputs.reset || m_lastDispatchFrame == UINT32_MAX
-      || frameId != m_lastDispatchFrame + 1;
+    // Only reset on an explicit reset or the first dispatch. Resetting on any
+    // non-consecutive frame restarted accumulation after every skipped frame,
+    // leaving output permanently unconverged; NRD's own disocclusion handling
+    // rejects history that no longer matches.
+    m_settings.m_resetHistory |= inputs.reset || m_lastDispatchFrame == UINT32_MAX;
 
     ScopedGpuProfileZone(ctx, "NRD");
     static_cast<RtxContext*>(ctx.ptr())->setFramePassStage(RtxFramePassStage::NRD);

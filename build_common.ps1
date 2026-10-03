@@ -969,11 +969,28 @@ function Set-VisualStudioBuildEnvironment {
     @('x64', 'amd64')
   }
 
+  # vcvarsall.bat runs vswhere.exe by name; it lives in the VS Installer
+  # folder, which is often not on PATH.
+  $vsInstallerDir = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer'
+  if ((Test-Path -LiteralPath (Join-Path $vsInstallerDir 'vswhere.exe')) -and
+      -not (($env:PATH -split ';') -contains $vsInstallerDir)) {
+    $env:PATH = $vsInstallerDir + ';' + $env:PATH
+  }
+
   $lastError = $null
   foreach ($vcArg in $vcVarCandidates) {
     Write-Host "[build] Setting Visual Studio compiler environment for $Architecture using vcvarsall.bat $vcArg" -ForegroundColor Yellow
     $cmdLine = 'call "' + $vcVarsAll + '" ' + $vcArg + ' >nul && set'
-    $envLines = & $env:ComSpec /d /s /c $cmdLine 2>&1
+    # Windows PowerShell 5.1 turns every stderr line of a native command into
+    # an ErrorRecord, which ErrorActionPreference=Stop makes fatal even when
+    # cmd succeeds. vcvarsall's warnings are not failures: the exit code is.
+    $previousPreference = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+      $envLines = & $env:ComSpec /d /s /c $cmdLine 2>&1 | ForEach-Object { "$_" }
+    } finally {
+      $ErrorActionPreference = $previousPreference
+    }
     $exitCode = if ($null -eq $LASTEXITCODE) { 0 } else { $LASTEXITCODE }
     if ($exitCode -ne 0) {
       $lastError = ($envLines | Out-String).Trim()

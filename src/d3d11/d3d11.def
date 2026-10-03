@@ -10,3 +10,4 @@ EXPORTS
     remixapi_InitializeLibrary @25
     remixapi_dxvk_WasLastPresentRayTraced
     remixapi_dxvk_GetCompletedRaytracedFrameCount
+    remix_vkfe_get_api

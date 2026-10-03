@@ -19,6 +19,9 @@ endif
 
 if get_option('enable_d3d11')
   subdir('d3d11')
+  # Native Vulkan front end: an implicit Vulkan layer that hands the game's
+  # VkDevice to Remix's d3d11.dll (remix_vk_frontend.h).
+  subdir('vklayer')
 endif
 
 # Nothing selected

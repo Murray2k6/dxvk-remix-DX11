@@ -26,6 +26,8 @@ namespace dxvk {
     friend class D3D11SwapChain;
     friend class D3D11Rtx;
     friend struct RemixAPIPrivateAccessor;
+    // DX12 / Vulkan front end: runs EndFrame/OnPresent on the game's image.
+    friend class D3D11VkFrontendDevice;
 
     constexpr static VkDeviceSize StagingBufferSize = 4ull << 20;
   public:

@@ -202,13 +202,21 @@ static void STDMETHODCALLTYPE HDraw(ID3D11DeviceContext* self, UINT vertexCount,
 static void STDMETHODCALLTYPE HDrawIndexedInstanced(ID3D11DeviceContext* self, UINT indexCountPerInstance, UINT instanceCount, UINT startIndexLocation, INT baseVertexLocation, UINT startInstanceLocation) {
   V219NotifyDraw("ID3D11DeviceContext::DrawIndexedInstanced");
   if (oDrawIndexedInstanced) oDrawIndexedInstanced(self, indexCountPerInstance, instanceCount, startIndexLocation, baseVertexLocation, startInstanceLocation);
-  dx11_capture::RecordUncapturedDraw(indexCountPerInstance, instanceCount);
+  // Engines routinely issue single-instance geometry through the instanced
+  // entry point; that is an ordinary draw and is captured as one.
+  if (instanceCount == 1)
+    dx11_capture::CaptureDrawIndexed(self, indexCountPerInstance, startIndexLocation, baseVertexLocation);
+  else
+    dx11_capture::RecordUncapturedDraw(indexCountPerInstance, instanceCount);
 }
 
 static void STDMETHODCALLTYPE HDrawInstanced(ID3D11DeviceContext* self, UINT vertexCountPerInstance, UINT instanceCount, UINT startVertexLocation, UINT startInstanceLocation) {
   V219NotifyDraw("ID3D11DeviceContext::DrawInstanced");
   if (oDrawInstanced) oDrawInstanced(self, vertexCountPerInstance, instanceCount, startVertexLocation, startInstanceLocation);
-  dx11_capture::RecordUncapturedDraw(vertexCountPerInstance, instanceCount);
+  if (instanceCount == 1)
+    dx11_capture::CaptureDraw(self, vertexCountPerInstance, startVertexLocation);
+  else
+    dx11_capture::RecordUncapturedDraw(vertexCountPerInstance, instanceCount);
 }
 
 static void STDMETHODCALLTYPE HDrawAuto(ID3D11DeviceContext* self) {

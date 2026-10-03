@@ -1,0 +1,859 @@
+diff --git a/libs/d3d12core/d3d12core.def b/libs/d3d12core/d3d12core.def
+--- a/libs/d3d12core/d3d12core.def
++++ b/libs/d3d12core/d3d12core.def
+@@ -3,3 +3,5 @@
+ EXPORTS
+     D3D12GetInterface
+     D3D12SDKVersion DATA PRIVATE
++
++    remix_vkd3d_heap_view
+diff --git a/libs/vkd3d/command.c b/libs/vkd3d/command.c
+index ea1e8a03..c386bb15 100644
+--- a/libs/vkd3d/command.c
++++ b/libs/vkd3d/command.c
+@@ -28,6 +28,9 @@
+ #include "vkd3d_renderdoc.h"
+ #endif
+
++/* Remix: copied into include/ by build_vkd3d_proton.ps1 from the Remix tree. */
++#include "remix/remix_vk_frontend.h"
++
+ static HRESULT d3d12_fence_signal(struct d3d12_fence *fence, struct vkd3d_fence_worker *worker, uint64_t value);
+ static void d3d12_command_queue_add_submission(struct d3d12_command_queue *queue,
+         const struct d3d12_command_queue_submission *sub);
+@@ -6208,6 +6211,39 @@ void d3d12_command_list_invalidate_descriptor_heap(struct d3d12_command_list *li
+     WARN("Invalidating descriptor heap due to meta command which is incompatible with heaps.\n");
+ }
+
++/* Remix: an export of the Remix Vulkan layer, or NULL when it is not loaded.
++ * Resolving twice on a race is harmless: both find the same export. */
++static void *remix_layer_entry(const char *name, void **cache, uint32_t *resolved)
++{
++#ifdef _WIN32
++    if (!vkd3d_atomic_uint32_load_explicit(resolved, vkd3d_memory_order_acquire))
++    {
++        HMODULE module = GetModuleHandleA("remix_vk_layer.dll");
++        *cache = module ? (void *)GetProcAddress(module, name) : NULL;
++        vkd3d_atomic_uint32_store_explicit(resolved, 1, vkd3d_memory_order_release);
++    }
++    return *cache;
++#else
++    return NULL;
++#endif
++}
++
++static PFN_remix_vklayer_annotate_indirect remix_annotate_indirect_entry(void)
++{
++    static void *entry;
++    static uint32_t resolved;
++    return (PFN_remix_vklayer_annotate_indirect)remix_layer_entry(
++            REMIX_VKLAYER_ANNOTATE_INDIRECT_ENTRY_POINT, &entry, &resolved);
++}
++
++static PFN_remix_vklayer_note_indirect_layout remix_note_indirect_layout_entry(void)
++{
++    static void *entry;
++    static uint32_t resolved;
++    return (PFN_remix_vklayer_note_indirect_layout)remix_layer_entry(
++            REMIX_VKLAYER_NOTE_INDIRECT_LAYOUT_ENTRY_POINT, &entry, &resolved);
++}
++
+ static void vk_access_and_stage_flags_from_d3d12_resource_state(const struct d3d12_command_list *list,
+         const struct d3d12_resource *resource, uint32_t state_mask, VkQueueFlags vk_queue_flags,
+         VkPipelineStageFlags2 *stages, VkAccessFlags2 *access)
+@@ -6322,6 +6358,14 @@ static void vk_access_and_stage_flags_from_d3d12_resource_state(const struct d3d
+                 *stages |= VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT;
+                 *access |= VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT;
+
++                /* Remix: its capture of generated-commands draws reads the
++                 * commands' root constants in the vertex shader. */
++                if ((vk_queue_flags & VK_QUEUE_GRAPHICS_BIT) && remix_annotate_indirect_entry())
++                {
++                    *stages |= VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT;
++                    *access |= VK_ACCESS_2_SHADER_READ_BIT;
++                }
++
+                 /* We might use preprocessing. */
+                 if (list->device->device_info.device_generated_commands_features.deviceGeneratedCommands)
+                 {
+@@ -7124,6 +7168,7 @@ static void d3d12_command_list_reset_api_state(struct d3d12_command_list *list,
+     memset(list->so_counter_buffer_offsets, 0, sizeof(list->so_counter_buffer_offsets));
+
+     list->cbv_srv_uav_descriptors_view = NULL;
++    list->remix_cbv_srv_uav_count = 0;
+     list->vrs_image = NULL;
+
+     ID3D12GraphicsCommandList10_SetPipelineState(iface, initial_pipeline_state);
+@@ -9061,6 +9106,353 @@ static bool d3d12_command_list_emit_predicated_command(struct d3d12_command_list
+     return true;
+ }
+
++/* Remix: the Remix Vulkan layer sees this list's Vulkan commands (pipelines,
++ * draws, present) but not what is lost below D3D12: root CBV addresses and
++ * descriptor heap contents. Right before each draw, report the D3D12
++ * bindings of the graphics root signature to the layer, which attaches them
++ * to the draw it is about to see. Inert when the layer is not loaded. */
++static PFN_remix_vklayer_annotate_draw remix_annotate_entry(void)
++{
++    static PFN_remix_vklayer_annotate_draw entry;
++    static uint32_t resolved;
++
++#ifdef _WIN32
++    /* Resolving twice on a race is harmless: both find the same export. */
++    if (!vkd3d_atomic_uint32_load_explicit(&resolved, vkd3d_memory_order_acquire))
++    {
++        HMODULE module = GetModuleHandleA("remix_vk_layer.dll");
++        entry = module ? (PFN_remix_vklayer_annotate_draw)(void *)GetProcAddress(module,
++                REMIX_VKLAYER_ANNOTATE_ENTRY_POINT) : NULL;
++        vkd3d_atomic_uint32_store_explicit(&resolved, 1, vkd3d_memory_order_release);
++    }
++#endif
++
++    return entry;
++}
++
++static uint32_t remix_stage_mask(enum vkd3d_shader_visibility visibility)
++{
++    switch (visibility)
++    {
++        case VKD3D_SHADER_VISIBILITY_VERTEX:        return 1u << REMIX_VKFE_STAGE_VERTEX;
++        case VKD3D_SHADER_VISIBILITY_HULL:          return 1u << REMIX_VKFE_STAGE_HULL;
++        case VKD3D_SHADER_VISIBILITY_DOMAIN:        return 1u << REMIX_VKFE_STAGE_DOMAIN;
++        case VKD3D_SHADER_VISIBILITY_GEOMETRY:      return 1u << REMIX_VKFE_STAGE_GEOMETRY;
++        case VKD3D_SHADER_VISIBILITY_PIXEL:         return 1u << REMIX_VKFE_STAGE_PIXEL;
++        case VKD3D_SHADER_VISIBILITY_AMPLIFICATION: return 1u << REMIX_VKFE_STAGE_TASK;
++        case VKD3D_SHADER_VISIBILITY_MESH:          return 1u << REMIX_VKFE_STAGE_MESH;
++        default:                                    return (1u << REMIX_VKFE_STAGE_COUNT) - 1u;
++    }
++}
++
++/* CPU pointer of a GPU VA in host-visible memory (upload / ReBAR / custom
++ * write-back heaps), or in the shadow of a default-heap buffer filled by
++ * CopyBufferRegion (remix_shadow_copy), or NULL. */
++static const void *remix_cpu_from_va(struct d3d12_command_list *list, VkDeviceAddress va, VkDeviceSize *size,
++        uint32_t *per_draw)
++{
++    const struct vkd3d_unique_resource *res;
++    const struct remix_shadow *shadow;
++    VkDeviceSize offset, page;
++    const uint8_t *bytes;
++
++    *per_draw = 0;
++
++    if (!va)
++        return NULL;
++
++    res = vkd3d_va_map_deref(&list->device->memory_allocator.va_map, va);
++
++    if (!res || va < res->va || va - res->va >= res->size)
++        return NULL;
++
++    offset = va - res->va;
++
++    if (res->remix_cpu_address)
++    {
++        *size = res->size - offset;
++        return (const uint8_t *)res->remix_cpu_address + offset;
++    }
++
++    /* Within one shadow page: constant buffers are at most 64 KiB and
++     * 256-byte aligned, so a CBV rarely crosses one; when it does, the
++     * part in the page is what Remix reads. */
++    shadow = vkd3d_atomic_ptr_load_explicit(&res->remix_shadow, vkd3d_memory_order_acquire);
++    page = offset / REMIX_SHADOW_PAGE_SIZE;
++
++    if (!shadow || page >= shadow->page_count)
++        return NULL;
++
++    bytes = vkd3d_atomic_ptr_load_explicit(&shadow->pages[page], vkd3d_memory_order_acquire);
++
++    if (!bytes)
++        return NULL;
++
++    *size = min(res->size - offset, (VkDeviceSize)REMIX_SHADOW_PAGE_SIZE - offset % REMIX_SHADOW_PAGE_SIZE);
++    *per_draw = 1;
++    return bytes + offset % REMIX_SHADOW_PAGE_SIZE;
++}
++
++/* The VkBuffer and offset holding a GPU VA, or VK_NULL_HANDLE. */
++static void remix_buffer_from_va(struct d3d12_command_list *list, VkDeviceAddress va,
++        VkBuffer *buffer, VkDeviceSize *offset)
++{
++    const struct vkd3d_unique_resource *res;
++
++    *buffer = VK_NULL_HANDLE;
++    *offset = 0;
++
++    if (!va || !(res = vkd3d_va_map_deref(&list->device->memory_allocator.va_map, va)) ||
++            va < res->va || va - res->va >= res->size)
++        return;
++
++    *buffer = res->vk_buffer;
++    *offset = va - res->va;
++}
++
++/* Copy-source tracing for default-heap constant buffers: engines write
++ * constants into an upload ring and CopyBufferRegion them into a default
++ * buffer the root / table CBVs point at, which the CPU cannot read. Keep the
++ * bytes copied, as of recording, in a page shadow of the destination. Only
++ * small copies (constant-buffer sized), so geometry and texture uploads are
++ * not duplicated. Recording threads racing on the same bytes write the
++ * same kind of data; pages are published with compare-exchange. */
++static void remix_shadow_copy(struct d3d12_command_list *list, VkDeviceAddress dst_va,
++        VkDeviceAddress src_va, VkDeviceSize byte_count)
++{
++    struct vkd3d_unique_resource *dst;
++    struct remix_shadow *shadow, *existing;
++    VkDeviceSize src_size = 0, offset, page_count, done = 0;
++    uint32_t src_shadowed;
++    const uint8_t *src;
++
++    if (!remix_annotate_entry() || !byte_count || byte_count > D3D12_REQ_CONSTANT_BUFFER_ELEMENT_COUNT * 16u)
++        return;
++
++    /* Copies between default buffers chain through their shadows. */
++    if (!(src = remix_cpu_from_va(list, src_va, &src_size, &src_shadowed)) || src_size < byte_count)
++        return;
++
++    dst = (struct vkd3d_unique_resource *)vkd3d_va_map_deref(&list->device->memory_allocator.va_map, dst_va);
++
++    if (!dst || dst->remix_cpu_address || dst_va < dst->va || dst_va - dst->va + byte_count > dst->size)
++        return;
++
++    shadow = vkd3d_atomic_ptr_load_explicit(&dst->remix_shadow, vkd3d_memory_order_acquire);
++
++    if (!shadow)
++    {
++        page_count = (dst->size + REMIX_SHADOW_PAGE_SIZE - 1) / REMIX_SHADOW_PAGE_SIZE;
++
++        if (!(shadow = vkd3d_calloc(1, sizeof(*shadow) + page_count * sizeof(shadow->pages[0]))))
++            return;
++
++        shadow->page_count = page_count;
++        existing = vkd3d_atomic_ptr_compare_exchange(&dst->remix_shadow, NULL, shadow,
++                vkd3d_memory_order_release, vkd3d_memory_order_acquire);
++
++        if (existing)
++        {
++            vkd3d_free(shadow);
++            shadow = existing;
++        }
++    }
++
++    offset = dst_va - dst->va;
++
++    while (done < byte_count)
++    {
++        VkDeviceSize page = (offset + done) / REMIX_SHADOW_PAGE_SIZE;
++        VkDeviceSize in_page = (offset + done) % REMIX_SHADOW_PAGE_SIZE;
++        VkDeviceSize n = min(byte_count - done, (VkDeviceSize)REMIX_SHADOW_PAGE_SIZE - in_page);
++        uint8_t *bytes = vkd3d_atomic_ptr_load_explicit(&shadow->pages[page], vkd3d_memory_order_acquire);
++
++        if (!bytes)
++        {
++            uint8_t *fresh, *other;
++
++            if (!(fresh = vkd3d_calloc(1, REMIX_SHADOW_PAGE_SIZE)))
++                return;
++
++            other = vkd3d_atomic_ptr_compare_exchange(&shadow->pages[page], NULL, fresh,
++                    vkd3d_memory_order_release, vkd3d_memory_order_acquire);
++
++            if (other)
++            {
++                vkd3d_free(fresh);
++                bytes = other;
++            }
++            else
++                bytes = fresh;
++        }
++
++        /* memmove: a copy within one default buffer reads its own shadow. */
++        memmove(bytes + in_page, src + done, n);
++        done += n;
++    }
++}
++
++static void d3d12_command_list_remix_annotate_draw(struct d3d12_command_list *list)
++{
++    /* Root CBVs and tables in a frame rarely exceed a few dozen entries. */
++    enum { REMIX_MAX_ANNOTATIONS = 128, REMIX_MAX_RANGE = 8 };
++    const struct vkd3d_pipeline_bindings *bindings = &list->graphics_bindings;
++    const struct d3d12_root_signature *rs = bindings->root_signature;
++    const struct vkd3d_descriptor_metadata_view *heap = list->cbv_srv_uav_descriptors_view;
++    remix_vkfe_binding out[REMIX_MAX_ANNOTATIONS];
++    PFN_remix_vklayer_annotate_draw annotate;
++    unsigned int count = 0, constant = 0, i, j, k;
++
++    if (!(annotate = remix_annotate_entry()) || !rs)
++        return;
++
++    for (i = 0; i < rs->parameter_count && count < REMIX_MAX_ANNOTATIONS; i++)
++    {
++        const struct vkd3d_shader_root_parameter *p = &rs->parameters[i];
++
++        switch (p->parameter_type)
++        {
++            case D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS:
++            {
++                /* root_constants[] lists the constant parameters in order. */
++                const struct vkd3d_shader_push_constant_buffer *c = &rs->root_constants[constant++];
++                remix_vkfe_binding *b = &out[count++];
++
++                memset(b, 0, sizeof(*b));
++                /* Push-constant kind: the values live in the list state at the
++                 * same address for every draw, so Remix must copy them per draw
++                 * rather than share bytes by address. Register and space still
++                 * name the b# they are bound as. */
++                b->kind = REMIX_VKFE_BINDING_PUSH_CONSTANTS;
++                b->stage_mask = remix_stage_mask(c->shader_visibility);
++                b->slot = c->register_index;
++                b->space = c->register_space;
++                b->size = c->size;
++                b->host_data = &bindings->root_constants[p->constant.constant_index];
++                break;
++            }
++
++            case D3D12_ROOT_PARAMETER_TYPE_CBV:
++            case D3D12_ROOT_PARAMETER_TYPE_SRV:
++            {
++                const struct vkd3d_shader_resource_binding *rb = p->descriptor.binding;
++                VkDeviceAddress va = bindings->remix_root_descriptor_va[i];
++                bool is_cbv = p->parameter_type == D3D12_ROOT_PARAMETER_TYPE_CBV;
++                VkDeviceSize size = 0;
++                uint32_t per_draw = 0;
++                const void *cpu = remix_cpu_from_va(list, va, &size, &per_draw);
++                remix_vkfe_binding *b;
++
++                if (!rb || !va)
++                    break;
++
++                b = &out[count++];
++                memset(b, 0, sizeof(*b));
++                b->kind = is_cbv ? REMIX_VKFE_BINDING_CONSTANT_BUFFER : REMIX_VKFE_BINDING_STORAGE_BUFFER;
++                b->stage_mask = remix_stage_mask(rb->shader_visibility);
++                b->slot = rb->register_index;
++                b->space = rb->register_space;
++                b->address = va;
++                /* Root SRVs carry no size; the allocation's end bounds them. */
++                b->size = is_cbv ? min(size, (VkDeviceSize)D3D12_REQ_CONSTANT_BUFFER_ELEMENT_COUNT * 16u) : size;
++                b->host_data = cpu;
++                b->host_data_per_draw = per_draw;
++                break;
++            }
++
++            case D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE:
++            {
++                /* Tables are read from the shader-visible heap's CPU
++                 * metadata, which exists on the classic descriptor path the
++                 * Remix layer selects (it hides VK_EXT_descriptor_buffer). */
++                if (!heap)
++                    break;
++
++                for (j = 0; j < p->descriptor_table.binding_count && count < REMIX_MAX_ANNOTATIONS; j++)
++                {
++                    const struct vkd3d_shader_resource_binding *rb = &p->descriptor_table.first_binding[j];
++                    /* Unbounded ranges: only the first entry is known to be in the heap. */
++                    unsigned int range = rb->register_count == ~0u ? 1u : min(rb->register_count, (unsigned int)REMIX_MAX_RANGE);
++                    bool is_cbv = rb->type == VKD3D_SHADER_DESCRIPTOR_TYPE_CBV;
++                    bool is_srv_image = rb->type == VKD3D_SHADER_DESCRIPTOR_TYPE_SRV &&
++                            (rb->flags & VKD3D_SHADER_BINDING_FLAG_IMAGE);
++                    /* Structured / typed buffers: engine light lists (UE local
++                     * lights, HDRP LightData) live in these. */
++                    bool is_srv_buffer = rb->type == VKD3D_SHADER_DESCRIPTOR_TYPE_SRV &&
++                            (rb->flags & VKD3D_SHADER_BINDING_FLAG_BUFFER);
++
++                    if (!is_cbv && !is_srv_image && !is_srv_buffer)
++                        continue;
++
++                    for (k = 0; k < range && count < REMIX_MAX_ANNOTATIONS; k++)
++                    {
++                        const struct vkd3d_descriptor_metadata_view *view = heap +
++                                bindings->descriptor_tables[rb->descriptor_table] + rb->descriptor_offset + k;
++                        remix_vkfe_binding *b = &out[count];
++
++                        memset(b, 0, sizeof(*b));
++                        b->stage_mask = remix_stage_mask(rb->shader_visibility);
++                        b->slot = rb->register_index + k;
++                        b->space = rb->register_space;
++
++                        if (is_cbv || is_srv_buffer)
++                        {
++                            VkDeviceSize size = 0;
++                            uint32_t per_draw = 0;
++
++                            if (!(view->info.buffer.flags & VKD3D_DESCRIPTOR_FLAG_BUFFER_VA_RANGE))
++                                continue;
++
++                            b->kind = is_cbv ? REMIX_VKFE_BINDING_CONSTANT_BUFFER : REMIX_VKFE_BINDING_STORAGE_BUFFER;
++                            b->address = view->info.buffer.va;
++                            b->host_data = remix_cpu_from_va(list, view->info.buffer.va, &size, &per_draw);
++                            b->host_data_per_draw = per_draw;
++                            b->size = b->host_data ? min((VkDeviceSize)view->info.buffer.range, size)
++                                    : (VkDeviceSize)view->info.buffer.range;
++                            /* The Vulkan buffer behind the view, so Remix can copy
++                             * GPU-only bytes back (material tables, light lists). */
++                            remix_buffer_from_va(list, view->info.buffer.va, &b->buffer, &b->offset);
++                        }
++                        else
++                        {
++                            const struct vkd3d_view *image_view = view->info.image.view;
++
++                            if (!(view->info.image.flags & VKD3D_DESCRIPTOR_FLAG_IMAGE_VIEW) || !image_view)
++                                continue;
++
++                            b->kind = REMIX_VKFE_BINDING_TEXTURE;
++                            b->view = image_view->vk_image_view;
++                            b->layout = image_view->remix_layout;
++                        }
++
++                        count++;
++                    }
++                }
++                break;
++            }
++
++            default:
++                /* Root UAVs are written by the GPU: nothing to read. */
++                break;
++        }
++    }
++
++    /* The bound shader-visible heap, for SM 6.6 ResourceDescriptorHeap[]
++     * indices Remix finds in material data (remix_vkd3d_heap_view). */
++    if (heap && list->remix_cbv_srv_uav_count && count < REMIX_MAX_ANNOTATIONS)
++    {
++        remix_vkfe_binding *b = &out[count++];
++
++        memset(b, 0, sizeof(*b));
++        b->kind = REMIX_VKFE_BINDING_DESCRIPTOR_HEAP;
++        b->stage_mask = (1u << REMIX_VKFE_STAGE_COUNT) - 1u;
++        b->host_data = heap;
++        b->size = list->remix_cbv_srv_uav_count;
++    }
++
++    annotate(list->cmd.vk_command_buffer, out, count);
++}
++
+ static void STDMETHODCALLTYPE d3d12_command_list_DrawInstanced(d3d12_command_list_iface *iface,
+         UINT vertex_count_per_instance, UINT instance_count, UINT start_vertex_location,
+         UINT start_instance_location)
+@@ -9096,6 +9467,8 @@ static void STDMETHODCALLTYPE d3d12_command_list_DrawInstanced(d3d12_command_lis
+
+     list->cmd.estimated_cost += VKD3D_COMMAND_COST_HIGH;
+
++    d3d12_command_list_remix_annotate_draw(list);
++
+     if (!list->predication.fallback_enabled)
+         VK_CALL(vkCmdDraw(list->cmd.vk_command_buffer, vertex_count_per_instance,
+                 instance_count, start_vertex_location, start_instance_location));
+@@ -9171,6 +9544,8 @@ static void STDMETHODCALLTYPE d3d12_command_list_DrawIndexedInstanced(d3d12_comm
+
+     d3d12_command_list_check_index_buffer_strip_cut_value(list);
+
++    d3d12_command_list_remix_annotate_draw(list);
++
+     if (!list->predication.fallback_enabled)
+         VK_CALL(vkCmdDrawIndexed(list->cmd.vk_command_buffer, index_count_per_instance,
+                 instance_count, start_vertex_location, base_vertex_location, start_instance_location));
+@@ -9428,6 +9803,8 @@ static void STDMETHODCALLTYPE d3d12_command_list_CopyBufferRegion(d3d12_command_
+             !!(dst_resource->flags & VKD3D_RESOURCE_RESERVED));
+     VK_CALL(vkCmdCopyBuffer2(list->cmd.vk_command_buffer, &copy_info));
+
++    remix_shadow_copy(list, dst_resource->res.va + dst_offset, src_resource->res.va + src_offset, byte_count);
++
+     VKD3D_BREADCRUMB_COMMAND(COPY);
+ }
+
+@@ -14349,6 +14726,7 @@ static void d3d12_command_list_set_descriptor_heaps_buffers(struct d3d12_command
+                 /* In case we need to hoist buffer descriptors. */
+                 d = d3d12_desc_decode_va(heap->cpu_va.ptr);
+                 list->cbv_srv_uav_descriptors_view = d.view;
++                list->remix_cbv_srv_uav_count = heap->desc.NumDescriptors;
+             }
+         }
+         else if (heap->desc.Type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER)
+@@ -14403,6 +14781,7 @@ static void d3d12_command_list_set_descriptor_heaps_sets(struct d3d12_command_li
+             struct d3d12_desc_split d;
+             d = d3d12_desc_decode_va(heap->cpu_va.ptr);
+             list->cbv_srv_uav_descriptors_view = d.view;
++            list->remix_cbv_srv_uav_count = heap->desc.NumDescriptors;
+         }
+     }
+
+@@ -14806,6 +15185,8 @@ static void d3d12_command_list_set_root_descriptor(struct d3d12_command_list *li
+ {
+     struct vkd3d_root_descriptor_info *descriptor = &bindings->root_descriptors[index];
+
++    bindings->remix_root_descriptor_va[index] = gpu_address;
++
+     if (bindings->root_signature->root_descriptor_raw_va_mask & (1ull << index))
+         d3d12_command_list_set_root_descriptor_va(list, descriptor, gpu_address);
+     else
+@@ -18368,6 +18749,34 @@ static void d3d12_command_list_execute_indirect_state_template_dgc(
+     }
+     d3d12_command_list_debug_mark_begin_region(list, tag);
+
++    /* Remix: the D3D12 bindings and the command stream of this GPU-driven
++     * draw, for the layer's capture replay (remix_vklayer_annotate_indirect). */
++    if (signature->pipeline_type == VKD3D_PIPELINE_TYPE_GRAPHICS && remix_annotate_indirect_entry() &&
++            list->graphics_bindings.root_signature)
++    {
++        const D3D12_INDIRECT_ARGUMENT_TYPE action =
++                signature->desc.pArgumentDescs[signature->desc.NumArgumentDescs - 1].Type;
++        remix_vkfe_indirect_annotation annotation;
++
++        if (action == D3D12_INDIRECT_ARGUMENT_TYPE_DRAW || action == D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED)
++        {
++            memset(&annotation, 0, sizeof(annotation));
++            annotation.layout = list->graphics_bindings.root_signature->graphics.vk_pipeline_layout;
++            annotation.argument_buffer = arg_buffer->res.vk_buffer;
++            annotation.argument_offset = arg_buffer->mem.offset + arg_buffer_offset;
++            annotation.argument_address = arg_buffer->res.va + arg_buffer_offset;
++            annotation.stride = signature->desc.ByteStride;
++            annotation.max_command_count = max_command_count;
++            annotation.count_buffer = count_buffer ? count_buffer->res.vk_buffer : VK_NULL_HANDLE;
++            annotation.count_offset = count_buffer ? count_buffer->mem.offset + count_buffer_offset : 0;
++            annotation.indexed = action == D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED;
++            annotation.args_offset = signature->argument_buffer_offset_for_command;
++
++            d3d12_command_list_remix_annotate_draw(list);
++            remix_annotate_indirect_entry()(list->cmd.vk_command_buffer, &annotation);
++        }
++    }
++
+     VK_CALL(vkCmdExecuteGeneratedCommandsEXT(list->cmd.vk_command_buffer,
+             explicit_preprocess || dgc_mode == VKD3D_DGC_MODE_EXECUTE_ONLY ? VK_TRUE : VK_FALSE,
+             &generated_ext));
+@@ -18644,6 +19053,8 @@ static void STDMETHODCALLTYPE d3d12_command_list_ExecuteIndirect(d3d12_command_l
+                 break;
+             }
+
++            d3d12_command_list_remix_annotate_draw(list);
++
+             if (count_buffer || list->predication.fallback_enabled)
+             {
+                 VK_CALL(vkCmdDrawIndirectCount(list->cmd.vk_command_buffer, arg_impl->res.vk_buffer,
+@@ -18669,6 +19080,8 @@ static void STDMETHODCALLTYPE d3d12_command_list_ExecuteIndirect(d3d12_command_l
+
+             d3d12_command_list_check_index_buffer_strip_cut_value(list);
+
++            d3d12_command_list_remix_annotate_draw(list);
++
+             if (count_buffer || list->predication.fallback_enabled)
+             {
+                 VK_CALL(vkCmdDrawIndexedIndirectCount(list->cmd.vk_command_buffer, arg_impl->res.vk_buffer,
+@@ -27220,6 +27633,66 @@ end:
+     return hr;
+ }
+
++/* Remix: tell the layer which push-constant ranges this command signature's
++ * commands set for the root signature's graphics pipeline layout, and where
++ * each sits in a command (the D3D12 argument layout, which the replay reads
++ * directly). Signatures that also change views or vertex / index buffers per
++ * command are not reported: the replay cannot reproduce those. */
++static void remix_note_command_signature(const D3D12_COMMAND_SIGNATURE_DESC *desc,
++        struct d3d12_root_signature *root_signature)
++{
++    remix_vkfe_indirect_constant constants[REMIX_VKFE_MAX_INDIRECT_CONSTANTS];
++    PFN_remix_vklayer_note_indirect_layout note = remix_note_indirect_layout_entry();
++    const struct vkd3d_shader_root_constant *root_constant;
++    uint32_t constant_count = 0, offset = 0;
++    unsigned int i;
++
++    if (!note || !root_signature || !root_signature->graphics.vk_pipeline_layout)
++        return;
++
++    for (i = 0; i < desc->NumArgumentDescs; i++)
++    {
++        const D3D12_INDIRECT_ARGUMENT_DESC *arg = &desc->pArgumentDescs[i];
++
++        switch (arg->Type)
++        {
++            case D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT:
++                if (constant_count == REMIX_VKFE_MAX_INDIRECT_CONSTANTS ||
++                        !(root_constant = root_signature_get_32bit_constants(root_signature, arg->Constant.RootParameterIndex)))
++                    return;
++                constants[constant_count].push_offset =
++                        (root_constant->constant_index + arg->Constant.DestOffsetIn32BitValues) * sizeof(uint32_t);
++                constants[constant_count].size = arg->Constant.Num32BitValuesToSet * sizeof(uint32_t);
++                constants[constant_count].command_offset = offset;
++                constant_count++;
++                offset += arg->Constant.Num32BitValuesToSet * sizeof(uint32_t);
++                break;
++
++            case D3D12_INDIRECT_ARGUMENT_TYPE_INCREMENTING_CONSTANT:
++                if (constant_count == REMIX_VKFE_MAX_INDIRECT_CONSTANTS ||
++                        !(root_constant = root_signature_get_32bit_constants(root_signature,
++                                arg->IncrementingConstant.RootParameterIndex)))
++                    return;
++                constants[constant_count].push_offset =
++                        (root_constant->constant_index + arg->IncrementingConstant.DestOffsetIn32BitValues) * sizeof(uint32_t);
++                constants[constant_count].size = sizeof(uint32_t);
++                constants[constant_count].command_offset = REMIX_VKFE_INDIRECT_COMMAND_INDEX;
++                constant_count++;
++                break;
++
++            case D3D12_INDIRECT_ARGUMENT_TYPE_DRAW:
++            case D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED:
++                break;
++
++            default:
++                return;
++        }
++    }
++
++    if (constant_count)
++        note(root_signature->graphics.vk_pipeline_layout, desc->ByteStride, constant_count, constants);
++}
++
+ HRESULT d3d12_command_signature_create(struct d3d12_device *device, struct d3d12_root_signature *root_signature,
+         const D3D12_COMMAND_SIGNATURE_DESC *desc,
+         struct d3d12_command_signature **signature)
+@@ -27409,6 +27882,9 @@ HRESULT d3d12_command_signature_create(struct d3d12_device *device, struct d3d12
+             if (FAILED(hr = d3d12_command_signature_init_state_template_dgc(object, desc, root_signature, device)))
+                 goto err;
+
++        if (pipeline_type == VKD3D_PIPELINE_TYPE_GRAPHICS)
++            remix_note_command_signature(desc, root_signature);
++
+         /* Heuristic. If game uses fancy execute indirect we're more inclined to split command buffers
+          * for optimal reordering. */
+         vkd3d_atomic_uint32_store_explicit(&device->device_has_dgc_templates, 1, vkd3d_memory_order_relaxed);
+diff --git a/libs/vkd3d/memory.c b/libs/vkd3d/memory.c
+index 131a09b9..fc3d2520 100644
+--- a/libs/vkd3d/memory.c
++++ b/libs/vkd3d/memory.c
+@@ -1184,6 +1184,11 @@ static HRESULT vkd3d_allocation_assign_gpu_address(struct vkd3d_memory_allocatio
+         return E_OUTOFMEMORY;
+     }
+
++    /* Remix: cpu_address is the mapping of the allocation at offset 0 and
++     * resource.va the address of the same base buffer, so VA -> CPU is
++     * remix_cpu_address + (va - resource.va). Mapped before this point. */
++    allocation->resource.remix_cpu_address = allocation->cpu_address;
++
+     /* Internal scratch buffers are not visible to application so we never have to map it back to VkBuffer. */
+     if (!(allocation->flags & VKD3D_ALLOCATION_FLAG_INTERNAL_SCRATCH))
+         vkd3d_va_map_insert(&allocator->va_map, &allocation->resource);
+@@ -1283,6 +1288,10 @@ static void vkd3d_memory_allocation_free(const struct vkd3d_memory_allocation *a
+         vkd3d_free(allocation->resource.view_map);
+     }
+
++    /* Remix: after the VA map entry is gone, so no draw annotation can
++     * still find it. */
++    remix_shadow_free(allocation->resource.remix_shadow);
++
+     if (allocation->flags & VKD3D_ALLOCATION_FLAG_GLOBAL_BUFFER)
+         VK_CALL(vkDestroyBuffer(device->vk_device, allocation->resource.vk_buffer, NULL));
+
+diff --git a/libs/vkd3d/resource.c b/libs/vkd3d/resource.c
+index a8fc26b1..4e42795b 100644
+--- a/libs/vkd3d/resource.c
++++ b/libs/vkd3d/resource.c
+@@ -7272,6 +7272,10 @@ static void vkd3d_create_texture_srv(vkd3d_cpu_descriptor_va_t desc_va,
+
+     view = vkd3d_create_texture_srv_view(device, resource, desc);
+
++    /* Remix samples the texture in the same layout the descriptor uses. */
++    if (view)
++        view->remix_layout = resource->common_layout;
++
+     descriptor_info.image.sampler = VK_NULL_HANDLE;
+     descriptor_info.image.imageView = view ? view->vk_image_view : VK_NULL_HANDLE;
+     descriptor_info.image.imageLayout = view ? resource->common_layout : VK_IMAGE_LAYOUT_UNDEFINED;
+@@ -10306,6 +10310,86 @@ static void d3d12_descriptor_heap_report_allocation(const D3D12_DESCRIPTOR_HEAP_
+ }
+ #endif
+
++/* Remix: live shader-visible CBV/SRV/UAV heaps (their metadata arrays), so
++ * remix_vkd3d_heap_view never reads a heap destroyed since Remix saw it.
++ * Lookups run under the same lock as destruction. */
++#define REMIX_MAX_LIVE_HEAPS 64
++static pthread_mutex_t remix_heap_lock = PTHREAD_MUTEX_INITIALIZER;
++static struct { const void *metadata; uint32_t count; } remix_live_heaps[REMIX_MAX_LIVE_HEAPS];
++
++static bool remix_heap_is_tracked(const struct d3d12_device *device, const D3D12_DESCRIPTOR_HEAP_DESC *desc)
++{
++    return desc->Type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV &&
++            (desc->Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) &&
++            !d3d12_device_use_embedded_mutable_descriptors(device);
++}
++
++static void remix_heap_register(const void *metadata, uint32_t count)
++{
++    unsigned int i;
++
++    pthread_mutex_lock(&remix_heap_lock);
++    for (i = 0; i < REMIX_MAX_LIVE_HEAPS; i++)
++    {
++        if (!remix_live_heaps[i].metadata)
++        {
++            remix_live_heaps[i].metadata = metadata;
++            remix_live_heaps[i].count = count;
++            break;
++        }
++    }
++    pthread_mutex_unlock(&remix_heap_lock);
++}
++
++static void remix_heap_unregister(const void *metadata)
++{
++    unsigned int i;
++
++    pthread_mutex_lock(&remix_heap_lock);
++    for (i = 0; i < REMIX_MAX_LIVE_HEAPS; i++)
++    {
++        if (remix_live_heaps[i].metadata == metadata)
++            remix_live_heaps[i].metadata = NULL;
++    }
++    pthread_mutex_unlock(&remix_heap_lock);
++}
++
++/* Remix: descriptor `index` of a heap reported as
++ * REMIX_VKFE_BINDING_DESCRIPTOR_HEAP (exported from d3d12core.dll). */
++uint32_t remix_vkd3d_heap_view(const void *heap, uint32_t descriptor_count, uint32_t index,
++        VkImageView *view, VkImageLayout *layout)
++{
++    const struct vkd3d_descriptor_metadata_view *metadata = heap;
++    const struct vkd3d_view *image_view;
++    uint32_t result = 0;
++    unsigned int i;
++
++    if (!metadata || !view || !layout || index >= descriptor_count)
++        return 0;
++
++    pthread_mutex_lock(&remix_heap_lock);
++
++    for (i = 0; i < REMIX_MAX_LIVE_HEAPS; i++)
++    {
++        if (remix_live_heaps[i].metadata == heap && index < remix_live_heaps[i].count)
++        {
++            metadata += index;
++
++            if ((metadata->info.image.flags & VKD3D_DESCRIPTOR_FLAG_IMAGE_VIEW) &&
++                    (image_view = metadata->info.image.view))
++            {
++                *view = image_view->vk_image_view;
++                *layout = image_view->remix_layout;
++                result = 1;
++            }
++            break;
++        }
++    }
++
++    pthread_mutex_unlock(&remix_heap_lock);
++    return result;
++}
++
+ HRESULT d3d12_descriptor_heap_create(struct d3d12_device *device,
+         const D3D12_DESCRIPTOR_HEAP_DESC *desc, struct d3d12_descriptor_heap **descriptor_heap)
+ {
+@@ -10483,6 +10567,9 @@ HRESULT d3d12_descriptor_heap_create(struct d3d12_device *device,
+
+     d3d12_descriptor_heap_init_descriptors(object);
+
++    if (remix_heap_is_tracked(device, desc))
++        remix_heap_register(d3d12_desc_decode_va(object->cpu_va.ptr).view, desc->NumDescriptors);
++
+     TRACE("Created descriptor heap %p.\n", object);
+
+ #ifdef VKD3D_ENABLE_DESCRIPTOR_QA
+@@ -10500,6 +10587,9 @@ void d3d12_descriptor_heap_cleanup(struct d3d12_descriptor_heap *descriptor_heap
+     const struct vkd3d_vk_device_procs *vk_procs = &descriptor_heap->device->vk_procs;
+     struct d3d12_device *device = descriptor_heap->device;
+
++    if (remix_heap_is_tracked(device, &descriptor_heap->desc))
++        remix_heap_unregister(d3d12_desc_decode_va(descriptor_heap->cpu_va.ptr).view);
++
+ #ifndef VKD3D_NO_TRACE_MESSAGES
+     if (descriptor_heap->desc.Type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV ||
+             descriptor_heap->desc.Type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER)
+diff --git a/libs/vkd3d/vkd3d_private.h b/libs/vkd3d/vkd3d_private.h
+index 3e71f89c..aa4a4f28 100644
+--- a/libs/vkd3d/vkd3d_private.h
++++ b/libs/vkd3d/vkd3d_private.h
+@@ -860,8 +860,40 @@ struct vkd3d_unique_resource
+     /* This is used to handle views when we cannot bind it to a
+      * specific ID3D12Resource, i.e. RTAS. Only allocated as needed. */
+     struct vkd3d_view_map *view_map;
++
++    /* Remix: CPU mapping of the allocation at va (NULL if not host
++     * visible, and for sparse buffers). Set where the allocation enters the
++     * VA map. */
++    void *remix_cpu_address;
++
++    /* Remix: for default-heap allocations, the bytes small CopyBufferRegion
++     * calls from host-visible memory wrote (constant buffers filled from an
++     * upload ring), in lazily allocated pages. NULL until the first copy. */
++    struct remix_shadow *remix_shadow;
++};
++
++/* Remix: page table of a vkd3d_unique_resource's shadow. */
++#define REMIX_SHADOW_PAGE_SIZE (64u * 1024u)
++
++struct remix_shadow
++{
++    VkDeviceSize page_count;
++    uint8_t *pages[];
+ };
+
++static inline void remix_shadow_free(struct remix_shadow *shadow)
++{
++    VkDeviceSize i;
++
++    if (!shadow)
++        return;
++
++    for (i = 0; i < shadow->page_count; i++)
++        vkd3d_free(shadow->pages[i]);
++
++    vkd3d_free(shadow);
++}
++
+ struct vkd3d_device_memory_allocation
+ {
+     VkDeviceMemory vk_memory;
+@@ -1367,6 +1399,10 @@ struct vkd3d_view
+             unsigned int w_size;
+         } texture;
+     } info;
++
++    /* Remix: layout the image is sampled in through this view (the
++     * resource's common layout). */
++    VkImageLayout remix_layout;
+ };
+
+ void vkd3d_view_decref(struct vkd3d_view *view, struct d3d12_device *device);
+@@ -2878,6 +2914,10 @@ struct vkd3d_pipeline_bindings
+
+     uint32_t root_constants[D3D12_MAX_ROOT_COST];
+     uint64_t root_constant_dirty_mask;
++
++    /* Remix: root descriptor addresses on every path. The push-descriptor
++     * path keeps only buffer + offset; Remix reads root CBV bytes by VA. */
++    VkDeviceAddress remix_root_descriptor_va[D3D12_MAX_ROOT_COST];
+ };
+
+ struct vkd3d_dynamic_state
+@@ -3510,6 +3550,9 @@ struct d3d12_command_list
+     size_t pending_queries_count;
+
+     const struct vkd3d_descriptor_metadata_view *cbv_srv_uav_descriptors_view;
++    /* Remix: descriptor count of the bound CBV/SRV/UAV heap (bounds
++     * remix_vkd3d_heap_view lookups of SM 6.6 heap indices). */
++    uint32_t remix_cbv_srv_uav_count;
+
+     struct d3d12_resource *vrs_image;
+
+@@ -3577,6 +3620,10 @@ void d3d12_command_list_invalidate_root_parameters(struct d3d12_command_list *li
+         struct vkd3d_pipeline_bindings *bindings, bool invalidate_legacy_descriptor_sets,
+         struct vkd3d_pipeline_bindings *sibling_push_domain);
+ void d3d12_command_list_invalidate_descriptor_heap(struct d3d12_command_list *list);
++
++/* Remix (exported from d3d12core.dll, see remix_vk_frontend.h). */
++uint32_t remix_vkd3d_heap_view(const void *heap, uint32_t descriptor_count, uint32_t index,
++        VkImageView *view, VkImageLayout *layout);
+ void d3d12_command_list_update_global_descriptor_heap(struct d3d12_command_list *list);
+ void d3d12_command_list_flush_dgc_batch(struct d3d12_command_list *list);
+ void d3d12_command_list_meta_push_data(struct d3d12_command_list *list,

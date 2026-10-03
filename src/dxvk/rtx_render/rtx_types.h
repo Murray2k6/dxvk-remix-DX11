@@ -681,6 +681,20 @@ struct ShaderProgramInfo {
   uint32_t minorVersion = 0;
 };
 
+// A terrain bake recorded outside Remix's context (the DX12 / Vulkan front
+// end replays the game's draw into this image in the game's command buffer,
+// with TerrainBaker::getExternalBakeLayout's cascades). TerrainBaker copies
+// it into the cascade map and binds it like its own bake.
+struct ExternalTerrainBake {
+  Rc<DxvkImageView> image;              // cascade grid, bakeLevelResolution per level
+  uint32_t          numCascades = 0;
+  uint32_t          cascadeMapSizeX = 0;
+  uint32_t          cascadeMapSizeY = 0;
+  float             lastCascadeScale = 1.0f;
+  Matrix4           worldToCascade0Texture;
+  uint64_t          frame = 0;          // the front end's frame it was baked in
+};
+
 struct DrawCallState {
   DrawCallState() = default;
   DrawCallState(const DrawCallState& _input) = default;
@@ -767,6 +781,23 @@ struct DrawCallState {
 
   // Render-pass classification for diagnostics (points to a static string).
   const char* passDescription = "Unknown";
+
+  // The game's own draw call, as issued (the committed geometry may be a
+  // flattened capture instead). The DX11 terrain bake replays exactly this
+  // draw with the game's bound shaders. valid = false for indirect draws.
+  struct GameDraw {
+    bool     valid = false;
+    bool     indexed = false;
+    uint32_t count = 0;
+    uint32_t start = 0;
+    int32_t  base = 0;
+    uint32_t firstInstance = 0;
+    uint32_t instanceCount = 1;
+  } gameDraw;
+
+  // Set instead of gameDraw by the DX12 / Vulkan front end when it baked
+  // this terrain draw itself.
+  std::shared_ptr<const ExternalTerrainBake> externalTerrainBake;
 
   float minZ = 0.0f;
   float maxZ = 1.0f;
@@ -864,6 +895,8 @@ private:
   friend class RtxContext;
   friend class SceneManager;
   friend struct D3D11Rtx;
+  // DX12 / Vulkan front end (d3d11_vk_capture.cpp)
+  friend class D3D11VkFrontendDevice;
   friend class TerrainBaker;
   friend struct RemixAPIPrivateAccessor;
   friend class RtxParticleSystemManager;

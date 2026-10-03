@@ -37,6 +37,8 @@ d3d11_src = [
   'd3d11_state.cpp',
   'd3d11_state_object.cpp',
   'd3d11_swapchain.cpp',
+  'd3d11_input_guard.cpp',
+  'd3d11_engine_profile.cpp',
   'd3d11_texture.cpp',
   'd3d11_util.cpp',
   'd3d11_video.cpp',
@@ -44,11 +46,17 @@ d3d11_src = [
   'd3d11_view_rtv.cpp',
   'd3d11_view_srv.cpp',
   'd3d11_view_uav.cpp',
+  'd3d11_light_decode.cpp',
+  'd3d11_vk_frontend.cpp',
+  'd3d11_vk_capture.cpp',
+  'd3d11_vk_spirv.cpp',
 ]
 
 d3d11_shaders = files([
   'shaders/d3d11_video_blit_frag.frag',
   'shaders/d3d11_video_blit_vert.vert',
+  'shaders/d3d11_vk_ui_composite_frag.frag',
+  'shaders/d3d11_vk_ui_layer_frag.frag',
 ])
 
 d3d11_rtx_include_path = include_directories('../dxvk', '../../public/include')
@@ -58,7 +66,7 @@ d3d11_dll = shared_library('d3d11'+dll_ext, dxgi_common_src + d3d11_src,
   name_prefix         : '',
   link_args           : [ usd_plugin_delay_load_args, remix_satellite_delay_load_args, '/DEPENDENTLOADFLAG:0x1100' ],
   dependencies        : [ lib_dxgi, dxbc_dep, dxvk_dep ],
-  include_directories : [ dxvk_include_path, dxvk_shader_include_path, usd_include_paths, lssusd_include_paths, d3d11_rtx_include_path ],
+  include_directories : [ dxvk_include_path, dxvk_shader_include_path, usd_include_paths, lssusd_include_paths, d3d11_rtx_include_path, remix_api_include_path ],
   install             : true,
   vs_module_defs      : 'd3d11'+def_spec_ext,
   override_options    : ['cpp_std='+dxvk_cpp_std])

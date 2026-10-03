@@ -370,8 +370,11 @@ namespace dxvk {
         ::GetWindowLongW(m_window, GWL_EXSTYLE));
       ::SetRect(&newRect, 0, 0, newRect.right - newRect.left, newRect.bottom - newRect.top);
       ::OffsetRect(&newRect, oldRect.left, oldRect.top);    
-      ::MoveWindow(m_window, newRect.left, newRect.top,
-          newRect.right - newRect.left, newRect.bottom - newRect.top, TRUE);
+      // Asynchronous from foreign threads: a synchronous move deadlocks when
+      // the window thread is waiting on the caller (see EnterFullscreenMode).
+      ::SetWindowPos(m_window, nullptr, newRect.left, newRect.top,
+        newRect.right - newRect.left, newRect.bottom - newRect.top, SWP_NOZORDER | SWP_NOACTIVATE
+        | (::GetWindowThreadProcessId(m_window, nullptr) == ::GetCurrentThreadId() ? 0u : SWP_ASYNCWINDOWPOS));
     } else {
       Com<IDXGIOutput> output;
       
@@ -397,8 +400,11 @@ namespace dxvk {
       
       RECT newRect = desc.DesktopCoordinates;
       
-      ::MoveWindow(m_window, newRect.left, newRect.top,
-          newRect.right - newRect.left, newRect.bottom - newRect.top, TRUE);
+      // Asynchronous from foreign threads: a synchronous move deadlocks when
+      // the window thread is waiting on the caller (see EnterFullscreenMode).
+      ::SetWindowPos(m_window, nullptr, newRect.left, newRect.top,
+        newRect.right - newRect.left, newRect.bottom - newRect.top, SWP_NOZORDER | SWP_NOACTIVATE
+        | (::GetWindowThreadProcessId(m_window, nullptr) == ::GetCurrentThreadId() ? 0u : SWP_ASYNCWINDOWPOS));
     }
     
     return S_OK;
@@ -632,8 +638,18 @@ namespace dxvk {
     style   &= ~WS_OVERLAPPEDWINDOW;
     exstyle &= ~WS_EX_OVERLAPPEDWINDOW;
     
-    ::SetWindowLongW(m_window, GWL_STYLE, style);
-    ::SetWindowLongW(m_window, GWL_EXSTYLE, exstyle);
+    // SetWindowLong/SetWindowPos send messages synchronously to the window's
+    // thread. Games call SetFullscreenState from a render thread while their
+    // window thread waits on it, which deadlocked Fallout 4 here. Skip no-op
+    // style writes and move the window asynchronously from foreign threads.
+    const bool onWindowThread =
+      ::GetWindowThreadProcessId(m_window, nullptr) == ::GetCurrentThreadId();
+    const UINT asyncFlag = onWindowThread ? 0u : SWP_ASYNCWINDOWPOS;
+
+    if (style != m_windowState.style)
+      ::SetWindowLongW(m_window, GWL_STYLE, style);
+    if (exstyle != m_windowState.exstyle)
+      ::SetWindowLongW(m_window, GWL_EXSTYLE, exstyle);
     
     // Move the window so that it covers the entire output
     DXGI_OUTPUT_DESC desc;
@@ -648,7 +664,7 @@ namespace dxvk {
     // normal borderless-fullscreen window under focus changes.
     ::SetWindowPos(m_window, emulateFullscreen ? HWND_TOP : HWND_TOPMOST,
       rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top,
-      SWP_FRAMECHANGED | SWP_SHOWWINDOW | SWP_NOACTIVATE);
+      SWP_FRAMECHANGED | SWP_SHOWWINDOW | SWP_NOACTIVATE | asyncFlag);
     
     m_monitor = desc.Monitor;
     m_target  = std::move(output);
@@ -700,10 +716,16 @@ namespace dxvk {
     LONG curStyle   = ::GetWindowLongW(m_window, GWL_STYLE) & ~WS_VISIBLE;
     LONG curExstyle = ::GetWindowLongW(m_window, GWL_EXSTYLE) & ~WS_EX_TOPMOST;
     
+    // See EnterFullscreenMode: avoid synchronous cross-thread window messages.
+    const bool onWindowThread =
+      ::GetWindowThreadProcessId(m_window, nullptr) == ::GetCurrentThreadId();
+
     if (curStyle == (m_windowState.style & ~(WS_VISIBLE | WS_OVERLAPPEDWINDOW))
      && curExstyle == (m_windowState.exstyle & ~(WS_EX_TOPMOST | WS_EX_OVERLAPPEDWINDOW))) {
-      ::SetWindowLongW(m_window, GWL_STYLE,   m_windowState.style);
-      ::SetWindowLongW(m_window, GWL_EXSTYLE, m_windowState.exstyle);
+      if (::GetWindowLongW(m_window, GWL_STYLE) != m_windowState.style)
+        ::SetWindowLongW(m_window, GWL_STYLE,   m_windowState.style);
+      if (::GetWindowLongW(m_window, GWL_EXSTYLE) != m_windowState.exstyle)
+        ::SetWindowLongW(m_window, GWL_EXSTYLE, m_windowState.exstyle);
     }
     
     // Restore window position and apply the style
@@ -711,7 +733,7 @@ namespace dxvk {
     
     ::SetWindowPos(m_window, (m_windowState.exstyle & WS_EX_TOPMOST) ? HWND_TOPMOST : HWND_NOTOPMOST,
       rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top,
-      SWP_FRAMECHANGED | SWP_NOACTIVATE);
+      SWP_FRAMECHANGED | SWP_NOACTIVATE | (onWindowThread ? 0u : SWP_ASYNCWINDOWPOS));
     
     NotifyModeChange(monitor, TRUE);
     return S_OK;

@@ -85,6 +85,11 @@
   X(SubsurfaceRadius,                 subsurface_radius,                      Vector3,        Vector3(0.f),               Vector3(65504.f),          Vector3(0.5f, 0.5f, 0.5f)) \
   X(SubsurfaceRadiusScale,            subsurface_radius_scale,                float,          0.f,                        65504.0f,                  1.f) \
   X(SubsurfaceMaxSampleRadius,        subsurface_max_sample_radius,           float,          0.f,                        65504.0f,                  16.f) \
+  /* Normal map encoding: 0 octahedral (Remix assets), 1 tangent-space RGB (OpenGL, +Y), 2 tangent-space RGB */ \
+  /* (DirectX, -Y), 3 two-channel XY (BC5/R8G8, DirectX, z reconstructed), 4 DXT5nm (X in A, Y in G, DirectX), */ \
+  /* 5 XY swapped, 6 two-channel signed XY (BC5_SNORM/R8G8_SNORM, sampled in [-1, 1], DirectX, z reconstructed). */ \
+  /* Game normal maps captured by the DX11 layer use 2..6; Remix-ingested assets keep 0. */ \
+  X(NormalEncoding,                   normalmap_encoding,                     uint8_t,        0,                          255,                       0) \
   /* Sampler State */ \
   X(FilterMode,                       filter_mode,                            uint8_t,        lss::Mdl::Filter::Nearest,  lss::Mdl::Filter::Linear,  lss::Mdl::Filter::Linear)  \
   X(WrapModeU,                        wrap_mode_u,                            uint8_t,        lss::Mdl::WrapMode::Clamp,  lss::Mdl::WrapMode::Clip,  lss::Mdl::WrapMode::Repeat) \

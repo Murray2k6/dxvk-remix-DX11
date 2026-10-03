@@ -18,8 +18,10 @@
 #pragma warning(disable: 4099) // DX11_V213_FIX_WX_C4099_C4146
 #endif
 #include "d3d11_include.h"
+#include "d3d11_engine_profile.h"
 
 #include "../dxvk/rtx_render/rtx_types.h"
+#include "rtx/dx11/dx11_light_state.h"
 #include "../dxvk/rtx_render/rtx_hashing.h"
 #include "../dxvk/rtx_render/rtx_materials.h"
 #include "../dxvk/rtx_render/rtx_utils.h"
@@ -28,12 +30,16 @@
 #include "../util/util_threadpool.h"
 #include "../util/sync/sync_signal.h"
 
+#include <unordered_map>
 #include <unordered_set>
 #include <memory>
 
 namespace dxvk {
 
   class D3D11DeviceContext;
+  class D3D11Buffer;
+  class D3D11CommonShader;
+  struct D3D11ShaderResourceBindings;
 
   class D3D11Rtx {
   public:
@@ -86,6 +92,10 @@ namespace dxvk {
 
     void Initialize();
     bool OnDrawAuto();
+
+    /// Called before each compute dispatch: imports the frame's light list
+    /// from a tiled-deferred light buffer, when the dispatch reads one.
+    void OnDispatch();
     bool OnDraw(UINT vertexCount, UINT startVertex);
     bool OnDrawIndexed(UINT indexCount, UINT startIndex, INT baseVertex);
     bool OnDrawInstanced(UINT vertexCountPerInstance, UINT instanceCount, UINT startVertex, UINT startInstance);
@@ -97,6 +107,14 @@ namespace dxvk {
     // Must be called with the context lock held.
     // EndFrame runs the RT pipeline writing output into backbuffer (called BEFORE recording the blit).
     void EndFrame(const Rc<DxvkImage>& backbuffer, VkExtent2D remixViewportExtent = { 0u, 0u });
+
+    // 2D lift presentation (AUDIT.md, "2D lift"): while sprites are lifted as
+    // emissive layers their emission is the sprite's own colour, so exposure
+    // and the tone curve are held neutral (auto exposure off, EV 0, global
+    // tonemapper without its curve) on the derived option layer, and released
+    // when lifting stops. Shared by the DX11 path (source 0) and the Vulkan
+    // front end (source 1): held while either lifts.
+    static void SetLift2DPresentation(bool lifting, uint32_t source = 0);
     // Queue the same final-image capture used by the Remix developer window.
     // The swapchain WndProc uses this for Print Screen after consuming the key
     // before it reaches the vanilla game.
@@ -109,7 +127,11 @@ namespace dxvk {
 
   private:
     static constexpr uint32_t kMaxConcurrentDraws = 6 * 1024;
-    using GeometryProcessor = WorkerThreadPool<kMaxConcurrentDraws>;
+    // LowLatency=false: idle workers sleep on a condition variable. The
+    // low-latency mode spins (spinlock + yield) forever; with one pool per
+    // immediate AND per deferred context, Fallout 4 kept many cores busy
+    // doing nothing and starved the game's own threads.
+    using GeometryProcessor = WorkerThreadPool<kMaxConcurrentDraws, true, false>;
 
     D3D11DeviceContext*                  m_context;
     struct CameraTrackingState;
@@ -139,6 +161,11 @@ namespace dxvk {
     // DX11_V319_DEFERRED_LIGHT_VOLUMES: lights created from light-volume draws
     // this frame, bounded by rtx.dx11.deferredLightVolumeMaxPerFrame.
     uint32_t                             m_deferredLightVolumesThisFrame = 0;
+    // Lights created from volumes this frame (position + range), to drop the
+    // duplicates that repeated effect/marker draws produce at one spot.
+    std::vector<Vector4>                 m_deferredLightVolumePositionsThisFrame;
+    // Surface textures of draws converted to Remix water (see SubmitDraw).
+    fast_unordered_set                   m_refractiveSurfaceTextures;
     // DX11_V319_LIGHT_VOLUMES_SELF_ARM: evidence that this game lights deferred,
     // gathered from the draws themselves so no engine has to be recognised.
     uint32_t                             m_deferredLightVolumeCandidatesThisFrame = 0;
@@ -274,6 +301,12 @@ namespace dxvk {
       // per-frame GPU work/allocation budget. Kept separate from structural
       // capture failures so field logs show whether a scene needs more budget.
       uint32_t positionCaptureBudgetRejected = 0;
+      // Capture-cache churn: entries created / evicted / reset by a contract
+      // change this frame, and budget-refused draws served from a prior capture.
+      uint32_t posCacheNew = 0;
+      uint32_t posCacheEvicted = 0;
+      uint32_t posCacheContractReset = 0;
+      uint32_t posCacheStaleReuse = 0;
       uint32_t position2D = 0;
       uint32_t noPositionBuffer = 0;
       uint32_t noIndexBuffer = 0;
@@ -298,6 +331,41 @@ namespace dxvk {
       // DX11_V277: depth-only draws (prepass/shadow re-renders) excluded so
       // geometry never enters the RT scene as stacked coincident copies.
       uint32_t depthOnlySkipped = 0;
+      uint32_t farPlaneSkySkipped = 0;
+      uint32_t waterCompanionSkipped = 0;
+      uint32_t cameraCenteredSkipped = 0;
+      uint32_t screenSpaceVsSkipped = 0;
+      uint32_t orthographicUi = 0;  // rtx.orthographicIsUI routing
+      uint32_t volumeBoxSkipped = 0;
+      uint32_t otherCameraNoSteer = 0;
+      uint32_t exactWorldTransform = 0;
+      uint32_t exactWorldRebased = 0;
+      uint64_t exactWorldVerticesSaved = 0;
+      uint32_t autoDecals = 0;
+      uint32_t autoParticles = 0;
+      // Engine-knowledge pass handling (documentation/engine_knowledge):
+      // re-draws of a mesh already submitted this frame (forward per-light
+      // passes, velocity passes, overlay shells), and light-prepass geometry
+      // passes whose depth-EQUAL material pass carries the real material.
+      uint32_t duplicatePassSkipped = 0;
+      uint32_t lightPrepassGeometrySkipped = 0;
+      uint32_t passKeyUnavailable = 0;
+      uint32_t noLayoutWorldCandidate = 0;
+      uint32_t vertexPulledAdmitted = 0;
+      uint32_t projectedDecals = 0;
+      uint32_t tessellatedAdmitted = 0;
+      uint32_t indirectAdmitted = 0;
+      uint32_t geometryShaderAdmitted = 0;
+      uint32_t lightVolumeColours = 0;
+      uint32_t indirectRejected = 0;
+      uint32_t decalVolumeUnresolved = 0;
+      uint32_t mirroredViewSkipped = 0;
+      uint32_t tiledLightsImported = 0;
+      uint32_t lift2DCandidates = 0;
+      uint32_t secondaryViewSkipped = 0;
+      uint32_t autoTerrain = 0;
+      uint32_t lift2DAccepted = 0;
+      uint32_t lift2DCaptureFailed = 0;
       // DX11_V281: wireframe-fill draws (debug/editor overlays) excluded -
       // their triangles are lines on screen, not solid RT surfaces.
       uint32_t wireframeSkipped = 0;
@@ -309,6 +377,107 @@ namespace dxvk {
     };
 
     SubmitRejectStats                    m_submitRejectStats;
+
+    // Same-frame pass identity: input-assembler range plus the constant data
+    // that feeds SV_Position. Two draws with the same key put the same
+    // triangles in the same place, so only the first becomes RT geometry.
+    std::unordered_set<uint64_t>         m_passKeysThisFrame;
+    // Camera-independent mesh ranges submitted this frame (velocity re-draws).
+    std::unordered_set<uint64_t>         m_meshKeysThisFrame;
+    // Keys whose opaque depth-EQUAL (material) pass was submitted; a
+    // depth-writing draw with a key seen there last frame is the light-prepass
+    // geometry pass and is left to that material pass.
+    std::unordered_set<uint64_t>         m_equalPassKeysThisFrame;
+    std::unordered_set<uint64_t>         m_equalPassKeysPrevFrame;
+    bool                                 m_abDisableEngineKnowledge = false;
+    // 2D lift (rtx.dx11.lift2DLayers): sprite draws of a 2D game become
+    // emissive planes at their layer depth. m_lift2DFrame is decided at frame
+    // start from the previous frames; m_lift2DDraw/Depth carry the decision
+    // for the draw being submitted into position capture.
+    bool                                 m_lift2DFrame = false;
+    bool                                 m_lift2DDraw = false;
+    float                                m_lift2DDepth = 0.0f;
+    uint32_t                             m_lift2DLayer = 0;
+    uint32_t                             m_lift2DStreak = 0;
+    uint32_t                             m_perspectiveSceneThisFrame = 0;
+    bool                                 m_seenPerspectiveScene = false;
+    // Skyrim SE per-draw forward lights, deduplicated and added once a frame.
+    std::vector<Dx11LightDesc>           m_frameDrawLights;
+    std::unordered_set<uint64_t>         m_frameDrawLightKeys;
+    // Width of the largest target real scene draws went into, this frame and
+    // last: the main target, whatever its dynamic-resolution scale.
+    uint32_t                             m_frameSceneTargetWidth = 0;
+    uint32_t                             m_prevFrameSceneTargetWidth = 0;
+    // The offscreen target the game composites onto the back buffer, learned
+    // from last frame's composite draw; lifted like the back buffer.
+    const DxvkImage*                     m_lift2DSceneTarget = nullptr;
+    const DxvkImage*                     m_lift2DSceneTargetNext = nullptr;
+    const D3D11EngineProfile*            m_engineProfile = nullptr;
+
+    // Camera knowledge for the bound vertex shader: where its camera constants
+    // live, from RDEF variable names or the engine's documented register
+    // layout (documentation/engine_knowledge). Byte offsets, -1 = absent.
+    struct CameraSeed {
+      bool        valid = false;
+      uint32_t    slot = UINT32_MAX;     // VS cbuffer slot of the matrices
+      uint32_t    eyeSlot = UINT32_MAX;  // VS cbuffer slot of Eye/NegEye
+      int32_t     offsets[size_t(D3D11CameraField::Count)];
+      const char* source = "";
+    };
+    std::unordered_map<uint64_t, CameraSeed> m_cameraSeedCache;
+    bool                                 m_eyeNegated = false;  // eye stored as -eye
+    // This draw's projection with TAA jitter kept (set per ExtractTransforms).
+    Matrix4                              m_drawJitteredProjection;
+    bool                                 m_drawJitteredProjectionValid = false;
+    // Handedness (sign of det(view rotation)) of the main camera, learned
+    // from scene draws; opposite-sign views are mirror/reflection passes.
+    int                                  m_mainViewDetSign = 0;
+    // Sun direction learned from orthographic shadow passes (light ViewProj
+    // depth axis), voted per frame by draw count.
+    struct SunVote { Vector3 direction; uint32_t count; };
+    std::vector<SunVote>                 m_sunVotes;
+    Vector3                              m_sunDirection = Vector3(0.0f);
+    bool                                 m_sunDirectionValid = false;
+    void LearnSunFromShadowDraw();
+    bool ImportTypedLightBuffer(const D3D11ShaderResourceBindings& views);
+    bool ImportKatanaClusterLights(const D3D11ShaderResourceBindings& views, const D3D11CommonShader* shader);
+
+    // Draw*InstancedIndirect being submitted: capture replays the same
+    // indirect draw on the GPU (arguments never read on the CPU).
+    struct IndirectReplay {
+      bool            active = false;
+      bool            indexed = false;
+      DxvkBufferSlice args;
+      uint32_t        offset = 0;
+      uint64_t        identity = 0;
+    };
+    IndirectReplay                       m_indirectReplay;
+
+    // UI composition: the presented image, and offscreen render targets that
+    // receive only UI and are composited onto it (identity only).
+    const DxvkImage*                     m_lastBackbufferImage = nullptr;
+    std::vector<const DxvkImage*>        m_offscreenUiTargets;
+    bool TryInjectAtUiComposite();
+    bool ImportFrostbitePunctualLights();
+    void CollectSkyrimDrawLights();
+    void ClassifyClipProjection(bool& orthographic, bool& perspective) const;
+    bool IsLift2DTarget() const;
+    const DxvkImage* Lift2DSampledRenderTarget(bool& samplesOnlyRenderTargets) const;
+    Matrix4 Lift2DProjection() const;
+    void SubmitIndirectDraw(ID3D11Buffer* argumentBuffer, UINT argumentOffset, bool indexed);
+    void ApplyLearnedSunDirection();
+    uint32_t                             m_viewDetPositiveVotes = 0;
+    uint32_t                             m_viewDetNegativeVotes = 0;
+    uint32_t                             m_cameraSeedProjLocks = 0;
+    uint32_t                             m_cameraSeedVpFactored = 0;
+    const CameraSeed* ResolveCameraSeed();
+
+    // Returns false when the draw's position inputs cannot be identified.
+    bool ComputeDrawPassKey(bool indexed, UINT count, UINT start, INT base,
+                            UINT firstInstance,
+                            const RasterBuffer& positionBuffer,
+                            const RasterBuffer& indexBuffer, uint64_t positionIdentity,
+                            uint64_t& key, uint64_t& meshKey) const;
     // Screen-space UI is raster composition, not ray-traced world geometry.
     // Keep the texture hashes discoverable for manual categorization, but
     // preserve draw order by either injecting immediately before the first
@@ -501,6 +670,28 @@ namespace dxvk {
     VkDeviceSize m_positionCaptureCacheBytes = 0;
     void SweepPositionCaptureCache(uint32_t currentFrame);
 
+    // COLOR0 -> B8G8R8A8 conversions of non-DYNAMIC vertex buffers. Reading a
+    // mapped vertex buffer on the CPU goes over PCIe on resizable-BAR memory;
+    // converting every draw every frame cost Fallout 4 100+ ms per frame.
+    struct ColorConvertEntry {
+      Rc<DxvkBuffer> buffer;
+      VkDeviceSize   size = 0;
+      uint32_t       convertedFrame = 0;
+      uint32_t       lastUsedFrame = 0;
+    };
+    std::unordered_map<uint64_t, ColorConvertEntry> m_colorConvertCache;
+    VkDeviceSize m_colorConvertCacheBytes = 0;
+
+    // Sampled object-space bounds of non-DYNAMIC position streams (raw, before
+    // the outward bias), keyed like the COLOR0 cache.
+    struct BoundsCacheEntry {
+      float    mn[3];
+      float    mx[3];
+      bool     anyValid = false;
+      uint32_t sampledVerts = 0;
+    };
+    std::unordered_map<uint64_t, BoundsCacheEntry> m_boundsCache;
+
     // Capture memory stays device-local. Camera estimators share a bounded
     // host-visible readback ring; a command-list completion signal, not frame
     // age or an unrecorded buffer's isInUse state, authorizes CPU access/reuse.
@@ -515,6 +706,12 @@ namespace dxvk {
       Matrix4  clipToPosition;
       bool     clipUsesWDepth = false;
       bool     viewSpaceCamera = false;
+      // Player-body probe: the samples decide whether this skinned mesh is
+      // the player's own body around the camera, and feed no camera estimate.
+      bool     playerProbe = false;
+      // World placement the renderer used for these bytes (diagnostic).
+      Matrix4  capturedToWorld;
+      bool     hasCapturedToWorld = false;
       uint32_t vertexCount = 0;
       uint32_t stride = 0;
     };
@@ -530,11 +727,45 @@ namespace dxvk {
     uint64_t                               m_cameraAnchorNextSequence = 0;
     uint32_t                               m_cameraAnchorWriteIndex = kCameraAnchorBatchCount;
     uint32_t                               m_cameraAnchorLastConsumedFrame = ~0u;
+    // Capture keys of skinned meshes found surrounding the camera (the
+    // player's own body in first person) -> frame they last tested positive,
+    // and the frame each key was last probed.
+    // Draws refused by the capture budget with no earlier capture to reuse
+    // (this frame / last frame); drives capture fairness in the capture path.
+    uint32_t                               m_tiledLightImportFrame = ~0u;
+    // One- and two-channel albedo textures as grey (rrr1) / grey + alpha
+    // (rrrg) views, keyed by the game's view (held, so the key stays valid);
+    // entries unused for a while are dropped.
+    struct GreyAlbedoView {
+      Rc<DxvkImageView> source;
+      Rc<DxvkImageView> view;
+      uint32_t          lastFrame = 0;
+    };
+    // Mutable: filled from the const material path (FillMaterialData).
+    mutable std::unordered_map<const DxvkImageView*, GreyAlbedoView> m_greyAlbedoViews;
+    mutable uint32_t                       m_greyAlbedoPruneFrame = 0;
+    Rc<DxvkImageView> ToGreyAlbedoView(const Rc<DxvkImageView>& view) const;
+    // Exact eye position for camera-relative engines (see ExtractTransforms):
+    // the camera-constant offset that holds it once found, and the discovery
+    // state used to find it.
+    size_t                                 m_eyeOffset = SIZE_MAX;
+    Vector3                                m_eyeOriginShift = Vector3(0.0f);
+    std::vector<Vector3>                   m_eyeSamples;
+    std::vector<uint32_t>                  m_eyeVotes;
+    Vector3                                m_eyeLastEstimate = Vector3(0.0f);
+    uint32_t                               m_eyeLastSampleFrame = 0;
+    bool                                   m_eyeHaveSample = false;
+    bool                                   m_eyeSignatureChecked = false;
+    bool                                   m_abDisableExactWorld = false;
+    uint32_t                               m_starvedCapturesThisFrame = 0;
+    uint32_t                               m_prevFrameStarvedCaptures = 0;
+    std::unordered_map<uint64_t, uint32_t> m_playerBodyKeys;
+    std::unordered_map<uint64_t, uint32_t> m_playerProbeLastFrame;
     // Set per draw by ExtractTransforms: the game supplied a real view matrix
     // whose translation is exactly zero, i.e. it renders camera-relative.
     bool                                   m_cameraAnchorViewTranslationFree = false;
     void QueueCameraAnchorSample(const PositionCaptureEntry& entry, uint64_t meshKey,
-                                 bool viewSpaceCamera = false);
+                                 bool viewSpaceCamera = false, bool playerProbe = false);
     void SealCameraAnchorSamples();
     void ConsumeCameraAnchorSamples();
 
@@ -561,6 +792,13 @@ namespace dxvk {
     VkDeviceSize m_helperUnpooledBytesThisFrame = 0;
     uint32_t m_helperUnpooledFrame = ~0u;
     Rc<DxvkBuffer> AcquireHostVisibleHelperBuffer(VkDeviceSize size, const char* name);
+
+    // Shrinks an indexed draw's vertex streams to [minIndex, maxIndex] and
+    // supplies indices rebased to that range. Returns false (leaving the draw
+    // untouched) when the indices cannot be read on the CPU.
+    bool RebaseIndexedVertexRange(DrawCallState& dcs, uint32_t indexCount,
+                                  const D3D11Buffer* idxShadowSource,
+                                  VkDeviceSize idxShadowOffset);
     void RecycleHelperBuffers();
 
     void SubmitDraw(bool indexed, UINT count, UINT start, INT base,

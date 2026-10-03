@@ -927,6 +927,14 @@ if dxvk_is_ninja
       )
     endif
 
+    # DX12 / Vulkan front end: the Remix Vulkan layer and its manifest
+    # (install_remix_vk_layer.ps1 registers the manifest).
+    meson.add_install_script(
+      join_paths(global_src_root_norm, 'scripts-common/install_file_in_dir.bat'),
+      join_paths(current_build_dir_norm, 'src/vklayer', 'remix_vk_layer.*'), output_path,
+      install_tag: target_suffix
+    )
+
   endforeach
 
   # generate VS project files for ninja

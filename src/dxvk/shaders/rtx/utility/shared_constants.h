@@ -44,6 +44,12 @@ static const uint8_t surfaceMaterialTypeMask = uint8_t(0x3u);
 #define OPAQUE_SURFACE_MATERIAL_FLAG_IGNORE_ALPHA_CHANNEL (1 << COMMON_MATERIAL_FLAG_TYPE_OFFSET(2))
 #define OPAQUE_SURFACE_MATERIAL_FLAG_IS_RAYTRACED_RENDER_TARGET (1 << COMMON_MATERIAL_FLAG_TYPE_OFFSET(3))
 #define OPAQUE_SURFACE_MATERIAL_FLAG_HAS_DISPLACEMENT (1 << COMMON_MATERIAL_FLAG_TYPE_OFFSET(4))
+// bit in OpaqueSurfaceMaterial::normalEncoding above the packed encoding byte:
+// roughness comes from a game texture (inferred, clamped in the shader)
+#define OPAQUE_SURFACE_MATERIAL_ENCODING_INFERRED_ROUGHNESS (1 << 8)
+// legacy envmap reflection: white F0, metallic = mask channel x 4 x the
+// metallic constant (LegacyMaterialData::untintedReflection)
+#define OPAQUE_SURFACE_MATERIAL_ENCODING_UNTINTED_REFLECTION (1 << 9)
 
 
 #define OPAQUE_SURFACE_MATERIAL_INTERACTION_FLAG_HAS_HEIGHT_TEXTURE (1 << 0)

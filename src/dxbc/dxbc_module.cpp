@@ -73,10 +73,11 @@ namespace dxvk {
   Rc<DxvkShader> DxbcModule::compilePassthroughShader(
     const DxbcModuleInfo& moduleInfo,
     const std::string&    fileName,
-          bool            preserveSystemValues) const {
+          bool            preserveSystemValues,
+          uint32_t        inputVertices) const {
     if (m_shexChunk == nullptr)
       throw DxvkError("DxbcModule::compile: No SHDR/SHEX chunk");
-    
+
     DxbcAnalysisInfo analysisInfo;
 
     DxbcCompiler compiler(
@@ -84,8 +85,8 @@ namespace dxvk {
       DxbcProgramType::GeometryShader,
       m_osgnChunk, m_osgnChunk,
       m_psgnChunk, analysisInfo);
-    
-    compiler.processXfbPassthrough(preserveSystemValues);
+
+    compiler.processXfbPassthrough(preserveSystemValues, inputVertices);
     return compiler.finalize();
   }
 

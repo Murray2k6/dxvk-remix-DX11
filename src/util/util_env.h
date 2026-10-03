@@ -215,10 +215,20 @@ namespace dxvk::env {
     std::memcpy(logPath, exePath, size_t(dirLen) + 1);
     std::memcpy(logPath + dirLen + 1, "remix-dx11-boot.log", sizeof("remix-dx11-boot.log"));
 
-    const HANDLE file = ::CreateFileA(logPath, FILE_APPEND_DATA,
+    HANDLE file = ::CreateFileA(logPath, FILE_APPEND_DATA,
       FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (file == INVALID_HANDLE_VALUE)
       return;
+    // One line per DLL attach, forever: start over past 64 KiB so the file
+    // stays a recent history instead of growing stale.
+    LARGE_INTEGER bootLogSize = {};
+    if (::GetFileSizeEx(file, &bootLogSize) && bootLogSize.QuadPart > 64 * 1024) {
+      ::CloseHandle(file);
+      file = ::CreateFileA(logPath, FILE_APPEND_DATA,
+        FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+      if (file == INVALID_HANDLE_VALUE)
+        return;
+    }
 
     char line[640];
     size_t pos = 0;

@@ -17,6 +17,8 @@
 #pragma warning(disable: 4146) // DX11_V213_FIX_WX_C4099_C4146
 #endif
 #include "dxbc_compiler.h"
+#include "../dxvk/dxvk_spec_const.h"
+#include "../dxvk/rtx_render/rtx_spec_constants.h"
 
 namespace dxvk {
 
@@ -211,10 +213,17 @@ namespace dxvk {
   }
 
 
-  void DxbcCompiler::processXfbPassthrough(bool preserveSystemValues) {
-    m_module.setExecutionMode (m_entryPointId, spv::ExecutionModeInputPoints);
-    m_module.setExecutionMode (m_entryPointId, spv::ExecutionModeOutputPoints);
-    m_module.setOutputVertices(m_entryPointId, 1);
+  void DxbcCompiler::processXfbPassthrough(bool preserveSystemValues, uint32_t inputVertices) {
+    // Vulkan requires the GS input primitive to match the IA topology, or the
+    // tessellator's output when HS/DS are bound. Point input serves plain VS
+    // replays drawn as point lists; tessellated (and triangle-list) replays
+    // feed triangles, streamed out as one 3-vertex primitive each.
+    const bool triangles = inputVertices == 3u;
+    m_module.setExecutionMode (m_entryPointId, triangles
+      ? spv::ExecutionModeTriangles : spv::ExecutionModeInputPoints);
+    m_module.setExecutionMode (m_entryPointId, triangles
+      ? spv::ExecutionModeOutputTriangleStrip : spv::ExecutionModeOutputPoints);
+    m_module.setOutputVertices(m_entryPointId, triangles ? 3u : 1u);
     m_module.setInvocations   (m_entryPointId, 1);
     m_gs.invocationCount = 1;
 
@@ -223,7 +232,7 @@ namespace dxvk {
       if (preserveSystemValues && e->systemValue == DxbcSystemValue::Position) {
         needsPerVertexInput = true;
       } else {
-        emitDclInput(e->registerId, 1,
+        emitDclInput(e->registerId, triangles ? 3u : 1u,
           e->componentMask, DxbcSystemValue::None,
           DxbcInterpolationMode::Undefined);
       }
@@ -235,17 +244,21 @@ namespace dxvk {
     // generic registers, but the Remix position capture must retain this
     // system-value linkage or it will record unrelated/undefined vertex data.
     if (needsPerVertexInput)
-      emitDclInputPerVertex(1, "gs_vertex_in");
+      emitDclInputPerVertex(triangles ? 3u : 1u, "gs_vertex_in");
 
     // Figure out which streams to enable
     uint32_t streamMask = 0;
 
     for (size_t i = 0; i < m_xfbVars.size(); i++)
       streamMask |= 1u << m_xfbVars[i].streamId;
-    
+
     for (uint32_t streamId : bit::BitMask(streamMask)) {
-      emitXfbOutputSetup(streamId, true, preserveSystemValues);
-      m_module.opEmitVertex(m_module.constu32(streamId));
+      for (uint32_t v = 0; v < (triangles ? 3u : 1u); ++v) {
+        emitXfbOutputSetup(streamId, true, preserveSystemValues, v);
+        m_module.opEmitVertex(m_module.constu32(streamId));
+      }
+      if (triangles)
+        m_module.opEndPrimitive(m_module.constu32(streamId));
     }
 
     // End the main function
@@ -6917,6 +6930,73 @@ namespace dxvk {
   }
   
   
+  // DX11 terrain bake (rtx_terrain_baker.cpp, bakeDrawCallDx11): when the
+  // CustomVertexTransformEnabled pipeline spec constant is set, the final
+  // SV_Position is multiplied by a 4x4 matrix (four float4 rows) from the
+  // Remix-owned uniform block at constant-buffer slot 15 of this stage, which
+  // D3D11 never uses (games 0-13, immediate constants 14). The baker puts the
+  // draw's clip-to-scene mapping and the bake camera in that matrix, so the
+  // game's own VS and PS render the draw into the bake target. Off (spec
+  // constant false), this is a dead branch and slot 15 stays unbound.
+  void DxbcCompiler::emitBakeTransform() {
+    if (m_perVertexOut == 0)
+      return;
+    const uint32_t vec4Type = getVectorTypeId({ DxbcScalarType::Float32, 4 });
+    const uint32_t floatType = getScalarTypeId(DxbcScalarType::Float32);
+
+    const uint32_t arrayType = m_module.defArrayTypeUnique(vec4Type, m_module.constu32(4));
+    m_module.decorateArrayStride(arrayType, 16);
+    const uint32_t structType = m_module.defStructTypeUnique(1, &arrayType);
+    m_module.decorate(structType, spv::DecorationBlock);
+    m_module.memberDecorateOffset(structType, 0, 0);
+    m_module.setDebugName(structType, "rtx_bake_t");
+    const uint32_t varId = m_module.newVar(
+      m_module.defPointerType(structType, spv::StorageClassUniform), spv::StorageClassUniform);
+    m_module.setDebugName(varId, "rtx_bake");
+    const uint32_t bindingId = computeConstantBufferBinding(m_programInfo.type(), 15);
+    m_module.decorateDescriptorSet(varId, 0);
+    m_module.decorateBinding(varId, bindingId);
+
+    // Bound-ness spec constant, as for every D3D11 cbuffer binding.
+    const uint32_t boundId = m_module.specConstBool(true);
+    m_module.decorateSpecId(boundId, bindingId);
+
+    DxvkResourceSlot resource;
+    resource.slot = bindingId;
+    resource.type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    resource.view = VK_IMAGE_VIEW_TYPE_MAX_ENUM;
+    resource.access = VK_ACCESS_UNIFORM_READ_BIT;
+    m_resourceSlots.push_back(resource);
+
+    const uint32_t enabledId = m_module.specConstBool(false);
+    m_module.decorateSpecId(enabledId, getSpecId(RtxSpecConstantId::CustomVertexTransformEnabled));
+    m_module.setDebugName(enabledId, "rtx_bake_enabled");
+
+    const uint32_t labelBake = m_module.allocateId();
+    const uint32_t labelEnd = m_module.allocateId();
+    m_module.opSelectionMerge(labelEnd, spv::SelectionControlMaskNone);
+    m_module.opBranchConditional(enabledId, labelBake, labelEnd);
+    m_module.opLabel(labelBake);
+
+    const uint32_t positionMember = m_module.consti32(PerVertex_Position);
+    const uint32_t positionPtr = m_module.opAccessChain(
+      m_module.defPointerType(vec4Type, spv::StorageClassOutput), m_perVertexOut, 1, &positionMember);
+    const uint32_t position = m_module.opLoad(vec4Type, positionPtr);
+    const uint32_t rowPtrType = m_module.defPointerType(vec4Type, spv::StorageClassUniform);
+    std::array<uint32_t, 4> components;
+    for (uint32_t r = 0; r < 4; ++r) {
+      const std::array<uint32_t, 2> indices = { m_module.consti32(0), m_module.consti32(int32_t(r)) };
+      const uint32_t rowPtr = m_module.opAccessChain(rowPtrType, varId, 2, indices.data());
+      const uint32_t row = m_module.opLoad(vec4Type, rowPtr);
+      components[r] = m_module.opDot(floatType, row, position);
+    }
+    m_module.opStore(positionPtr, m_module.opCompositeConstruct(vec4Type, 4, components.data()));
+
+    m_module.opBranch(labelEnd);
+    m_module.opLabel(labelEnd);
+  }
+
+
   void DxbcCompiler::emitVsFinalize() {
     this->emitMainFunctionBegin();
     this->emitInputSetup();
@@ -6924,6 +7004,7 @@ namespace dxvk {
       m_module.defVoidType(),
       m_vs.functionId, 0, nullptr);
     this->emitOutputSetup();
+    this->emitBakeTransform();
     this->emitClipCullStore(DxbcSystemValue::ClipDistance, m_clipDistances);
     this->emitClipCullStore(DxbcSystemValue::CullDistance, m_cullDistances);
     this->emitFunctionEnd();
@@ -6962,6 +7043,7 @@ namespace dxvk {
       m_module.defVoidType(),
       m_ds.functionId, 0, nullptr);
     this->emitOutputSetup();
+    this->emitBakeTransform();
     this->emitClipCullStore(DxbcSystemValue::ClipDistance, m_clipDistances);
     this->emitClipCullStore(DxbcSystemValue::CullDistance, m_cullDistances);
     this->emitFunctionEnd();
@@ -7092,7 +7174,8 @@ namespace dxvk {
   void DxbcCompiler::emitXfbOutputSetup(
           uint32_t                          streamId,
           bool                              passthrough,
-          bool                              preserveSystemValues) {
+          bool                              preserveSystemValues,
+          uint32_t                          vertexIndex) {
     for (size_t i = 0; i < m_xfbVars.size(); i++) {
       if (m_xfbVars[i].streamId == streamId) {
         DxbcRegisterValue value;
@@ -7100,7 +7183,7 @@ namespace dxvk {
         if (passthrough && preserveSystemValues
          && m_xfbVars[i].systemValue == DxbcSystemValue::Position) {
           value = emitGsSystemValueLoad(
-            DxbcSystemValue::Position, m_xfbVars[i].srcMask, 0);
+            DxbcSystemValue::Position, m_xfbVars[i].srcMask, vertexIndex);
         } else {
           DxbcRegisterPointer srcPtr = passthrough
             ? m_vRegs[m_xfbVars[i].outputId]
@@ -7109,7 +7192,7 @@ namespace dxvk {
           if (passthrough) {
             srcPtr = emitArrayAccess(srcPtr,
               spv::StorageClassInput,
-              m_module.constu32(0));
+              m_module.constu32(vertexIndex));
           }
 
           value = emitRegisterExtract(

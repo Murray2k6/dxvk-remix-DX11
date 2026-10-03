@@ -41,6 +41,24 @@ f16vec3 translucentSurfaceMaterialInteractionResolveTransmittanceColor(f16vec3 t
   return gammaToLinear(transmittanceColor);
 }
 
+// A game's tangent-space normal map captured by the DX11 layer (NormalEncoding:
+// 2 RGB, 3 XY, 4 DXT5nm .ag, 5 XY swapped, 6 XY signed (SNORM: sampled in
+// [-1, 1] already)), decoded as in the opaque material.
+vec3 decodeGameTangentNormal(vec4 normalSample, uint encoding, float normalIntensity)
+{
+  vec2 xy = encoding == 4u ? vec2(normalSample.a, normalSample.g)
+          : encoding == 5u ? vec2(normalSample.g, normalSample.r)
+          : vec2(normalSample.xy);
+  if (encoding != 6u)
+    xy = xy * 2.0f - 1.0f;
+  // Remix tangent space is +Y (OpenGL); DirectX maps store -Y.
+  if (encoding >= 2u)
+    xy.y = -xy.y;
+  xy *= normalIntensity;
+  const float z = (encoding >= 3u) ? sqrt(saturate(1.0f - dot(xy, xy))) : (float(normalSample.z) * 2.0f - 1.0f);
+  return normalize(vec3(xy, max(z, 1.0e-3f)));
+}
+
 // Translucent Surface Material Interaction Functions
 
 TranslucentSurfaceMaterialInteraction translucentSurfaceMaterialInteractionCreate(
@@ -102,11 +120,16 @@ TranslucentSurfaceMaterialInteraction translucentSurfaceMaterialInteractionCreat
   if (normalLoaded)
   {
     // Note: Using f16 from texture to decode from is fine as the original texture is only 8 bits of precision.
-    vec3 tangentNormal = unsignedOctahedralToHemisphereDirection(vec2(normalSample.xy), cb.translucentMaterialArgs.normalIntensity);
+    const uint normalEncoding = translucentSurfaceMaterial.normalEncoding & 7u;
+    vec3 tangentNormal = normalEncoding == 0u
+      ? unsignedOctahedralToHemisphereDirection(vec2(normalSample.xy), cb.translucentMaterialArgs.normalIntensity)
+      : decodeGameTangentNormal(normalSample, normalEncoding, cb.translucentMaterialArgs.normalIntensity);
 
     if (secondNormalLoaded)
     {
-      const vec3 tangentNormal2 = unsignedOctahedralToHemisphereDirection(vec2(secondNormalSample.xy), cb.translucentMaterialArgs.normalIntensity);
+      const vec3 tangentNormal2 = normalEncoding == 0u
+        ? unsignedOctahedralToHemisphereDirection(vec2(secondNormalSample.xy), cb.translucentMaterialArgs.normalIntensity)
+        : decodeGameTangentNormal(secondNormalSample, normalEncoding, cb.translucentMaterialArgs.normalIntensity);
 
       tangentNormal = normalBlendRNM(tangentNormal2, tangentNormal);
     }

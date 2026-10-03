@@ -319,6 +319,18 @@ namespace {
     return true;
   }
 
+  // Match the native x64 path before handing the projection to Remix:
+  //  * strip TAA sub-pixel jitter (row 2, columns 0/1) - Remix applies its own
+  //    jitter, so forwarding the game's doubled it and shimmered the RT image;
+  //  * canonicalize negative X/Y scales - a flipped projection otherwise
+  //    renders the ray-traced scene mirrored or upside-down.
+  void sanitizeProjectionRowMajor(float* m) {
+    m[8] = 0.0f;
+    m[9] = 0.0f;
+    if (m[0] < 0.0f) m[0] = -m[0];
+    if (m[5] < 0.0f) m[5] = -m[5];
+  }
+
   // Rigid-body view: orthonormal 3x3, affine last column, not identity.
   bool isViewLikeRowMajor(const float* m) {
     if (!isFinite16(m)) return false;
@@ -390,6 +402,7 @@ namespace {
         }
       }
       if (projOff == SIZE_MAX) continue;
+      sanitizeProjectionRowMajor(proj);
 
       // Pass 2: find the view in the same buffer (both conventions).
       bool viewFound = false;
@@ -859,7 +872,8 @@ namespace {
       ClientMessage c(Commands::RemixApi_DrawInstance);
       serializeAndSend<serialize::InstanceInfo>(c, instInfo);
       sendBool(c, false);
-      g_frameCoverage.recordCapturedDraw(g_frameIndex.load(std::memory_order_relaxed));
+      g_frameCoverage.recordCapturedDraw(g_frameIndex.load(std::memory_order_relaxed),
+        indexCount);
     }
   }
 

@@ -129,9 +129,21 @@ void main(uint2 threadId : SV_DispatchThreadID, uint linearIndex : SV_GroupIndex
 
     const float currentExposure = middleGrey / max(0.001f, currentLum * (1.0 - middleGrey));
 
-    // Smooth out large exposure swings over time
-    const float previousExposure = OutExposure[0];
-    const float adaptedExposure = previousExposure + (currentExposure - previousExposure) * (1.f - exp2(-cb.autoExposureSpeed));
+    // Smooth out large exposure swings over time.
+    // The stored exposure feeds back into every later frame, so one NaN (an
+    // empty histogram makes the mean 0/0) used to turn the output black for
+    // the rest of the session. Skip updates that are not finite, and restart
+    // from the current measurement if the stored value was ever poisoned.
+    float previousExposure = OutExposure[0];
+    if (!isfinite(previousExposure) || previousExposure <= 0.0f)
+    {
+      previousExposure = isfinite(currentExposure) && currentExposure > 0.0f ? currentExposure : 1.0f;
+    }
+    float adaptedExposure = previousExposure;
+    if (totalWeight > 0.0f && isfinite(currentExposure) && currentExposure > 0.0f)
+    {
+      adaptedExposure = previousExposure + (currentExposure - previousExposure) * (1.f - exp2(-cb.autoExposureSpeed));
+    }
 
     OutExposure[0] = adaptedExposure;
   }

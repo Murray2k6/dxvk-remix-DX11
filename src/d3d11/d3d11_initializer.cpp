@@ -91,6 +91,14 @@ namespace dxvk {
           constexpr size_t kMaxIndexShadowBytes = 32ull << 20;
           if (desc.ByteWidth > 0 && desc.ByteWidth <= kMaxIndexShadowBytes)
             pBuffer->SetIndexShadow(pInitialData->pSysMem, desc.ByteWidth);
+        } else if ((desc.BindFlags & D3D11_BIND_VERTEX_BUFFER)
+                && desc.Usage == D3D11_USAGE_IMMUTABLE
+                && desc.ByteWidth > 0 && desc.ByteWidth <= (64u << 10)) {
+          // Small immutable vertex buffers (deferred-decal / light-volume unit
+          // cubes and spheres): the RT path reads their object-space extent to
+          // project box decals onto the surfaces they cover. Same creation-time
+          // shadow storage as index buffers.
+          pBuffer->SetIndexShadow(pInitialData->pSysMem, desc.ByteWidth);
         }
       }
     }

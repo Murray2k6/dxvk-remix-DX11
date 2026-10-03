@@ -5,6 +5,84 @@
 
 namespace dxvk {
 
+  namespace {
+
+    // The window surface vkd3d-proton's presenter asks for
+    // (IDXGIVkSurfaceFactory, DXVK 2.x / vkd3d_swapchain_factory.idl).
+    class DxgiVkSurfaceFactory : public ComObject<IDXGIVkSurfaceFactory> {
+    public:
+      explicit DxgiVkSurfaceFactory(HWND hWnd) : m_window(hWnd) { }
+
+      HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppvObject) final {
+        if (ppvObject == nullptr)
+          return E_POINTER;
+        *ppvObject = nullptr;
+        if (riid == __uuidof(IUnknown) || riid == __uuidof(IDXGIVkSurfaceFactory)) {
+          *ppvObject = ref(this);
+          return S_OK;
+        }
+        return E_NOINTERFACE;
+      }
+
+      VkResult STDMETHODCALLTYPE CreateSurface(VkInstance Instance, VkPhysicalDevice, VkSurfaceKHR* pSurface) final {
+        const auto create = reinterpret_cast<PFN_vkCreateWin32SurfaceKHR>(
+          vkGetInstanceProcAddr(Instance, "vkCreateWin32SurfaceKHR"));
+        if (create == nullptr)
+          return VK_ERROR_EXTENSION_NOT_PRESENT;
+        VkWin32SurfaceCreateInfoKHR info = { VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR };
+        info.hinstance = reinterpret_cast<HINSTANCE>(GetWindowLongPtrW(m_window, GWLP_HINSTANCE));
+        info.hwnd = m_window;
+        return create(Instance, &info, nullptr, pSurface);
+      }
+
+    private:
+      HWND m_window;
+    };
+
+    // vkd3d-proton's presenter (DXVK 2.x layout) behind this branch's older
+    // IDXGIVkSwapChain, so the existing DxgiSwapChain drives it unchanged.
+    class DxgiVkPresenterAdapter : public ComObject<IDXGIVkSwapChain> {
+    public:
+      explicit DxgiVkPresenterAdapter(IDXGIVkSwapChain2x* pPresenter) : m_presenter(pPresenter) { }
+
+      HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppvObject) final {
+        if (ppvObject == nullptr)
+          return E_POINTER;
+        *ppvObject = nullptr;
+        if (riid == __uuidof(IUnknown) || riid == __uuidof(IDXGIVkSwapChain)) {
+          *ppvObject = ref(this);
+          return S_OK;
+        }
+        return m_presenter->QueryInterface(riid, ppvObject);
+      }
+
+      HRESULT STDMETHODCALLTYPE GetDesc(DXGI_SWAP_CHAIN_DESC1* pDesc) final { return m_presenter->GetDesc(pDesc); }
+      HRESULT STDMETHODCALLTYPE GetAdapter(REFIID riid, void** ppvObject) final { return m_presenter->GetAdapter(riid, ppvObject); }
+      HRESULT STDMETHODCALLTYPE GetDevice(REFIID riid, void** ppDevice) final { return m_presenter->GetDevice(riid, ppDevice); }
+      HRESULT STDMETHODCALLTYPE GetImage(UINT BufferId, REFIID riid, void** ppBuffer) final { return m_presenter->GetImage(BufferId, riid, ppBuffer); }
+      UINT STDMETHODCALLTYPE GetImageIndex() final { return m_presenter->GetImageIndex(); }
+      UINT STDMETHODCALLTYPE GetFrameLatency() final { return m_presenter->GetFrameLatency(); }
+      HANDLE STDMETHODCALLTYPE GetFrameLatencyEvent() final { return m_presenter->GetFrameLatencyEvent(); }
+      HRESULT STDMETHODCALLTYPE ChangeProperties(const DXGI_SWAP_CHAIN_DESC1* pDesc) final {
+        return m_presenter->ChangeProperties(pDesc, nullptr, nullptr);
+      }
+      HRESULT STDMETHODCALLTYPE SetPresentRegion(const RECT* pRegion) final { return m_presenter->SetPresentRegion(pRegion); }
+      HRESULT STDMETHODCALLTYPE SetGammaControl(UINT NumControlPoints, const DXGI_RGB* pControlPoints) final {
+        return m_presenter->SetGammaControl(NumControlPoints, pControlPoints);
+      }
+      HRESULT STDMETHODCALLTYPE SetFrameLatency(UINT MaxLatency) final { return m_presenter->SetFrameLatency(MaxLatency); }
+      HRESULT STDMETHODCALLTYPE Present(UINT SyncInterval, UINT PresentFlags, const DXGI_PRESENT_PARAMETERS* pPresentParameters) final {
+        return m_presenter->Present(SyncInterval, PresentFlags, pPresentParameters);
+      }
+      // DXVK 2.x presenters follow mode changes through ChangeProperties.
+      void STDMETHODCALLTYPE NotifyModeChange(BOOL, const DXGI_MODE_DESC*) final { }
+
+    private:
+      Com<IDXGIVkSwapChain2x> m_presenter;
+    };
+
+  }
+
   DxgiFactory::DxgiFactory(UINT Flags)
   // DX11_V283_SHARED_VK_INSTANCE: all factories share the process-wide
   // instance; concurrent creations serialize instead of racing the loader.
@@ -144,6 +222,25 @@ namespace dxvk {
     if (!ppSwapChain || !pDesc || !hWnd || !pDevice)
       return DXGI_ERROR_INVALID_CALL;
     
+    // DX12 through vkd3d-proton (documentation/engine_knowledge/DX12_PLAN.md):
+    // its command queue builds the presenter through the DXVK 2.x factory.
+    Com<IDXGIVkSwapChainFactory> vkFactory;
+    if (SUCCEEDED(pDevice->QueryInterface(
+          __uuidof(IDXGIVkSwapChainFactory),
+          reinterpret_cast<void**>(&vkFactory)))) {
+      Com<IDXGIVkSurfaceFactory> surfaceFactory = new DxgiVkSurfaceFactory(hWnd);
+      Com<IDXGIVkSwapChain2x> presenter;
+      HRESULT hr = vkFactory->CreateSwapChain(surfaceFactory.ptr(), pDesc, &presenter);
+      if (FAILED(hr)) {
+        Logger::err(str::format("DXGI: vkd3d-proton presenter creation failed: ", hr));
+        return hr;
+      }
+      Com<IDXGIVkSwapChain> adapter = new DxgiVkPresenterAdapter(presenter.ptr());
+      *ppSwapChain = ref(new DxgiSwapChain(this, adapter.ptr(), hWnd, pDesc, pFullscreenDesc));
+      Logger::info("DXGI: D3D12 swap chain created through vkd3d-proton");
+      return S_OK;
+    }
+
     Com<IWineDXGISwapChainFactory> wineDevice;
     
     if (SUCCEEDED(pDevice->QueryInterface(

@@ -325,6 +325,28 @@ namespace dxvk {
 
     std::array<std::atomic<VkDeviceSize>, VK_MAX_MEMORY_HEAPS> m_heapAlloc;
 
+    // Remix's device extensions and features, with the feature pNext chain
+    // built inside enabledFeatures. Shared by createDevice and the imported
+    // device path (dxvk_device_import.cpp). Returns whether CUDA interop
+    // extensions were requested.
+    bool planDevice(
+      const Rc<DxvkInstance>&     instance,
+            DxvkDeviceExtensions& devExtensions,
+            DxvkDeviceFeatures&   enabledFeatures,
+            DxvkNameSet&          extensionsEnabled);
+
+    void checkDriverVersion(const Rc<DxvkInstance>& instance) const;
+
+    Rc<DxvkDevice> createDeviceWithPlan(
+      const Rc<DxvkInstance>&     instance,
+            DxvkDeviceExtensions& devExtensions,
+            DxvkDeviceFeatures&   enabledFeatures,
+            DxvkNameSet&          extensionsEnabled,
+            DxvkNameList&         extensionNameList,
+            bool                  enableCudaInterop);
+
+    friend class DxvkDeviceImporter;
+
     void initHeapAllocInfo();
     void queryExtensions();
     void queryDeviceInfo();

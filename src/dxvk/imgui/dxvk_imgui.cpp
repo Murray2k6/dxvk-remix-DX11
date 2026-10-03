@@ -951,6 +951,33 @@ namespace dxvk {
     // rtx.keepTexturesForTagging enabled, ReleaseTexture keeps the entries.
     drainPendingTextureReleases();
 
+    // The release queue keys on the texture's hash at destruction time, but a
+    // texture's content hash can change after the grid registered it (data
+    // uploaded after creation, streamed mips), so some releases never match
+    // and the grid kept the game's freed textures alive in VRAM. Independently
+    // of hashes: an entry whose image is referenced only by this grid has been
+    // discarded by the game and by Remix. Drop it unless
+    // rtx.keepTexturesForTagging ("Preserve discarded textures") is on.
+    {
+      static uint32_t s_discardSweepFrame = 0;
+      if (++s_discardSweepFrame >= 120u) {
+        s_discardSweepFrame = 0;
+        if (!RtxOptions::keepTexturesForTagging()) {
+          for (auto it = g_imguiTextureMap.begin(); it != g_imguiTextureMap.end();) {
+            const Rc<DxvkImageView>& view = it->second.imageView;
+            const bool discarded = view != nullptr
+              && view->refCount() == 1u
+              && view->image() != nullptr
+              && view->image()->refCount() == 1u;
+            if (discarded)
+              it = g_imguiTextureMap.erase(it);
+            else
+              ++it;
+          }
+        }
+      }
+    }
+
     ImGui_ImplDxvk::NewFrame();
     ImGui_ImplWin32_NewFrame();
 

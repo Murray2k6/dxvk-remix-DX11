@@ -431,6 +431,60 @@ namespace dxvk {
   }
 
   DxvkInstance::DxvkInstance() {
+    initOptionsAndProviders();
+
+    m_vkl = new vk::LibraryFn();
+    m_vki = new vk::InstanceFn(true, this->createInstance());
+
+    initAdapters();
+  }
+
+
+  DxvkInstance::DxvkInstance(const DxvkInstanceImport& import) {
+    initOptionsAndProviders();
+
+    if (import.instance == VK_NULL_HANDLE)
+      throw DxvkError("DxvkInstance: imported VkInstance is null");
+
+    m_imported = true;
+    m_vkl = new vk::LibraryFn();
+    // owned=false: the game destroys its own instance.
+    m_vki = new vk::InstanceFn(false, import.instance, import.getInstanceProcAddr);
+
+    // Record which of DXVK's instance extensions the game enabled. Remix
+    // cannot add instance extensions after the fact; the DX12 and Vulkan
+    // front ends request them when the game's instance is created
+    // (vkd3d-proton patch / layer vkCreateInstance hook).
+    DxvkNameSet enabled;
+    for (uint32_t i = 0; i < import.extensionCount; i++)
+      enabled.add(import.extensionNames[i]);
+
+    DxvkInstanceExtensions insExtensions;
+    DxvkExt* insExtensionList[] = {
+      &insExtensions.extDebugUtils,
+      &insExtensions.khrGetSurfaceCapabilities2,
+      &insExtensions.khrSurface,
+      &insExtensions.khrDeviceProperties2,
+      &insExtensions.khrExternalMemoryCapabilities,
+      &insExtensions.khrExternalSemaphoreCapabilities,
+    };
+
+    for (DxvkExt* ext : insExtensionList) {
+      if (uint32_t revision = enabled.supports(ext->name()))
+        ext->enable(revision);
+    }
+
+    m_extensions = insExtensions;
+
+    Logger::info(str::format("[Remix-Import] adopted game VkInstance with ", import.extensionCount, " extensions"));
+    for (uint32_t i = 0; i < import.extensionCount; i++)
+      Logger::info(str::format("  ", import.extensionNames[i]));
+
+    initAdapters();
+  }
+
+
+  void DxvkInstance::initOptionsAndProviders() {
     Logger::info(str::format("Game: ", env::getExeName()));
     Logger::info(str::format("DXVK_Remix: ", DXVK_VERSION));
 
@@ -498,10 +552,10 @@ namespace dxvk {
 
     for (const auto& provider : m_extProviders)
       provider->initInstanceExtensions();
+  }
 
-    m_vkl = new vk::LibraryFn();
-    m_vki = new vk::InstanceFn(true, this->createInstance());
 
+  void DxvkInstance::initAdapters() {
     // DX11_V284: init markers - the FFXV hang trace ended AFTER
     // "vkCreateInstance returned VK_SUCCESS" with no adapter logs, i.e. the
     // hang was in adapter enumeration below while ANOTHER dxvk copy (the
@@ -543,7 +597,8 @@ namespace dxvk {
       // NV-DXVK end
     }
 
-    if (RtxOptions::areValidationLayersEnabled()) {
+    // An imported instance has debug utils only if the game enabled it.
+    if (RtxOptions::areValidationLayersEnabled() && (!m_imported || m_extensions.extDebugUtils)) {
       // NV-DXVK start: use EXT_debug_utils
       VkDebugUtilsMessengerCreateInfoEXT info = {};
       info.sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT;

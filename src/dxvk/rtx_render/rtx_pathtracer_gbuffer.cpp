@@ -70,7 +70,7 @@ namespace dxvk {
 
   // Defined within an unnamed namespace to ensure unique definition across binary
   namespace {
-    class GbufferRayGenShader : public AsyncManagedShader {
+    class GbufferRayGenShader : public ManagedShader {
     public:
       BINDLESS_ENABLED()
 

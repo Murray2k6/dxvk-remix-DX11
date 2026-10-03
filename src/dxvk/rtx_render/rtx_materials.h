@@ -569,7 +569,8 @@ struct RtOpaqueSurfaceMaterial {
     uint32_t samplerIndex, float displaceIn, float displaceOut,
     uint32_t subsurfaceMaterialIndex, bool isRaytracedRenderTarget,
     uint16_t samplerFeedbackStamp,
-    uint32_t secondaryTextureIndex = 0
+    uint32_t secondaryTextureIndex = 0,
+    uint16_t normalEncoding = 0
   ) :
     m_albedoOpacityTextureIndex{ albedoOpacityTextureIndex }, m_secondaryTextureIndex{secondaryTextureIndex}, m_normalTextureIndex{ normalTextureIndex },
     m_tangentTextureIndex { tangentTextureIndex }, m_heightTextureIndex { heightTextureIndex }, m_roughnessTextureIndex{ roughnessTextureIndex },
@@ -581,7 +582,8 @@ struct RtOpaqueSurfaceMaterial {
     m_ignoreAlphaChannel { ignoreAlphaChannel }, m_enableThinFilm { enableThinFilm }, m_alphaIsThinFilmThickness { alphaIsThinFilmThickness },
     m_thinFilmThicknessConstant { thinFilmThicknessConstant }, m_samplerIndex{ samplerIndex }, m_displaceIn{ displaceIn },
     m_displaceOut{ displaceOut }, m_subsurfaceMaterialIndex(subsurfaceMaterialIndex), m_isRaytracedRenderTarget(isRaytracedRenderTarget),
-    m_samplerFeedbackStamp{ samplerFeedbackStamp }
+    m_samplerFeedbackStamp{ samplerFeedbackStamp },
+    m_normalEncoding{ normalEncoding }
   {
     updateCachedData();
     updateCachedHash();
@@ -673,7 +675,11 @@ struct RtOpaqueSurfaceMaterial {
     // data[26]
     writeGPUHelperExplicit<2>(data, offset, m_samplerFeedbackStamp);
 
-    writeGPUPadding<10>(data, offset);
+    // data[27]: normal map encoding (see NormalEncoding in rtx_material_data.h),
+    // bit 8: OPAQUE_SURFACE_MATERIAL_ENCODING_INFERRED_ROUGHNESS
+    writeGPUHelperExplicit<2>(data, offset, uint16_t(m_normalEncoding));
+
+    writeGPUPadding<8>(data, offset);
     assert(offset - oldOffset == kSurfaceMaterialGPUSize);
   }
 
@@ -784,7 +790,7 @@ struct RtOpaqueSurfaceMaterial {
 private:
   void updateCachedHash() {
     static_assert(
-      sizeof(*this) == 120,
+      sizeof(*this) == 128,
       "add new member for hashing if needed: add a MEMBER into the struct + add a VALUE into the list-init"
     );
     struct HashStruct {
@@ -813,6 +819,7 @@ private:
       uint32_t isRaytracedRenderTarget;   // NOTE: uint32_t to avoid padding
       uint32_t samplerFeedbackStamp;      // NOTE: uint32_t to avoid padding
       uint32_t secondaryTextureIndex;
+      uint32_t normalEncoding;            // NOTE: uint32_t to avoid padding
       // NOTE: There must be NO padding between members, as the struct is used for hashing
     };
     static_assert(alignof(HashStruct) == 4 && sizeof(HashStruct) % 4 == 0);
@@ -842,6 +849,7 @@ private:
       m_isRaytracedRenderTarget,
       m_samplerFeedbackStamp,
       m_secondaryTextureIndex,
+      m_normalEncoding,
     };
     m_cachedHash = XXH3_64bits(&hashData, sizeof(hashData));
   }
@@ -893,6 +901,10 @@ private:
 
   uint16_t m_samplerFeedbackStamp;
 
+  // NormalEncoding (rtx_material_data.h) in the low byte; bit 8 marks
+  // roughness taken from a game texture. Sits in existing padding.
+  uint16_t m_normalEncoding = 0;
+
   XXH64_hash_t m_cachedHash;
 
   // Note: Cached values are not involved in the hash as they are derived from the input data
@@ -908,14 +920,16 @@ struct RtTranslucentSurfaceMaterial {
     float refractiveIndex,
     float transmittanceMeasurementDistance, const Vector3& transmittanceColor,
     bool enableEmission, float emissiveIntensity, const Vector3& emissiveColorConstant,
-    bool isThinWalled, float thinWallThickness, bool useDiffuseLayer, uint32_t samplerIndex) :
+    bool isThinWalled, float thinWallThickness, bool useDiffuseLayer, uint32_t samplerIndex,
+    uint8_t normalEncoding = 0) :
     m_normalTextureIndex(normalTextureIndex),
     m_transmittanceTextureIndex(transmittanceTextureIndex),
     m_emissiveColorTextureIndex(emissiveColorTextureIndex),
     m_refractiveIndex(refractiveIndex),
     m_transmittanceMeasurementDistance(transmittanceMeasurementDistance), m_transmittanceColor(transmittanceColor),
     m_enableEmission(enableEmission), m_emissiveIntensity(emissiveIntensity), m_emissiveColorConstant(emissiveColorConstant),
-    m_isThinWalled(isThinWalled), m_thinWallThickness(thinWallThickness), m_useDiffuseLayer(useDiffuseLayer), m_samplerIndex(samplerIndex)
+    m_isThinWalled(isThinWalled), m_thinWallThickness(thinWallThickness), m_useDiffuseLayer(useDiffuseLayer), m_samplerIndex(samplerIndex),
+    m_normalEncoding(normalEncoding)
   {
     updateCachedData();
     updateCachedHash();
@@ -966,9 +980,13 @@ struct RtTranslucentSurfaceMaterial {
     writeGPUHelper(data, offset, glm::packHalf1x16(m_emissiveColorConstant.x));
     writeGPUHelper(data, offset, glm::packHalf1x16(m_emissiveColorConstant.y));
     writeGPUHelper(data, offset, glm::packHalf1x16(m_emissiveColorConstant.z));
-    
-    // data[17 - 31]
-    writeGPUPadding<30>(data, offset);
+
+    // data[17]: normal map encoding (NormalEncoding in rtx_material_data.h;
+    // 0 = Remix octahedral, a game's tangent-space water map otherwise)
+    writeGPUHelperExplicit<2>(data, offset, static_cast<uint16_t>(m_normalEncoding));
+
+    // data[18 - 31]
+    writeGPUPadding<28>(data, offset);
 
     assert(offset - oldOffset == kSurfaceMaterialGPUSize);
   }
@@ -1016,6 +1034,7 @@ private:
       float thinWallThickness;
       uint32_t useDiffuseLayer; // NOTE: uint32_t to avoid padding
       uint32_t samplerIndex;
+      uint32_t normalEncoding;  // NOTE: uint32_t to avoid padding
       // NOTE: There must be NO padding between members, as the struct is used for hashing
     };
     static_assert(alignof(HashStruct) == 4 && sizeof(HashStruct) % 4 == 0);
@@ -1033,6 +1052,7 @@ private:
       m_thinWallThickness,
       m_useDiffuseLayer,
       m_samplerIndex,
+      m_normalEncoding,
     };
     m_cachedHash = XXH3_64bits(&hashData, sizeof(hashData));
   }
@@ -1072,6 +1092,8 @@ private:
   bool m_isThinWalled;
   float m_thinWallThickness;
   bool m_useDiffuseLayer;
+  // Sits in the padding after m_useDiffuseLayer; the class stays 96 bytes.
+  uint8_t m_normalEncoding = 0;
 
   XXH64_hash_t m_cachedHash;
 
@@ -1803,6 +1825,45 @@ struct LegacyMaterialData {
   // conversion can use it as the albedo constant instead of rendering white.
   Vector4 constantAlbedo = Vector4(1.0f, 1.0f, 1.0f, 1.0f);
   bool hasConstantAlbedo = false;
+  // Set by the D3D11 capture for draws whose shader refracts a copy of the
+  // rendered scene (water, glass). Converted to a translucent material when no
+  // replacement exists. Not part of the material hash.
+  bool isRefractiveSurface = false;
+  // The game's own tangent-space normal map, inferred by the D3D11 capture
+  // (BC5/R8G8 two-channel, or a reflection-named RGB map), and its encoding
+  // (NormalEncoding in rtx_material_data.h). Not part of the material hash.
+  TextureRef normalTexture = {};
+  uint8_t normalEncoding = 0;
+  // Set by the D3D11 capture for a 2D sprite lifted into the path-traced scene
+  // (rtx.dx11.lift2DLayers). Its own colour becomes its emission and the
+  // surface is matte (no diffuse/specular), so it shows exactly as authored
+  // while still casting shadows on, and lighting, the layers behind it.
+  // Not part of the material hash.
+  bool isLiftedSprite = false;
+  // Further game textures the D3D11 capture identified by the shader
+  // reflection's names (roughness, metallic, emissive). Not part of the
+  // material hash.
+  TextureRef roughnessTexture = {};
+  TextureRef metallicTexture = {};
+  TextureRef emissiveTexture = {};
+  // Channel layout of those maps, packed beside the normal encoding for the
+  // GPU: roughness channel, roughness map holds smoothness (1 - roughness),
+  // metallic channel. See NormalEncoding in rtx_material_data.h.
+  uint8_t roughnessChannel = 0;
+  bool roughnessIsSmoothness = false;
+  uint8_t metallicChannel = 0;
+  // The roughness map is the game's authored PBR roughness (named in its own
+  // material data), not a spec / gloss map read as roughness: not clamped
+  // as inferred roughness.
+  bool roughnessAuthored = false;
+  // Legacy cubemap reflection (Bethesda envmaps and the like): the game adds
+  // an untinted reflection on top of a dark diffuse. Path traced as a
+  // reflector with white F0 whose metallic is the mask channel (the metallic
+  // texture) times reflectionStrength (0..4), or the strength alone without a mask
+  // (OPAQUE_SURFACE_MATERIAL_ENCODING_UNTINTED_REFLECTION). Not part of the
+  // material hash.
+  bool untintedReflection = false;
+  float reflectionStrength = 0.0f;
 
   void setHashOverride(XXH64_hash_t hash) {
     m_cachedHash = hash;
@@ -1842,6 +1903,8 @@ struct LegacyMaterialData {
 private:
   friend class RtxContext;
   friend struct D3D11Rtx;
+  // DX12 / Vulkan front end (d3d11_vk_capture.cpp)
+  friend class D3D11VkFrontendDevice;
   friend class TerrainBaker;
   friend class SceneManager;
   friend struct RemixAPIPrivateAccessor;

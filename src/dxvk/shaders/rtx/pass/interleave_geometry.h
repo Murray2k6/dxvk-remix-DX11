@@ -33,6 +33,11 @@
 
 // CPU-side half-float to float conversion (GPU uses the f16tof32 intrinsic built-in)
 #include "../utility/f16_conversion.h"
+#include <limits>
+
+// A captured vertex that cannot be reconstructed (non-finite clip position)
+// gets a NaN X: Vulkan makes any BLAS triangle with a NaN vertex X inactive,
+// so the triangle disappears instead of collapsing onto the camera origin.
 
 #else
 #define WriteBuffer(T) RWStructuredBuffer<T>
@@ -88,6 +93,8 @@ namespace interleaver {
   bool formatConversionUintSupported(uint32_t format) {
     switch (format) {
     case SupportedVkFormats::VK_FORMAT_B8G8R8A8_UNORM:
+    case SupportedVkFormats::VK_FORMAT_R32G32B32_SFLOAT:
+    case SupportedVkFormats::VK_FORMAT_R32G32B32A32_SFLOAT:
       return true;
     default:
       return false;
@@ -141,6 +148,26 @@ namespace interleaver {
     case SupportedVkFormats::VK_FORMAT_B8G8R8A8_UNORM:
       // Passthrough format we support in other places
       return uint3(input[index], 0, 0);
+    case SupportedVkFormats::VK_FORMAT_R32G32B32_SFLOAT:
+    case SupportedVkFormats::VK_FORMAT_R32G32B32A32_SFLOAT:
+    {
+      // Vertex colour streamed out of a game's vertex shader (DX11 capture,
+      // DX12 / Vulkan front end): float RGB(A), packed into the B8G8R8A8 word
+      // the rest of the pipeline consumes (R at bits 16-23, G 8-15, B 0-7,
+      // A 24-31). Float RGB has opaque alpha.
+      const uint channels = format == SupportedVkFormats::VK_FORMAT_R32G32B32_SFLOAT ? 3u : 4u;
+      uint packed = channels == 3u ? (255u << 24) : 0u;
+      for (uint c = 0; c < channels; c++) {
+        uint32_t word = input[index + c];
+        // Clamp without min/max (unavailable on this header's C++ side) and
+        // map NaN to 0.
+        float v = asfloat(word);
+        v = (v > 0.0f) ? ((v < 1.0f) ? v : 1.0f) : 0.0f;
+        const uint shift = c == 0 ? 16u : (c == 1 ? 8u : (c == 2 ? 0u : 24u));
+        packed |= uint(v * 255.0f + 0.5f) << shift;
+      }
+      return uint3(packed, 0, 0);
+    }
     }
     return uint3(1,1,1);
   }
@@ -160,7 +187,14 @@ namespace interleaver {
                       srcPosition[srcPositionIndex + 2],
                       srcPosition[srcPositionIndex + 3]);
       const mat4& m = cb.clipToPosition;
-      if ((cb.attributeFlags & INTERLEAVE_GEOMETRY_FLAG_CLIP_W_DEPTH) != 0) {
+      // A vertex shader that culls by writing z = -w (Avalanche Apex) puts
+      // the vertex outside every clip volume; the reconstruction would bring
+      // it back as a spike. NaN X makes its triangles inactive in the BLAS.
+      // (w < 0 alone is a real vertex of a triangle crossing the near plane.)
+      const bool shaderCulled = clip.w != 0.0f && clip.z == -clip.w;
+      if (shaderCulled) {
+        position = float3(std::numeric_limits<float>::quiet_NaN(), 0.0f, 0.0f);
+      } else if ((cb.attributeFlags & INTERLEAVE_GEOMETRY_FLAG_CLIP_W_DEPTH) != 0) {
         const float invXScale = m.m[0].x;
         const float invYScale = m.m[1].y;
         if (std::isfinite(clip.x) && std::isfinite(clip.y)
@@ -170,7 +204,7 @@ namespace interleaver {
                             clip.y * invYScale,
                             clip.w);
         } else {
-          position = float3(0.0f, 0.0f, 0.0f);
+          position = float3(std::numeric_limits<float>::quiet_NaN(), 0.0f, 0.0f);
         }
       } else {
         const vec4 p = m.m[0] * clip.x + m.m[1] * clip.y
@@ -181,7 +215,7 @@ namespace interleaver {
           const float invW = 1.0f / p.w;
           position = float3(p.x * invW, p.y * invW, p.z * invW);
         } else {
-          position = float3(0.0f, 0.0f, 0.0f);
+          position = float3(std::numeric_limits<float>::quiet_NaN(), 0.0f, 0.0f);
         }
       }
 #else
@@ -189,7 +223,10 @@ namespace interleaver {
                                  srcPosition[srcPositionIndex + 1],
                                  srcPosition[srcPositionIndex + 2],
                                  srcPosition[srcPositionIndex + 3]);
-      if ((cb.attributeFlags & INTERLEAVE_GEOMETRY_FLAG_CLIP_W_DEPTH) != 0) {
+      if (clip.w != 0.0f && clip.z == -clip.w) {
+        // Shader-culled vertex (z = -w), see the C++ path above.
+        position = float3(asfloat(0x7fc00000u), 0.0f, 0.0f);
+      } else if ((cb.attributeFlags & INTERLEAVE_GEOMETRY_FLAG_CLIP_W_DEPTH) != 0) {
         const float invXScale = cb.clipToPosition[0][0];
         const float invYScale = cb.clipToPosition[1][1];
         if (all(isfinite(float4(clip.x, clip.y, clip.w, invXScale)))
@@ -198,13 +235,13 @@ namespace interleaver {
                             clip.y * invYScale,
                             clip.w);
         else
-          position = float3(0.0f, 0.0f, 0.0f);
+          position = float3(asfloat(0x7fc00000u), 0.0f, 0.0f);
       } else {
         const float4 p = mul(cb.clipToPosition, clip);
         if (all(isfinite(p)) && abs(p.w) > 1.0e-20f)
           position = p.xyz / p.w;
         else
-          position = float3(0.0f, 0.0f, 0.0f);
+          position = float3(asfloat(0x7fc00000u), 0.0f, 0.0f);
       }
 #endif
     }
